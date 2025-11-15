@@ -14,6 +14,10 @@ on:
       - '*'
   pull_request:
   workflow_dispatch:
+    inputs:
+      version_name:
+        description: "One of major, minor, or patch"
+        required: true
 
 permissions:
   contents: read
