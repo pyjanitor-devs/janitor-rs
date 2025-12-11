@@ -5,6 +5,8 @@ mod index_builder;
 /// A Python module implemented in Rust.
 #[pymodule]
 fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(index_builder::right_ind_le_single, m)?)?;
+    m.add_function(wrap_pyfunction!(index_builder::right_ind_ge_single, m)?)?;
     m.add_function(wrap_pyfunction!(index_builder::left_index_single, m)?)?;
     Ok(())
 }
