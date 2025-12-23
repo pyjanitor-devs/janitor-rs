@@ -1,5 +1,5 @@
 /// compare rows where only ends exist - for !=
-/// and matches exist
+/// and matches does not exist
 use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
@@ -24,13 +24,14 @@ macro_rules! generic_compare {
             ends: ArrayView1<'_, i64>,
             left_booleans: ArrayView1<'_, bool>,
             right_booleans: ArrayView1<'_, bool>,
-            matches: ArrayView1<'_, i8>,
+
             is_extension_array: bool,
             op: i8,
         ) -> (Array1<i8>, Array1<i64>, i64)
         // The macro will expand into the contents of this block.
         {
-            let mut result = Array1::<i8>::zeros(matches.len());
+            let length: i64 = ends.sum();
+            let mut result = Array1::<i8>::zeros(length as usize);
             let mut counts_array = Array1::<i64>::zeros(left.len());
             let mut total: i64 = 0;
             let mut n: usize = 0;
@@ -44,10 +45,6 @@ macro_rules! generic_compare {
                 let end_ = *end as usize;
                 let mut counter: i64 = 0;
                 for nn in start_..end_ {
-                    if matches[n] == 0 {
-                        n += 1;
-                        continue;
-                    }
                     let right_bool_ = right_booleans[nn];
                     //pd.NA != pd.NA returns pd.NA, which defaults to False
                     // pd.NA != anything returns pd.NA, which defaults to False
@@ -91,7 +88,7 @@ generic_compare!(array_compare_uint8, u8);
 generic_compare!(array_compare_float64, f64);
 generic_compare!(array_compare_float32, f32);
 
-#[pyfunction(name = "compare_end_ne_int64")]
+#[pyfunction(name = "compare_end_ne_1st_int64")]
 pub fn compare_int64<'py>(
     py: Python<'py>,
     left: PyReadonlyArray1<'py, i64>,
@@ -101,7 +98,6 @@ pub fn compare_int64<'py>(
     left_booleans: PyReadonlyArray1<'py, bool>,
     right_booleans: PyReadonlyArray1<'py, bool>,
 
-    matches: PyReadonlyArray1<'py, i8>,
     is_extension_array: bool,
     op: i8,
 ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
@@ -109,7 +105,6 @@ pub fn compare_int64<'py>(
     let right = right.as_array();
     let starts = starts.as_array();
 
-    let matches = matches.as_array();
     let left_booleans = left_booleans.as_array();
     let right_booleans = right_booleans.as_array();
     let (result, counts_array, total) = array_compare_int64(
@@ -118,7 +113,6 @@ pub fn compare_int64<'py>(
         starts,
         left_booleans,
         right_booleans,
-        matches,
         is_extension_array,
         op,
     );
@@ -129,7 +123,7 @@ pub fn compare_int64<'py>(
     )
 }
 
-#[pyfunction(name = "compare_end_ne_int32")]
+#[pyfunction(name = "compare_end_ne_1st_int32")]
 pub fn compare_int32<'py>(
     py: Python<'py>,
     left: PyReadonlyArray1<'py, i32>,
@@ -139,7 +133,6 @@ pub fn compare_int32<'py>(
     left_booleans: PyReadonlyArray1<'py, bool>,
     right_booleans: PyReadonlyArray1<'py, bool>,
 
-    matches: PyReadonlyArray1<'py, i8>,
     is_extension_array: bool,
     op: i8,
 ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
@@ -147,7 +140,6 @@ pub fn compare_int32<'py>(
     let right = right.as_array();
     let starts = starts.as_array();
 
-    let matches = matches.as_array();
     let left_booleans = left_booleans.as_array();
     let right_booleans = right_booleans.as_array();
     let (result, counts_array, total) = array_compare_int32(
@@ -156,7 +148,6 @@ pub fn compare_int32<'py>(
         starts,
         left_booleans,
         right_booleans,
-        matches,
         is_extension_array,
         op,
     );
@@ -167,7 +158,7 @@ pub fn compare_int32<'py>(
     )
 }
 
-#[pyfunction(name = "compare_end_ne_int16")]
+#[pyfunction(name = "compare_end_ne_1st_int16")]
 pub fn compare_int16<'py>(
     py: Python<'py>,
     left: PyReadonlyArray1<'py, i16>,
@@ -177,7 +168,6 @@ pub fn compare_int16<'py>(
     left_booleans: PyReadonlyArray1<'py, bool>,
     right_booleans: PyReadonlyArray1<'py, bool>,
 
-    matches: PyReadonlyArray1<'py, i8>,
     is_extension_array: bool,
     op: i8,
 ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
@@ -185,7 +175,6 @@ pub fn compare_int16<'py>(
     let right = right.as_array();
     let starts = starts.as_array();
 
-    let matches = matches.as_array();
     let left_booleans = left_booleans.as_array();
     let right_booleans = right_booleans.as_array();
     let (result, counts_array, total) = array_compare_int16(
@@ -194,7 +183,6 @@ pub fn compare_int16<'py>(
         starts,
         left_booleans,
         right_booleans,
-        matches,
         is_extension_array,
         op,
     );
@@ -205,7 +193,7 @@ pub fn compare_int16<'py>(
     )
 }
 
-#[pyfunction(name = "compare_end_ne_int8")]
+#[pyfunction(name = "compare_end_ne_1st_int8")]
 pub fn compare_int8<'py>(
     py: Python<'py>,
     left: PyReadonlyArray1<'py, i8>,
@@ -215,7 +203,6 @@ pub fn compare_int8<'py>(
     left_booleans: PyReadonlyArray1<'py, bool>,
     right_booleans: PyReadonlyArray1<'py, bool>,
 
-    matches: PyReadonlyArray1<'py, i8>,
     is_extension_array: bool,
     op: i8,
 ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
@@ -223,7 +210,6 @@ pub fn compare_int8<'py>(
     let right = right.as_array();
     let starts = starts.as_array();
 
-    let matches = matches.as_array();
     let left_booleans = left_booleans.as_array();
     let right_booleans = right_booleans.as_array();
     let (result, counts_array, total) = array_compare_int8(
@@ -232,7 +218,6 @@ pub fn compare_int8<'py>(
         starts,
         left_booleans,
         right_booleans,
-        matches,
         is_extension_array,
         op,
     );
@@ -243,7 +228,7 @@ pub fn compare_int8<'py>(
     )
 }
 
-#[pyfunction(name = "compare_end_ne_float32")]
+#[pyfunction(name = "compare_end_ne_1st_float32")]
 pub fn compare_float32<'py>(
     py: Python<'py>,
     left: PyReadonlyArray1<'py, f32>,
@@ -253,7 +238,6 @@ pub fn compare_float32<'py>(
     left_booleans: PyReadonlyArray1<'py, bool>,
     right_booleans: PyReadonlyArray1<'py, bool>,
 
-    matches: PyReadonlyArray1<'py, i8>,
     is_extension_array: bool,
     op: i8,
 ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
@@ -261,7 +245,6 @@ pub fn compare_float32<'py>(
     let right = right.as_array();
     let starts = starts.as_array();
 
-    let matches = matches.as_array();
     let left_booleans = left_booleans.as_array();
     let right_booleans = right_booleans.as_array();
     let (result, counts_array, total) = array_compare_float32(
@@ -270,7 +253,6 @@ pub fn compare_float32<'py>(
         starts,
         left_booleans,
         right_booleans,
-        matches,
         is_extension_array,
         op,
     );
@@ -281,7 +263,7 @@ pub fn compare_float32<'py>(
     )
 }
 
-#[pyfunction(name = "compare_end_ne_float64")]
+#[pyfunction(name = "compare_end_ne_1st_float64")]
 pub fn compare_float64<'py>(
     py: Python<'py>,
     left: PyReadonlyArray1<'py, f64>,
@@ -291,7 +273,6 @@ pub fn compare_float64<'py>(
     left_booleans: PyReadonlyArray1<'py, bool>,
     right_booleans: PyReadonlyArray1<'py, bool>,
 
-    matches: PyReadonlyArray1<'py, i8>,
     is_extension_array: bool,
     op: i8,
 ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
@@ -299,7 +280,6 @@ pub fn compare_float64<'py>(
     let right = right.as_array();
     let starts = starts.as_array();
 
-    let matches = matches.as_array();
     let left_booleans = left_booleans.as_array();
     let right_booleans = right_booleans.as_array();
     let (result, counts_array, total) = array_compare_float64(
@@ -308,7 +288,6 @@ pub fn compare_float64<'py>(
         starts,
         left_booleans,
         right_booleans,
-        matches,
         is_extension_array,
         op,
     );
@@ -319,7 +298,7 @@ pub fn compare_float64<'py>(
     )
 }
 
-#[pyfunction(name = "compare_end_ne_uint64")]
+#[pyfunction(name = "compare_end_ne_1st_uint64")]
 pub fn compare_uint64<'py>(
     py: Python<'py>,
     left: PyReadonlyArray1<'py, u64>,
@@ -329,7 +308,6 @@ pub fn compare_uint64<'py>(
     left_booleans: PyReadonlyArray1<'py, bool>,
     right_booleans: PyReadonlyArray1<'py, bool>,
 
-    matches: PyReadonlyArray1<'py, i8>,
     is_extension_array: bool,
     op: i8,
 ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
@@ -337,7 +315,6 @@ pub fn compare_uint64<'py>(
     let right = right.as_array();
     let starts = starts.as_array();
 
-    let matches = matches.as_array();
     let left_booleans = left_booleans.as_array();
     let right_booleans = right_booleans.as_array();
     let (result, counts_array, total) = array_compare_uint64(
@@ -346,7 +323,6 @@ pub fn compare_uint64<'py>(
         starts,
         left_booleans,
         right_booleans,
-        matches,
         is_extension_array,
         op,
     );
@@ -357,7 +333,7 @@ pub fn compare_uint64<'py>(
     )
 }
 
-#[pyfunction(name = "compare_end_ne_uint32")]
+#[pyfunction(name = "compare_end_ne_1st_uint32")]
 pub fn compare_uint32<'py>(
     py: Python<'py>,
     left: PyReadonlyArray1<'py, u32>,
@@ -367,7 +343,6 @@ pub fn compare_uint32<'py>(
     left_booleans: PyReadonlyArray1<'py, bool>,
     right_booleans: PyReadonlyArray1<'py, bool>,
 
-    matches: PyReadonlyArray1<'py, i8>,
     is_extension_array: bool,
     op: i8,
 ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
@@ -375,7 +350,6 @@ pub fn compare_uint32<'py>(
     let right = right.as_array();
     let starts = starts.as_array();
 
-    let matches = matches.as_array();
     let left_booleans = left_booleans.as_array();
     let right_booleans = right_booleans.as_array();
     let (result, counts_array, total) = array_compare_uint32(
@@ -384,7 +358,6 @@ pub fn compare_uint32<'py>(
         starts,
         left_booleans,
         right_booleans,
-        matches,
         is_extension_array,
         op,
     );
@@ -395,7 +368,7 @@ pub fn compare_uint32<'py>(
     )
 }
 
-#[pyfunction(name = "compare_end_ne_uint16")]
+#[pyfunction(name = "compare_end_ne_1st_uint16")]
 pub fn compare_uint16<'py>(
     py: Python<'py>,
     left: PyReadonlyArray1<'py, u16>,
@@ -405,7 +378,6 @@ pub fn compare_uint16<'py>(
     left_booleans: PyReadonlyArray1<'py, bool>,
     right_booleans: PyReadonlyArray1<'py, bool>,
 
-    matches: PyReadonlyArray1<'py, i8>,
     is_extension_array: bool,
     op: i8,
 ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
@@ -413,7 +385,6 @@ pub fn compare_uint16<'py>(
     let right = right.as_array();
     let starts = starts.as_array();
 
-    let matches = matches.as_array();
     let left_booleans = left_booleans.as_array();
     let right_booleans = right_booleans.as_array();
     let (result, counts_array, total) = array_compare_uint16(
@@ -422,7 +393,6 @@ pub fn compare_uint16<'py>(
         starts,
         left_booleans,
         right_booleans,
-        matches,
         is_extension_array,
         op,
     );
@@ -433,7 +403,7 @@ pub fn compare_uint16<'py>(
     )
 }
 
-#[pyfunction(name = "compare_end_ne_uint8")]
+#[pyfunction(name = "compare_end_ne_1st_uint8")]
 pub fn compare_uint8<'py>(
     py: Python<'py>,
     left: PyReadonlyArray1<'py, u8>,
@@ -443,7 +413,6 @@ pub fn compare_uint8<'py>(
     left_booleans: PyReadonlyArray1<'py, bool>,
     right_booleans: PyReadonlyArray1<'py, bool>,
 
-    matches: PyReadonlyArray1<'py, i8>,
     is_extension_array: bool,
     op: i8,
 ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
@@ -451,7 +420,6 @@ pub fn compare_uint8<'py>(
     let right = right.as_array();
     let starts = starts.as_array();
 
-    let matches = matches.as_array();
     let left_booleans = left_booleans.as_array();
     let right_booleans = right_booleans.as_array();
     let (result, counts_array, total) = array_compare_uint8(
@@ -460,7 +428,6 @@ pub fn compare_uint8<'py>(
         starts,
         left_booleans,
         right_booleans,
-        matches,
         is_extension_array,
         op,
     );
@@ -477,21 +444,18 @@ mod tests {
     use numpy::ndarray::Array1;
 
     #[test]
-    fn test_array_compare_int64_ne_ends() {
+    fn test_array_compare_int64_ne_ends_1st() {
         let left = Array1::from_vec(vec![10, 20]);
         let right = Array1::from_vec(vec![5, 10, 25, 20]);
         let ends = Array1::from_vec(vec![2, 4]);
         let left_booleans = Array1::from_vec(vec![false, false]);
         let right_booleans = Array1::from_vec(vec![false, false, false, false]);
-        let matches = Array1::from_vec(vec![1, 1, 1, 1, 1, 1]);
-
         let (result, counts_array, total) = array_compare_int64(
             left.view(),
             right.view(),
             ends.view(),
             left_booleans.view(),
             right_booleans.view(),
-            matches.view(),
             false,
             5, // not equal
         );
