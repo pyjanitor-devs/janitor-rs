@@ -11,11 +11,14 @@ mod comp_ne_ends;
 mod comp_ne_ends_1st;
 mod comp_ne_starts;
 mod comp_ne_starts_1st;
+mod comp_no_range;
+mod comp_no_range_ne;
 mod comp_posns;
 mod comp_posns_ne;
 mod comp_starts;
 mod index_builder;
 mod left_le_right;
+
 /// Helper functions for PyJanitor implemented in Rust.
 #[pymodule]
 fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -45,6 +48,17 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(comp::compare_float32, m)?)?;
     m.add_function(wrap_pyfunction!(comp::compare_float64, m)?)?;
 
+    m.add_function(wrap_pyfunction!(comp_no_range_ne::compare_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range_ne::compare_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range_ne::compare_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range_ne::compare_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range_ne::compare_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range_ne::compare_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range_ne::compare_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range_ne::compare_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range_ne::compare_float32, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range_ne::compare_float64, m)?)?;
+
     m.add_function(wrap_pyfunction!(comp_ne::compare_uint64, m)?)?;
     m.add_function(wrap_pyfunction!(comp_ne::compare_uint32, m)?)?;
     m.add_function(wrap_pyfunction!(comp_ne::compare_uint16, m)?)?;
@@ -55,6 +69,17 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(comp_ne::compare_int8, m)?)?;
     m.add_function(wrap_pyfunction!(comp_ne::compare_float32, m)?)?;
     m.add_function(wrap_pyfunction!(comp_ne::compare_float64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(comp_no_range::compare_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range::compare_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range::compare_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range::compare_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range::compare_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range::compare_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range::compare_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range::compare_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range::compare_float32, m)?)?;
+    m.add_function(wrap_pyfunction!(comp_no_range::compare_float64, m)?)?;
 
     m.add_function(wrap_pyfunction!(comp_ne_starts::compare_uint64, m)?)?;
     m.add_function(wrap_pyfunction!(comp_ne_starts::compare_uint32, m)?)?;
