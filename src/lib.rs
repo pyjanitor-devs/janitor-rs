@@ -23,6 +23,8 @@ mod comp_starts;
 mod index_builder;
 mod left_le_right;
 
+
+
 /// Helper functions for PyJanitor implemented in Rust.
 #[pymodule]
 fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -43,6 +45,7 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(index_builder::index_starts_ends_1st, m)?)?;
     m.add_function(wrap_pyfunction!(index_builder::index_starts_ends_last, m)?)?;
 
+
     m.add_function(wrap_pyfunction!(comp::compare_uint64, m)?)?;
     m.add_function(wrap_pyfunction!(comp::compare_uint32, m)?)?;
     m.add_function(wrap_pyfunction!(comp::compare_uint16, m)?)?;
@@ -53,6 +56,9 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(comp::compare_int8, m)?)?;
     m.add_function(wrap_pyfunction!(comp::compare_float32, m)?)?;
     m.add_function(wrap_pyfunction!(comp::compare_float64, m)?)?;
+
+
+
 
     m.add_function(wrap_pyfunction!(bin_search_lt::compare_uint64, m)?)?;
     m.add_function(wrap_pyfunction!(bin_search_lt::compare_uint32, m)?)?;

@@ -16,7 +16,7 @@ macro_rules! bin_search {
             let mut result = Array1::<i64>::zeros(left.len());
             let zipped = izip!(left.into_iter(), starts.into_iter(), ends.into_iter());
             for (pos, (left_value, start, end)) in zipped.enumerate() {
-                if *start == -1 || *end == -1 {
+                if *start == -1 || *end == -1 || *start >= *end {
                     result[pos as usize] = -1;
                     continue;
                 }
@@ -33,7 +33,7 @@ macro_rules! bin_search {
                         min_idx = mid_idx + 1;
                     }
                 }
-                if min_idx == 0 {
+                if min_idx == *start {
                     result[pos as usize] = -1;
                     continue;
                 }

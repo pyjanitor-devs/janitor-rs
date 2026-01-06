@@ -17,7 +17,7 @@ macro_rules! bin_search {
             let r_len = right.len() as i64;
             let zipped = izip!(left.into_iter(), starts.into_iter(), ends.into_iter());
             for (pos, (left_value, start, end)) in zipped.enumerate() {
-                if *start == -1 || *end == -1 {
+                if *start == -1 || *end == -1 || *start >= *end {
                     result[pos as usize] = -1;
                     continue;
                 }

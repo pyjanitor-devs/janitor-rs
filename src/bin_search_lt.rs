@@ -14,10 +14,9 @@ macro_rules! bin_search {
         // The macro will expand into the contents of this block.
         {
             let mut result = Array1::<i64>::zeros(left.len());
-            let r_len = right.len() as i64;
             let zipped = izip!(left.into_iter(), starts.into_iter(), ends.into_iter());
             for (pos, (left_value, start, end)) in zipped.enumerate() {
-                if *start == -1 || *end == -1 {
+                if *start == -1 || *end == -1 || *start >= *end {
                     result[pos as usize] = -1;
                     continue;
                 }
@@ -34,7 +33,7 @@ macro_rules! bin_search {
                         max_idx = mid_idx;
                     }
                 }
-                if min_idx == r_len {
+                if min_idx == *end {
                     result[pos as usize] = -1;
                     continue;
                 }
