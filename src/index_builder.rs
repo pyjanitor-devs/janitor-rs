@@ -37,15 +37,49 @@ pub fn index_repeat<'py>(
     result.into_pyarray(py)
 }
 
+fn index_trim_positions(
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    length: i64,
+) -> Array1<i64> {
+    let mut result = Array1::<i64>::zeros(length as usize);
+    let mut val: i64;
+    let mut pos: usize = 0;
+    for (i, number) in positions.indexed_iter() {
+        if *number < 0 {
+            continue;
+        }
+        val = index[i];
+        result[pos] = val;
+        pos += 1;
+    }
+    result
+}
+
+/// This function replicates index[positions>-1]
+#[pyfunction(name = "index_trim_positions")]
+#[pyo3(signature = (*, index, positions, length))]
+pub fn index_trim_pos<'py>(
+    py: Python<'py>,
+    index: PyReadonlyArray1<'py, i64>,
+    positions: PyReadonlyArray1<'py, i64>,
+    length: i64,
+) -> Bound<'py, PyArray1<i64>> {
+    let index = index.as_array();
+    let positions = positions.as_array();
+    let result = index_trim_positions(index, positions, length);
+    result.into_pyarray(py)
+}
+
 fn trim_index(index: ArrayView1<'_, i64>, counts: ArrayView1<'_, i64>, length: i64) -> Array1<i64> {
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut val: i64;
     let mut pos: usize = 0;
     for (i, number) in counts.indexed_iter() {
-        val = index[i];
         if *number == 0 {
             continue;
         }
+        val = index[i];
         result[pos] = val;
         pos += 1;
     }
@@ -734,6 +768,31 @@ pub fn index_positions_last<'py>(
     let ends = ends.as_array();
     let positions = positions.as_array();
     let result = build_positional_index_last(index, starts, ends, counts, positions, length);
+    result.into_pyarray(py)
+}
+
+fn reorder_index(positions: ArrayView1<'_, i64>, starts: ArrayView1<'_, i64>) -> Array1<i64> {
+    let mut result = Array1::<i64>::zeros(positions.len());
+    let mut counts: Array1<i64> = Array1::zeros(starts.len());
+    for (index, val) in positions.indexed_iter() {
+        let mut pos = starts[*val as usize];
+        pos += counts[*val as usize];
+        counts[*val as usize] += 1;
+        result[pos as usize] = index as i64;
+    }
+    result
+}
+
+#[pyfunction(name = "reorder_index")]
+#[pyo3(signature = (*, positions, starts))]
+pub fn reorder_indices<'py>(
+    py: Python<'py>,
+    positions: PyReadonlyArray1<'py, i64>,
+    starts: PyReadonlyArray1<'py, i64>,
+) -> Bound<'py, PyArray1<i64>> {
+    let positions = positions.as_array();
+    let starts = starts.as_array();
+    let result = reorder_index(positions, starts);
     result.into_pyarray(py)
 }
 
