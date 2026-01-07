@@ -771,7 +771,6 @@ pub fn index_positions_last<'py>(
     result.into_pyarray(py)
 }
 
-
 fn reorder_index(positions: ArrayView1<'_, i64>, starts: ArrayView1<'_, i64>) -> Array1<i64> {
     let mut result = Array1::<i64>::zeros(positions.len());
     let mut counts: Array1<i64> = Array1::zeros(starts.len());
