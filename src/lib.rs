@@ -22,6 +22,14 @@ mod comp_posns_ne;
 mod comp_starts;
 mod index_builder;
 mod left_le_right;
+mod max_ends;
+mod max_starts;
+mod min_ends;
+mod min_starts;
+mod sum_ends;
+mod sum_starts;
+mod prod_ends;
+mod prod_starts;
 
 /// Helper functions for PyJanitor implemented in Rust.
 #[pymodule]
@@ -53,6 +61,171 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(comp::compare_int8, m)?)?;
     m.add_function(wrap_pyfunction!(comp::compare_float32, m)?)?;
     m.add_function(wrap_pyfunction!(comp::compare_float64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(min_starts::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(min_starts::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(min_starts::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(min_starts::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(min_starts::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(min_starts::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(min_starts::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(min_starts::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(min_starts::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(min_starts::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(max_starts::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(max_starts::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(max_starts::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(max_starts::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(max_starts::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(max_starts::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(max_starts::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(max_starts::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(max_starts::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(max_starts::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(max_ends::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(max_ends::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(max_ends::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(max_ends::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(max_ends::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(max_ends::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(max_ends::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(max_ends::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(max_ends::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(max_ends::compute_f64, m)?)?;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    m.add_function(wrap_pyfunction!(prod_starts::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_starts::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_starts::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_starts::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_starts::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_starts::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_starts::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_starts::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_starts::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_starts::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(prod_ends::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_ends::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_ends::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_ends::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_ends::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_ends::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_ends::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_ends::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_ends::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(prod_ends::compute_f64, m)?)?;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    m.add_function(wrap_pyfunction!(min_ends::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(min_ends::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(min_ends::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(min_ends::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(min_ends::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(min_ends::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(min_ends::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(min_ends::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(min_ends::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(min_ends::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(sum_starts::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_starts::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_starts::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_starts::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_starts::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_starts::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_starts::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_starts::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_starts::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_starts::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(sum_ends::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_ends::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_ends::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_ends::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_ends::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_ends::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_ends::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_ends::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_ends::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(sum_ends::compute_f64, m)?)?;
 
     m.add_function(wrap_pyfunction!(bin_search_lt::compare_uint64, m)?)?;
     m.add_function(wrap_pyfunction!(bin_search_lt::compare_uint32, m)?)?;
