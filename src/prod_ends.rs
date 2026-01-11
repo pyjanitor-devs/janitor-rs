@@ -17,7 +17,9 @@ macro_rules! generic_compute {
                 let mut total: i64 = 1;
                 let end_ = *end as usize;
                 for nn in start_..end_ {
-                    if booleans[nn] {continue;}
+                    if booleans[nn] {
+                        continue;
+                    }
                     let current = arr[nn];
                     total *= current as i64;
                 }
@@ -27,10 +29,6 @@ macro_rules! generic_compute {
         }
     };
 }
-
-
-
-
 
 macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
@@ -46,7 +44,9 @@ macro_rules! generic_compute_floats {
                 let mut total: f64 = 1.;
                 let end_ = *end as usize;
                 for nn in 0..end_ {
-                    if booleans[nn] {continue;}
+                    if booleans[nn] {
+                        continue;
+                    }
                     let current = arr[nn];
                     total *= current as f64;
                 }
@@ -187,7 +187,6 @@ pub fn compute_uint8<'py>(
 
     result.into_pyarray(py)
 }
-
 
 #[pyfunction(name = "compute_prod_end_f32")]
 pub fn compute_f32<'py>(

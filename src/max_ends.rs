@@ -17,9 +17,11 @@ macro_rules! generic_compute {
                 let mut base_val = arr[0];
                 let end_ = *end as usize;
                 for nn in 0..end_ {
-                    if booleans[nn] {continue;}
+                    if booleans[nn] {
+                        continue;
+                    }
                     let current = arr[nn];
-                    if (base==-1) || (current > base_val) {
+                    if (base == -1) || (current > base_val) {
                         base_val = current;
                         base = nn as i64;
                     }

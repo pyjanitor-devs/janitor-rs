@@ -619,8 +619,7 @@ fn build_positional_index(
         if *position < 0 {
             continue;
         }
-        let pos = *position as usize;
-        let val: i64 = index[pos];
+        let val: i64 = index[*position as usize];
         result[n] = val;
         n += 1;
     }
