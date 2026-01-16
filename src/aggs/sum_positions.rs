@@ -54,7 +54,7 @@ pub fn compute_int64<'py>(
     arr: PyReadonlyArray1<'py, i64>,
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
-    
+
     positions: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
 ) -> Bound<'py, PyArray1<i64>> {
@@ -62,9 +62,9 @@ pub fn compute_int64<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let positions = positions.as_array();
-    
+
     let booleans = booleans.as_array();
-    let result = array_compute_int64(arr, starts, ends,  positions, booleans);
+    let result = array_compute_int64(arr, starts, ends, positions, booleans);
 
     result.into_pyarray(py)
 }
@@ -75,7 +75,7 @@ pub fn compute_int32<'py>(
     arr: PyReadonlyArray1<'py, i32>,
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
-    
+
     positions: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
 ) -> Bound<'py, PyArray1<i64>> {
@@ -83,9 +83,9 @@ pub fn compute_int32<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let positions = positions.as_array();
-    
+
     let booleans = booleans.as_array();
-    let result = array_compute_int32(arr, starts, ends,  positions, booleans);
+    let result = array_compute_int32(arr, starts, ends, positions, booleans);
 
     result.into_pyarray(py)
 }
@@ -96,7 +96,7 @@ pub fn compute_int16<'py>(
     arr: PyReadonlyArray1<'py, i16>,
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
-    
+
     positions: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
 ) -> Bound<'py, PyArray1<i64>> {
@@ -104,9 +104,9 @@ pub fn compute_int16<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let positions = positions.as_array();
-    
+
     let booleans = booleans.as_array();
-    let result = array_compute_int16(arr, starts, ends,  positions, booleans);
+    let result = array_compute_int16(arr, starts, ends, positions, booleans);
 
     result.into_pyarray(py)
 }
@@ -117,7 +117,7 @@ pub fn compute_int8<'py>(
     arr: PyReadonlyArray1<'py, i64>,
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
-    
+
     positions: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
 ) -> Bound<'py, PyArray1<i64>> {
@@ -125,9 +125,9 @@ pub fn compute_int8<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let positions = positions.as_array();
-    
+
     let booleans = booleans.as_array();
-    let result = array_compute_int8(arr, starts, ends,  positions, booleans);
+    let result = array_compute_int8(arr, starts, ends, positions, booleans);
 
     result.into_pyarray(py)
 }
@@ -138,7 +138,7 @@ pub fn compute_uint64<'py>(
     arr: PyReadonlyArray1<'py, u64>,
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
-    
+
     positions: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
 ) -> Bound<'py, PyArray1<i64>> {
@@ -146,9 +146,9 @@ pub fn compute_uint64<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let positions = positions.as_array();
-    
+
     let booleans = booleans.as_array();
-    let result = array_compute_uint64(arr, starts, ends,  positions, booleans);
+    let result = array_compute_uint64(arr, starts, ends, positions, booleans);
 
     result.into_pyarray(py)
 }
@@ -159,7 +159,7 @@ pub fn compute_uint32<'py>(
     arr: PyReadonlyArray1<'py, u32>,
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
-    
+
     positions: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
 ) -> Bound<'py, PyArray1<i64>> {
@@ -167,9 +167,9 @@ pub fn compute_uint32<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let positions = positions.as_array();
-    
+
     let booleans = booleans.as_array();
-    let result = array_compute_uint32(arr, starts, ends,  positions, booleans);
+    let result = array_compute_uint32(arr, starts, ends, positions, booleans);
 
     result.into_pyarray(py)
 }
@@ -180,7 +180,7 @@ pub fn compute_uint16<'py>(
     arr: PyReadonlyArray1<'py, u16>,
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
-    
+
     positions: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
 ) -> Bound<'py, PyArray1<i64>> {
@@ -188,9 +188,9 @@ pub fn compute_uint16<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let positions = positions.as_array();
-    
+
     let booleans = booleans.as_array();
-    let result = array_compute_uint16(arr, starts, ends,  positions, booleans);
+    let result = array_compute_uint16(arr, starts, ends, positions, booleans);
 
     result.into_pyarray(py)
 }
@@ -201,7 +201,7 @@ pub fn compute_uint8<'py>(
     arr: PyReadonlyArray1<'py, u8>,
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
-    
+
     positions: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
 ) -> Bound<'py, PyArray1<i64>> {
@@ -209,9 +209,9 @@ pub fn compute_uint8<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let positions = positions.as_array();
-    
+
     let booleans = booleans.as_array();
-    let result = array_compute_uint8(arr, starts, ends,  positions, booleans);
+    let result = array_compute_uint8(arr, starts, ends, positions, booleans);
 
     result.into_pyarray(py)
 }
@@ -266,7 +266,7 @@ pub fn compute_f32<'py>(
     arr: PyReadonlyArray1<'py, f32>,
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
-    
+
     positions: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
 ) -> Bound<'py, PyArray1<f64>> {
@@ -274,9 +274,9 @@ pub fn compute_f32<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let positions = positions.as_array();
-    
+
     let booleans = booleans.as_array();
-    let result = array_compute_f32(arr, starts, ends,  positions, booleans);
+    let result = array_compute_f32(arr, starts, ends, positions, booleans);
 
     result.into_pyarray(py)
 }
@@ -287,7 +287,7 @@ pub fn compute_f64<'py>(
     arr: PyReadonlyArray1<'py, f64>,
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
-    
+
     positions: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
 ) -> Bound<'py, PyArray1<f64>> {
@@ -295,9 +295,9 @@ pub fn compute_f64<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let positions = positions.as_array();
-    
+
     let booleans = booleans.as_array();
-    let result = array_compute_f64(arr, starts, ends,  positions, booleans);
+    let result = array_compute_f64(arr, starts, ends, positions, booleans);
 
     result.into_pyarray(py)
 }
