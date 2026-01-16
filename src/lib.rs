@@ -36,529 +36,895 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compare::comp::compare_float32, m)?)?;
     m.add_function(wrap_pyfunction!(compare::comp::compare_float64, m)?)?;
 
-    m.add_function(wrap_pyfunction!(aggs::min_starts::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts::compute_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_starts::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_starts::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_starts::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_starts::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_starts::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_starts::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_starts::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_starts::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_starts::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_starts::compute_f64, m)?)?;
 
-    m.add_function(wrap_pyfunction!(aggs::max_starts::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::prod_starts_ends::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts_ends::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts_ends::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts_ends::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts_ends::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts_ends::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts_ends::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts_ends::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts_ends::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts_ends::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_ends::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_ends::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_ends::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_ends::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_ends::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_ends::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_ends::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_ends::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_ends::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_ends::compute_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_starts::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_starts::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_starts::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_starts::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_starts::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_starts::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_starts::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_starts::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_starts::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_starts::compute_f64, m)?)?;
 
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_ends_matches::compute_uint64,
+        aggs::prod::prod_starts_ends::compute_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_ends_matches::compute_uint32,
+        aggs::prod::prod_starts_ends::compute_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_ends_matches::compute_uint16,
+        aggs::prod::prod_starts_ends::compute_uint16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_ends_matches::compute_uint8,
+        aggs::prod::prod_starts_ends::compute_uint8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_ends_matches::compute_int64,
+        aggs::prod::prod_starts_ends::compute_int64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_ends_matches::compute_int32,
+        aggs::prod::prod_starts_ends::compute_int32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_ends_matches::compute_int16,
+        aggs::prod::prod_starts_ends::compute_int16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_ends_matches::compute_int8,
+        aggs::prod::prod_starts_ends::compute_int8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_ends_matches::compute_f32,
+        aggs::prod::prod_starts_ends::compute_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_ends_matches::compute_f64,
+        aggs::prod::prod_starts_ends::compute_f64,
         m
     )?)?;
 
     m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_ends_matches::compute_uint64,
+        aggs::sum::sum_starts_ends::compute_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_ends_matches::compute_uint32,
+        aggs::sum::sum_starts_ends::compute_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_ends_matches::compute_uint16,
+        aggs::sum::sum_starts_ends::compute_uint16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_ends_matches::compute_uint8,
+        aggs::sum::sum_starts_ends::compute_uint8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_ends_matches::compute_int64,
+        aggs::sum::sum_starts_ends::compute_int64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_ends_matches::compute_int32,
+        aggs::sum::sum_starts_ends::compute_int32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_ends_matches::compute_int16,
+        aggs::sum::sum_starts_ends::compute_int16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_ends_matches::compute_int8,
+        aggs::sum::sum_starts_ends::compute_int8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_ends_matches::compute_f32,
+        aggs::sum::sum_starts_ends::compute_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_ends_matches::compute_f64,
+        aggs::sum::sum_starts_ends::compute_f64,
         m
     )?)?;
 
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_ends_matches::compute_uint64,
+        aggs::sum::sum_starts_ends_matches::compute_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_ends_matches::compute_uint32,
+        aggs::sum::sum_starts_ends_matches::compute_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_ends_matches::compute_uint16,
+        aggs::sum::sum_starts_ends_matches::compute_uint16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_ends_matches::compute_uint8,
+        aggs::sum::sum_starts_ends_matches::compute_uint8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_ends_matches::compute_int64,
+        aggs::sum::sum_starts_ends_matches::compute_int64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_ends_matches::compute_int32,
+        aggs::sum::sum_starts_ends_matches::compute_int32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_ends_matches::compute_int16,
+        aggs::sum::sum_starts_ends_matches::compute_int16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_ends_matches::compute_int8,
+        aggs::sum::sum_starts_ends_matches::compute_int8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_ends_matches::compute_f32,
+        aggs::sum::sum_starts_ends_matches::compute_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_ends_matches::compute_f64,
+        aggs::sum::sum_starts_ends_matches::compute_f64,
         m
     )?)?;
 
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_ends_matches::compute_uint64,
+        aggs::prod::prod_starts_ends_matches::compute_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_ends_matches::compute_uint32,
+        aggs::prod::prod_starts_ends_matches::compute_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_ends_matches::compute_uint16,
+        aggs::prod::prod_starts_ends_matches::compute_uint16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_ends_matches::compute_uint8,
+        aggs::prod::prod_starts_ends_matches::compute_uint8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_ends_matches::compute_int64,
+        aggs::prod::prod_starts_ends_matches::compute_int64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_ends_matches::compute_int32,
+        aggs::prod::prod_starts_ends_matches::compute_int32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_ends_matches::compute_int16,
+        aggs::prod::prod_starts_ends_matches::compute_int16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_ends_matches::compute_int8,
+        aggs::prod::prod_starts_ends_matches::compute_int8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_ends_matches::compute_f32,
+        aggs::prod::prod_starts_ends_matches::compute_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_ends_matches::compute_f64,
+        aggs::prod::prod_starts_ends_matches::compute_f64,
         m
     )?)?;
 
-    m.add_function(wrap_pyfunction!(aggs::min_starts_ends::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts_ends::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts_ends::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts_ends::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts_ends::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts_ends::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts_ends::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts_ends::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts_ends::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts_ends::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::max_starts_ends::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts_ends::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts_ends::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts_ends::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts_ends::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts_ends::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts_ends::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts_ends::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts_ends::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts_ends::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::max_ends::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::prod_starts::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::prod_ends::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::min_ends::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::sum_starts::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::sum_positions::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_positions::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_positions::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_positions::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_positions::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_positions::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_positions::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_positions::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_positions::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_positions::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::min_positions::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_positions::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_positions::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_positions::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_positions::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_positions::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_positions::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_positions::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_positions::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_positions::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::max_positions::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_positions::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_positions::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_positions::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_positions::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_positions::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_positions::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_positions::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_positions::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_positions::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::prod_positions::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_positions::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_positions::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_positions::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_positions::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_positions::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_positions::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_positions::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_positions::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_positions::compute_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends_matches::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends_matches::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends_matches::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends_matches::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends_matches::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends_matches::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends_matches::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends_matches::compute_f64,
+        m
+    )?)?;
 
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_matches::compute_uint64,
+        aggs::min::min_starts_ends_matches::compute_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_matches::compute_uint32,
+        aggs::min::min_starts_ends_matches::compute_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_matches::compute_uint16,
+        aggs::min::min_starts_ends_matches::compute_uint16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_matches::compute_uint8,
+        aggs::min::min_starts_ends_matches::compute_uint8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_matches::compute_int64,
+        aggs::min::min_starts_ends_matches::compute_int64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_matches::compute_int32,
+        aggs::min::min_starts_ends_matches::compute_int32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::sum_starts_matches::compute_int16,
+        aggs::min::min_starts_ends_matches::compute_int16,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_matches::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_matches::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_starts_matches::compute_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_ends_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_ends_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_ends_matches::compute_f64,
+        m
+    )?)?;
 
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_matches::compute_uint64,
+        aggs::min::min_starts_ends::compute_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_matches::compute_uint32,
+        aggs::min::min_starts_ends::compute_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_matches::compute_uint16,
+        aggs::min::min_starts_ends::compute_uint16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_matches::compute_uint8,
+        aggs::min::min_starts_ends::compute_uint8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_matches::compute_int64,
+        aggs::min::min_starts_ends::compute_int64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_matches::compute_int32,
+        aggs::min::min_starts_ends::compute_int32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::max_starts_matches::compute_int16,
+        aggs::min::min_starts_ends::compute_int16,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts_matches::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts_matches::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_starts_matches::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(aggs::max_ends_matches::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends_matches::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends_matches::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends_matches::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends_matches::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends_matches::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends_matches::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends_matches::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends_matches::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::max_ends_matches::compute_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_ends::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_ends::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_ends::compute_f64,
+        m
+    )?)?;
 
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_matches::compute_uint64,
+        aggs::max::max_starts_ends::compute_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_matches::compute_uint32,
+        aggs::max::max_starts_ends::compute_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_matches::compute_uint16,
+        aggs::max::max_starts_ends::compute_uint16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_matches::compute_uint8,
+        aggs::max::max_starts_ends::compute_uint8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_matches::compute_int64,
+        aggs::max::max_starts_ends::compute_int64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_matches::compute_int32,
+        aggs::max::max_starts_ends::compute_int32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::min_starts_matches::compute_int16,
+        aggs::max::max_starts_ends::compute_int16,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts_matches::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts_matches::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_starts_matches::compute_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_ends::compute_f64,
+        m
+    )?)?;
 
-    m.add_function(wrap_pyfunction!(aggs::min_ends_matches::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends_matches::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends_matches::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends_matches::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends_matches::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends_matches::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends_matches::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends_matches::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends_matches::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::min_ends_matches::compute_f64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_matches::compute_uint64,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_matches::compute_uint32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_matches::compute_uint16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_matches::compute_uint8,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_matches::compute_int64,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_matches::compute_int32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_matches::compute_int16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        aggs::prod_starts_matches::compute_int8,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts_matches::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_starts_matches::compute_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_ends::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_ends::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_ends::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_ends::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_ends::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_ends::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_ends::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_ends::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_ends::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_ends::compute_f64, m)?)?;
 
     m.add_function(wrap_pyfunction!(
-        aggs::prod_ends_matches::compute_uint64,
+        aggs::prod::prod_starts::compute_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::prod_ends_matches::compute_uint32,
+        aggs::prod::prod_starts::compute_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::prod_ends_matches::compute_uint16,
+        aggs::prod::prod_starts::compute_uint16,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends_matches::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends_matches::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends_matches::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends_matches::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends_matches::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends_matches::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::prod_ends_matches::compute_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_starts::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_starts::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_starts::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_starts::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_starts::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_starts::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_starts::compute_f64, m)?)?;
 
-    m.add_function(wrap_pyfunction!(aggs::sum_ends_matches::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends_matches::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends_matches::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends_matches::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends_matches::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends_matches::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends_matches::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends_matches::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends_matches::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends_matches::compute_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_ends::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_ends::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_ends::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_ends::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_ends::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_ends::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_ends::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_ends::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_ends::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::prod::prod_ends::compute_f64, m)?)?;
 
-    m.add_function(wrap_pyfunction!(aggs::sum_ends::compute_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends::compute_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends::compute_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends::compute_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends::compute_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends::compute_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends::compute_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends::compute_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends::compute_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(aggs::sum_ends::compute_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_ends::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_ends::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_ends::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_ends::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_ends::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_ends::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_ends::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_ends::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_ends::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_ends::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_starts::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_starts::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_starts::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_starts::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_starts::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_starts::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_starts::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_starts::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_starts::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_starts::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_positions::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_positions::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_positions::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_positions::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_positions::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_positions::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_positions::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_positions::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_positions::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_positions::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_positions::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_positions::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_positions::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_positions::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_positions::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_positions::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_positions::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_positions::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_positions::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::min::min_positions::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_positions::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_positions::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_positions::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_positions::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_positions::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_positions::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_positions::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_positions::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_positions::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::max::max_positions::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_positions::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_positions::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_positions::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_positions::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_positions::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_positions::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_positions::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_positions::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_positions::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_positions::compute_f64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_starts_matches::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_starts_matches::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_starts_matches::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_starts_matches::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_starts_matches::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_starts_matches::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_starts_matches::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_starts_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_starts_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_starts_matches::compute_f64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_matches::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_matches::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_matches::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_matches::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_matches::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_matches::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_matches::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_starts_matches::compute_f64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_ends_matches::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_ends_matches::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_ends_matches::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_ends_matches::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_ends_matches::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_ends_matches::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_ends_matches::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_ends_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_ends_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max::max_ends_matches::compute_f64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_matches::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_matches::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_matches::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_matches::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_matches::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_matches::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_matches::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_starts_matches::compute_f64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_ends_matches::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_ends_matches::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_ends_matches::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_ends_matches::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_ends_matches::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_ends_matches::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_ends_matches::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_ends_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_ends_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min::min_ends_matches::compute_f64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_starts_matches::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_starts_matches::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_starts_matches::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_starts_matches::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_starts_matches::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_starts_matches::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_starts_matches::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_starts_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_starts_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_starts_matches::compute_f64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_ends_matches::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_ends_matches::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_ends_matches::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_ends_matches::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_ends_matches::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_ends_matches::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_ends_matches::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_ends_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_ends_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod::prod_ends_matches::compute_f64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_ends_matches::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_ends_matches::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_ends_matches::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_ends_matches::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_ends_matches::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_ends_matches::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_ends_matches::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_ends_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_ends_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum::sum_ends_matches::compute_f64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_f64, m)?)?;
 
     m.add_function(wrap_pyfunction!(
         bin_search::bin_search_lt::compare_uint64,
