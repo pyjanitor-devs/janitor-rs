@@ -141,6 +141,47 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
 
     m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends::compute_f64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
         aggs::sum::sum_starts_ends_matches::compute_uint64,
         m
     )?)?;
@@ -451,6 +492,41 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(aggs::sum::sum_starts::compute_f64, m)?)?;
 
     m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum_rev::sum_starts::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum_rev::sum_starts::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
         aggs::sum::sum_positions::compute_uint64,
         m
     )?)?;
@@ -481,6 +557,47 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(aggs::sum::sum_positions::compute_int8, m)?)?;
     m.add_function(wrap_pyfunction!(aggs::sum::sum_positions::compute_f32, m)?)?;
     m.add_function(wrap_pyfunction!(aggs::sum::sum_positions::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_positions::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_positions::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_positions::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_positions::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_positions::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_positions::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_positions::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_positions::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_positions::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_positions::compute_f64,
+        m
+    )?)?;
 
     m.add_function(wrap_pyfunction!(
         aggs::min::min_positions::compute_uint64,
@@ -625,6 +742,47 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(
         aggs::sum::sum_starts_matches::compute_f64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_matches::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_matches::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_matches::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_matches::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_matches::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_matches::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_matches::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_matches::compute_f64,
         m
     )?)?;
 
@@ -915,6 +1073,47 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
 
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends_matches::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends_matches::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends_matches::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends_matches::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends_matches::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends_matches::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends_matches::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_starts_ends_matches::compute_f64,
+        m
+    )?)?;
+
     m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_uint64, m)?)?;
     m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_uint32, m)?)?;
     m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_uint16, m)?)?;
@@ -925,6 +1124,67 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_int8, m)?)?;
     m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_f32, m)?)?;
     m.add_function(wrap_pyfunction!(aggs::sum::sum_ends::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum_rev::sum_ends::compute_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum_rev::sum_ends::compute_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum_rev::sum_ends::compute_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum_rev::sum_ends::compute_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum_rev::sum_ends::compute_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum_rev::sum_ends::compute_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(aggs::sum_rev::sum_ends::compute_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends_matches::compute_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends_matches::compute_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends_matches::compute_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends_matches::compute_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends_matches::compute_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends_matches::compute_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends_matches::compute_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends_matches::compute_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends_matches::compute_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_ends_matches::compute_f64,
+        m
+    )?)?;
 
     m.add_function(wrap_pyfunction!(
         bin_search::bin_search_lt::compare_uint64,
