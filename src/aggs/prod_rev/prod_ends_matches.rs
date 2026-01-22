@@ -1,288 +1,133 @@
-use numpy::ndarray::{Array1, ArrayView1};
+use itertools::izip;
+use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+use std::collections::HashMap;
 
-macro_rules! generic_compute_ints {
+macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
-        fn $fname(
-            arr: ArrayView1<'_, $type>,
-            ends: ArrayView1<'_, i64>,
-            counts: ArrayView1<'_, i64>,
-            matches: ArrayView1<'_, i8>,
-            booleans: ArrayView1<'_, bool>,
-        ) -> Array1<i64>
+        #[pyfunction]
+        pub fn $fname<'py>(
+            py: Python<'py>,
+            arr: PyReadonlyArray1<'py, $type>,
+            index: PyReadonlyArray1<'py, i64>,
+            ends: PyReadonlyArray1<'py, i64>,
+            counts: PyReadonlyArray1<'py, i64>,
+            matches: PyReadonlyArray1<'py, i8>,
+            booleans: PyReadonlyArray1<'py, bool>,
+            length: i64,
+        ) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)
         // The macro will expand into the contents of this block.
         {
-            let mut result = Array1::<i64>::zeros(ends.len());
+            let arr = arr.as_array();
+            let index = index.as_array();
+            let ends = ends.as_array();
+            let matches = matches.as_array();
+            let counts = counts.as_array();
+            let booleans = booleans.as_array();
+            let length = length as usize;
+            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let mut n: usize = 0;
-            let zipped = ends.into_iter().zip(counts.into_iter());
-            for (pos, (end, count)) in zipped.enumerate() {
+            let zipped = izip!(
+                arr.into_iter(),
+                ends.into_iter(),
+                counts.into_iter(),
+                booleans.into_iter()
+            );
+            for (current, end, count, boolean) in zipped {
                 let end_ = *end as usize;
-                let mut total: i64 = 1;
-                if *count == 0 {
+                if *boolean || (*count == 0) {
                     n += end_;
                     continue;
                 }
-                for nn in 0..end_ {
+                let current_ = *current as i64;
+                for item in 0..end_ {
                     if matches[n] == 0 {
                         n += 1;
                         continue;
                     }
-                    if booleans[nn] {
-                        n += 1;
-                        continue;
-                    }
-                    let current = arr[nn];
-                    total *= current as i64;
+                    let pos = index[item];
+                    *dictionary.entry(pos).or_insert(0) *= current_;
                     n += 1;
                 }
-                result[pos] = total;
             }
-            result
+            let mut indexers = Array1::<i64>::zeros(length);
+            let mut result = Array1::<i64>::zeros(length);
+            for (pos, (key, val)) in dictionary.iter().enumerate() {
+                indexers[pos] = *key;
+                result[pos] = *val;
+            }
+            (indexers.into_pyarray(py), result.into_pyarray(py))
         }
     };
 }
 
-generic_compute_ints!(array_compute_int64, i64);
-generic_compute_ints!(array_compute_int32, i32);
-generic_compute_ints!(array_compute_int16, i16);
-generic_compute_ints!(array_compute_int8, i8);
-generic_compute_ints!(array_compute_uint64, u64);
-generic_compute_ints!(array_compute_uint32, u32);
-generic_compute_ints!(array_compute_uint16, u16);
-generic_compute_ints!(array_compute_uint8, u8);
+compute_ints!(compute_prod_rev_end_match_int64, i64);
+compute_ints!(compute_prod_rev_end_match_int32, i32);
+compute_ints!(compute_prod_rev_end_match_int16, i16);
+compute_ints!(compute_prod_rev_end_match_int8, i8);
+compute_ints!(compute_prod_rev_end_match_uint64, u64);
+compute_ints!(compute_prod_rev_end_match_uint32, u32);
+compute_ints!(compute_prod_rev_end_match_uint16, u16);
+compute_ints!(compute_prod_rev_end_match_uint8, u8);
 
-#[pyfunction(name = "compute_prod_end_match_int64")]
-pub fn compute_int64<'py>(
-    py: Python<'py>,
-    arr: PyReadonlyArray1<'py, i64>,
-    ends: PyReadonlyArray1<'py, i64>,
-    counts: PyReadonlyArray1<'py, i64>,
-    matches: PyReadonlyArray1<'py, i8>,
-    booleans: PyReadonlyArray1<'py, bool>,
-) -> Bound<'py, PyArray1<i64>> {
-    let arr = arr.as_array();
-    let ends = ends.as_array();
-    let matches = matches.as_array();
-    let counts = counts.as_array();
-    let booleans = booleans.as_array();
-    let result = array_compute_int64(arr, ends, counts, matches, booleans);
-
-    result.into_pyarray(py)
-}
-
-#[pyfunction(name = "compute_prod_end_match_int32")]
-pub fn compute_int32<'py>(
-    py: Python<'py>,
-    arr: PyReadonlyArray1<'py, i32>,
-    ends: PyReadonlyArray1<'py, i64>,
-    counts: PyReadonlyArray1<'py, i64>,
-    matches: PyReadonlyArray1<'py, i8>,
-    booleans: PyReadonlyArray1<'py, bool>,
-) -> Bound<'py, PyArray1<i64>> {
-    let arr = arr.as_array();
-    let ends = ends.as_array();
-    let matches = matches.as_array();
-    let counts = counts.as_array();
-    let booleans = booleans.as_array();
-    let result = array_compute_int32(arr, ends, counts, matches, booleans);
-
-    result.into_pyarray(py)
-}
-
-#[pyfunction(name = "compute_prod_end_match_int16")]
-pub fn compute_int16<'py>(
-    py: Python<'py>,
-    arr: PyReadonlyArray1<'py, i16>,
-    ends: PyReadonlyArray1<'py, i64>,
-    counts: PyReadonlyArray1<'py, i64>,
-    matches: PyReadonlyArray1<'py, i8>,
-    booleans: PyReadonlyArray1<'py, bool>,
-) -> Bound<'py, PyArray1<i64>> {
-    let arr = arr.as_array();
-    let ends = ends.as_array();
-    let matches = matches.as_array();
-    let counts = counts.as_array();
-    let booleans = booleans.as_array();
-    let result = array_compute_int16(arr, ends, counts, matches, booleans);
-
-    result.into_pyarray(py)
-}
-
-#[pyfunction(name = "compute_prod_end_match_int8")]
-pub fn compute_int8<'py>(
-    py: Python<'py>,
-    arr: PyReadonlyArray1<'py, i8>,
-    ends: PyReadonlyArray1<'py, i64>,
-    counts: PyReadonlyArray1<'py, i64>,
-    matches: PyReadonlyArray1<'py, i8>,
-    booleans: PyReadonlyArray1<'py, bool>,
-) -> Bound<'py, PyArray1<i64>> {
-    let arr = arr.as_array();
-    let ends = ends.as_array();
-    let matches = matches.as_array();
-    let counts = counts.as_array();
-    let booleans = booleans.as_array();
-    let result = array_compute_int8(arr, ends, counts, matches, booleans);
-
-    result.into_pyarray(py)
-}
-
-#[pyfunction(name = "compute_prod_end_match_uint64")]
-pub fn compute_uint64<'py>(
-    py: Python<'py>,
-    arr: PyReadonlyArray1<'py, u64>,
-    ends: PyReadonlyArray1<'py, i64>,
-    counts: PyReadonlyArray1<'py, i64>,
-    matches: PyReadonlyArray1<'py, i8>,
-    booleans: PyReadonlyArray1<'py, bool>,
-) -> Bound<'py, PyArray1<i64>> {
-    let arr = arr.as_array();
-    let ends = ends.as_array();
-    let matches = matches.as_array();
-    let counts = counts.as_array();
-    let booleans = booleans.as_array();
-    let result = array_compute_uint64(arr, ends, counts, matches, booleans);
-
-    result.into_pyarray(py)
-}
-
-#[pyfunction(name = "compute_prod_end_match_uint32")]
-pub fn compute_uint32<'py>(
-    py: Python<'py>,
-    arr: PyReadonlyArray1<'py, u32>,
-    ends: PyReadonlyArray1<'py, i64>,
-    counts: PyReadonlyArray1<'py, i64>,
-    matches: PyReadonlyArray1<'py, i8>,
-    booleans: PyReadonlyArray1<'py, bool>,
-) -> Bound<'py, PyArray1<i64>> {
-    let arr = arr.as_array();
-    let ends = ends.as_array();
-    let matches = matches.as_array();
-    let counts = counts.as_array();
-    let booleans = booleans.as_array();
-    let result = array_compute_uint32(arr, ends, counts, matches, booleans);
-
-    result.into_pyarray(py)
-}
-
-#[pyfunction(name = "compute_prod_end_match_uint16")]
-pub fn compute_uint16<'py>(
-    py: Python<'py>,
-    arr: PyReadonlyArray1<'py, u16>,
-    ends: PyReadonlyArray1<'py, i64>,
-    counts: PyReadonlyArray1<'py, i64>,
-    matches: PyReadonlyArray1<'py, i8>,
-    booleans: PyReadonlyArray1<'py, bool>,
-) -> Bound<'py, PyArray1<i64>> {
-    let arr = arr.as_array();
-    let ends = ends.as_array();
-    let matches = matches.as_array();
-    let counts = counts.as_array();
-    let booleans = booleans.as_array();
-    let result = array_compute_uint16(arr, ends, counts, matches, booleans);
-
-    result.into_pyarray(py)
-}
-
-#[pyfunction(name = "compute_prod_end_match_uint8")]
-pub fn compute_uint8<'py>(
-    py: Python<'py>,
-    arr: PyReadonlyArray1<'py, u8>,
-    ends: PyReadonlyArray1<'py, i64>,
-    counts: PyReadonlyArray1<'py, i64>,
-    matches: PyReadonlyArray1<'py, i8>,
-    booleans: PyReadonlyArray1<'py, bool>,
-) -> Bound<'py, PyArray1<i64>> {
-    let arr = arr.as_array();
-    let ends = ends.as_array();
-    let matches = matches.as_array();
-    let counts = counts.as_array();
-    let booleans = booleans.as_array();
-    let result = array_compute_uint8(arr, ends, counts, matches, booleans);
-
-    result.into_pyarray(py)
-}
-
-/// kahan prodmation
-macro_rules! generic_compute_floats {
+macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
-        fn $fname(
-            arr: ArrayView1<'_, $type>,
-            ends: ArrayView1<'_, i64>,
-            counts: ArrayView1<'_, i64>,
-            matches: ArrayView1<'_, i8>,
-            booleans: ArrayView1<'_, bool>,
-        ) -> Array1<f64>
+        #[pyfunction]
+        pub fn $fname<'py>(
+            py: Python<'py>,
+            arr: PyReadonlyArray1<'py, $type>,
+            index: PyReadonlyArray1<'py, i64>,
+            ends: PyReadonlyArray1<'py, i64>,
+            counts: PyReadonlyArray1<'py, i64>,
+            matches: PyReadonlyArray1<'py, i8>,
+            booleans: PyReadonlyArray1<'py, bool>,
+            length: i64,
+        ) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)
         // The macro will expand into the contents of this block.
         {
-            let mut result = Array1::<f64>::zeros(ends.len());
+            let arr = arr.as_array();
+            let index = index.as_array();
+            let ends = ends.as_array();
+            let matches = matches.as_array();
+            let counts = counts.as_array();
+            let booleans = booleans.as_array();
+            let length = length as usize;
+            let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let mut n: usize = 0;
-            let zipped = ends.into_iter().zip(counts.into_iter());
-            for (pos, (end, count)) in zipped.enumerate() {
+            let zipped = izip!(
+                arr.into_iter(),
+                ends.into_iter(),
+                counts.into_iter(),
+                booleans.into_iter()
+            );
+            for (current, end, count, boolean) in zipped {
                 let end_ = *end as usize;
-                let mut total: f64 = 1.;
-                if *count == 0 {
+                if *boolean || (*count == 0) {
                     n += end_;
                     continue;
                 }
-                for nn in 0..end_ {
+                let current_ = *current as f64;
+                for item in 0..end_ {
                     if matches[n] == 0 {
                         n += 1;
                         continue;
                     }
-                    if booleans[nn] {
-                        n += 1;
-                        continue;
-                    }
-                    let current: f64 = arr[nn] as f64;
-                    total *= current;
+                    let pos = index[item];
+                    *dictionary.entry(pos).or_insert(0.) *= current_;
                     n += 1;
                 }
-                result[pos] = total;
             }
-            result
+            let mut indexers = Array1::<i64>::zeros(length);
+            let mut result = Array1::<f64>::zeros(length);
+            for (pos, (key, val)) in dictionary.iter().enumerate() {
+                indexers[pos] = *key;
+                result[pos] = *val;
+            }
+            (indexers.into_pyarray(py), result.into_pyarray(py))
         }
     };
 }
 
-generic_compute_floats!(array_compute_f64, f64);
-generic_compute_floats!(array_compute_f32, f32);
-
-#[pyfunction(name = "compute_prod_end_match_f32")]
-pub fn compute_f32<'py>(
-    py: Python<'py>,
-    arr: PyReadonlyArray1<'py, f32>,
-    ends: PyReadonlyArray1<'py, i64>,
-    counts: PyReadonlyArray1<'py, i64>,
-    matches: PyReadonlyArray1<'py, i8>,
-    booleans: PyReadonlyArray1<'py, bool>,
-) -> Bound<'py, PyArray1<f64>> {
-    let arr = arr.as_array();
-    let ends = ends.as_array();
-    let matches = matches.as_array();
-    let counts = counts.as_array();
-    let booleans = booleans.as_array();
-    let result = array_compute_f32(arr, ends, counts, matches, booleans);
-
-    result.into_pyarray(py)
-}
-
-#[pyfunction(name = "compute_prod_end_match_f64")]
-pub fn compute_f64<'py>(
-    py: Python<'py>,
-    arr: PyReadonlyArray1<'py, f64>,
-    ends: PyReadonlyArray1<'py, i64>,
-    counts: PyReadonlyArray1<'py, i64>,
-    matches: PyReadonlyArray1<'py, i8>,
-    booleans: PyReadonlyArray1<'py, bool>,
-) -> Bound<'py, PyArray1<f64>> {
-    let arr = arr.as_array();
-    let ends = ends.as_array();
-    let matches = matches.as_array();
-    let counts = counts.as_array();
-    let booleans = booleans.as_array();
-    let result = array_compute_f64(arr, ends, counts, matches, booleans);
-
-    result.into_pyarray(py)
-}
+compute_floats!(compute_prod_rev_end_match_f64, f64);
+compute_floats!(compute_prod_rev_end_match_f32, f32);
