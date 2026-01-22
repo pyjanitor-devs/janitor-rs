@@ -100,14 +100,12 @@ macro_rules! compute_floats {
                 let current_ = *current as f64;
                 for item in start_..end_ {
                     let pos = index[item];
-                    let mut total = dictionary.get(&pos).copied().unwrap_or(0.);
-                    let mut compensation = mapping.get(&pos).copied().unwrap_or(0.);
-                    let difference = current_ - compensation;
-                    let increment = total + difference;
-                    compensation = (increment - total) - difference;
-                    total = increment;
-                    *dictionary.entry(pos).or_insert(0.) = total;
-                    *mapping.entry(pos).or_insert(0.) = compensation;
+                    let total = dictionary.entry(pos).or_insert(0.);
+                    let compensation = mapping.entry(pos).or_insert(0.);
+                    let difference = current_ - *compensation;
+                    let increment = *total + difference;
+                    *compensation = (increment - *total) - difference;
+                    *total = increment;
                 }
             }
             let mut indexers = Array1::<i64>::zeros(length);
