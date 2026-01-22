@@ -27,6 +27,7 @@ macro_rules! compute {
             let booleans = booleans.as_array();
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+            let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
             let end_: usize = arr.len();
             let zipped = izip!(
                 arr.into_iter(),
@@ -35,7 +36,6 @@ macro_rules! compute {
                 booleans.into_iter()
             );
             let mut n: usize = 0;
-            let mut base_val = arr[0];
             for (posn, (current, start, count, boolean)) in zipped.enumerate() {
                 let start_ = *start as usize;
                 if *boolean || (*count == 0) {
@@ -43,18 +43,18 @@ macro_rules! compute {
                     n += size;
                     continue;
                 }
-                let mut base: i64 = -1;
                 for item in start_..end_ {
                     if matches[n] == 0 {
                         n += 1;
                         continue;
                     }
                     let pos = index[item];
-                    if (base == -1) || (*current < base_val) {
-                        base_val = *current;
-                        base = posn as i64;
+                    let base = dictionary.entry(pos).or_insert(-1);
+                    let base_val = mapping.entry(pos).or_insert(*current);
+                    if (*base == -1) || (*current < *base_val) {
+                        *base_val = *current;
+                        *base = posn as i64;
                     }
-                    dictionary.insert(pos, base);
                     n += 1;
                 }
             }

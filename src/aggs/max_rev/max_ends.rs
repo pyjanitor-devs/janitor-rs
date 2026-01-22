@@ -23,21 +23,21 @@ macro_rules! compute {
             let booleans = booleans.as_array();
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+            let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
             let zipped = izip!(arr.into_iter(), ends.into_iter(), booleans.into_iter());
-            let mut base_val = arr[0];
             for (posn, (current, end, boolean)) in zipped.enumerate() {
                 if *boolean {
                     continue;
                 }
                 let end_ = *end as usize;
-                let mut base: i64 = -1;
                 for item in 0..end_ {
                     let pos = index[item];
-                    if (base == -1) || (*current > base_val) {
-                        base_val = *current;
-                        base = posn as i64;
+                    let base = dictionary.entry(pos).or_insert(-1);
+                    let base_val = mapping.entry(pos).or_insert(*current);
+                    if (*base == -1) || (*current > *base_val) {
+                        *base_val = *current;
+                        *base = posn as i64;
                     }
-                    dictionary.insert(pos, base);
                 }
             }
             let mut indexers = Array1::<i64>::zeros(length);
