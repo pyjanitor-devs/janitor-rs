@@ -1628,10 +1628,6 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        aggs::size_rev::computes::compute_size_no_range,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
         aggs::size_rev::computes::compute_size_rev_end,
         m
     )?)?;
