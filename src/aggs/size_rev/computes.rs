@@ -3,6 +3,43 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
+
+#[pyfunction]
+pub fn compute_size_no_range<'py>(
+    py: Python<'py>,
+    index: PyReadonlyArray1<'py, i64>,
+) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>) {
+    let index = index.as_array();
+    let mut dictionary: HashMap<i64, i64> = HashMap::new();
+    for item in index.into_iter() {
+            *dictionary.entry(*item).or_insert(0) += 1;
+        
+    }
+    let length = dictionary.len();
+    let mut indexers = Array1::<i64>::zeros(length);
+    let mut result = Array1::<i64>::zeros(length);
+    for (pos, (key, val)) in dictionary.iter().enumerate() {
+        indexers[pos] = *key;
+        result[pos] = *val;
+    }
+    (indexers.into_pyarray(py), result.into_pyarray(py))
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #[pyfunction]
 pub fn compute_size_rev_end<'py>(
     py: Python<'py>,

@@ -5,3 +5,4 @@ pub mod sum_starts;
 pub mod sum_starts_ends;
 pub mod sum_starts_ends_matches;
 pub mod sum_starts_matches;
+pub mod sum_no_range;

@@ -8,6 +8,236 @@ mod left_le_right;
 /// Helper functions for PyJanitor implemented in Rust.
 #[pymodule]
 fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+
+
+    m.add_function(wrap_pyfunction!(
+        aggs::prod_rev::prod_no_range::compute_prod_rev_no_range_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod_rev::prod_no_range::compute_prod_rev_no_range_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod_rev::prod_no_range::compute_prod_rev_no_range_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod_rev::prod_no_range::compute_prod_rev_no_range_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod_rev::prod_no_range::compute_prod_rev_no_range_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod_rev::prod_no_range::compute_prod_rev_no_range_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod_rev::prod_no_range::compute_prod_rev_no_range_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod_rev::prod_no_range::compute_prod_rev_no_range_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod_rev::prod_no_range::compute_prod_rev_no_range_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::prod_rev::prod_no_range::compute_prod_rev_no_range_f64,
+        m
+    )?)?;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_no_range::compute_sum_rev_no_range_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_no_range::compute_sum_rev_no_range_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_no_range::compute_sum_rev_no_range_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_no_range::compute_sum_rev_no_range_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_no_range::compute_sum_rev_no_range_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_no_range::compute_sum_rev_no_range_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_no_range::compute_sum_rev_no_range_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_no_range::compute_sum_rev_no_range_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_no_range::compute_sum_rev_no_range_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::sum_rev::sum_no_range::compute_sum_rev_no_range_f64,
+        m
+    )?)?;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    m.add_function(wrap_pyfunction!(
+        aggs::min_rev::min_no_range::compute_min_rev_no_range_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min_rev::min_no_range::compute_min_rev_no_range_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min_rev::min_no_range::compute_min_rev_no_range_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min_rev::min_no_range::compute_min_rev_no_range_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min_rev::min_no_range::compute_min_rev_no_range_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min_rev::min_no_range::compute_min_rev_no_range_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min_rev::min_no_range::compute_min_rev_no_range_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min_rev::min_no_range::compute_min_rev_no_range_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min_rev::min_no_range::compute_min_rev_no_range_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::min_rev::min_no_range::compute_min_rev_no_range_f64,
+        m
+    )?)?;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    m.add_function(wrap_pyfunction!(
+        aggs::max_rev::max_no_range::compute_max_rev_no_range_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max_rev::max_no_range::compute_max_rev_no_range_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max_rev::max_no_range::compute_max_rev_no_range_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max_rev::max_no_range::compute_max_rev_no_range_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max_rev::max_no_range::compute_max_rev_no_range_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max_rev::max_no_range::compute_max_rev_no_range_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max_rev::max_no_range::compute_max_rev_no_range_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max_rev::max_no_range::compute_max_rev_no_range_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max_rev::max_no_range::compute_max_rev_no_range_f32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::max_rev::max_no_range::compute_max_rev_no_range_f64,
+        m
+    )?)?;
+
+
+
+
+
+
+
+
+
+
     m.add_function(wrap_pyfunction!(
         aggs::max_rev::max_starts::compute_max_rev_start_uint64,
         m
@@ -1395,6 +1625,10 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(
         aggs::size_rev::computes::compute_size_rev_start,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        aggs::size_rev::computes::compute_size_no_range,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(

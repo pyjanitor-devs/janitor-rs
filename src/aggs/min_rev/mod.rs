@@ -5,3 +5,4 @@ pub mod min_starts;
 pub mod min_starts_ends;
 pub mod min_starts_ends_matches;
 pub mod min_starts_matches;
+pub mod min_no_range;

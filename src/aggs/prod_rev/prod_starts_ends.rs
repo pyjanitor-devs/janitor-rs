@@ -40,9 +40,10 @@ macro_rules! compute_ints {
                 let current_ = *current as i64;
                 for item in start_..end_ {
                     let pos = index[item];
-                    *dictionary.entry(pos).or_insert(0) *= current_;
+                    *dictionary.entry(pos).or_insert(1) *= current_;
                 }
             }
+            let length = dictionary.len();
             let mut indexers = Array1::<i64>::zeros(length);
             let mut result = Array1::<i64>::zeros(length);
             for (pos, (key, val)) in dictionary.iter().enumerate() {
@@ -99,9 +100,10 @@ macro_rules! compute_floats {
                 let current_ = *current as f64;
                 for item in start_..end_ {
                     let pos = index[item];
-                    *dictionary.entry(pos).or_insert(0.) *= current_;
+                    *dictionary.entry(pos).or_insert(1.) *= current_;
                 }
             }
+            let length = dictionary.len();
             let mut indexers = Array1::<i64>::zeros(length);
             let mut result = Array1::<f64>::zeros(length);
             for (pos, (key, val)) in dictionary.iter().enumerate() {

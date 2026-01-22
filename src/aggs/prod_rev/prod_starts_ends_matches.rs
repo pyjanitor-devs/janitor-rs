@@ -52,13 +52,13 @@ macro_rules! compute_ints {
                         continue;
                     }
                     let pos = index[item];
-                    *dictionary.entry(pos).or_insert(0) *= current_;
+                    *dictionary.entry(pos).or_insert(1) *= current_;
                     n += 1;
                 }
             }
+            let length = dictionary.len();
             let mut indexers = Array1::<i64>::zeros(length);
             let mut result = Array1::<i64>::zeros(length);
-
             for (pos, (key, val)) in dictionary.iter().enumerate() {
                 indexers[pos] = *key;
                 result[pos] = *val;
@@ -125,10 +125,11 @@ macro_rules! compute_floats {
                         continue;
                     }
                     let pos = index[item];
-                    *dictionary.entry(pos).or_insert(0.) *= current_;
+                    *dictionary.entry(pos).or_insert(1.) *= current_;
                     n += 1;
                 }
             }
+            let length = dictionary.len();
             let mut indexers = Array1::<i64>::zeros(length);
             let mut result = Array1::<f64>::zeros(length);
             for (pos, (key, val)) in dictionary.iter().enumerate() {

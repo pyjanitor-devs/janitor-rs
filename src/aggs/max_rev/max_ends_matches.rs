@@ -56,6 +56,7 @@ macro_rules! compute {
                     n += 1;
                 }
             }
+            let length = dictionary.len();
             let mut indexers = Array1::<i64>::zeros(length);
             let mut result = Array1::<i64>::zeros(length);
             for (pos, (key, val)) in dictionary.iter().enumerate() {

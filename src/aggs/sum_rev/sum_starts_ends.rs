@@ -43,6 +43,7 @@ macro_rules! compute_ints {
                     *dictionary.entry(pos).or_insert(0) += current_;
                 }
             }
+            let length = dictionary.len();
             let mut indexers = Array1::<i64>::zeros(length);
             let mut result = Array1::<i64>::zeros(length);
             for (pos, (key, val)) in dictionary.iter().enumerate() {
@@ -108,6 +109,7 @@ macro_rules! compute_floats {
                     *total = increment;
                 }
             }
+            let length = dictionary.len();
             let mut indexers = Array1::<i64>::zeros(length);
             let mut result = Array1::<f64>::zeros(length);
             for (pos, (key, val)) in dictionary.iter().enumerate() {
