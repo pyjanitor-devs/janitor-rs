@@ -91,6 +91,7 @@ macro_rules! compute_floats {
                     let difference = current_ - *compensation;
                     let increment = *total + difference;
                     *compensation = (increment - *total) - difference;
+                    println!("Compensation: {}, total: {}, increment: {}, difference: {}", *compensation, *total, increment, difference);
                     if *compensation != *compensation {
                         *compensation = 0.;
                     }
