@@ -33,14 +33,15 @@ macro_rules! compute_ints {
             );
             for (current, start, end, boolean) in zipped {
                 let start_ = *start as usize;
-                let end_ = *end as usize;
-                if *boolean {
-                    continue;
-                }
+                let end_ = *end as usize;                
                 let current_ = *current as i64;
                 for item in start_..end_ {
                     let pos = index[item];
-                    *dictionary.entry(pos).or_insert(0) += current_;
+                    let total = dictionary.entry(pos).or_insert(0);
+                    if *boolean {
+                    continue;
+                }
+                    *total += current_;
                 }
             }
             let length = dictionary.len();
@@ -92,10 +93,7 @@ macro_rules! compute_floats {
                 ends.into_iter(),
                 booleans.into_iter(),
             );
-            for (current, start, end, boolean) in zipped {
-                if *boolean {
-                    continue;
-                }
+            for (current, start, end, boolean) in zipped {                
                 let start_ = *start as usize;
                 let end_ = *end as usize;
                 let current_ = *current as f64;
@@ -103,6 +101,9 @@ macro_rules! compute_floats {
                     let pos = index[item];
                     let total = dictionary.entry(pos).or_insert(0.);
                     let compensation = mapping.entry(pos).or_insert(0.);
+                    if *boolean {
+                    continue;
+                }
                     let difference = current_ - *compensation;
                     let increment = *total + difference;
                     *compensation = (increment - *total) - difference;

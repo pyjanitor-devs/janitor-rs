@@ -37,19 +37,15 @@ macro_rules! compute_ints {
             let mut n: usize = 0;
             for (current, start, count, boolean) in zipped {
                 let start_ = *start as usize;
-                if *boolean || (*count == 0) {
-                    let size = end_ - start_;
-                    n += size;
-                    continue;
-                }
                 let current_ = *current as i64;
                 for item in start_..end_ {
-                    if matches[n] == 0 {
+                    let pos = index[item];
+                    let total = dictionary.entry(pos).or_insert(1);
+                    if (matches[n] == 0) || (*boolean) || (*count == 0) {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    *dictionary.entry(pos).or_insert(1) *= current_;
+                    *total *= current_;
                     n += 1;
                 }
             }
@@ -107,19 +103,15 @@ macro_rules! compute_floats {
             let end_: usize = index.len();
             for (current, start, count, boolean) in zipped {
                 let start_ = *start as usize;
-                if *boolean || (*count == 0) {
-                    let size = end_ - start_;
-                    n += size;
-                    continue;
-                }
                 let current_ = *current as f64;
                 for item in start_..end_ {
-                    if matches[n] == 0 {
+                    let pos = index[item];
+                    let total = dictionary.entry(pos).or_insert(1.);
+                    if (matches[n] == 0) || (*boolean) || (*count == 0) {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    *dictionary.entry(pos).or_insert(1.) *= current_;
+                    *total *= current_;
                     n += 1;
                 }
             }

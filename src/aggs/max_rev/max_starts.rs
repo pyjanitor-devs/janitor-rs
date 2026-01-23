@@ -27,14 +27,14 @@ macro_rules! compute {
             let end_: usize = index.len();
             let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
             for (posn, (current, start, boolean)) in zipped.enumerate() {
-                let start_ = *start as usize;
-                if *boolean {
-                    continue;
-                }
+                let start_ = *start as usize;                
                 for item in start_..end_ {
                     let pos = index[item];
                     let base = dictionary.entry(pos).or_insert(-1);
                     let base_val = mapping.entry(pos).or_insert(*current);
+                    if *boolean {
+                    continue;
+                }
                     if (*base == -1) || (*current > *base_val) {
                         *base_val = *current;
                         *base = posn as i64;

@@ -41,19 +41,14 @@ macro_rules! compute {
             for (posn, (current, start, end, count, boolean)) in zipped.enumerate() {
                 let start_ = *start as usize;
                 let end_ = *end as usize;
-                if *boolean || (*count == 0) {
-                    let size = end_ - start_;
-                    n += size;
-                    continue;
-                }
-                for item in start_..end_ {
-                    if matches[n] == 0 {
-                        n += 1;
-                        continue;
-                    }
+                for item in start_..end_ {                    
                     let pos = index[item];
                     let base = dictionary.entry(pos).or_insert(-1);
                     let base_val = mapping.entry(pos).or_insert(*current);
+                    if (matches[n] == 0) || *boolean || (*count == 0) {
+                        n += 1;
+                        continue;
+                    }
                     if (*base == -1) || (*current > *base_val) {
                         *base_val = *current;
                         *base = posn as i64;

@@ -25,12 +25,12 @@ macro_rules! compute_ints {
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let zipped = izip!(left_index.into_iter(), right_index.into_iter(), booleans.into_iter());
             for (index_left, index_right, boolean) in zipped {
+                let total = dictionary.entry(*index_right).or_insert(1);
                 if *boolean {
                     continue;
                 }
                 let current = arr[*index_left as usize];
-                let current = current as i64;
-                let total = dictionary.entry(*index_right).or_insert(1);
+                let current = current as i64;                
                 *total *= current;
             }
             let length = dictionary.len();
@@ -77,12 +77,12 @@ macro_rules! compute_floats {
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let zipped = izip!(left_index.into_iter(), right_index.into_iter(), booleans.into_iter());
             for (index_left, index_right, boolean) in zipped {
+                let total = dictionary.entry(*index_right).or_insert(1.);
                 if *boolean {
                     continue;
                 }
                 let current = arr[*index_left as usize];
-                let current = current as f64;
-                let total = dictionary.entry(*index_right).or_insert(1.);
+                let current = current as f64;                
                 *total *= current;
             }
             let length = dictionary.len();

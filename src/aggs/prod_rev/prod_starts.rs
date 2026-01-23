@@ -25,19 +25,18 @@ macro_rules! compute_ints {
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let end_: usize = index.len();
             let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
-
             for (current, start, boolean) in zipped {
-                let start_ = *start as usize;
-                if *boolean {
-                    continue;
-                }
-                let current_ = *current as i64;
-                for item in start_..end_ {
+                let start_ = *start as usize;    
+                let current_ = *current as i64;            
+                for item in start_..end_ {                    
                     let pos = index[item];
-                    *dictionary.entry(pos).or_insert(1) *= current_;
+                    let total = dictionary.entry(pos).or_insert(1);
+                    if *boolean {
+                        continue;
+                    }
+                    *total *= current_;
                 }
             }
-            let length = dictionary.len();
             let mut indexers = Array1::<i64>::zeros(length);
             let mut result = Array1::<i64>::zeros(length);
             for (pos, (key, val)) in dictionary.iter().enumerate() {
@@ -78,17 +77,17 @@ macro_rules! compute_floats {
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
-
             let end_: usize = index.len();
             for (current, start, boolean) in zipped {
-                let start_ = *start as usize;
-                if *boolean {
-                    continue;
-                }
+                let start_ = *start as usize;     
                 let current_ = *current as f64;
-                for item in start_..end_ {
+                for item in start_..end_ {                    
                     let pos = index[item];
-                    *dictionary.entry(pos).or_insert(1.) *= current_;
+                    let total = dictionary.entry(pos).or_insert(1.);
+                    if *boolean {
+                        continue;
+                    }
+                    *total *= current_;
                 }
             }
             let length = dictionary.len();

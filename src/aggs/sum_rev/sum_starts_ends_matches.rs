@@ -40,26 +40,21 @@ macro_rules! compute_ints {
             for (current, start, end, count, boolean) in zipped {
                 let start_ = *start as usize;
                 let end_ = *end as usize;
-                if *boolean || (*count == 0) {
-                    let size = end_ - start_;
-                    n += size;
-                    continue;
-                }
                 let current_ = *current as i64;
                 for item in start_..end_ {
-                    if matches[n] == 0 {
+                    let pos = index[item];
+                    let total = dictionary.entry(pos).or_insert(0);
+                    if (matches[n] == 0) || *boolean || (*count == 0) {
                         n += 1;
                         continue;
-                    }
-                    let pos = index[item];
-                    *dictionary.entry(pos).or_insert(0) += current_;
+                    }                    
+                    *total += current_;
                     n += 1;
                 }
             }
             let length = dictionary.len();
             let mut indexers = Array1::<i64>::zeros(length);
             let mut result = Array1::<i64>::zeros(length);
-
             for (pos, (key, val)) in dictionary.iter().enumerate() {
                 indexers[pos] = *key;
                 result[pos] = *val;
@@ -115,20 +110,15 @@ macro_rules! compute_floats {
             for (current, start, end, count, boolean) in zipped {
                 let start_ = *start as usize;
                 let end_ = *end as usize;
-                if *boolean || (*count == 0) {
-                    let size = end_ - start_;
-                    n += size;
-                    continue;
-                }
                 let current_ = *current as f64;
-                for item in start_..end_ {
-                    if matches[n] == 0 {
-                        n += 1;
-                        continue;
-                    }
+                for item in start_..end_ {                    
                     let pos = index[item];
                     let total = dictionary.entry(pos).or_insert(0.);
                     let compensation = mapping.entry(pos).or_insert(0.);
+                    if (matches[n] == 0) || *boolean || (*count == 0) {
+                        n += 1;
+                        continue;
+                    }
                     let difference = current_ - *compensation;
                     let increment = *total + difference;
                     *compensation = (increment - *total) - difference;

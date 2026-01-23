@@ -25,14 +25,15 @@ macro_rules! compute_ints {
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let zipped = izip!(arr.into_iter(), ends.into_iter(), booleans.into_iter());
             for (current, end, boolean) in zipped {
-                if *boolean {
-                    continue;
-                }
                 let end_ = *end as usize;
                 let current_ = *current as i64;
                 for item in 0..end_ {
                     let pos = index[item];
-                    *dictionary.entry(pos).or_insert(0) += current_;
+                    let total = dictionary.entry(pos).or_insert(0);
+                    if *boolean {
+                    continue;
+                }
+                    *total += current_;
                 }
             }
             let length = dictionary.len();
@@ -77,16 +78,16 @@ macro_rules! compute_floats {
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
             let zipped = izip!(arr.into_iter(), ends.into_iter(), booleans.into_iter());
-            for (current, end, boolean) in zipped {
-                if *boolean {
-                    continue;
-                }
+            for (current, end, boolean) in zipped {                
                 let end_ = *end as usize;
                 let current_ = *current as f64;
                 for item in 0..end_ {
                     let pos = index[item];
                     let total = dictionary.entry(pos).or_insert(0.);
                     let compensation = mapping.entry(pos).or_insert(0.);
+                    if *boolean {
+                    continue;
+                }
                     let difference = current_ - *compensation;
                     let increment = *total + difference;
                     *compensation = (increment - *total) - difference;

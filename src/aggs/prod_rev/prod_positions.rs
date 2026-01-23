@@ -34,9 +34,6 @@ macro_rules! compute_ints {
                 booleans.into_iter()
             );
             for (current, start, end, boolean) in zipped {
-                if *boolean {
-                    continue;
-                }
                 let start_ = *start as usize;
                 let end_ = *end as usize;
                 let current_ = *current as i64;
@@ -46,7 +43,11 @@ macro_rules! compute_ints {
                         continue;
                     }
                     let pos = index[indexer as usize];
-                    *dictionary.entry(pos).or_insert(1) *= current_;
+                    let total = dictionary.entry(pos).or_insert(1);
+                    if *boolean {
+                        continue;
+                    }
+                    *total *= current_;
                 }
             }
             let length = dictionary.len();
@@ -100,9 +101,6 @@ macro_rules! compute_floats {
                 booleans.into_iter()
             );
             for (current, start, end, boolean) in zipped {
-                if *boolean {
-                    continue;
-                }
                 let start_ = *start as usize;
                 let end_ = *end as usize;
                 let current_ = *current as f64;
@@ -112,7 +110,11 @@ macro_rules! compute_floats {
                         continue;
                     }
                     let pos = index[indexer as usize];
-                    *dictionary.entry(pos).or_insert(1.) *= current_;
+                    let total = dictionary.entry(pos).or_insert(1.);
+                    if *boolean {
+                        continue;
+                    }
+                    *total *= current_;
                 }
             }
             let length = dictionary.len();
