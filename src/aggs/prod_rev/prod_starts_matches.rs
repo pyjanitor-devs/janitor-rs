@@ -27,7 +27,7 @@ macro_rules! compute_ints {
             let booleans = booleans.as_array();
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-            let end_: usize = arr.len();
+            let end_: usize = index.len();
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -104,7 +104,7 @@ macro_rules! compute_floats {
                 booleans.into_iter()
             );
             let mut n: usize = 0;
-            let end_: usize = arr.len();
+            let end_: usize = index.len();
             for (current, start, count, boolean) in zipped {
                 let start_ = *start as usize;
                 if *boolean || (*count == 0) {

@@ -28,7 +28,7 @@ macro_rules! compute {
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
-            let end_: usize = arr.len();
+            let end_: usize = index.len();
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
