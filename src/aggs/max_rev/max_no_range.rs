@@ -1,4 +1,3 @@
-use itertools::izip;
 use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
@@ -24,12 +23,13 @@ macro_rules! compute {
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
-            let zipped = izip!(left_index.into_iter(), right_index.into_iter(), booleans.into_iter());
-            for (index_left, index_right, boolean) in zipped {                
+            let zipped = left_index.into_iter().zip(right_index.into_iter());
+            for (index_left, index_right) in zipped {                
                 let current = arr[*index_left as usize];
+                let boolean = booleans[*index_left as usize];
                 let base = dictionary.entry(*index_right).or_insert(-1);
                 let base_val = mapping.entry(*index_right).or_insert(current);
-                if *boolean {
+                if boolean {
                     continue;
                 }
                 if (*base == -1) || (current > *base_val) {

@@ -1,4 +1,3 @@
-use itertools::izip;
 use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
@@ -23,16 +22,13 @@ macro_rules! compute_ints {
             let booleans = booleans.as_array();
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-            let zipped = izip!(
-                left_index.into_iter(),
-                right_index.into_iter(),
-                booleans.into_iter()
-            );
-            for (index_left, index_right, boolean) in zipped {
+            let zipped = left_index.into_iter().zip(right_index.into_iter());
+            for (index_left, index_right) in zipped {                
                 let current = arr[*index_left as usize];
+                let boolean = booleans[*index_left as usize];
                 let current = current as i64;
                 let total = dictionary.entry(*index_right).or_insert(0);
-                if *boolean {
+                if boolean {
                     continue;
                 }
                 *total += current;
@@ -78,17 +74,14 @@ macro_rules! compute_floats {
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
-            let zipped = izip!(
-                left_index.into_iter(),
-                right_index.into_iter(),
-                booleans.into_iter()
-            );
-            for (index_left, index_right, boolean) in zipped {
+            let zipped = left_index.into_iter().zip(right_index.into_iter());
+            for (index_left, index_right) in zipped {                
                 let current = arr[*index_left as usize];
+                let boolean = booleans[*index_left as usize];
                 let current = current as f64;
                 let total = dictionary.entry(*index_right).or_insert(0.);
                 let compensation = mapping.entry(*index_right).or_insert(0.);
-                if *boolean {
+                if boolean {
                     continue;
                 }
                 let difference = current - *compensation;
