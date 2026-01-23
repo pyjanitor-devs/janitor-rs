@@ -88,6 +88,9 @@ macro_rules! compute_floats {
                 let difference = current - *compensation;
                 let increment = *total + difference;
                 *compensation = (increment - *total) - difference;
+                if *compensation != *compensation {
+                        *compensation = 0.;
+                    }
                 *total = increment;
             }
             let length = dictionary.len();

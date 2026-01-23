@@ -107,6 +107,9 @@ macro_rules! compute_floats {
                     let difference = current_ - *compensation;
                     let increment = *total + difference;
                     *compensation = (increment - *total) - difference;
+                    if *compensation != *compensation {
+                        *compensation = 0.;
+                    }
                     *total = increment;
                 }
             }
