@@ -90,9 +90,14 @@ macro_rules! compute_floats {
                 }
                     let difference = current_ - *compensation;
                     let increment = *total + difference;
+                    // adapted from pandas' cython code
+                    // # GH#53606; GH#60303
+                    // # If val is +/- infinity compensation is NaN
+                    // # which would lead to results being NaN instead
+                    // # of +/- infinity. We cannot use util.is_nan
+                    // # because of no gil
                     *compensation = (increment - *total) - difference;
-                    println!("Compensation: {}, total: {}, increment: {}, difference: {}", *compensation, *total, increment, difference);
-                    if *compensation != *compensation {
+                    if !compensation.is_finite() {
                         *compensation = 0.;
                     }
                     *total = increment;

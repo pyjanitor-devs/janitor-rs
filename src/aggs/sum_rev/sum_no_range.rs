@@ -23,8 +23,12 @@ macro_rules! compute_ints {
             let booleans = booleans.as_array();
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-            let zipped = izip!(left_index.into_iter(), right_index.into_iter(), booleans.into_iter());
-            for (index_left, index_right, boolean) in zipped {                
+            let zipped = izip!(
+                left_index.into_iter(),
+                right_index.into_iter(),
+                booleans.into_iter()
+            );
+            for (index_left, index_right, boolean) in zipped {
                 let current = arr[*index_left as usize];
                 let current = current as i64;
                 let total = dictionary.entry(*index_right).or_insert(0);
@@ -54,8 +58,6 @@ compute_ints!(compute_sum_rev_no_range_uint32, u32);
 compute_ints!(compute_sum_rev_no_range_uint16, u16);
 compute_ints!(compute_sum_rev_no_range_uint8, u8);
 
-
-
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
         #[pyfunction]
@@ -76,7 +78,11 @@ macro_rules! compute_floats {
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
-            let zipped = izip!(left_index.into_iter(), right_index.into_iter(), booleans.into_iter());
+            let zipped = izip!(
+                left_index.into_iter(),
+                right_index.into_iter(),
+                booleans.into_iter()
+            );
             for (index_left, index_right, boolean) in zipped {
                 let current = arr[*index_left as usize];
                 let current = current as f64;
@@ -88,9 +94,15 @@ macro_rules! compute_floats {
                 let difference = current - *compensation;
                 let increment = *total + difference;
                 *compensation = (increment - *total) - difference;
-                if *compensation != *compensation {
-                        *compensation = 0.;
-                    }
+                // adapted from pandas' cython code
+                // # GH#53606; GH#60303
+                // # If val is +/- infinity compensation is NaN
+                // # which would lead to results being NaN instead
+                // # of +/- infinity. We cannot use util.is_nan
+                // # because of no gil
+                if !compensation.is_finite() {
+                    *compensation = 0.;
+                }
                 *total = increment;
             }
             let length = dictionary.len();
@@ -104,27 +116,6 @@ macro_rules! compute_floats {
         }
     };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 compute_floats!(compute_sum_rev_no_range_f64, f64);
 compute_floats!(compute_sum_rev_no_range_f32, f32);

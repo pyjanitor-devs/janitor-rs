@@ -42,12 +42,16 @@ macro_rules! compute_ints {
                 let end_ = *end as usize;
                 let current_ = *current as i64;
                 for item in start_..end_ {
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(0);
-                    if (matches[n] == 0) || *boolean || (*count == 0) {
+                    if (matches[n] == 0) {
                         n += 1;
                         continue;
-                    }                    
+                    }
+                    let pos = index[item];
+                    let total = dictionary.entry(pos).or_insert(0);
+                    if *boolean || (*count == 0) {
+                        n += 1;
+                        continue;
+                    }
                     *total += current_;
                     n += 1;
                 }
@@ -111,18 +115,28 @@ macro_rules! compute_floats {
                 let start_ = *start as usize;
                 let end_ = *end as usize;
                 let current_ = *current as f64;
-                for item in start_..end_ {                    
+                for item in start_..end_ {
+                    if (matches[n] == 0) {
+                        n += 1;
+                        continue;
+                    }
                     let pos = index[item];
                     let total = dictionary.entry(pos).or_insert(0.);
                     let compensation = mapping.entry(pos).or_insert(0.);
-                    if (matches[n] == 0) || *boolean || (*count == 0) {
+                    if  *boolean || (*count == 0) {
                         n += 1;
                         continue;
                     }
                     let difference = current_ - *compensation;
                     let increment = *total + difference;
                     *compensation = (increment - *total) - difference;
-                    if *compensation != *compensation {
+                    // adapted from pandas' cython code
+                    // # GH#53606; GH#60303
+                    // # If val is +/- infinity compensation is NaN
+                    // # which would lead to results being NaN instead
+                    // # of +/- infinity. We cannot use util.is_nan
+                    // # because of no gil
+                    if !compensation.is_finite() {
                         *compensation = 0.;
                     }
                     *total = increment;

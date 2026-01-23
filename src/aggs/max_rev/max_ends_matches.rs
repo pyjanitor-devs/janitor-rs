@@ -37,11 +37,15 @@ macro_rules! compute {
             );
             for (posn, (current, end, count, boolean)) in zipped.enumerate() {
                 let end_ = *end as usize;
-                for item in 0..end_ {                    
+                for item in 0..end_ {
+                    if (matches[n] == 0) {
+                        n += 1;
+                        continue;
+                    }                    
                     let pos = index[item];
                     let base = dictionary.entry(pos).or_insert(-1);
                     let base_val = mapping.entry(pos).or_insert(*current);
-                    if (matches[n] == 0) || *boolean || (*count == 0) {
+                    if  *boolean || (*count == 0) {
                         n += 1;
                         continue;
                     }

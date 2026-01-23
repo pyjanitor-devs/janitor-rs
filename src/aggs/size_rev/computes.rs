@@ -21,7 +21,8 @@ pub fn compute_size_rev_end<'py>(
         let end_ = *end as usize;
         for item in start_..end_ {
             let pos = index[item];
-            *dictionary.entry(pos).or_insert(0) += 1;
+            let total = dictionary.entry(pos).or_insert(0);
+            *total += 1;
         }
     }
     let mut indexers = Array1::<i64>::zeros(length);
@@ -49,12 +50,12 @@ pub fn compute_size_rev_start<'py>(
         let start_ = *start as usize;
         for item in start_..end_ {
             let pos = index[item];
-            *dictionary.entry(pos).or_insert(0) += 1;
+            let total = dictionary.entry(pos).or_insert(0);
+            *total += 1;
         }
     }
     let mut indexers = Array1::<i64>::zeros(length);
     let mut result = Array1::<i64>::zeros(length);
-
     for (pos, (key, val)) in dictionary.iter().enumerate() {
         indexers[pos] = *key;
         result[pos] = *val;
@@ -83,15 +84,16 @@ pub fn compute_size_rev_end_matches<'py>(
             if matches[n] == 0 {
                 n += 1;
                 continue;
-            }
+            } 
             let pos = index[item];
-            *dictionary.entry(pos).or_insert(0) += 1;
+            let total = dictionary.entry(pos).or_insert(0);           
+            *total += 1;
             n += 1;
         }
     }
+    let length = dictionary.len();
     let mut indexers = Array1::<i64>::zeros(length);
     let mut result = Array1::<i64>::zeros(length);
-
     for (pos, (key, val)) in dictionary.iter().enumerate() {
         indexers[pos] = *key;
         result[pos] = *val;
@@ -116,16 +118,18 @@ pub fn compute_size_rev_start_matches<'py>(
     let mut n: usize = 0;
     for start in starts.into_iter() {
         let start_ = *start as usize;
-        for item in start_..end_ {
+        for item in start_..end_ {            
             if matches[n] == 0 {
                 n += 1;
                 continue;
             }
             let pos = index[item];
-            *dictionary.entry(pos).or_insert(0) += 1;
+            let total = dictionary.entry(pos).or_insert(0);
+            *total += 1;
             n += 1;
         }
     }
+    let length = dictionary.len();
     let mut indexers = Array1::<i64>::zeros(length);
     let mut result = Array1::<i64>::zeros(length);
     for (pos, (key, val)) in dictionary.iter().enumerate() {
@@ -155,16 +159,18 @@ pub fn compute_size_rev_start_end_matches<'py>(
     for (start, end) in zipped {
         let start_ = *start as usize;
         let end_ = *end as usize;
-        for item in start_..end_ {
+        for item in start_..end_ {            
             if matches[n] == 0 {
                 n += 1;
                 continue;
             }
             let pos = index[item];
-            *dictionary.entry(pos).or_insert(0) += 1;
+            let total = dictionary.entry(pos).or_insert(0);
+            *total += 1;
             n += 1;
         }
     }
+    let length = dictionary.len();
     let mut indexers = Array1::<i64>::zeros(length);
     let mut result = Array1::<i64>::zeros(length);
 
@@ -194,12 +200,12 @@ pub fn compute_size_rev_start_end<'py>(
         let end_ = *end as usize;
         for item in start_..end_ {
             let pos = index[item];
-            *dictionary.entry(pos).or_insert(0) += 1;
+            let total = dictionary.entry(pos).or_insert(0);
+            *total += 1;
         }
     }
     let mut indexers = Array1::<i64>::zeros(length);
     let mut result = Array1::<i64>::zeros(length);
-
     for (pos, (key, val)) in dictionary.iter().enumerate() {
         indexers[pos] = *key;
         result[pos] = *val;
@@ -232,12 +238,13 @@ pub fn compute_size_rev_positions<'py>(
                 continue;
             }
             let pos = index[pos as usize];
-            *dictionary.entry(pos).or_insert(0) += 1;
+            let total = dictionary.entry(pos).or_insert(0);
+            *total += 1;
         }
     }
+    let length = dictionary.len();
     let mut indexers = Array1::<i64>::zeros(length);
     let mut result = Array1::<i64>::zeros(length);
-
     for (pos, (key, val)) in dictionary.iter().enumerate() {
         indexers[pos] = *key;
         result[pos] = *val;

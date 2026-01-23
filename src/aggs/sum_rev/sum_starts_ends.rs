@@ -33,14 +33,14 @@ macro_rules! compute_ints {
             );
             for (current, start, end, boolean) in zipped {
                 let start_ = *start as usize;
-                let end_ = *end as usize;                
+                let end_ = *end as usize;
                 let current_ = *current as i64;
                 for item in start_..end_ {
                     let pos = index[item];
                     let total = dictionary.entry(pos).or_insert(0);
                     if *boolean {
-                    continue;
-                }
+                        continue;
+                    }
                     *total += current_;
                 }
             }
@@ -93,7 +93,7 @@ macro_rules! compute_floats {
                 ends.into_iter(),
                 booleans.into_iter(),
             );
-            for (current, start, end, boolean) in zipped {                
+            for (current, start, end, boolean) in zipped {
                 let start_ = *start as usize;
                 let end_ = *end as usize;
                 let current_ = *current as f64;
@@ -102,12 +102,18 @@ macro_rules! compute_floats {
                     let total = dictionary.entry(pos).or_insert(0.);
                     let compensation = mapping.entry(pos).or_insert(0.);
                     if *boolean {
-                    continue;
-                }
+                        continue;
+                    }
                     let difference = current_ - *compensation;
                     let increment = *total + difference;
                     *compensation = (increment - *total) - difference;
-                    if *compensation != *compensation {
+                    // adapted from pandas' cython code
+                    // # GH#53606; GH#60303
+                    // # If val is +/- infinity compensation is NaN
+                    // # which would lead to results being NaN instead
+                    // # of +/- infinity. We cannot use util.is_nan
+                    // # because of no gil
+                    if !compensation.is_finite() {
                         *compensation = 0.;
                     }
                     *total = increment;
