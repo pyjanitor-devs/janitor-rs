@@ -38,7 +38,9 @@ macro_rules! compute_ints {
                 for item in start_..end_ {
                     let pos = index[item];
                     let total = dictionary.entry(pos).or_insert(1);
-                    if *boolean {continue;}
+                    if *boolean {
+                        continue;
+                    }
                     *total *= current_;
                 }
             }
@@ -97,7 +99,9 @@ macro_rules! compute_floats {
                 for item in start_..end_ {
                     let pos = index[item];
                     let total = dictionary.entry(pos).or_insert(1.);
-                    if *boolean { continue;}
+                    if *boolean {
+                        continue;
+                    }
                     *total *= current_;
                 }
             }

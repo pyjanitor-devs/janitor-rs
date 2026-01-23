@@ -36,7 +36,7 @@ macro_rules! compute_ints {
             );
             for (current, end, count, boolean) in zipped {
                 let end_ = *end as usize;
-                let current_ = *current as i64;                
+                let current_ = *current as i64;
                 for item in 0..end_ {
                     if (matches[n] == 0) {
                         n += 1;
@@ -44,10 +44,10 @@ macro_rules! compute_ints {
                     }
                     let pos = index[item];
                     let total = dictionary.entry(pos).or_insert(0);
-                    if  *boolean || (*count == 0) {
+                    if *boolean || (*count == 0) {
                         n += 1;
                         continue;
-                    }                    
+                    }
                     *total += current_;
                     n += 1;
                 }
@@ -118,10 +118,11 @@ macro_rules! compute_floats {
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
-                    }                    
+                    }
                     let difference = current_ - *compensation;
                     let increment = *total + difference;
                     *compensation = (increment - *total) - difference;
+                    // https://github.com/pandas-dev/pandas/blob/fee326fa8338d57230f742a6d8a2ce527f3479bc/pandas/_libs/groupby.pyx#L801
                     // adapted from pandas' cython code
                     // # GH#53606; GH#60303
                     // # If val is +/- infinity compensation is NaN

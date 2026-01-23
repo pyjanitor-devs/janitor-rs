@@ -46,10 +46,10 @@ macro_rules! compute {
                     let pos = index[item];
                     let base = dictionary.entry(pos).or_insert(-1);
                     let base_val = mapping.entry(pos).or_insert(*current);
-                    if  *boolean || (*count == 0) {
+                    if *boolean || (*count == 0) {
                         n += 1;
-                    continue;
-                }
+                        continue;
+                    }
                     if (*base == -1) || (*current < *base_val) {
                         *base_val = *current;
                         *base = posn as i64;

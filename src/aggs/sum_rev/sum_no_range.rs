@@ -23,7 +23,7 @@ macro_rules! compute_ints {
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let zipped = left_index.into_iter().zip(right_index.into_iter());
-            for (index_left, index_right) in zipped {                
+            for (index_left, index_right) in zipped {
                 let current = arr[*index_left as usize];
                 let boolean = booleans[*index_left as usize];
                 let current = current as i64;
@@ -75,7 +75,7 @@ macro_rules! compute_floats {
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
             let zipped = left_index.into_iter().zip(right_index.into_iter());
-            for (index_left, index_right) in zipped {                
+            for (index_left, index_right) in zipped {
                 let current = arr[*index_left as usize];
                 let boolean = booleans[*index_left as usize];
                 let current = current as f64;

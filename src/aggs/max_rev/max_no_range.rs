@@ -24,7 +24,7 @@ macro_rules! compute {
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
             let zipped = left_index.into_iter().zip(right_index.into_iter());
-            for (index_left, index_right) in zipped {                
+            for (index_left, index_right) in zipped {
                 let current = arr[*index_left as usize];
                 let boolean = booleans[*index_left as usize];
                 let base = dictionary.entry(*index_right).or_insert(-1);

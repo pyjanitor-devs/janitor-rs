@@ -41,11 +41,11 @@ macro_rules! compute {
                     if (matches[n] == 0) {
                         n += 1;
                         continue;
-                    }                    
+                    }
                     let pos = index[item];
                     let base = dictionary.entry(pos).or_insert(-1);
                     let base_val = mapping.entry(pos).or_insert(*current);
-                    if  *boolean || (*count == 0) {
+                    if *boolean || (*count == 0) {
                         n += 1;
                         continue;
                     }

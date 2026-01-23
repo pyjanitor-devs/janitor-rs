@@ -26,9 +26,9 @@ macro_rules! compute_ints {
             let end_: usize = index.len();
             let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
             for (current, start, boolean) in zipped {
-                let start_ = *start as usize;    
-                let current_ = *current as i64;            
-                for item in start_..end_ {                    
+                let start_ = *start as usize;
+                let current_ = *current as i64;
+                for item in start_..end_ {
                     let pos = index[item];
                     let total = dictionary.entry(pos).or_insert(1);
                     if *boolean {
@@ -79,9 +79,9 @@ macro_rules! compute_floats {
             let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
             let end_: usize = index.len();
             for (current, start, boolean) in zipped {
-                let start_ = *start as usize;     
+                let start_ = *start as usize;
                 let current_ = *current as f64;
-                for item in start_..end_ {                    
+                for item in start_..end_ {
                     let pos = index[item];
                     let total = dictionary.entry(pos).or_insert(1.);
                     if *boolean {

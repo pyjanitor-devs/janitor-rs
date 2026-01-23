@@ -3,8 +3,6 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-
-
 #[pyfunction]
 pub fn compute_size_rev_end<'py>(
     py: Python<'py>,
@@ -84,9 +82,9 @@ pub fn compute_size_rev_end_matches<'py>(
             if matches[n] == 0 {
                 n += 1;
                 continue;
-            } 
+            }
             let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);           
+            let total = dictionary.entry(pos).or_insert(0);
             *total += 1;
             n += 1;
         }
@@ -118,7 +116,7 @@ pub fn compute_size_rev_start_matches<'py>(
     let mut n: usize = 0;
     for start in starts.into_iter() {
         let start_ = *start as usize;
-        for item in start_..end_ {            
+        for item in start_..end_ {
             if matches[n] == 0 {
                 n += 1;
                 continue;
@@ -159,7 +157,7 @@ pub fn compute_size_rev_start_end_matches<'py>(
     for (start, end) in zipped {
         let start_ = *start as usize;
         let end_ = *end as usize;
-        for item in start_..end_ {            
+        for item in start_..end_ {
             if matches[n] == 0 {
                 n += 1;
                 continue;

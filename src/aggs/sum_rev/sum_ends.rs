@@ -31,8 +31,8 @@ macro_rules! compute_ints {
                     let pos = index[item];
                     let total = dictionary.entry(pos).or_insert(0);
                     if *boolean {
-                    continue;
-                }
+                        continue;
+                    }
                     *total += current_;
                 }
             }
@@ -78,7 +78,7 @@ macro_rules! compute_floats {
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
             let zipped = izip!(arr.into_iter(), ends.into_iter(), booleans.into_iter());
-            for (current, end, boolean) in zipped {                
+            for (current, end, boolean) in zipped {
                 let end_ = *end as usize;
                 let current_ = *current as f64;
                 for item in 0..end_ {
@@ -86,8 +86,8 @@ macro_rules! compute_floats {
                     let total = dictionary.entry(pos).or_insert(0.);
                     let compensation = mapping.entry(pos).or_insert(0.);
                     if *boolean {
-                    continue;
-                }
+                        continue;
+                    }
                     let difference = current_ - *compensation;
                     let increment = *total + difference;
                     // adapted from pandas' cython code

@@ -23,14 +23,14 @@ macro_rules! compute_ints {
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let zipped = left_index.into_iter().zip(right_index.into_iter());
-            for (index_left, index_right) in zipped {                
+            for (index_left, index_right) in zipped {
                 let current = arr[*index_left as usize];
                 let boolean = booleans[*index_left as usize];
                 let total = dictionary.entry(*index_right).or_insert(1);
                 if boolean {
                     continue;
                 }
-                let current = current as i64;                
+                let current = current as i64;
                 *total *= current;
             }
             let length = dictionary.len();
@@ -54,8 +54,6 @@ compute_ints!(compute_prod_rev_no_range_uint32, u32);
 compute_ints!(compute_prod_rev_no_range_uint16, u16);
 compute_ints!(compute_prod_rev_no_range_uint8, u8);
 
-
-
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
         #[pyfunction]
@@ -76,14 +74,14 @@ macro_rules! compute_floats {
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let zipped = left_index.into_iter().zip(right_index.into_iter());
-            for (index_left, index_right) in zipped {                
+            for (index_left, index_right) in zipped {
                 let current = arr[*index_left as usize];
                 let boolean = booleans[*index_left as usize];
                 let total = dictionary.entry(*index_right).or_insert(1.);
                 if boolean {
                     continue;
                 }
-                let current = current as f64;                
+                let current = current as f64;
                 *total *= current;
             }
             let length = dictionary.len();
@@ -97,27 +95,6 @@ macro_rules! compute_floats {
         }
     };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 compute_floats!(compute_prod_rev_no_range_f64, f64);
 compute_floats!(compute_prod_rev_no_range_f32, f32);

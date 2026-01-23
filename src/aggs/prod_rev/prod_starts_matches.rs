@@ -45,7 +45,7 @@ macro_rules! compute_ints {
                     }
                     let pos = index[item];
                     let total = dictionary.entry(pos).or_insert(1);
-                    if  (*boolean) || (*count == 0) {
+                    if (*boolean) || (*count == 0) {
                         n += 1;
                         continue;
                     }
