@@ -1050,16 +1050,31 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(index_builder::index_starts_ends_1st, m)?)?;
     m.add_function(wrap_pyfunction!(index_builder::index_starts_ends_last, m)?)?;
 
-    m.add_function(wrap_pyfunction!(compare::comp::compare_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp::compare_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp::compare_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp::compare_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp::compare_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp::compare_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp::compare_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp::compare_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp::compare_float32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp::compare_float64, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp::compare_start_end_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp::compare_start_end_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp::compare_start_end_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(compare::comp::compare_start_end_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp::compare_start_end_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp::compare_start_end_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp::compare_start_end_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp::compare_start_end_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp::compare_start_end_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp::compare_start_end_float64,
+        m
+    )?)?;
 
     m.add_function(wrap_pyfunction!(
         aggs::min::min_starts::compute_min_start_uint64,
@@ -2526,505 +2541,751 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
 
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_lt::compare_uint64,
+        bin_search::bin_search_lt::binary_search_lt_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_lt::compare_uint32,
+        bin_search::bin_search_lt::binary_search_lt_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_lt::compare_uint16,
+        bin_search::bin_search_lt::binary_search_lt_uint16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_lt::compare_uint8,
+        bin_search::bin_search_lt::binary_search_lt_uint8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_lt::compare_int64,
+        bin_search::bin_search_lt::binary_search_lt_int64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_lt::compare_int32,
+        bin_search::bin_search_lt::binary_search_lt_int32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_lt::compare_int16,
+        bin_search::bin_search_lt::binary_search_lt_int16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_lt::compare_int8,
+        bin_search::bin_search_lt::binary_search_lt_int8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_lt::compare_float32,
+        bin_search::bin_search_lt::binary_search_lt_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_lt::compare_float64,
-        m
-    )?)?;
-
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_le::compare_uint64,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_le::compare_uint32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_le::compare_uint16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_le::compare_uint8,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_le::compare_int64,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_le::compare_int32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_le::compare_int16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_le::compare_int8,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_le::compare_float32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_le::compare_float64,
+        bin_search::bin_search_lt::binary_search_lt_f64,
         m
     )?)?;
 
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_ge::compare_uint64,
+        bin_search::bin_search_le::binary_search_le_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_ge::compare_uint32,
+        bin_search::bin_search_le::binary_search_le_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_ge::compare_uint16,
+        bin_search::bin_search_le::binary_search_le_uint16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_ge::compare_uint8,
+        bin_search::bin_search_le::binary_search_le_uint8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_ge::compare_int64,
+        bin_search::bin_search_le::binary_search_le_int64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_ge::compare_int32,
+        bin_search::bin_search_le::binary_search_le_int32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_ge::compare_int16,
+        bin_search::bin_search_le::binary_search_le_int16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_ge::compare_int8,
+        bin_search::bin_search_le::binary_search_le_int8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_ge::compare_float32,
+        bin_search::bin_search_le::binary_search_le_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_ge::compare_float64,
-        m
-    )?)?;
-
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_gt::compare_uint64,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_gt::compare_uint32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_gt::compare_uint16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_gt::compare_uint8,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_gt::compare_int64,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_gt::compare_int32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_gt::compare_int16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_gt::compare_int8,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_gt::compare_float32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        bin_search::bin_search_gt::compare_float64,
+        bin_search::bin_search_le::binary_search_le_f64,
         m
     )?)?;
 
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range_ne::compare_uint64,
+        bin_search::bin_search_ge::binary_search_ge_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range_ne::compare_uint32,
+        bin_search::bin_search_ge::binary_search_ge_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range_ne::compare_uint16,
+        bin_search::bin_search_ge::binary_search_ge_uint16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range_ne::compare_uint8,
+        bin_search::bin_search_ge::binary_search_ge_uint8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range_ne::compare_int64,
+        bin_search::bin_search_ge::binary_search_ge_int64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range_ne::compare_int32,
+        bin_search::bin_search_ge::binary_search_ge_int32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range_ne::compare_int16,
+        bin_search::bin_search_ge::binary_search_ge_int16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range_ne::compare_int8,
+        bin_search::bin_search_ge::binary_search_ge_int8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range_ne::compare_float32,
+        bin_search::bin_search_ge::binary_search_ge_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range_ne::compare_float64,
-        m
-    )?)?;
-
-    m.add_function(wrap_pyfunction!(compare::comp_ne::compare_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne::compare_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne::compare_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne::compare_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne::compare_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne::compare_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne::compare_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne::compare_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne::compare_float32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne::compare_float64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(compare::comp_no_range::compare_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_no_range::compare_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_no_range::compare_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_no_range::compare_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_no_range::compare_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_no_range::compare_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_no_range::compare_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_no_range::compare_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_no_range::compare_float32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_no_range::compare_float64,
+        bin_search::bin_search_ge::binary_search_ge_f64,
         m
     )?)?;
 
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts::compare_uint64,
+        bin_search::bin_search_gt::binary_search_gt_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts::compare_uint32,
+        bin_search::bin_search_gt::binary_search_gt_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts::compare_uint16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_starts::compare_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_starts::compare_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_starts::compare_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_starts::compare_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_starts::compare_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts::compare_float32,
+        bin_search::bin_search_gt::binary_search_gt_uint16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts::compare_float64,
-        m
-    )?)?;
-
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts_1st::compare_uint64,
+        bin_search::bin_search_gt::binary_search_gt_uint8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts_1st::compare_uint32,
+        bin_search::bin_search_gt::binary_search_gt_int64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts_1st::compare_uint16,
+        bin_search::bin_search_gt::binary_search_gt_int32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts_1st::compare_uint8,
+        bin_search::bin_search_gt::binary_search_gt_int16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts_1st::compare_int64,
+        bin_search::bin_search_gt::binary_search_gt_int8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts_1st::compare_int32,
+        bin_search::bin_search_gt::binary_search_gt_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts_1st::compare_int16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts_1st::compare_int8,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts_1st::compare_float32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts_1st::compare_float64,
-        m
-    )?)?;
-
-    m.add_function(wrap_pyfunction!(compare::comp_ne_ends::compare_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_ends::compare_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_ends::compare_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_ends::compare_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_ends::compare_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_ends::compare_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_ends::compare_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_ends::compare_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_ends::compare_float32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_ends::compare_float64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(compare::comp_ne_1st::compare_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_1st::compare_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_1st::compare_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_1st::compare_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_1st::compare_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_1st::compare_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_1st::compare_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_1st::compare_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_1st::compare_float32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ne_1st::compare_float64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends_1st::compare_uint64,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends_1st::compare_uint32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends_1st::compare_uint16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends_1st::compare_uint8,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends_1st::compare_int64,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends_1st::compare_int32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends_1st::compare_int16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends_1st::compare_int8,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends_1st::compare_float32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends_1st::compare_float64,
-        m
-    )?)?;
-
-    m.add_function(wrap_pyfunction!(compare::comp_first::compare_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_first::compare_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_first::compare_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_first::compare_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_first::compare_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_first::compare_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_first::compare_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_first::compare_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_first::compare_float32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_first::compare_float64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(
-        compare::comp_first_starts::compare_uint64,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_first_starts::compare_uint32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_first_starts::compare_uint16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_first_starts::compare_uint8,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_first_starts::compare_int64,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_first_starts::compare_int32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_first_starts::compare_int16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_first_starts::compare_int8,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_first_starts::compare_float32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_first_starts::compare_float64,
+        bin_search::bin_search_gt::binary_search_gt_f64,
         m
     )?)?;
 
     m.add_function(wrap_pyfunction!(
-        compare::comp_first_ends::compare_uint64,
+        compare::comp_no_range_ne::compare_no_range_ne_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first_ends::compare_uint32,
+        compare::comp_no_range_ne::compare_no_range_ne_uint32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first_ends::compare_uint16,
+        compare::comp_no_range_ne::compare_no_range_ne_uint16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first_ends::compare_uint8,
+        compare::comp_no_range_ne::compare_no_range_ne_uint8,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first_ends::compare_int64,
+        compare::comp_no_range_ne::compare_no_range_ne_int64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first_ends::compare_int32,
+        compare::comp_no_range_ne::compare_no_range_ne_int32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first_ends::compare_int16,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_first_ends::compare_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_first_ends::compare_float32,
+        compare::comp_no_range_ne::compare_no_range_ne_int16,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first_ends::compare_float64,
+        compare::comp_no_range_ne::compare_no_range_ne_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_no_range_ne::compare_no_range_ne_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_no_range_ne::compare_no_range_ne_float64,
         m
     )?)?;
 
-    m.add_function(wrap_pyfunction!(compare::comp_starts::compare_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_starts::compare_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_starts::compare_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_starts::compare_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_starts::compare_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_starts::compare_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_starts::compare_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_starts::compare_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_starts::compare_float32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_starts::compare_float64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_float32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_float64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(compare::comp_posns::compare_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns::compare_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns::compare_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns::compare_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns::compare_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns::compare_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns::compare_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns::compare_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns::compare_float32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns::compare_float64, m)?)?;
-
-    m.add_function(wrap_pyfunction!(compare::comp_posns_ne::compare_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns_ne::compare_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns_ne::compare_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns_ne::compare_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns_ne::compare_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns_ne::compare_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns_ne::compare_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(compare::comp_posns_ne::compare_int8, m)?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_posns_ne::compare_float32,
+        compare::comp_ne::compare_start_end_ne_uint64,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_posns_ne::compare_float64,
+        compare::comp_ne::compare_start_end_ne_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne::compare_start_end_ne_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne::compare_start_end_ne_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne::compare_start_end_ne_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne::compare_start_end_ne_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne::compare_start_end_ne_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne::compare_start_end_ne_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne::compare_start_end_ne_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne::compare_start_end_ne_float64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        compare::comp_no_range::compare_no_range_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_no_range::compare_no_range_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_no_range::compare_no_range_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_no_range::compare_no_range_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_no_range::compare_no_range_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_no_range::compare_no_range_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_no_range::compare_no_range_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_no_range::compare_no_range_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_no_range::compare_no_range_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_no_range::compare_no_range_float64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts::compare_start_ne_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts::compare_start_ne_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts::compare_start_ne_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts::compare_start_ne_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts::compare_start_ne_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts::compare_start_ne_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts::compare_start_ne_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts::compare_start_ne_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts::compare_start_ne_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts::compare_start_ne_float64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts_1st::compare_start_ne_1st_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts_1st::compare_start_ne_1st_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts_1st::compare_start_ne_1st_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts_1st::compare_start_ne_1st_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts_1st::compare_start_ne_1st_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts_1st::compare_start_ne_1st_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts_1st::compare_start_ne_1st_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts_1st::compare_start_ne_1st_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts_1st::compare_start_ne_1st_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_starts_1st::compare_start_ne_1st_float64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends::compare_end_ne_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends::compare_end_ne_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends::compare_end_ne_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends::compare_end_ne_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends::compare_end_ne_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends::compare_end_ne_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends::compare_end_ne_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends::compare_end_ne_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends::compare_end_ne_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends::compare_end_ne_float64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_1st::compare_start_end_ne_1st_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_1st::compare_start_end_ne_1st_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_1st::compare_start_end_ne_1st_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_1st::compare_start_end_ne_1st_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_1st::compare_start_end_ne_1st_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_1st::compare_start_end_ne_1st_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_1st::compare_start_end_ne_1st_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_1st::compare_start_end_ne_1st_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_1st::compare_start_end_ne_1st_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_1st::compare_start_end_ne_1st_float64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends_1st::compare_end_ne_1st_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends_1st::compare_end_ne_1st_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends_1st::compare_end_ne_1st_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends_1st::compare_end_ne_1st_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends_1st::compare_end_ne_1st_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends_1st::compare_end_ne_1st_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends_1st::compare_end_ne_1st_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends_1st::compare_end_ne_1st_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends_1st::compare_end_ne_1st_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_ne_ends_1st::compare_end_ne_1st_float64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first::compare_first_start_end_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first::compare_first_start_end_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first::compare_first_start_end_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first::compare_first_start_end_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first::compare_first_start_end_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first::compare_first_start_end_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first::compare_first_start_end_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first::compare_first_start_end_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first::compare_first_start_end_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first::compare_first_start_end_float64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_starts::compare_first_start_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_starts::compare_first_start_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_starts::compare_first_start_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_starts::compare_first_start_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_starts::compare_first_start_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_starts::compare_first_start_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_starts::compare_first_start_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_starts::compare_first_start_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_starts::compare_first_start_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_starts::compare_first_start_float64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_ends::compare_first_end_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_ends::compare_first_end_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_ends::compare_first_end_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_ends::compare_first_end_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_ends::compare_first_end_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_ends::compare_first_end_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_ends::compare_first_end_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_ends::compare_first_end_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_ends::compare_first_end_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_first_ends::compare_first_end_float64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        compare::comp_starts::compare_start_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_starts::compare_start_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_starts::compare_start_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_starts::compare_start_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_starts::compare_start_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_starts::compare_start_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_starts::compare_start_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_starts::compare_start_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_starts::compare_start_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_starts::compare_start_float64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_end_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_end_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_end_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_end_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_end_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_end_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_end_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_end_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_end_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp_ends::compare_end_f64, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns::compare_posns_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns::compare_posns_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns::compare_posns_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns::compare_posns_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns::compare_posns_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns::compare_posns_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns::compare_posns_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns::compare_posns_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns::compare_posns_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns::compare_posns_float64,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns_ne::compare_posns_ne_uint64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns_ne::compare_posns_ne_uint32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns_ne::compare_posns_ne_uint16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns_ne::compare_posns_ne_uint8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns_ne::compare_posns_ne_int64,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns_ne::compare_posns_ne_int32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns_ne::compare_posns_ne_int16,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns_ne::compare_posns_ne_int8,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns_ne::compare_posns_ne_float32,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        compare::comp_posns_ne::compare_posns_ne_float64,
         m
     )?)?;
 
