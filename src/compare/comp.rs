@@ -31,7 +31,6 @@ macro_rules! generic_compare {
             let starts_array = starts.as_array();
             let ends_array = ends.as_array();
             let matches_array = matches.as_array();
-
             let mut result = Array1::<i8>::zeros(matches_array.len());
             let mut counts_array = Array1::<i64>::zeros(left_array.len());
             let mut total: i64 = 0;
@@ -76,5 +75,5 @@ generic_compare!(compare_start_end_uint64, u64);
 generic_compare!(compare_start_end_uint32, u32);
 generic_compare!(compare_start_end_uint16, u16);
 generic_compare!(compare_start_end_uint8, u8);
-generic_compare!(compare_start_end_float64, f64);
-generic_compare!(compare_start_end_float32, f32);
+generic_compare!(compare_start_end_f64, f64);
+generic_compare!(compare_start_end_f32, f32);

@@ -63,5 +63,5 @@ generic_compare!(compare_first_start_uint64, u64);
 generic_compare!(compare_first_start_uint32, u32);
 generic_compare!(compare_first_start_uint16, u16);
 generic_compare!(compare_first_start_uint8, u8);
-generic_compare!(compare_first_start_float64, f64);
-generic_compare!(compare_first_start_float32, f32);
+generic_compare!(compare_first_start_f64, f64);
+generic_compare!(compare_first_start_f32, f32);

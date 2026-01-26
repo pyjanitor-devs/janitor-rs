@@ -57,5 +57,5 @@ generic_compare!(compare_no_range_uint64, u64);
 generic_compare!(compare_no_range_uint32, u32);
 generic_compare!(compare_no_range_uint16, u16);
 generic_compare!(compare_no_range_uint8, u8);
-generic_compare!(compare_no_range_float64, f64);
-generic_compare!(compare_no_range_float32, f32);
+generic_compare!(compare_no_range_f64, f64);
+generic_compare!(compare_no_range_f32, f32);

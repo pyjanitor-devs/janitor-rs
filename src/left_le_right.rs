@@ -36,12 +36,10 @@ fn left_le_right(
     let total_counts: i64 = counts.values().sum();
     // keep track of the very first position of values from right
     // in the lookup array
-    let mut dictionary: HashMap<i64, i64> = HashMap::new();
-    let (k, val) = counts.pop_last().unwrap();
-    let mut position = total_counts - val;
-    dictionary.insert(k, position);
+    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(counts.len());
     // ensure iteration starts from the largest value in right
     // for proper alignment in the lookup_array
+    let mut position = total_counts;
     for (key, count) in counts.into_iter().rev() {
         position -= count;
         dictionary.insert(key, position);
@@ -60,15 +58,27 @@ fn left_le_right(
         for position in start_..end {
             right_val = right[position];
             *counts.entry(right_val).or_insert(0) += 1;
-            let lookup_position = *dictionary.get(&right_val).unwrap() as usize;
-            let size = counts.get(&right_val).unwrap();
+            let lookup_position = dictionary.entry(right_val).or_insert(-1);
+            if *lookup_position == -1 {
+                continue;
+            }
+            let lookup_position = *lookup_position as usize;
+            let size = counts.entry(right_val).or_insert(0);
+            if *size == 0 {
+                continue;
+            }
+            let size = *size;
             // zero indexing ,hence the value-1
             let indexer = lookup_position + (size - 1);
             lookup_array[indexer] = position as i64;
         }
         end = start_;
         for (key, size) in counts.range(left_val..=&max_right) {
-            let lookup_position = *dictionary.get(&key).unwrap() as usize;
+            let lookup_position = dictionary.entry(*key).or_insert(-1);
+            if *lookup_position == -1 {
+                continue;
+            }
+            let lookup_position = *lookup_position as usize;
             for indexer in lookup_position..lookup_position + size {
                 let position = lookup_array[indexer];
                 result[n] = position;

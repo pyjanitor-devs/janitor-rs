@@ -1,5 +1,6 @@
 /// compare rows where only ends exist (usually a >/>= join)
 /// and matches already exist
+use itertools::izip;
 use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
@@ -23,6 +24,7 @@ macro_rules! generic_compare {
             left: PyReadonlyArray1<'py, $type>,
             right: PyReadonlyArray1<'py, $type>,
             ends: PyReadonlyArray1<'py, i64>,
+            counts: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             op: i8,
         ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
@@ -30,14 +32,19 @@ macro_rules! generic_compare {
             let right_array = right.as_array();
             let ends_array = ends.as_array();
             let matches_array = matches.as_array();
+            let counts = counts.as_array();
             let mut result = Array1::<i8>::zeros(matches_array.len());
             let mut counts_array = Array1::<i64>::zeros(left_array.len());
             let mut total: i64 = 0;
             let start = 0;
             let mut n = 0;
-            let zipped = left_array.into_iter().zip(ends_array.into_iter());
-            for (position, (left_val, end)) in zipped.enumerate() {
+            let zipped = izip!(left_array.into_iter(), ends_array.into_iter(), counts.into_iter());
+            for (position, (left_val, end, count)) in zipped.enumerate() {
                 let end_ = *end as usize;
+                if *count == 0 {
+                    let size = end_ - start;
+                    n += size;
+                    continue;}                
                 let mut counter: i64 = 0;
                 for nn in start..end_ {
                     if matches_array[n] == 0 {

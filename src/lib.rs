@@ -1033,22 +1033,46 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
 
-    m.add_function(wrap_pyfunction!(index_builder::index_repeat, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_trim, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::reorder_indices, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_trim_pos, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_positions, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_positions_first, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_positions_last, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_starts, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_starts_1st, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_starts_last, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_ends, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_ends_1st, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_ends_last, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_starts_ends, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_starts_ends_1st, m)?)?;
-    m.add_function(wrap_pyfunction!(index_builder::index_starts_ends_last, m)?)?;
+    m.add_function(wrap_pyfunction!(index_builder::repeat_index, m)?)?;
+    m.add_function(wrap_pyfunction!(index_builder::trim_index, m)?)?;
+    m.add_function(wrap_pyfunction!(index_builder::reorder_index, m)?)?;
+    m.add_function(wrap_pyfunction!(index_builder::index_trim_positions, m)?)?;
+    m.add_function(wrap_pyfunction!(index_builder::build_positional_index, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        index_builder::build_positional_index_first,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        index_builder::build_positional_index_last,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(index_builder::index_starts_only, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        index_builder::index_starts_only_keep_first,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        index_builder::index_starts_only_keep_last,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(index_builder::index_ends_only, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        index_builder::index_ends_only_keep_first,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        index_builder::index_ends_only_keep_last,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(index_builder::index_starts_and_ends, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        index_builder::index_starts_and_ends_keep_first,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        index_builder::index_starts_and_ends_keep_last,
+        m
+    )?)?;
 
     m.add_function(wrap_pyfunction!(
         compare::comp::compare_start_end_uint64,
@@ -1067,14 +1091,8 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compare::comp::compare_start_end_int32, m)?)?;
     m.add_function(wrap_pyfunction!(compare::comp::compare_start_end_int16, m)?)?;
     m.add_function(wrap_pyfunction!(compare::comp::compare_start_end_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp::compare_start_end_float32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp::compare_start_end_float64,
-        m
-    )?)?;
+    m.add_function(wrap_pyfunction!(compare::comp::compare_start_end_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp::compare_start_end_f64, m)?)?;
 
     m.add_function(wrap_pyfunction!(
         aggs::min::min_starts::compute_min_start_uint64,
@@ -2737,11 +2755,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range_ne::compare_no_range_ne_float32,
+        compare::comp_no_range_ne::compare_no_range_ne_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range_ne::compare_no_range_ne_float64,
+        compare::comp_no_range_ne::compare_no_range_ne_f64,
         m
     )?)?;
 
@@ -2778,11 +2796,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne::compare_start_end_ne_float32,
+        compare::comp_ne::compare_start_end_ne_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne::compare_start_end_ne_float64,
+        compare::comp_ne::compare_start_end_ne_f64,
         m
     )?)?;
 
@@ -2819,11 +2837,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range::compare_no_range_float32,
+        compare::comp_no_range::compare_no_range_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_no_range::compare_no_range_float64,
+        compare::comp_no_range::compare_no_range_f64,
         m
     )?)?;
 
@@ -2860,11 +2878,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts::compare_start_ne_float32,
+        compare::comp_ne_starts::compare_start_ne_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts::compare_start_ne_float64,
+        compare::comp_ne_starts::compare_start_ne_f64,
         m
     )?)?;
 
@@ -2901,11 +2919,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts_1st::compare_start_ne_1st_float32,
+        compare::comp_ne_starts_1st::compare_start_ne_1st_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_starts_1st::compare_start_ne_1st_float64,
+        compare::comp_ne_starts_1st::compare_start_ne_1st_f64,
         m
     )?)?;
 
@@ -2942,11 +2960,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends::compare_end_ne_float32,
+        compare::comp_ne_ends::compare_end_ne_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends::compare_end_ne_float64,
+        compare::comp_ne_ends::compare_end_ne_f64,
         m
     )?)?;
 
@@ -2983,11 +3001,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_1st::compare_start_end_ne_1st_float32,
+        compare::comp_ne_1st::compare_start_end_ne_1st_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_1st::compare_start_end_ne_1st_float64,
+        compare::comp_ne_1st::compare_start_end_ne_1st_f64,
         m
     )?)?;
 
@@ -3024,11 +3042,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends_1st::compare_end_ne_1st_float32,
+        compare::comp_ne_ends_1st::compare_end_ne_1st_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_ne_ends_1st::compare_end_ne_1st_float64,
+        compare::comp_ne_ends_1st::compare_end_ne_1st_f64,
         m
     )?)?;
 
@@ -3065,11 +3083,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first::compare_first_start_end_float32,
+        compare::comp_first::compare_first_start_end_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first::compare_first_start_end_float64,
+        compare::comp_first::compare_first_start_end_f64,
         m
     )?)?;
 
@@ -3106,11 +3124,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first_starts::compare_first_start_float32,
+        compare::comp_first_starts::compare_first_start_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first_starts::compare_first_start_float64,
+        compare::comp_first_starts::compare_first_start_f64,
         m
     )?)?;
 
@@ -3147,11 +3165,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first_ends::compare_first_end_float32,
+        compare::comp_first_ends::compare_first_end_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_first_ends::compare_first_end_float64,
+        compare::comp_first_ends::compare_first_end_f64,
         m
     )?)?;
 
@@ -3188,11 +3206,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_starts::compare_start_float32,
+        compare::comp_starts::compare_start_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_starts::compare_start_float64,
+        compare::comp_starts::compare_start_f64,
         m
     )?)?;
 
@@ -3239,14 +3257,8 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         compare::comp_posns::compare_posns_int8,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_posns::compare_posns_float32,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        compare::comp_posns::compare_posns_float64,
-        m
-    )?)?;
+    m.add_function(wrap_pyfunction!(compare::comp_posns::compare_posns_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(compare::comp_posns::compare_posns_f64, m)?)?;
 
     m.add_function(wrap_pyfunction!(
         compare::comp_posns_ne::compare_posns_ne_uint64,
@@ -3281,11 +3293,11 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_posns_ne::compare_posns_ne_float32,
+        compare::comp_posns_ne::compare_posns_ne_f32,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        compare::comp_posns_ne::compare_posns_ne_float64,
+        compare::comp_posns_ne::compare_posns_ne_f64,
         m
     )?)?;
 

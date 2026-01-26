@@ -24,6 +24,7 @@ macro_rules! generic_compare {
             left: PyReadonlyArray1<'py, $type>,
             right: PyReadonlyArray1<'py, $type>,
             starts: PyReadonlyArray1<'py, i64>,
+            counts: PyReadonlyArray1<'py, i64>,
             left_booleans: PyReadonlyArray1<'py, bool>,
             right_booleans: PyReadonlyArray1<'py, bool>,
             matches: PyReadonlyArray1<'py, i8>,
@@ -33,6 +34,7 @@ macro_rules! generic_compare {
             let left_array = left.as_array();
             let right_array = right.as_array();
             let starts_array = starts.as_array();
+            let counts = counts.as_array();
             let left_booleans_array = left_booleans.as_array();
             let right_booleans_array = right_booleans.as_array();
             let matches_array = matches.as_array();
@@ -45,8 +47,10 @@ macro_rules! generic_compare {
                 left_array.into_iter(),
                 left_booleans_array.into_iter(),
                 starts_array.into_iter(),
+                counts.into_iter()
             );
-            for (position, (left_val, left_bool, start)) in zipped.enumerate() {
+            for (position, (left_val, left_bool, start, count)) in zipped.enumerate() {
+                if *count == 0 {continue;}
                 let start_ = *start as usize;
                 let mut counter: i64 = 0;
                 for nn in start_..end_ {
@@ -96,5 +100,5 @@ generic_compare!(compare_start_ne_uint64, u64);
 generic_compare!(compare_start_ne_uint32, u32);
 generic_compare!(compare_start_ne_uint16, u16);
 generic_compare!(compare_start_ne_uint8, u8);
-generic_compare!(compare_start_ne_float64, f64);
-generic_compare!(compare_start_ne_float32, f32);
+generic_compare!(compare_start_ne_f64, f64);
+generic_compare!(compare_start_ne_f32, f32);
