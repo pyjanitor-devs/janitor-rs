@@ -38,13 +38,18 @@ macro_rules! generic_compare {
             let mut total: i64 = 0;
             let start = 0;
             let mut n = 0;
-            let zipped = izip!(left_array.into_iter(), ends_array.into_iter(), counts.into_iter());
+            let zipped = izip!(
+                left_array.into_iter(),
+                ends_array.into_iter(),
+                counts.into_iter()
+            );
             for (position, (left_val, end, count)) in zipped.enumerate() {
                 let end_ = *end as usize;
                 if *count == 0 {
                     let size = end_ - start;
                     n += size;
-                    continue;}                
+                    continue;
+                }
                 let mut counter: i64 = 0;
                 for nn in start..end_ {
                     if matches_array[n] == 0 {

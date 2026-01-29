@@ -1,6 +1,5 @@
 /// compare rows where only starts exist (usually a </<= join)
 /// and matches already exist
-
 use itertools::izip;
 use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
@@ -39,13 +38,18 @@ macro_rules! generic_compare {
             let mut total: i64 = 0;
             let mut n: usize = 0;
             let end = right_array.len();
-            let zipped = izip!(left_array.into_iter(), starts_array.into_iter(), counts.into_iter());
+            let zipped = izip!(
+                left_array.into_iter(),
+                starts_array.into_iter(),
+                counts.into_iter()
+            );
             for (position, (left_val, start, count)) in zipped.enumerate() {
                 let start_ = *start as usize;
                 if *count == 0 {
                     let size = end - start_;
                     n += size;
-                    continue;}                
+                    continue;
+                }
                 let mut counter: i64 = 0;
                 for nn in start_..end {
                     if matches_array[n] == 0 {

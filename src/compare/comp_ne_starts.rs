@@ -50,7 +50,9 @@ macro_rules! generic_compare {
                 counts.into_iter()
             );
             for (position, (left_val, left_bool, start, count)) in zipped.enumerate() {
-                if *count == 0 {continue;}
+                if *count == 0 {
+                    continue;
+                }
                 let start_ = *start as usize;
                 let mut counter: i64 = 0;
                 for nn in start_..end_ {

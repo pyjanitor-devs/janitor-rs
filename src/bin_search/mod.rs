@@ -1,4 +1,10 @@
 pub mod bin_search_ge;
+pub mod bin_search_ge_first;
+pub mod bin_search_ge_regions;
 pub mod bin_search_gt;
+pub mod bin_search_gt_first;
+pub mod bin_search_gt_regions;
 pub mod bin_search_le;
+pub mod bin_search_le_first;
 pub mod bin_search_lt;
+pub mod bin_search_lt_first;
