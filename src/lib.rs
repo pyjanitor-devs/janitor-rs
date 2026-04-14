@@ -4,10 +4,12 @@ mod bin_search;
 mod compare;
 mod index_builder;
 mod left_le_right;
+mod pivot_polars;
 
 /// Helper functions for PyJanitor implemented in Rust.
 #[pymodule]
 fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(pivot_polars::spec::spec_reshape, m)?)?;
     m.add_function(wrap_pyfunction!(
         aggs::prod_rev::prod_no_range::compute_prod_rev_no_range_uint64,
         m
