@@ -60,3 +60,24 @@ generic_compute!(compute_min_positions_uint16, u16);
 generic_compute!(compute_min_positions_uint8, u8);
 generic_compute!(compute_min_positions_f64, f64);
 generic_compute!(compute_min_positions_f32, f32);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Int8PositionsFn = for<'py> fn(
+        Python<'py>,
+        PyReadonlyArray1<'py, i8>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, bool>,
+    ) -> Bound<'py, PyArray1<i64>>;
+
+    #[test]
+    fn int8_wrapper_accepts_an_int8_array() {
+        // ELI5: the typed slot only accepts a wrapper whose `arr` is really
+        // `i8`; changing the macro argument back to `i64` breaks compilation.
+        let _wrapper: Int8PositionsFn = compute_min_positions_int8;
+    }
+}
