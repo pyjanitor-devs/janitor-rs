@@ -58,6 +58,14 @@ macro_rules! generic_compute {
         {
             // Cast only values inside the requested ranges. Widening the
             // whole column would make a tiny suffix query scan and copy it.
+            //
+            // Note (applies to the uint64 instantiation only): `value as
+            // i64` is a bit-reinterpretation (two's complement), not a
+            // widen, for any u64 value >= 2^63 - e.g. 2^63 becomes
+            // i64::MIN. This is pre-existing behavior this PR doesn't
+            // change; see `u64_values_above_i63_reinterpret_bits` below,
+            // which locks it in and documents it now that it's
+            // independently testable without a Python interpreter.
             let result = sum_start_core_with_cast(
                 arr.as_array(),
                 starts.as_array(),
@@ -179,6 +187,24 @@ mod tests {
         let booleans = Array1::<bool>::from_elem(100, false);
         let got = sum_start_core(arr.view(), starts.view(), booleans.view());
         assert_eq!(got[0], -100_i64);
+    }
+
+    #[test]
+    fn u64_values_above_i63_reinterpret_bits() {
+        // Documents pre-existing, unchanged behavior of the uint64
+        // instantiation's `|value| value as i64` cast (see the note on
+        // `generic_compute!` above): for a u64 value >= 2^63, this is a
+        // bit-reinterpretation (two's complement), not a widen -
+        // matching NumPy's own `.astype(np.int64)` unsafe-cast semantics
+        // on the pyjanitor side of this same boundary, not a bug to fix
+        // in this crate independently of that Python-side contract.
+        let arr = Array1::<u64>::from_elem(1, 2u64.pow(63));
+        let starts = array![0_i64];
+        let booleans = array![false];
+        let got = sum_start_core_with_cast(arr.view(), starts.view(), booleans.view(), |value| {
+            value as i64
+        });
+        assert_eq!(got, array![i64::MIN]);
     }
 
     #[test]

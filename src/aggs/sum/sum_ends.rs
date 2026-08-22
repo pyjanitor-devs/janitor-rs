@@ -3,7 +3,11 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 /// For every `ends[i]`, sum `arr[..ends[i]]` (from the start of the array),
-/// skipping any position flagged `true` in `booleans` (a null mask).
+/// skipping any position flagged `true` in `booleans` (a null mask). An
+/// `end` of `-1` (the crate's sentinel for "invalid/no match", e.g. as
+/// returned by `binary_search_lt_core`) contributes `0`, matching that
+/// sentinel's meaning elsewhere rather than being cast to `usize` and
+/// walked off the end of `arr`.
 ///
 /// ELI5: the mirror image of `sum_start_core` -- instead of "everything
 /// from here to the end", it's "everything from the beginning up to here".
@@ -30,6 +34,9 @@ where
     let mut result = Array1::<i64>::zeros(ends.len());
     let start_: usize = 0;
     for (pos, end) in ends.indexed_iter() {
+        if *end == -1 {
+            continue; // result[pos] is already 0
+        }
         let mut total: i64 = 0;
         let end_ = *end as usize;
         for nn in start_..end_ {
@@ -154,6 +161,19 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let ends = array![3_i64];
         let booleans = array![true, true, true];
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn sentinel_end_is_zero_not_a_panic() {
+        // -1 is the crate's "invalid/no match" sentinel (see
+        // binary_search_lt_core). Cast naively to usize it becomes
+        // usize::MAX, and the loop would walk straight off the end of
+        // `arr`; this must return 0 instead of panicking.
+        let arr = array![1_i64, 2, 3];
+        let ends = array![-1_i64];
+        let booleans = array![false, false, false];
         let got = sum_end_core(arr.view(), ends.view(), booleans.view());
         assert_eq!(got, array![0]);
     }

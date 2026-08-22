@@ -34,6 +34,11 @@ fn binary_compare<T: std::cmp::PartialOrd>(left: &T, right: &T, op: i8) -> bool 
 /// whether position `n` on the tape satisfies `op` (left as `0` when the
 /// tape said skip), `counts_array[i]` is how many positions row `i`
 /// matched, and `total` is the grand total across every row.
+///
+/// A row with an invalid/inverted range (`start` or `end` is `-1`, the
+/// crate's "no match" sentinel, or `start >= end`, checked in `i64` space
+/// before either bound is cast to `usize`) contributes zero ticks to the
+/// tape, matching a genuinely empty range.
 pub fn compare_start_end_core<T: PartialOrd + Copy>(
     left: ArrayView1<T>,
     right: ArrayView1<T>,
@@ -48,6 +53,13 @@ pub fn compare_start_end_core<T: PartialOrd + Copy>(
     let mut n: usize = 0;
     let zipped = izip!(left.into_iter(), starts.into_iter(), ends.into_iter());
     for (position, (left_val, start, end)) in zipped.enumerate() {
+        if *start == -1 || *end == -1 || *start >= *end {
+            // No candidates for this row: 0 ticks on the shared `matches`
+            // tape, matching a genuinely empty [start, end) range. A lone
+            // `-1` sentinel cast to `usize` would otherwise wrap past
+            // `arr.len()`/`matches.len()` instead of contributing nothing.
+            continue;
+        }
         let start_ = *start as usize;
         let end_ = *end as usize;
         let mut counter: i64 = 0;
@@ -151,6 +163,32 @@ mod tests {
             assert_eq!(counts, array![expected_count], "op={op}");
             assert_eq!(total, expected_count, "op={op}");
         }
+    }
+
+    #[test]
+    fn sentinel_range_contributes_zero_ticks_not_a_panic() {
+        // -1 is the crate's "invalid/no match" sentinel. Cast naively to
+        // usize alone it becomes usize::MAX, and the inner loop would
+        // walk `right`/`matches` straight out of bounds instead of
+        // contributing zero ticks to the shared tape.
+        let left = array![3_i64, 5_i64];
+        let right = array![1_i64, 4, 9];
+        let starts = array![0_i64, 1_i64];
+        let ends = array![3_i64, -1_i64];
+        let matches = array![1_i8, 1, 1];
+
+        let (result, counts, total) = compare_start_end_core(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            matches.view(),
+            LT,
+        );
+        // row 0: 3<1 f, 3<4 t, 3<9 t
+        assert_eq!(result, array![0, 1, 1]);
+        assert_eq!(counts, array![2, 0]);
+        assert_eq!(total, 2);
     }
 
     #[test]

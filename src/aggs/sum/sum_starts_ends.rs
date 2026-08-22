@@ -7,9 +7,13 @@ use pyo3::prelude::*;
 ///
 /// ELI5: an arbitrary `[start, end)` slice instead of "to the end" or
 /// "from the beginning" -- same null-skip/overflow-wrap contract as
-/// `sum_start_core`. An inverted or empty range (`start >= end`)
-/// contributes `0` for free: Rust's `start_..end_` range simply produces
-/// no items to iterate when `start_ >= end_`, no special-casing needed.
+/// `sum_start_core`. An inverted or empty range (`start >= end`, checked
+/// in `i64` space before either bound is cast to `usize`) contributes `0`.
+/// `start`/`end` of `-1` (the crate's sentinel for "invalid/no match")
+/// also contributes `0`, rather than being cast to `usize::MAX` and
+/// walked off the end of `arr` -- a naive `start_ >= end_` check *after*
+/// casting would miss this, since a lone `-1` end wraps to a value larger
+/// than any real start.
 pub fn sum_start_end_core(
     arr: ArrayView1<i64>,
     starts: ArrayView1<i64>,
@@ -33,6 +37,9 @@ where
     let mut result = Array1::<i64>::zeros(starts.len());
     let zipped = starts.into_iter().zip(ends);
     for (pos, (start, end)) in zipped.enumerate() {
+        if *start == -1 || *end == -1 || *start >= *end {
+            continue; // result[pos] is already 0
+        }
         let mut total: i64 = 0;
         let start_ = *start as usize;
         let end_ = *end as usize;
@@ -172,6 +179,30 @@ mod tests {
         let starts = array![1_i64];
         let ends = array![1_i64];
         let booleans = array![false, false, false];
+        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn sentinel_end_is_zero_not_a_panic() {
+        // -1 is the crate's "invalid/no match" sentinel. Cast naively to
+        // usize alone it becomes usize::MAX -- larger than any real
+        // `start`, so a post-cast `start_ >= end_` check would miss it
+        // and the loop would walk straight off the end of `arr`.
+        let arr = array![1_i64, 2, 3, 4, 5];
+        let starts = array![2_i64];
+        let ends = array![-1_i64];
+        let booleans = array![false, false, false, false, false];
+        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn sentinel_start_is_zero_not_a_panic() {
+        let arr = array![1_i64, 2, 3, 4, 5];
+        let starts = array![-1_i64];
+        let ends = array![3_i64];
+        let booleans = array![false, false, false, false, false];
         let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
         assert_eq!(got, array![0]);
     }
