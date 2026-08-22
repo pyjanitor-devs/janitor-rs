@@ -19,6 +19,12 @@ macro_rules! generic_compute_ints {
             let starts = starts.as_array();
             let ends = ends.as_array();
             ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
             let arr = arr.as_array();
             let booleans = booleans.as_array();
             let mut result = Array1::<i64>::zeros(starts.len());
@@ -56,6 +62,12 @@ macro_rules! generic_compute_floats {
             let starts = starts.as_array();
             let ends = ends.as_array();
             ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
             let arr = arr.as_array();
             let booleans = booleans.as_array();
             let mut result = Array1::<f64>::zeros(starts.len());

@@ -490,3 +490,29 @@ keeps the validation cost outside the hot loop.
 **Recommendation**: Use the shared `ensure_equal_lengths` helper once at the
 PyO3 boundary and return `PyResult` so mismatches become a normal Python
 `ValueError`. Do not add the comparison inside a row or candidate loop.
+
+### [2026-08-23] Issue #34 resolved by reusing #36's `ensure_equal_lengths`, not a bespoke guard
+
+**Context**: Issue #34's initial fix (this branch, before rebasing onto #36)
+added a separate `booleans_len_ok` predicate that returned each kernel's own
+"nothing computed" value (`-1` for position kernels, `0` for `sum`, and a
+special-cased `1` fill for `prod`'s non-`_matches` shapes, since their
+empty-range identity isn't the zero-initialized default). That special-casing
+was itself a symptom: silently synthesizing a "nothing happened" result for a
+whole-call contract violation forces every family to separately re-derive what
+"nothing" means for its own accumulator.
+**Learning**: `booleans.len() == arr.len()` is the exact same shape of
+whole-call invariant as `starts.len() == ends.len()` (#36) -- `ensure_equal_lengths`
+doesn't care what the two lengths represent, only that a name/length pair
+matches another. Raising `PyValueError` via `?` sidesteps the identity-value
+problem entirely: there is no result to synthesize because the function never
+starts computing one.
+**Recommendation**: Rebase/stack a whole-call-invariant fix on top of any
+sibling fix already adding this kind of shared helper rather than developing
+a parallel one -- check `ensure_equal_lengths` (or its successor) for a name/
+length pair before inventing a new predicate. Call it once in the
+`#[pyfunction]` macro wrapper, before any `_core` function is invoked, not
+inside the `_core` function itself: the `_core` functions stay plain,
+PyO3-free, and directly Rust-testable (`ensure_equal_lengths` is covered by
+its own tests in `aggs::adversarial_bounds_tests`, generically -- there is no
+need to duplicate that coverage per call site or per kernel family).

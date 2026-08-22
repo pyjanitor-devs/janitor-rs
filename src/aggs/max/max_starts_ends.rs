@@ -63,6 +63,12 @@ macro_rules! generic_compute {
             let starts = starts.as_array();
             let ends = ends.as_array();
             ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
             let result = max_start_end_core(arr.as_array(), starts, ends, booleans.as_array());
             Ok(result.into_pyarray(py))
         }

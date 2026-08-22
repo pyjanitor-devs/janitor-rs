@@ -2,6 +2,8 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::ensure_equal_lengths;
+
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
         #[pyfunction]
@@ -10,9 +12,15 @@ macro_rules! generic_compute {
             arr: PyReadonlyArray1<'py, $type>,
             starts: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> Bound<'py, PyArray1<i64>>
+        ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
             let arr = arr.as_array();
             let starts = starts.as_array();
             let booleans = booleans.as_array();
@@ -30,7 +38,7 @@ macro_rules! generic_compute {
                 }
                 result[pos] = total;
             }
-            result.into_pyarray(py)
+            Ok(result.into_pyarray(py))
         }
     };
 }
@@ -43,9 +51,15 @@ macro_rules! generic_compute_floats {
             arr: PyReadonlyArray1<'py, $type>,
             starts: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> Bound<'py, PyArray1<f64>>
+        ) -> PyResult<Bound<'py, PyArray1<f64>>>
         // The macro will expand into the contents of this block.
         {
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
             let arr = arr.as_array();
             let starts = starts.as_array();
             let booleans = booleans.as_array();
@@ -63,7 +77,7 @@ macro_rules! generic_compute_floats {
                 }
                 result[pos] = total;
             }
-            result.into_pyarray(py)
+            Ok(result.into_pyarray(py))
         }
     };
 }

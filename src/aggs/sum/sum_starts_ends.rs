@@ -118,6 +118,12 @@ macro_rules! generic_compute_ints {
             let starts = starts.as_array();
             let ends = ends.as_array();
             ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
             let result = sum_start_end_core_with_cast(
                 arr.as_array(),
                 starts,
@@ -145,6 +151,12 @@ macro_rules! generic_compute_floats {
             let starts = starts.as_array();
             let ends = ends.as_array();
             ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
             let result = sum_start_end_float_core_with_cast(
                 arr.as_array(),
                 starts,
