@@ -115,15 +115,9 @@ generic_compute_floats!(compute_sum_positions_f64, f64);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggs::PositionsFn;
 
-    type Int8PositionsFn = for<'py> fn(
-        Python<'py>,
-        PyReadonlyArray1<'py, i8>,
-        PyReadonlyArray1<'py, i64>,
-        PyReadonlyArray1<'py, i64>,
-        PyReadonlyArray1<'py, i64>,
-        PyReadonlyArray1<'py, bool>,
-    ) -> Bound<'py, PyArray1<i64>>;
+    type Int8PositionsFn = PositionsFn<i8, i64>;
 
     #[test]
     fn int8_wrapper_accepts_an_int8_array() {

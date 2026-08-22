@@ -414,3 +414,16 @@ the same operation.
 **Recommendation**: Put sentinel/range validation in a helper shared by the
 integer and float paths, and add a direct regression test for each distinct
 loop implementation.
+
+### [2026-08-23] Position aggregations use `-1` for zero matches
+
+**Context**: Hardening the forward min/max `*_matches` kernels in PR #29.
+**Learning**: Their result arrays were zero-initialized, so a `count == 0`
+branch returned position `0`, even though pyjanitor treats `-1` as the
+no-result sentinel and masks that position to a missing aggregate value.
+Mixed rows with zero matches could therefore receive the first right-side
+value instead of a missing value.
+**Recommendation**: Initialize position-valued aggregation results to `-1`.
+When skipping a zero-count row on a flat match tape, preserve `-1` while still
+advancing the tape by the row's candidate-range width, and test a following
+non-empty row to catch alignment regressions.
