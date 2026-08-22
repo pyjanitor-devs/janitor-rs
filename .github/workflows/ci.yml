@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      # `extension-module` (the default feature) avoids linking against
+      # libpython, because the real wheel is dlopen()'d by a Python
+      # interpreter that already provides those symbols. A standalone
+      # `cargo test`/`cargo bench` binary has no such interpreter, so it
+      # needs the feature off to link. See the comment on the
+      # `[features]` table in Cargo.toml.
+      # No `--all-targets` here: that would also compile (but not run,
+      # since criterion benches aren't `#[test]`s) benches/kernels.rs under
+      # the `test` profile, which is wasted work -- the `cargo bench
+      # --no-run` step below already compiles it, under the `bench`
+      # profile it actually ships with, so nothing from a `test`-profile
+      # compile of it could be reused there anyway.
+      - name: cargo test (kernel unit tests)
+        run: cargo test --no-default-features
+
+      # Runs with every feature (including `extension-module`) enabled:
+      # clippy performs static analysis only, it never links a binary, so
+      # the linker issue above doesn't apply here -- this exercises the
+      # exact feature set the real wheel builds with.
+      - name: cargo clippy (full feature set, no linking required)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Compiles the benchmark harness without running the full suite, to
+      # keep CI fast -- `cargo bench` itself is for local use (see
+      # README.md) when actually comparing algorithm timings.
+      - name: cargo bench --no-run (compile-check only)
+        run: cargo bench --no-default-features --no-run

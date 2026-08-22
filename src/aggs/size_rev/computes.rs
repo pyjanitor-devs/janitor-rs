@@ -14,7 +14,7 @@ pub fn compute_size_rev_end<'py>(
     let index = index.as_array();
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-    let start_: usize = 0 as usize;
+    let start_: usize = 0_usize;
     for end in ends.into_iter() {
         let end_ = *end as usize;
         for item in start_..end_ {
@@ -74,7 +74,7 @@ pub fn compute_size_rev_end_matches<'py>(
     let matches = matches.as_array();
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-    let start_: usize = 0 as usize;
+    let start_: usize = 0_usize;
     let mut n: usize = 0;
     for end in ends.into_iter() {
         let end_ = *end as usize;
@@ -153,7 +153,7 @@ pub fn compute_size_rev_start_end_matches<'py>(
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
     let mut n: usize = 0;
-    let zipped = starts.into_iter().zip(ends.into_iter());
+    let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
         let start_ = *start as usize;
         let end_ = *end as usize;
@@ -192,7 +192,7 @@ pub fn compute_size_rev_start_end<'py>(
     let index = index.as_array();
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-    let zipped = starts.into_iter().zip(ends.into_iter());
+    let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
         let start_ = *start as usize;
         let end_ = *end as usize;
@@ -227,7 +227,7 @@ pub fn compute_size_rev_positions<'py>(
     let positions = positions.as_array();
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-    let zipped = starts.into_iter().zip(ends.into_iter());
+    let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
         let start_ = *start as usize;
         let end_ = *end as usize;

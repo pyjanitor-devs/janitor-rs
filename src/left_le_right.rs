@@ -80,7 +80,7 @@ pub fn region_positions<'py>(
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(counts.len());
     let mut counts: BTreeMap<i64, i64> = BTreeMap::new();
     let mut result = Array1::<i64>::zeros(total as usize);
-    let zipped = left.into_iter().zip(starts.into_iter());
+    let zipped = left.into_iter().zip(starts);
     let mut end = right.len();
     let mut n: usize = 0;
     for (left_val, start) in zipped {

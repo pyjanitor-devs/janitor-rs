@@ -1,0 +1,9 @@
+# Every `#[pyfunction]` kernel entry point intentionally exposes each
+# input array, mask, and length as a separate named Python-facing
+# argument (arr/starts/ends/matches/counts/index/positions/booleans/
+# length), up to 10 today. That's a Python API-design choice, not
+# something to refactor away by bundling arguments into an internal
+# struct just to satisfy the linter. This raises the threshold for that
+# one lint only -- every other clippy lint, and `-D warnings` itself,
+# still apply in full.
+too-many-arguments-threshold = 10
