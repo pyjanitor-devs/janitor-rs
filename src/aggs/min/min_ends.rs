@@ -2,29 +2,30 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::checked_end;
+
 /// For every `ends[i]`, find the position (not the value) of the smallest
 /// element in `arr[..ends[i]]`, skipping positions flagged `true` in
-/// `booleans` (a null mask). Returns `-1` when `arr` is empty (there's
-/// nothing to seed the running comparison from) or every candidate is
-/// null.
+/// `booleans` (a null mask). Returns `-1` when `end` is negative or past
+/// `arr.len()`, `arr` is empty, or every candidate is null.
 ///
-/// ELI5 (the guard): the mirror image of `min_start_core`'s guard --
-/// instead of the *requested range* being invalid, it's that `arr` itself
-/// has nothing in it, so the unconditional seed read `arr[0]` has no
-/// index `0` to read. See issue #27.
+/// ELI5 (the guard): validate the signed end before either casting it or
+/// reading `arr[0]`; otherwise `-1` becomes a huge index and an empty array
+/// has no seed value. See issue #27.
 pub fn min_end_core<T: PartialOrd + Copy>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
 ) -> Array1<i64> {
-    let mut result = Array1::<i64>::zeros(ends.len());
+    let mut result = Array1::<i64>::from_elem(ends.len(), -1);
     for (pos, end) in ends.indexed_iter() {
+        let Some(end_) = checked_end(*end, arr.len()) else {
+            continue;
+        };
         if arr.is_empty() {
-            result[pos] = -1;
             continue;
         }
         let mut base: i64 = -1;
-        let end_ = *end as usize;
         let mut base_val = arr[0];
         for nn in 0..end_ {
             if booleans[nn] {

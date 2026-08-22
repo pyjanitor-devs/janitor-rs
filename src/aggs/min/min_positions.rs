@@ -3,17 +3,17 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::{checked_index, checked_range};
+
 /// For every `(starts[i], ends[i])`, find the position (not the value) of
 /// the smallest `arr[positions[nn]]` over `nn` in `[starts[i], ends[i])`,
 /// skipping `nn` where `positions[nn] == -1` (no candidate at that slot)
-/// or where the candidate's own position is null. Returns `-1` when
-/// `arr` is empty (nothing to seed the running comparison from) or every
-/// candidate is skipped.
+/// or where the candidate's own position is null. Returns `-1` when the
+/// slot range is invalid, `arr` is empty, or every candidate is skipped.
 ///
-/// ELI5 (the guard): `min` needs a real array element to seed its
-/// comparison, and here the seed read is `arr[0]`, independent of
-/// `start`/`end`/`positions` -- so the only thing that can make it
-/// invalid is `arr` itself being empty. See issue #27.
+/// ELI5 (the guard): validate both the slot range and every indirect
+/// position before indexing; signed sentinels must never become huge
+/// `usize` values. See issue #27.
 pub fn min_positions_core<T: PartialOrd + Copy>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -21,30 +21,28 @@ pub fn min_positions_core<T: PartialOrd + Copy>(
     positions: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
 ) -> Array1<i64> {
-    let mut result = Array1::<i64>::zeros(starts.len());
+    let mut result = Array1::<i64>::from_elem(starts.len(), -1);
     let zipped = izip!(starts.into_iter(), ends.into_iter());
     for (pos, (start, end)) in zipped.enumerate() {
-        let start_ = *start as usize;
-        let end_ = *end as usize;
+        let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+            continue;
+        };
         if arr.is_empty() {
-            result[pos] = -1;
             continue;
         }
         let mut base: i64 = -1;
         let mut base_val = arr[0];
         for nn in start_..end_ {
-            let indexer = positions[nn];
-            if indexer == -1 {
+            let Some(indexer_) = checked_index(positions[nn], arr.len()) else {
                 continue;
-            }
-            let indexer_: usize = indexer as usize;
+            };
             if booleans[indexer_] {
                 continue;
             }
             let current = arr[indexer_];
             if (base == -1) || (current < base_val) {
                 base_val = current;
-                base = indexer;
+                base = indexer_ as i64;
             }
         }
         result[pos] = base;

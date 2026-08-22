@@ -2,15 +2,17 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::checked_end;
+
 /// For every `ends[i]`, find the position (not the value) of the
 /// smallest element in `arr[..ends[i]]` among positions the caller has
 /// flagged live in `matches` (a flat tape covering every row's candidate
-/// range back to back). Returns `-1` when `arr` is empty (nothing to
-/// seed the running comparison from) or every candidate is skipped/null.
+/// range back to back). Returns `-1` when `end` is invalid, `arr` is empty,
+/// the row has zero matches, or every candidate is skipped/null.
 ///
-/// ELI5 (the guard): the mirror image of `min_start_match_core`'s guard
-/// -- `arr` itself, not the range, is what can be invalid here, since the
-/// seed read is the fixed `arr[0]`. See issue #27.
+/// ELI5 (the guard): validate the signed end before casting or reading the
+/// fixed seed `arr[0]`, while zero-match rows still advance over their part
+/// of the flat match tape. See issue #27.
 pub fn min_end_match_core<T: PartialOrd + Copy>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
@@ -18,14 +20,15 @@ pub fn min_end_match_core<T: PartialOrd + Copy>(
     matches: ArrayView1<i8>,
     booleans: ArrayView1<bool>,
 ) -> Array1<i64> {
-    let mut result = Array1::<i64>::zeros(ends.len());
+    let mut result = Array1::<i64>::from_elem(ends.len(), -1);
     let mut n: usize = 0;
     let zipped = ends.into_iter().zip(counts);
     for (pos, (end, count)) in zipped.enumerate() {
-        let end_ = *end as usize;
+        let Some(end_) = checked_end(*end, arr.len()) else {
+            continue;
+        };
         if arr.is_empty() {
             n += end_;
-            result[pos] = -1;
             continue;
         }
         let mut base: i64 = -1;
@@ -127,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_count_does_not_panic() {
+    fn zero_count_returns_minus_one() {
         let arr = array![1_i64, 2, 3];
         let ends = array![3_i64];
         let counts = array![0_i64];
@@ -140,6 +143,6 @@ mod tests {
             matches.view(),
             booleans.view(),
         );
-        assert_eq!(got, array![0]);
+        assert_eq!(got, array![-1]);
     }
 }

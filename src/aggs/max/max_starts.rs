@@ -2,11 +2,13 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::checked_index;
+
 /// For every `starts[i]`, find the position (not the value) of the
 /// largest element in `arr[starts[i]..]`, skipping positions flagged
 /// `true` in `booleans` (a null mask). Returns `-1` when the range is
-/// empty (`starts[i] >= arr.len()`, including a `-1` sentinel cast to
-/// `usize`, which wraps past `arr.len()`) or every candidate is null.
+/// empty or invalid (`starts[i] < 0` or `starts[i] >= arr.len()`) or every
+/// candidate is null.
 ///
 /// ELI5 (the guard): unlike `sum`, which can start a running total at `0`
 /// with no data read, `max` needs an actual array element to compare
@@ -18,14 +20,12 @@ pub fn max_start_core<T: PartialOrd + Copy>(
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
 ) -> Array1<i64> {
-    let mut result = Array1::<i64>::zeros(starts.len());
+    let mut result = Array1::<i64>::from_elem(starts.len(), -1);
     let end_ = arr.len();
     for (pos, start) in starts.indexed_iter() {
-        let start_ = *start as usize;
-        if start_ >= end_ {
-            result[pos] = -1;
+        let Some(start_) = checked_index(*start, end_) else {
             continue;
-        }
+        };
         let mut base: i64 = -1;
         let mut base_val = arr[start_];
         for nn in start_..end_ {

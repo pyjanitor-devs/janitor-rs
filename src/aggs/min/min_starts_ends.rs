@@ -2,11 +2,13 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::checked_range;
+
 /// For every `(starts[i], ends[i])`, find the position (not the value) of
 /// the smallest element in `arr[starts[i]..ends[i]]`, skipping positions
 /// flagged `true` in `booleans`. Returns `-1` for an empty or inverted
-/// range (`start >= end`, including a `-1` sentinel cast to `usize`) or
-/// when every candidate is null.
+/// range (`start < 0`, `end < 0`, `start >= end`, or `end > arr.len()`),
+/// or when every candidate is null.
 ///
 /// ELI5 (the guard): same reasoning as `min_start_core` -- `min` needs a
 /// real array element to seed its comparison, so the range must be
@@ -17,15 +19,12 @@ pub fn min_start_end_core<T: PartialOrd + Copy>(
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
 ) -> Array1<i64> {
-    let mut result = Array1::<i64>::zeros(starts.len());
+    let mut result = Array1::<i64>::from_elem(starts.len(), -1);
     let zipped = starts.into_iter().zip(ends);
     for (pos, (start, end)) in zipped.enumerate() {
-        let start_ = *start as usize;
-        let end_ = *end as usize;
-        if start_ >= end_ {
-            result[pos] = -1;
+        let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
             continue;
-        }
+        };
         let mut base: i64 = -1;
         let mut base_val = arr[start_];
         for nn in start_..end_ {

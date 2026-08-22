@@ -9,3 +9,363 @@ pub mod prod_rev;
 pub mod size_rev;
 pub mod sum;
 pub mod sum_rev;
+
+/// Convert a signed position only when it names a real element.
+///
+/// ELI5: negative sentinels and positions past the end never become huge
+/// `usize` values; they are rejected while they are still signed.
+pub(crate) fn checked_index(index: i64, len: usize) -> Option<usize> {
+    usize::try_from(index).ok().filter(|&index| index < len)
+}
+
+/// Convert an exclusive signed end bound in the inclusive range `0..=len`.
+pub(crate) fn checked_end(end: i64, len: usize) -> Option<usize> {
+    usize::try_from(end).ok().filter(|&end| end <= len)
+}
+
+/// Convert a non-empty signed half-open range contained in `0..len`.
+pub(crate) fn checked_range(start: i64, end: i64, len: usize) -> Option<(usize, usize)> {
+    let start = usize::try_from(start).ok()?;
+    let end = checked_end(end, len)?;
+    (start < end).then_some((start, end))
+}
+
+#[cfg(test)]
+mod adversarial_bounds_tests {
+    use numpy::ndarray::array;
+
+    use super::max::max_ends::max_end_core;
+    use super::max::max_ends_matches::max_end_match_core;
+    use super::max::max_positions::max_positions_core;
+    use super::max::max_starts::max_start_core;
+    use super::max::max_starts_ends::max_start_end_core;
+    use super::max::max_starts_ends_matches::max_start_end_match_core;
+    use super::max::max_starts_matches::max_start_match_core;
+    use super::min::min_ends::min_end_core;
+    use super::min::min_ends_matches::min_end_match_core;
+    use super::min::min_positions::min_positions_core;
+    use super::min::min_starts::min_start_core;
+    use super::min::min_starts_ends::min_start_end_core;
+    use super::min::min_starts_ends_matches::min_start_end_match_core;
+    use super::min::min_starts_matches::min_start_match_core;
+
+    #[test]
+    fn every_forward_core_rejects_signed_and_one_past_bounds() {
+        let arr = array![5_i64, 1, 4];
+        let booleans = array![false, false, false];
+        let invalid_starts = array![-1_i64, 3, 4];
+        let invalid_ends = array![-1_i64, 4];
+        let zero_counts = array![0_i64, 0, 0];
+        let empty_matches = array![];
+
+        assert_eq!(
+            min_start_core(arr.view(), invalid_starts.view(), booleans.view()),
+            array![-1, -1, -1]
+        );
+        assert_eq!(
+            max_start_core(arr.view(), invalid_starts.view(), booleans.view()),
+            array![-1, -1, -1]
+        );
+        assert_eq!(
+            min_end_core(arr.view(), invalid_ends.view(), booleans.view()),
+            array![-1, -1]
+        );
+        assert_eq!(
+            max_end_core(arr.view(), invalid_ends.view(), booleans.view()),
+            array![-1, -1]
+        );
+
+        let starts = array![0_i64, 0];
+        assert_eq!(
+            min_start_end_core(
+                arr.view(),
+                starts.view(),
+                invalid_ends.view(),
+                booleans.view(),
+            ),
+            array![-1, -1]
+        );
+        assert_eq!(
+            max_start_end_core(
+                arr.view(),
+                starts.view(),
+                invalid_ends.view(),
+                booleans.view(),
+            ),
+            array![-1, -1]
+        );
+
+        let positions = array![0_i64, 1, 2];
+        let position_starts = array![-1_i64, 0];
+        let position_ends = array![1_i64, 4];
+        assert_eq!(
+            min_positions_core(
+                arr.view(),
+                position_starts.view(),
+                position_ends.view(),
+                positions.view(),
+                booleans.view(),
+            ),
+            array![-1, -1]
+        );
+        assert_eq!(
+            max_positions_core(
+                arr.view(),
+                position_starts.view(),
+                position_ends.view(),
+                positions.view(),
+                booleans.view(),
+            ),
+            array![-1, -1]
+        );
+
+        assert_eq!(
+            min_start_match_core(
+                arr.view(),
+                invalid_starts.view(),
+                zero_counts.view(),
+                empty_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, -1, -1]
+        );
+        assert_eq!(
+            max_start_match_core(
+                arr.view(),
+                invalid_starts.view(),
+                zero_counts.view(),
+                empty_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, -1, -1]
+        );
+
+        let invalid_end_counts = array![0_i64, 0];
+        assert_eq!(
+            min_end_match_core(
+                arr.view(),
+                invalid_ends.view(),
+                invalid_end_counts.view(),
+                empty_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, -1]
+        );
+        assert_eq!(
+            max_end_match_core(
+                arr.view(),
+                invalid_ends.view(),
+                invalid_end_counts.view(),
+                empty_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, -1]
+        );
+        assert_eq!(
+            min_start_end_match_core(
+                arr.view(),
+                starts.view(),
+                invalid_ends.view(),
+                invalid_end_counts.view(),
+                empty_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, -1]
+        );
+        assert_eq!(
+            max_start_end_match_core(
+                arr.view(),
+                starts.view(),
+                invalid_ends.view(),
+                invalid_end_counts.view(),
+                empty_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, -1]
+        );
+    }
+
+    #[test]
+    fn zero_count_rows_return_minus_one_without_shifting_the_match_tape() {
+        let arr = array![5_i64, 1, 4];
+        let booleans = array![false, false, false];
+        let counts = array![0_i64, 1];
+
+        let starts = array![0_i64, 1];
+        let start_matches = array![0_i8, 0, 0, 1, 0];
+        assert_eq!(
+            min_start_match_core(
+                arr.view(),
+                starts.view(),
+                counts.view(),
+                start_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, 1]
+        );
+        assert_eq!(
+            max_start_match_core(
+                arr.view(),
+                starts.view(),
+                counts.view(),
+                start_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, 1]
+        );
+
+        let ends = array![3_i64, 2];
+        let end_matches = array![0_i8, 0, 0, 0, 1];
+        assert_eq!(
+            min_end_match_core(
+                arr.view(),
+                ends.view(),
+                counts.view(),
+                end_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, 1]
+        );
+        assert_eq!(
+            max_end_match_core(
+                arr.view(),
+                ends.view(),
+                counts.view(),
+                end_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, 1]
+        );
+
+        let interval_ends = array![3_i64, 3];
+        assert_eq!(
+            min_start_end_match_core(
+                arr.view(),
+                starts.view(),
+                interval_ends.view(),
+                counts.view(),
+                start_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, 1]
+        );
+        assert_eq!(
+            max_start_end_match_core(
+                arr.view(),
+                starts.view(),
+                interval_ends.view(),
+                counts.view(),
+                start_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, 1]
+        );
+    }
+
+    #[test]
+    fn invalid_rows_contribute_zero_slots_to_the_match_tape() {
+        let arr = array![5_i64, 1, 4];
+        let booleans = array![false, false, false];
+        let counts = array![0_i64, 1];
+
+        let starts = array![-1_i64, 1];
+        let start_matches = array![1_i8, 0];
+        assert_eq!(
+            min_start_match_core(
+                arr.view(),
+                starts.view(),
+                counts.view(),
+                start_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, 1]
+        );
+        assert_eq!(
+            max_start_match_core(
+                arr.view(),
+                starts.view(),
+                counts.view(),
+                start_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, 1]
+        );
+
+        let ends = array![-1_i64, 2];
+        let end_matches = array![0_i8, 1];
+        assert_eq!(
+            min_end_match_core(
+                arr.view(),
+                ends.view(),
+                counts.view(),
+                end_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, 1]
+        );
+        assert_eq!(
+            max_end_match_core(
+                arr.view(),
+                ends.view(),
+                counts.view(),
+                end_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, 1]
+        );
+
+        let interval_ends = array![2_i64, 3];
+        assert_eq!(
+            min_start_end_match_core(
+                arr.view(),
+                starts.view(),
+                interval_ends.view(),
+                counts.view(),
+                start_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, 1]
+        );
+        assert_eq!(
+            max_start_end_match_core(
+                arr.view(),
+                starts.view(),
+                interval_ends.view(),
+                counts.view(),
+                start_matches.view(),
+                booleans.view(),
+            ),
+            array![-1, 1]
+        );
+    }
+
+    #[test]
+    fn positions_outside_the_value_array_are_skipped() {
+        let arr = array![5_i64, 1, 4];
+        let starts = array![0_i64];
+        let ends = array![2_i64];
+        let positions = array![-2_i64, 3];
+        let booleans = array![false, false, false];
+
+        assert_eq!(
+            min_positions_core(
+                arr.view(),
+                starts.view(),
+                ends.view(),
+                positions.view(),
+                booleans.view(),
+            ),
+            array![-1]
+        );
+        assert_eq!(
+            max_positions_core(
+                arr.view(),
+                starts.view(),
+                ends.view(),
+                positions.view(),
+                booleans.view(),
+            ),
+            array![-1]
+        );
+    }
+}

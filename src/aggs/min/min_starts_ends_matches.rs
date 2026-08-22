@@ -3,12 +3,13 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::checked_range;
+
 /// For every `(starts[i], ends[i])`, find the position (not the value) of
 /// the smallest element in `arr[starts[i]..ends[i]]` among positions the
 /// caller has flagged live in `matches` (a flat tape covering every row's
 /// candidate range back to back). Returns `-1` for an empty or inverted
-/// range (`start >= end`, including a `-1` sentinel) or when every
-/// candidate is skipped/null.
+/// range, a zero match count, or when every candidate is skipped/null.
 ///
 /// ELI5 (the guard): same reasoning as the other `_matches` guards --
 /// `start >= end` must be checked before either the seed read `arr[start_]`
@@ -22,16 +23,13 @@ pub fn min_start_end_match_core<T: PartialOrd + Copy>(
     matches: ArrayView1<i8>,
     booleans: ArrayView1<bool>,
 ) -> Array1<i64> {
-    let mut result = Array1::<i64>::zeros(starts.len());
+    let mut result = Array1::<i64>::from_elem(starts.len(), -1);
     let zipped = izip!(starts.into_iter(), ends.into_iter(), counts.into_iter());
     let mut n: usize = 0;
     for (pos, (start, end, count)) in zipped.enumerate() {
-        let start_ = *start as usize;
-        let end_ = *end as usize;
-        if start_ >= end_ {
-            result[pos] = -1;
+        let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
             continue;
-        }
+        };
         let mut base: i64 = -1;
         if *count == 0 {
             let size = end_ - start_;
@@ -157,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_count_does_not_panic() {
+    fn zero_count_returns_minus_one() {
         let arr = array![1_i64, 2, 3];
         let starts = array![0_i64];
         let ends = array![3_i64];
@@ -172,6 +170,6 @@ mod tests {
             matches.view(),
             booleans.view(),
         );
-        assert_eq!(got, array![0]);
+        assert_eq!(got, array![-1]);
     }
 }

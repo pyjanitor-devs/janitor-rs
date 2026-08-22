@@ -2,12 +2,15 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::checked_index;
+
 /// For every `starts[i]`, find the position (not the value) of the
 /// smallest element in `arr[starts[i]..]` among positions the caller has
 /// flagged live in `matches` (a flat tape covering every row's candidate
 /// range back to back -- see `compare_start_end_core` for the tape
 /// convention). Returns `-1` when the range is empty/invalid (including
-/// a `-1` sentinel `start`) or every candidate is skipped/null.
+/// a negative sentinel `start`), when the row has zero matches, or when
+/// every candidate is skipped/null.
 ///
 /// ELI5 (the guard): `min` needs a real array element to seed its
 /// comparison, so an invalid `start` must be caught *before* that seed
@@ -21,16 +24,14 @@ pub fn min_start_match_core<T: PartialOrd + Copy>(
     matches: ArrayView1<i8>,
     booleans: ArrayView1<bool>,
 ) -> Array1<i64> {
-    let mut result = Array1::<i64>::zeros(starts.len());
+    let mut result = Array1::<i64>::from_elem(starts.len(), -1);
     let mut n: usize = 0;
     let end_: usize = arr.len();
     let zipped = starts.into_iter().zip(counts);
     for (pos, (start, count)) in zipped.enumerate() {
-        let start_ = *start as usize;
-        if start_ >= end_ {
-            result[pos] = -1;
+        let Some(start_) = checked_index(*start, end_) else {
             continue;
-        }
+        };
         let mut base: i64 = -1;
         let mut base_val = arr[start_];
         if *count == 0 {
@@ -148,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_count_does_not_panic() {
+    fn zero_count_returns_minus_one() {
         // A valid (non-empty) range with count == 0 must not panic on the
         // seed read `arr[start_]`, even though this row's own loop never
         // runs; it's a distinct code path from the start_ >= end_ guard.
@@ -164,8 +165,6 @@ mod tests {
             matches.view(),
             booleans.view(),
         );
-        // count == 0 leaves result[pos] at its zero-initialized default
-        // (pre-existing behavior, unrelated to this fix) rather than -1.
-        assert_eq!(got, array![0]);
+        assert_eq!(got, array![-1]);
     }
 }
