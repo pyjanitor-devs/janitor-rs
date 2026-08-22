@@ -7,6 +7,16 @@ It serves as the agent's "constitution" for `janitor-rs` development.
 
 ## Agent Constitution
 
+**Before reviewing any PR in this repo** (whether asked directly, via a
+`/code-review`-style tool, or by forking a review subagent), read this
+file in full first, and make sure the review itself -- including any
+subagent or forked reviewer -- has it in context, not just the diff. The
+first review of PR #28 missed a real bug (see "Learned Patterns" and the
+adversarial-review Core Principle below) partly because this file didn't
+yet contain the crate's sentinel-value convention or the adversarial-input
+expectation; a reviewer with no access to this file is reviewing blind to
+exactly the kind of contract this crate depends on.
+
 ### Self-Improvement Protocol
 
 **CRITICAL RULE**: This file is a living document. Agents MUST update it when:
@@ -46,6 +56,24 @@ the bottom of this file.
   sentinel subtlety that's obvious for five minutes after you fix it and
   opaque forever after. This applies to doc comments on public functions
   and to inline comments on guards/branches alike.
+- **Review every PR adversarially, not just for plausibility**: a review
+  that asks "does this look right?" is not the same review as one that
+  asks "what input breaks this?" The first code review of PR #28 (8
+  independent agent angles plus a manual pass) reported "no correctness
+  bugs found" and missed a real one: `sum_end_core`, `sum_start_end_core`,
+  and `compare_start_end_core` all cast `start`/`end` to `usize`
+  unconditionally, and this crate's own established `-1` "no match"
+  sentinel (already guarded in `binary_search_lt_core`) casts to
+  `usize::MAX` and walks the loop off the end of the array -- see the
+  `-1` sentinel entry in "Learned Patterns" for the full story. It was
+  only found once someone deliberately tried the sentinel value against
+  each new `_core` function, rather than reading the code and judging it
+  self-consistent. Concretely, for every `_core` function touched or
+  added: explicitly try `-1`/sentinel values, `0`, the exact boundary
+  (`start == len`, `start == end`), and values one past whatever the
+  "obviously safe" case is -- for each *input*, not just the ones the
+  existing tests already cover. Trust a "no bugs found" review only as
+  far as the adversarial inputs it actually tried.
 
 ---
 
