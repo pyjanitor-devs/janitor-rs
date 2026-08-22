@@ -40,6 +40,10 @@ pub fn min_positions_core<T: PartialOrd + Copy>(
                 continue;
             }
             let current = arr[indexer_];
+            // ELI5: `base == -1` does double duty -- it's both "no candidate
+            // accepted yet" during the scan and the final "no match"
+            // sentinel if nothing ever qualifies. The strict `<` means an
+            // exact tie keeps the earliest position found, not the latest.
             if (base == -1) || (current < base_val) {
                 base_val = current;
                 base = indexer_ as i64;
