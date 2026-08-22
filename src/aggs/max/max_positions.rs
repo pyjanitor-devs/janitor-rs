@@ -101,16 +101,10 @@ generic_compute!(compute_max_positions_f32, f32);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggs::PositionsFn;
     use numpy::ndarray::array;
 
-    type Int8PositionsFn = for<'py> fn(
-        Python<'py>,
-        PyReadonlyArray1<'py, i8>,
-        PyReadonlyArray1<'py, i64>,
-        PyReadonlyArray1<'py, i64>,
-        PyReadonlyArray1<'py, i64>,
-        PyReadonlyArray1<'py, bool>,
-    ) -> Bound<'py, PyArray1<i64>>;
+    type Int8PositionsFn = PositionsFn<i8, i64>;
 
     #[test]
     fn int8_wrapper_accepts_an_int8_array() {

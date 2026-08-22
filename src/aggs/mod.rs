@@ -39,6 +39,27 @@ pub(crate) fn checked_range(start: i64, end: i64, len: usize) -> Option<(usize, 
     (start < end).then_some((start, end))
 }
 
+/// Shared function-pointer shape for the `_positions` family's `#[cfg(test)]`
+/// dtype-signature checks, parameterized over the input element type `T`
+/// and the (already-fixed-per-macro) result element type `R`.
+///
+/// ELI5: a regression test assigns a generated wrapper to
+/// `PositionsFn<i8, i64>` (etc.); that only compiles if the macro was
+/// instantiated with the input type the function's name promises, so a
+/// regression back to the wrong type is a compile error, not a runtime
+/// surprise. One shared alias instead of a copy in each `_positions.rs`
+/// file, so a future signature change (e.g. a new parameter) only needs
+/// updating here.
+#[cfg(test)]
+pub(crate) type PositionsFn<T, R> = for<'py> fn(
+    pyo3::Python<'py>,
+    numpy::PyReadonlyArray1<'py, T>,
+    numpy::PyReadonlyArray1<'py, i64>,
+    numpy::PyReadonlyArray1<'py, i64>,
+    numpy::PyReadonlyArray1<'py, i64>,
+    numpy::PyReadonlyArray1<'py, bool>,
+) -> pyo3::Bound<'py, numpy::PyArray1<R>>;
+
 #[cfg(test)]
 mod adversarial_bounds_tests {
     use numpy::ndarray::array;
