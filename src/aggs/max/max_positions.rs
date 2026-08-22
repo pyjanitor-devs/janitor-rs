@@ -1,18 +1,57 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-// ELI5: `$type` below only picks the dtype of the *input* array (`arr`) --
-// the result is always `i64` because this function returns the *position*
-// of the max element (`base = indexer`), not its value, and positions are
-// always `i64` regardless of what dtype the values themselves are. That's
-// unrelated to promotion (contrast with `sum`/`prod`, which really do widen
-// an accumulated value); `$type` here must still match the numpy dtype the
-// function's name promises, or pyo3 rejects the array at the Python
-// boundary. `compute_max_positions_int8` once had `i64` here (a leftover
-// copy-paste from a wider sibling) even though its name promises `i8`
-// input -- see issue #30.
+/// For every `(starts[i], ends[i])`, find the position (not the value) of
+/// the largest `arr[positions[nn]]` over `nn` in `[starts[i], ends[i])`,
+/// skipping `nn` where `positions[nn] == -1` (no candidate at that slot)
+/// or where the candidate's own position is null. Returns `-1` when
+/// `arr` is empty (nothing to seed the running comparison from) or every
+/// candidate is skipped.
+///
+/// ELI5 (the guard): `max` needs a real array element to seed its
+/// comparison, and here the seed read is `arr[0]`, independent of
+/// `start`/`end`/`positions` -- so the only thing that can make it
+/// invalid is `arr` itself being empty. See issue #27.
+pub fn max_positions_core<T: PartialOrd + Copy>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    positions: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+) -> Array1<i64> {
+    let mut result = Array1::<i64>::zeros(starts.len());
+    let zipped = izip!(starts.into_iter(), ends.into_iter());
+    for (pos, (start, end)) in zipped.enumerate() {
+        let start_ = *start as usize;
+        let end_ = *end as usize;
+        if arr.is_empty() {
+            result[pos] = -1;
+            continue;
+        }
+        let mut base: i64 = -1;
+        let mut base_val = arr[0];
+        for nn in start_..end_ {
+            let indexer = positions[nn];
+            if indexer == -1 {
+                continue;
+            }
+            let indexer_: usize = indexer as usize;
+            if booleans[indexer_] {
+                continue;
+            }
+            let current = arr[indexer_];
+            if (base == -1) || (current > base_val) {
+                base_val = current;
+                base = indexer;
+            }
+        }
+        result[pos] = base;
+    }
+    result
+}
+
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
         #[pyfunction]
@@ -26,40 +65,26 @@ macro_rules! generic_compute {
         ) -> Bound<'py, PyArray1<i64>>
         // The macro will expand into the contents of this block.
         {
-            let arr = arr.as_array();
-            let starts = starts.as_array();
-            let ends = ends.as_array();
-            let positions = positions.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<i64>::zeros(starts.len());
-            let zipped = izip!(starts.into_iter(), ends.into_iter());
-            for (pos, (start, end)) in zipped.enumerate() {
-                let start_ = *start as usize;
-                let end_ = *end as usize;
-                let mut base: i64 = -1;
-                let mut base_val = arr[0];
-                for nn in start_..end_ {
-                    let indexer = positions[nn];
-                    if indexer == -1 {
-                        continue;
-                    }
-                    let indexer_: usize = indexer as usize;
-                    if booleans[indexer_] {
-                        continue;
-                    }
-                    let current = arr[indexer_];
-                    if (base == -1) || (current > base_val) {
-                        base_val = current;
-                        base = indexer;
-                    }
-                }
-                result[pos] = base;
-            }
+            let result = max_positions_core(
+                arr.as_array(),
+                starts.as_array(),
+                ends.as_array(),
+                positions.as_array(),
+                booleans.as_array(),
+            );
             result.into_pyarray(py)
         }
     };
 }
 
+// ELI5: `$type` above only picks the dtype of the *input* array (`arr`) --
+// the result is always `i64` because this function returns the *position*
+// of the max element, not its value, so positions stay `i64` regardless of
+// what dtype the values themselves are. `$type` must still match the numpy
+// dtype the function's name promises, or pyo3 rejects the array at the
+// Python boundary: `compute_max_positions_int8` once had `i64` here (a
+// leftover copy-paste from a wider sibling) even though its name promises
+// `i8` input -- see issue #30.
 generic_compute!(compute_max_positions_int64, i64);
 generic_compute!(compute_max_positions_int32, i32);
 generic_compute!(compute_max_positions_int16, i16);
@@ -74,6 +99,7 @@ generic_compute!(compute_max_positions_f32, f32);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use numpy::ndarray::array;
 
     type Int8PositionsFn = for<'py> fn(
         Python<'py>,
@@ -89,5 +115,56 @@ mod tests {
         // ELI5: the typed slot only accepts a wrapper whose `arr` is really
         // `i8`; changing the macro argument back to `i64` breaks compilation.
         let _wrapper: Int8PositionsFn = compute_max_positions_int8;
+    }
+
+    #[test]
+    fn empty_array_returns_minus_one_not_a_panic() {
+        let arr: Array1<i64> = array![];
+        let starts = array![0_i64];
+        let ends = array![0_i64];
+        let positions: Array1<i64> = array![];
+        let booleans: Array1<bool> = array![];
+        let got = max_positions_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![-1]);
+    }
+
+    #[test]
+    fn finds_position_of_largest_via_indirection() {
+        let arr = array![10_i64, 30, 20];
+        let starts = array![0_i64];
+        let ends = array![3_i64];
+        let positions = array![0_i64, 1, 2];
+        let booleans = array![false, false, false];
+        let got = max_positions_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![1]); // arr[1] == 30 is largest
+    }
+
+    #[test]
+    fn skips_negative_one_position_sentinel() {
+        let arr = array![10_i64, 30, 20];
+        let starts = array![0_i64];
+        let ends = array![3_i64];
+        let positions = array![0_i64, -1, 2]; // slot 1 has no candidate
+        let booleans = array![false, false, false];
+        let got = max_positions_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![2]); // arr[2] == 20 is largest of the remaining
     }
 }

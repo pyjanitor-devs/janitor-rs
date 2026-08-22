@@ -1,7 +1,60 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+
+/// For every `(starts[i], ends[i])`, find the position (not the value) of
+/// the largest element in `arr[starts[i]..ends[i]]` among positions the
+/// caller has flagged live in `matches` (a flat tape covering every row's
+/// candidate range back to back). Returns `-1` for an empty or inverted
+/// range (`start >= end`, including a `-1` sentinel) or when every
+/// candidate is skipped/null.
+///
+/// ELI5 (the guard): same reasoning as the other `_matches` guards --
+/// `start >= end` must be checked before either the seed read `arr[start_]`
+/// or the `end_ - start_` subtraction in the `count == 0` branch, not
+/// folded into either of them. See issue #27.
+pub fn max_start_end_match_core<T: PartialOrd + Copy>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    counts: ArrayView1<i64>,
+    matches: ArrayView1<i8>,
+    booleans: ArrayView1<bool>,
+) -> Array1<i64> {
+    let mut result = Array1::<i64>::zeros(starts.len());
+    let zipped = izip!(starts.into_iter(), ends.into_iter(), counts.into_iter());
+    let mut n: usize = 0;
+    for (pos, (start, end, count)) in zipped.enumerate() {
+        let start_ = *start as usize;
+        let end_ = *end as usize;
+        if start_ >= end_ {
+            result[pos] = -1;
+            continue;
+        }
+        let mut base: i64 = -1;
+        if *count == 0 {
+            let size = end_ - start_;
+            n += size;
+            continue;
+        }
+        let mut base_val = arr[start_];
+        for nn in start_..end_ {
+            if (matches[n] == 0) || booleans[nn] {
+                n += 1;
+                continue;
+            }
+            let current = arr[nn];
+            if (base == -1) || (current > base_val) {
+                base_val = current;
+                base = nn as i64;
+            }
+            n += 1;
+        }
+        result[pos] = base;
+    }
+    result
+}
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
@@ -17,39 +70,14 @@ macro_rules! generic_compute {
         ) -> Bound<'py, PyArray1<i64>>
         // The macro will expand into the contents of this block.
         {
-            let arr = arr.as_array();
-            let starts = starts.as_array();
-            let ends = ends.as_array();
-            let counts = counts.as_array();
-            let matches = matches.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<i64>::zeros(starts.len());
-            let zipped = izip!(starts.into_iter(), ends.into_iter(), counts.into_iter());
-            let mut n: usize = 0;
-            for (pos, (start, end, count)) in zipped.enumerate() {
-                let mut base: i64 = -1;
-                let start_ = *start as usize;
-                let end_ = *end as usize;
-                if *count == 0 {
-                    let size = end_ - start_;
-                    n += size;
-                    continue;
-                }
-                let mut base_val = arr[start_];
-                for nn in start_..end_ {
-                    if (matches[n] == 0) || booleans[nn] {
-                        n += 1;
-                        continue;
-                    }
-                    let current = arr[nn];
-                    if (base == -1) || (current > base_val) {
-                        base_val = current;
-                        base = nn as i64;
-                    }
-                    n += 1;
-                }
-                result[pos] = base;
-            }
+            let result = max_start_end_match_core(
+                arr.as_array(),
+                starts.as_array(),
+                ends.as_array(),
+                counts.as_array(),
+                matches.as_array(),
+                booleans.as_array(),
+            );
             result.into_pyarray(py)
         }
     };
@@ -65,3 +93,85 @@ generic_compute!(compute_max_start_end_match_uint16, u16);
 generic_compute!(compute_max_start_end_match_uint8, u8);
 generic_compute!(compute_max_start_end_match_f64, f64);
 generic_compute!(compute_max_start_end_match_f32, f32);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn start_equal_to_end_returns_minus_one_not_a_panic() {
+        let arr = array![1_i64, 2, 3];
+        let starts = array![2_i64];
+        let ends = array![2_i64];
+        let counts = array![0_i64];
+        let matches: Array1<i8> = array![];
+        let booleans = array![false, false, false];
+        let got = max_start_end_match_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            counts.view(),
+            matches.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![-1]);
+    }
+
+    #[test]
+    fn sentinel_start_returns_minus_one_not_a_panic() {
+        let arr = array![1_i64, 2, 3];
+        let starts = array![-1_i64];
+        let ends = array![2_i64];
+        let counts = array![0_i64];
+        let matches: Array1<i8> = array![];
+        let booleans = array![false, false, false];
+        let got = max_start_end_match_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            counts.view(),
+            matches.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![-1]);
+    }
+
+    #[test]
+    fn finds_position_of_largest_among_matched_positions() {
+        let arr = array![5_i64, 9, 4];
+        let starts = array![0_i64];
+        let ends = array![3_i64];
+        let counts = array![2_i64];
+        let matches = array![1_i8, 0, 1]; // position 1 (value 9) excluded
+        let booleans = array![false, false, false];
+        let got = max_start_end_match_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            counts.view(),
+            matches.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![0]); // position of value 5 (5 vs 4, 9 excluded)
+    }
+
+    #[test]
+    fn zero_count_does_not_panic() {
+        let arr = array![1_i64, 2, 3];
+        let starts = array![0_i64];
+        let ends = array![3_i64];
+        let counts = array![0_i64];
+        let matches: Array1<i8> = array![0, 0, 0];
+        let booleans = array![false, false, false];
+        let got = max_start_end_match_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            counts.view(),
+            matches.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![0]);
+    }
+}
