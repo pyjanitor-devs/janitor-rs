@@ -1,6 +1,63 @@
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+
+use crate::aggs::{checked_index, checked_range};
+
+/// For every `(starts[i], ends[i])`, sum `arr[positions[nn]]` over `nn` in
+/// `[starts[i], ends[i])`, skipping `nn` where `positions[nn]` is not a
+/// valid index into `arr` (including the `-1` "no candidate" sentinel) or
+/// where the candidate's own position is null. Returns `0` (the additive
+/// identity) when the slot range is invalid or every candidate is skipped.
+///
+/// ELI5 (the guard): `checked_range(start, end, positions.len())` rejects a
+/// negative or out-of-bounds slot range *before* it's used to index
+/// `positions`; a row rejected here (e.g. `end == -1`, this crate's "no
+/// match" sentinel, cast to `usize` without a guard) would otherwise wrap
+/// to a huge `usize` and walk `positions` out of bounds. See issue #32.
+#[cfg(test)]
+pub(crate) fn sum_positions_core(
+    arr: ArrayView1<i64>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    positions: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+) -> Array1<i64> {
+    sum_positions_core_with_cast(arr, starts, ends, positions, booleans, |value| value)
+}
+
+fn sum_positions_core_with_cast<T, F>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    positions: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut to_i64: F,
+) -> Array1<i64>
+where
+    T: Copy,
+    F: FnMut(T) -> i64,
+{
+    let mut result = Array1::<i64>::zeros(starts.len());
+    let zipped = starts.into_iter().zip(ends);
+    for (pos, (start, end)) in zipped.enumerate() {
+        let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+            continue;
+        };
+        let mut total: i64 = 0;
+        for nn in start_..end_ {
+            let Some(indexer_) = checked_index(positions[nn], arr.len()) else {
+                continue;
+            };
+            if booleans[indexer_] {
+                continue;
+            }
+            total += to_i64(arr[indexer_]);
+        }
+        result[pos] = total;
+    }
+    result
+}
 
 // ELI5: `$type` below only picks the dtype of the *input* array (`arr`) --
 // the accumulator and result are always `i64`/`f64`, hardcoded in the macro
@@ -24,31 +81,14 @@ macro_rules! generic_compute_ints {
         ) -> Bound<'py, PyArray1<i64>>
         // The macro will expand into the contents of this block.
         {
-            let arr = arr.as_array();
-            let starts = starts.as_array();
-            let ends = ends.as_array();
-            let positions = positions.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<i64>::zeros(starts.len());
-            let zipped = starts.into_iter().zip(ends.into_iter());
-            for (pos, (start, end)) in zipped.enumerate() {
-                let start_ = *start as usize;
-                let end_ = *end as usize;
-                let mut total: i64 = 0;
-                for nn in start_..end_ {
-                    let indexer = positions[nn];
-                    if indexer == -1 {
-                        continue;
-                    }
-                    let indexer_: usize = indexer as usize;
-                    if booleans[indexer_] {
-                        continue;
-                    }
-                    let current = arr[indexer_];
-                    total += current as i64;
-                }
-                result[pos] = total;
-            }
+            let result = sum_positions_core_with_cast(
+                arr.as_array(),
+                starts.as_array(),
+                ends.as_array(),
+                positions.as_array(),
+                booleans.as_array(),
+                |value| value as i64,
+            );
             result.into_pyarray(py)
         }
     };
@@ -73,18 +113,21 @@ macro_rules! generic_compute_floats {
             let positions = positions.as_array();
             let booleans = booleans.as_array();
             let mut result = Array1::<f64>::zeros(starts.len());
-            let zipped = starts.into_iter().zip(ends.into_iter());
+            let zipped = starts.into_iter().zip(ends);
             for (pos, (start, end)) in zipped.enumerate() {
-                let start_ = *start as usize;
-                let end_ = *end as usize;
+                // ELI5 (the guard): same reasoning as the int path's
+                // `checked_range` call above -- a row with an invalid or
+                // sentinel-cast slot range must be rejected before it's
+                // used to index `positions`. See issue #32.
+                let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+                    continue;
+                };
                 let mut total: f64 = 0.0;
                 let mut compensation: f64 = 0.0;
                 for nn in start_..end_ {
-                    let indexer = positions[nn];
-                    if indexer == -1 {
+                    let Some(indexer_) = checked_index(positions[nn], arr.len()) else {
                         continue;
-                    }
-                    let indexer_: usize = indexer as usize;
+                    };
                     if booleans[indexer_] {
                         continue;
                     }
@@ -116,6 +159,7 @@ generic_compute_floats!(compute_sum_positions_f64, f64);
 mod tests {
     use super::*;
     use crate::aggs::PositionsFn;
+    use numpy::ndarray::array;
 
     type Int8PositionsFn = PositionsFn<i8, i64>;
 
@@ -124,5 +168,75 @@ mod tests {
         // ELI5: the typed slot only accepts a wrapper whose `arr` is really
         // `i8`; changing the macro argument back to `i64` breaks compilation.
         let _wrapper: Int8PositionsFn = compute_sum_positions_int8;
+    }
+
+    #[test]
+    fn end_sentinel_returns_zero_not_a_panic() {
+        // The exact reproduction from issue #32: `end == -1` used to cast
+        // to `usize::MAX` and walk `positions` out of bounds.
+        let arr = array![1_i64, 2, 3, 4, 5];
+        let starts = array![0_i64];
+        let ends = array![-1_i64];
+        let positions = array![0_i64, 1, 2, 3, 4];
+        let booleans = array![false, false, false, false, false];
+        let got = sum_positions_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn start_sentinel_returns_zero_not_a_panic() {
+        let arr = array![1_i64, 2, 3, 4, 5];
+        let starts = array![-1_i64];
+        let ends = array![3_i64];
+        let positions = array![0_i64, 1, 2, 3, 4];
+        let booleans = array![false, false, false, false, false];
+        let got = sum_positions_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn sums_via_indirection() {
+        let arr = array![10_i64, 20, 30];
+        let starts = array![0_i64];
+        let ends = array![3_i64];
+        let positions = array![0_i64, 1, 2];
+        let booleans = array![false, false, false];
+        let got = sum_positions_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![60]);
+    }
+
+    #[test]
+    fn skips_negative_one_position_sentinel_and_null_mask() {
+        let arr = array![10_i64, 20, 30];
+        let starts = array![0_i64];
+        let ends = array![3_i64];
+        let positions = array![0_i64, -1, 2]; // slot 1 has no candidate
+        let booleans = array![false, false, true]; // arr[2] is null
+        let got = sum_positions_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![10]);
     }
 }
