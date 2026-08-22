@@ -36,6 +36,9 @@ extension-module = ["pyo3/extension-module"]
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
+# `harness = false` hands control to criterion's own `main` (via
+# `criterion_main!` in benches/kernels.rs) instead of Rust's built-in,
+# libtest-based bench harness (which is nightly-only and not what we use).
 [[bench]]
 name = "kernels"
 harness = false

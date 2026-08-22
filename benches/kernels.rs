@@ -40,7 +40,8 @@ impl Fixture {
     fn new(n: usize) -> Self {
         let right = Array1::from_iter((0..n as i64).map(|i| i * 2));
         let left = Array1::from_iter((0..n as i64).map(|i| i * 2 + 1));
-        let starts = Array1::from_iter((0..n as i64).map(|i| i % (n as i64 + 1)));
+        // starts[i] = i, spread evenly across the whole array
+        let starts = Array1::from_iter(0..n as i64);
         let ends = Array1::from_elem(n, n as i64);
         Fixture {
             right,
@@ -51,6 +52,8 @@ impl Fixture {
     }
 }
 
+/// ELI5: for every value in `left`, find where it would slot into the
+/// sorted `right` array -- the building block behind a `<` join.
 fn bench_bin_search_lt(c: &mut Criterion) {
     let mut group = c.benchmark_group("bin_search_lt");
     for n in [100, 100_000] {
@@ -69,6 +72,9 @@ fn bench_bin_search_lt(c: &mut Criterion) {
     group.finish();
 }
 
+/// ELI5: for every row's slice of `right`, mark which positions satisfy
+/// `left OP right` -- the building block behind a range-join predicate
+/// (e.g. `A < B and C != D`).
 fn bench_compare_start_end(c: &mut Criterion) {
     let mut group = c.benchmark_group("compare_start_end");
     for n in [100, 100_000] {
@@ -95,6 +101,10 @@ fn bench_compare_start_end(c: &mut Criterion) {
     group.finish();
 }
 
+/// ELI5: `repeat_index` turns "3 apples, 2 plums" into "apple, apple,
+/// apple, plum, plum" (numpy.repeat); `trim_index` drops the entries
+/// whose count was zero. Both build the final left/right index arrays a
+/// join returns.
 fn bench_index_builders(c: &mut Criterion) {
     let mut group = c.benchmark_group("index_builder");
     for n in [100, 100_000] {

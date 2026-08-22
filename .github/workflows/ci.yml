@@ -31,8 +31,14 @@ jobs:
       # `cargo test`/`cargo bench` binary has no such interpreter, so it
       # needs the feature off to link. See the comment on the
       # `[features]` table in Cargo.toml.
+      # No `--all-targets` here: that would also compile (but not run,
+      # since criterion benches aren't `#[test]`s) benches/kernels.rs under
+      # the `test` profile, which is wasted work -- the `cargo bench
+      # --no-run` step below already compiles it, under the `bench`
+      # profile it actually ships with, so nothing from a `test`-profile
+      # compile of it could be reused there anyway.
       - name: cargo test (kernel unit tests)
-        run: cargo test --no-default-features --all-targets
+        run: cargo test --no-default-features
 
       # Runs with every feature (including `extension-module`) enabled:
       # clippy performs static analysis only, it never links a binary, so
