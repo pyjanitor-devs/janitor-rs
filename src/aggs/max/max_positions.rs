@@ -53,7 +53,7 @@ macro_rules! generic_compute {
 generic_compute!(compute_max_positions_int64, i64);
 generic_compute!(compute_max_positions_int32, i32);
 generic_compute!(compute_max_positions_int16, i16);
-generic_compute!(compute_max_positions_int8, i64);
+generic_compute!(compute_max_positions_int8, i8);
 generic_compute!(compute_max_positions_uint64, u64);
 generic_compute!(compute_max_positions_uint32, u32);
 generic_compute!(compute_max_positions_uint16, u16);
