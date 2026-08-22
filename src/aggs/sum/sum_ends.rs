@@ -14,6 +14,19 @@ pub fn sum_end_core(
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
 ) -> Array1<i64> {
+    sum_end_core_with_cast(arr, ends, booleans, |value| value)
+}
+
+fn sum_end_core_with_cast<T, F>(
+    arr: ArrayView1<T>,
+    ends: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut to_i64: F,
+) -> Array1<i64>
+where
+    T: Copy,
+    F: FnMut(T) -> i64,
+{
     let mut result = Array1::<i64>::zeros(ends.len());
     let start_: usize = 0;
     for (pos, end) in ends.indexed_iter() {
@@ -23,7 +36,7 @@ pub fn sum_end_core(
             if booleans[nn] {
                 continue;
             }
-            total += arr[nn];
+            total += to_i64(arr[nn]);
         }
         result[pos] = total;
     }
@@ -41,8 +54,12 @@ macro_rules! generic_compute {
         ) -> Bound<'py, PyArray1<i64>>
         // The macro will expand into the contents of this block.
         {
-            let widened = arr.as_array().mapv(|v| v as i64);
-            let result = sum_end_core(widened.view(), ends.as_array(), booleans.as_array());
+            let result = sum_end_core_with_cast(
+                arr.as_array(),
+                ends.as_array(),
+                booleans.as_array(),
+                |value| value as i64,
+            );
             result.into_pyarray(py)
         }
     };
@@ -149,5 +166,19 @@ mod tests {
         let booleans = Array1::<bool>::from_elem(100, false);
         let got = sum_end_core(arr.view(), ends.view(), booleans.view());
         assert_eq!(got[0], -100_i64);
+    }
+
+    #[test]
+    fn casts_only_values_in_requested_prefix() {
+        let arr = array![1_i32, 2, 3, 4];
+        let ends = array![1_i64];
+        let booleans = array![false, false, false, false];
+        let mut casts = 0;
+        let got = sum_end_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| {
+            casts += 1;
+            value as i64
+        });
+        assert_eq!(got, array![1]);
+        assert_eq!(casts, 1);
     }
 }

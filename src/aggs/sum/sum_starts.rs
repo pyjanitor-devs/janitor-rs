@@ -7,8 +7,7 @@ use pyo3::prelude::*;
 ///
 /// ELI5: `booleans[nn] == true` means "this value is missing, treat it as
 /// absent, not as zero" -- we skip it in the running total rather than
-/// adding it in. `arr` is already widened to `i64` by the caller (once per
-/// dtype), so this loop only has to know about one integer width.
+/// adding it in.
 ///
 /// Overflow note: `total += arr[nn]` wraps on overflow (Rust release
 /// builds don't panic on integer overflow), matching plain `i64`
@@ -20,6 +19,19 @@ pub fn sum_start_core(
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
 ) -> Array1<i64> {
+    sum_start_core_with_cast(arr, starts, booleans, |value| value)
+}
+
+fn sum_start_core_with_cast<T, F>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut to_i64: F,
+) -> Array1<i64>
+where
+    T: Copy,
+    F: FnMut(T) -> i64,
+{
     let mut result = Array1::<i64>::zeros(starts.len());
     let end_: usize = arr.len();
     for (pos, start) in starts.indexed_iter() {
@@ -29,7 +41,7 @@ pub fn sum_start_core(
             if booleans[nn] {
                 continue;
             }
-            total += arr[nn];
+            total += to_i64(arr[nn]);
         }
         result[pos] = total;
     }
@@ -47,12 +59,14 @@ macro_rules! generic_compute {
         ) -> Bound<'py, PyArray1<i64>>
         // The macro will expand into the contents of this block.
         {
-            // Widen to i64 once, per dtype, exactly as the inline `as i64`
-            // cast used to do per-element -- same cast, same overflow
-            // behavior, just hoisted so the summation loop below is
-            // written (and tested) only once instead of once per dtype.
-            let widened = arr.as_array().mapv(|v| v as i64);
-            let result = sum_start_core(widened.view(), starts.as_array(), booleans.as_array());
+            // Cast only values inside the requested ranges. Widening the
+            // whole column would make a tiny suffix query scan and copy it.
+            let result = sum_start_core_with_cast(
+                arr.as_array(),
+                starts.as_array(),
+                booleans.as_array(),
+                |value| value as i64,
+            );
             result.into_pyarray(py)
         }
     };
@@ -168,5 +182,19 @@ mod tests {
         let booleans = Array1::<bool>::from_elem(100, false);
         let got = sum_start_core(arr.view(), starts.view(), booleans.view());
         assert_eq!(got[0], -100_i64);
+    }
+
+    #[test]
+    fn casts_only_values_in_requested_suffix() {
+        let arr = array![1_i32, 2, 3, 4];
+        let starts = array![3_i64];
+        let booleans = array![false, false, false, false];
+        let mut casts = 0;
+        let got = sum_start_core_with_cast(arr.view(), starts.view(), booleans.view(), |value| {
+            casts += 1;
+            value as i64
+        });
+        assert_eq!(got, array![4]);
+        assert_eq!(casts, 1);
     }
 }

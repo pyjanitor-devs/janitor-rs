@@ -132,10 +132,10 @@ Where a kernel has been given test/benchmark coverage, the pattern is:
 
 1. Extract the algorithm into a `pub fn <name>_core(...)` that takes
    `numpy::ndarray::ArrayView1`/`Array1` (no PyO3 types at all).
-2. The `#[pyfunction]` macro body becomes a thin wrapper: `.as_array()`
-   (and, for integer aggregation kernels, `.mapv(|v| v as i64)` to widen --
-   same cast the macro used to do inline, just hoisted out once) then a
-   call to the core function.
+2. The `#[pyfunction]` macro body becomes a thin wrapper: `.as_array()` then
+   a call to the core function. For integer aggregation kernels, preserve
+   cast-on-access semantics inside the queried ranges; do not use `.mapv()`
+   to widen the whole input column before a potentially tiny range query.
 3. Add `#[cfg(test)] mod tests` at the bottom of the same file, testing the
    core function directly.
 4. If it's one of the four representative kernels in `benches/kernels.rs`,
@@ -304,3 +304,13 @@ PR description.
 **Recommendation**: Read "Non-Obvious Gotchas" before touching build
 config, adding a benchmark, or writing a test that checks overflow
 behavior in this crate.
+
+### [2026-08-22] Preserve sparse range costs when extracting integer sums
+
+**Context**: Reviewing the integer `sum_*` core extraction in PR #28.
+**Learning**: Widening an entire input with `.mapv(|v| v as i64)` before
+calling a range core changes a sparse query from O(queried width) work to
+O(array length) work and allocates a full-size temporary array.
+**Recommendation**: Pass the original typed view into a generic internal
+loop and cast only values visited by the requested ranges. Keep regression
+tests that count conversions for tiny prefix, suffix, and interval queries.
