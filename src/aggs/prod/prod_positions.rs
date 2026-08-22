@@ -2,6 +2,15 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+// ELI5: `$type` below only picks the dtype of the *input* array (`arr`) --
+// the accumulator and result are always `i64`, hardcoded in the macro body
+// a few lines down, regardless of `$type`. That widening is intentional
+// (it's how `prod` avoids overflowing a narrow dtype), but `$type` must
+// still match the numpy dtype the function's name promises, or pyo3
+// rejects the array at the Python boundary with a dtype mismatch instead
+// of computing anything. `compute_prod_positions_int8` once had `i64` here
+// (a leftover copy-paste from a wider sibling) even though its name
+// promises `i8` input -- see issue #30.
 macro_rules! generic_compute_ints {
     ($fname:ident, $type:ty) => {
         #[pyfunction]
@@ -48,13 +57,19 @@ macro_rules! generic_compute_ints {
 generic_compute_ints!(compute_prod_positions_int64, i64);
 generic_compute_ints!(compute_prod_positions_int32, i32);
 generic_compute_ints!(compute_prod_positions_int16, i16);
-generic_compute_ints!(compute_prod_positions_int8, i8);
+generic_compute_ints!(compute_prod_positions_int8, i8); // fixed: was `i64`, see issue #30
 generic_compute_ints!(compute_prod_positions_uint64, u64);
 generic_compute_ints!(compute_prod_positions_uint32, u32);
 generic_compute_ints!(compute_prod_positions_uint16, u16);
 generic_compute_ints!(compute_prod_positions_uint8, u8);
 
 /// kahan summation
+// ELI5: same story as `generic_compute_ints!` above -- `$type` only picks
+// the *input* array's dtype; the accumulator/result are always `f64`,
+// hardcoded a few lines down. `compute_prod_positions_f32` once had `f64`
+// here instead of `f32`, so a real `float32` numpy array failed the pyo3
+// dtype check even though the function's name promises it accepts one --
+// see issue #30.
 macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
         #[pyfunction]
@@ -98,7 +113,7 @@ macro_rules! generic_compute_floats {
     };
 }
 
-generic_compute_floats!(compute_prod_positions_f32, f32);
+generic_compute_floats!(compute_prod_positions_f32, f32); // fixed: was `f64`, see issue #30
 generic_compute_floats!(compute_prod_positions_f64, f64);
 
 #[cfg(test)]
