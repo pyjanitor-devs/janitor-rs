@@ -1,8 +1,14 @@
 use pyo3::prelude::*;
-mod aggs;
-mod bin_search;
-mod compare;
-mod index_builder;
+// `pub` here (rather than a private `mod`) only so `benches/kernels.rs`
+// can reach the handful of `pub` `*_core` algorithm functions inside these
+// modules -- everything else in them stays effectively private in
+// practice, since the only real entry point is the `#[pymodule]` below.
+// This is not a stable Rust API: it carries no semver guarantees, and
+// none of it is re-exported to Python beyond what `janitor_rs()` wires up.
+pub mod aggs;
+pub mod bin_search;
+pub mod compare;
+pub mod index_builder;
 mod left_le_right;
 
 /// Helper functions for PyJanitor implemented in Rust.

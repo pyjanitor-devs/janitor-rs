@@ -1,6 +1,40 @@
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+
+/// For every `starts[i]`, sum `arr[starts[i]..]` (to the end of the array),
+/// skipping any position flagged `true` in `booleans` (a null mask).
+///
+/// ELI5: `booleans[nn] == true` means "this value is missing, treat it as
+/// absent, not as zero" -- we skip it in the running total rather than
+/// adding it in. `arr` is already widened to `i64` by the caller (once per
+/// dtype), so this loop only has to know about one integer width.
+///
+/// Overflow note: `total += arr[nn]` wraps on overflow (Rust release
+/// builds don't panic on integer overflow), matching plain `i64`
+/// arithmetic on the Python/NumPy side of the boundary -- this is a
+/// deliberate parity contract with `janitor/functions/_conditional_join`
+/// in pyjanitor, not an oversight.
+pub fn sum_start_core(
+    arr: ArrayView1<i64>,
+    starts: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+) -> Array1<i64> {
+    let mut result = Array1::<i64>::zeros(starts.len());
+    let end_: usize = arr.len();
+    for (pos, start) in starts.indexed_iter() {
+        let mut total: i64 = 0;
+        let start_ = *start as usize;
+        for nn in start_..end_ {
+            if booleans[nn] {
+                continue;
+            }
+            total += arr[nn];
+        }
+        result[pos] = total;
+    }
+    result
+}
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
@@ -13,23 +47,12 @@ macro_rules! generic_compute {
         ) -> Bound<'py, PyArray1<i64>>
         // The macro will expand into the contents of this block.
         {
-            let arr = arr.as_array();
-            let starts = starts.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<i64>::zeros(starts.len());
-            let end_: usize = arr.len();
-            for (pos, start) in starts.indexed_iter() {
-                let mut total: i64 = 0;
-                let start_ = *start as usize;
-                for nn in start_..end_ {
-                    if booleans[nn] {
-                        continue;
-                    }
-                    let current = arr[nn];
-                    total += current as i64;
-                }
-                result[pos] = total;
-            }
+            // Widen to i64 once, per dtype, exactly as the inline `as i64`
+            // cast used to do per-element -- same cast, same overflow
+            // behavior, just hoisted so the summation loop below is
+            // written (and tested) only once instead of once per dtype.
+            let widened = arr.as_array().mapv(|v| v as i64);
+            let result = sum_start_core(widened.view(), starts.as_array(), booleans.as_array());
             result.into_pyarray(py)
         }
     };
@@ -82,3 +105,68 @@ generic_compute!(compute_sum_start_uint16, u16);
 generic_compute!(compute_sum_start_uint8, u8);
 generic_compute_floats!(compute_sum_start_f32, f32);
 generic_compute_floats!(compute_sum_start_f64, f64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn empty_array() {
+        let arr: Array1<i64> = array![];
+        let starts = array![0_i64];
+        let booleans: Array1<bool> = array![];
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn start_at_end_is_zero() {
+        let arr = array![1_i64, 2, 3];
+        let starts = array![3_i64]; // boundary: nothing left to sum
+        let booleans = array![false, false, false];
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn start_at_zero_sums_everything() {
+        let arr = array![1_i64, 2, 3];
+        let starts = array![0_i64]; // boundary: whole array
+        let booleans = array![false, false, false];
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        assert_eq!(got, array![6]);
+    }
+
+    #[test]
+    fn null_mask_skips_flagged_positions() {
+        let arr = array![1_i64, 2, 3, 4];
+        let starts = array![0_i64];
+        // position 1 (value 2) and position 3 (value 4) are "null"
+        let booleans = array![false, true, false, true];
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        assert_eq!(got, array![1 + 3]);
+    }
+
+    #[test]
+    fn all_null_range_is_zero() {
+        let arr = array![1_i64, 2, 3];
+        let starts = array![0_i64];
+        let booleans = array![true, true, true];
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn accumulation_overflow_wraps_instead_of_panicking() {
+        // 100 copies of i64::MAX / 2 overflows i64 many times over; this
+        // must wrap (two's complement), matching the NumPy/pyjanitor side
+        // of the boundary, not panic.
+        let value = i64::MAX / 2;
+        let arr = Array1::<i64>::from_elem(100, value);
+        let starts = array![0_i64];
+        let booleans = Array1::<bool>::from_elem(100, false);
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        assert_eq!(got[0], -100_i64);
+    }
+}

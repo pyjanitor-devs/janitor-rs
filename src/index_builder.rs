@@ -1,19 +1,23 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-/// This function replicates numpy.repeat
-#[pyfunction]
-#[pyo3(signature = (*, index, counts, length))]
-pub fn repeat_index<'py>(
-    py: Python<'py>,
-    index: PyReadonlyArray1<'py, i64>,
-    counts: PyReadonlyArray1<'py, i64>,
+/// Replicates `numpy.repeat(index, counts)`: emit `index[i]`, `counts[i]`
+/// times, for every `i`, back to back.
+///
+/// ELI5: like turning a compact "3 apples, 0 pears, 2 plums" tally into
+/// the flat list "apple, apple, apple, plum, plum" -- each label repeated
+/// as many times as its count says.
+///
+/// `length` must equal `counts.sum()`; the caller (the Python side)
+/// computes it once and passes it in so this function doesn't need to
+/// scan `counts` twice just to size its output.
+pub fn repeat_index_core(
+    index: ArrayView1<i64>,
+    counts: ArrayView1<i64>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
-    let index = index.as_array();
-    let counts = counts.as_array();
+) -> Array1<i64> {
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut val: i64;
@@ -25,6 +29,19 @@ pub fn repeat_index<'py>(
             n += 1;
         }
     }
+    result
+}
+
+/// This function replicates numpy.repeat
+#[pyfunction]
+#[pyo3(signature = (*, index, counts, length))]
+pub fn repeat_index<'py>(
+    py: Python<'py>,
+    index: PyReadonlyArray1<'py, i64>,
+    counts: PyReadonlyArray1<'py, i64>,
+    length: i64,
+) -> Bound<'py, PyArray1<i64>> {
+    let result = repeat_index_core(index.as_array(), counts.as_array(), length);
     result.into_pyarray(py)
 }
 
@@ -53,17 +70,17 @@ pub fn index_trim_positions<'py>(
     result.into_pyarray(py)
 }
 
-/// This function replicates index[counts>0]
-#[pyfunction]
-#[pyo3(signature = (*, index, counts, length))]
-pub fn trim_index<'py>(
-    py: Python<'py>,
-    index: PyReadonlyArray1<'py, i64>,
-    counts: PyReadonlyArray1<'py, i64>,
+/// Replicates `index[counts > 0]`: keep only the entries of `index` whose
+/// paired `counts` entry is non-zero, in order.
+///
+/// ELI5: walk the tally sheet and cross off every label that matched
+/// nothing (`count == 0`); what's left, in the same order, is the answer.
+/// `length` must equal `(counts != 0).sum()`.
+pub fn trim_index_core(
+    index: ArrayView1<i64>,
+    counts: ArrayView1<i64>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
-    let index = index.as_array();
-    let counts = counts.as_array();
+) -> Array1<i64> {
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut val: i64;
     let mut pos: usize = 0;
@@ -75,6 +92,19 @@ pub fn trim_index<'py>(
         result[pos] = val;
         pos += 1;
     }
+    result
+}
+
+/// This function replicates index[counts>0]
+#[pyfunction]
+#[pyo3(signature = (*, index, counts, length))]
+pub fn trim_index<'py>(
+    py: Python<'py>,
+    index: PyReadonlyArray1<'py, i64>,
+    counts: PyReadonlyArray1<'py, i64>,
+    length: i64,
+) -> Bound<'py, PyArray1<i64>> {
+    let result = trim_index_core(index.as_array(), counts.as_array(), length);
     result.into_pyarray(py)
 }
 
@@ -133,7 +163,7 @@ pub fn index_starts_only_keep_first<'py>(
     let mut pos: usize = 0;
     let mut val: i64;
     let end: usize = index.len();
-    let zipped = starts.into_iter().zip(counts.into_iter());
+    let zipped = starts.into_iter().zip(counts);
     for (start, count_) in zipped {
         let start_: usize = *start as usize;
         if *count_ == 0 {
@@ -358,7 +388,7 @@ pub fn index_starts_and_ends<'py>(
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    let zipped = starts.into_iter().zip(ends.into_iter());
+    let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
         let start_: usize = *start as usize;
         let end_: usize = *end as usize;
@@ -626,4 +656,74 @@ pub fn reorder_index<'py>(
         result[pos as usize] = index as i64;
     }
     result.into_pyarray(py)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn repeat_index_expands_each_entry_by_its_count() {
+        let index = array![10_i64, 20, 30];
+        let counts = array![3_i64, 0, 2];
+        let got = repeat_index_core(index.view(), counts.view(), 5);
+        assert_eq!(got, array![10, 10, 10, 30, 30]);
+    }
+
+    #[test]
+    fn repeat_index_all_zero_counts_gives_empty_output() {
+        let index = array![1_i64, 2, 3];
+        let counts = array![0_i64, 0, 0];
+        let got = repeat_index_core(index.view(), counts.view(), 0);
+        assert_eq!(got, Array1::<i64>::zeros(0));
+    }
+
+    #[test]
+    fn repeat_index_empty_input() {
+        let index: Array1<i64> = array![];
+        let counts: Array1<i64> = array![];
+        let got = repeat_index_core(index.view(), counts.view(), 0);
+        assert_eq!(got, Array1::<i64>::zeros(0));
+    }
+
+    #[test]
+    fn repeat_index_single_large_count() {
+        let index = array![7_i64];
+        let counts = array![5_i64];
+        let got = repeat_index_core(index.view(), counts.view(), 5);
+        assert_eq!(got, array![7, 7, 7, 7, 7]);
+    }
+
+    #[test]
+    fn trim_index_drops_zero_count_entries() {
+        let index = array![10_i64, 20, 30, 40];
+        let counts = array![1_i64, 0, 0, 2];
+        let got = trim_index_core(index.view(), counts.view(), 2);
+        assert_eq!(got, array![10, 40]);
+    }
+
+    #[test]
+    fn trim_index_all_zero_counts_gives_empty_output() {
+        let index = array![1_i64, 2, 3];
+        let counts = array![0_i64, 0, 0];
+        let got = trim_index_core(index.view(), counts.view(), 0);
+        assert_eq!(got, Array1::<i64>::zeros(0));
+    }
+
+    #[test]
+    fn trim_index_empty_input() {
+        let index: Array1<i64> = array![];
+        let counts: Array1<i64> = array![];
+        let got = trim_index_core(index.view(), counts.view(), 0);
+        assert_eq!(got, Array1::<i64>::zeros(0));
+    }
+
+    #[test]
+    fn trim_index_no_zero_counts_keeps_everything() {
+        let index = array![1_i64, 2, 3];
+        let counts = array![1_i64, 1, 1];
+        let got = trim_index_core(index.view(), counts.view(), 3);
+        assert_eq!(got, array![1, 2, 3]);
+    }
 }

@@ -6,9 +6,46 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "janitor_rs"
-crate-type = ["cdylib"]
+# "rlib" is added alongside "cdylib" only so `benches/kernels.rs` (and
+# `cargo test`'s own harness) can link against this crate as an ordinary
+# Rust library. It has no effect on the shipped Python extension module --
+# maturin only ever picks up the "cdylib" artifact for the wheel.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.27.2", features = ["extension-module", "generate-import-lib"] }
+pyo3 = { version = "0.27.2", features = ["generate-import-lib"] }
 numpy = "0.27"
 itertools = "0.14.0"
+
+# `extension-module` tells pyo3 not to link against libpython, because the
+# shipped wheel is dlopen()'d *by* a Python interpreter that already has
+# those symbols loaded. A plain `cargo test`/`cargo bench` binary is its
+# own standalone executable with no such interpreter to borrow symbols
+# from, so linking it with `extension-module` on fails with "symbol(s) not
+# found" for the Python C API (a well-known pyo3 pitfall, see
+# https://pyo3.rs/latest/faq.html#i-cant-run-cargo-test). Making it an
+# opt-out default feature instead of unconditional lets `cargo test
+# --no-default-features` / `cargo bench --no-default-features` link
+# normally against libpython, while `maturin build` (used for the real
+# wheel, see .github/workflows/release.yml) still gets the feature by
+# default, unchanged.
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
+# The published wheel is a `release` build, where `overflow-checks` defaults
+# to `false` -- integer overflow in the aggregation kernels wraps (two's
+# complement) instead of panicking, matching plain NumPy/i64 arithmetic on
+# the Python side of the boundary. Cargo's `test` profile otherwise inherits
+# `dev`'s `overflow-checks = true`, which would make `cargo test` panic on
+# the exact overflow behavior the shipped extension relies on. This makes
+# `cargo test` exercise the same contract as what actually ships.
+[profile.test]
+overflow-checks = false
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "kernels"
+harness = false
