@@ -4,6 +4,20 @@ use pyo3::prelude::*;
 
 use crate::aggs::{checked_index, checked_range};
 
+/// `#[cfg(test)]`-only entry point for direct, Python-free testing of
+/// [`prod_positions_core_with_cast`] (see its doc comment for the guard
+/// rationale) at the representative `i64` dtype.
+#[cfg(test)]
+pub(crate) fn prod_positions_core(
+    arr: ArrayView1<i64>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    positions: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+) -> Array1<i64> {
+    prod_positions_core_with_cast(arr, starts, ends, positions, booleans, |value| value)
+}
+
 /// For every `(starts[i], ends[i])`, multiply `arr[positions[nn]]` over `nn`
 /// in `[starts[i], ends[i])`, skipping `nn` where `positions[nn]` is not a
 /// valid index into `arr` (including the `-1` "no candidate" sentinel) or
@@ -18,17 +32,6 @@ use crate::aggs::{checked_index, checked_range};
 /// to a huge `usize` and walk `positions` out of bounds. The result starts
 /// at `1`, so rejecting a bad ticket preserves the same product identity
 /// that an empty range returned before this guard was added. See issue #32.
-#[cfg(test)]
-pub(crate) fn prod_positions_core(
-    arr: ArrayView1<i64>,
-    starts: ArrayView1<i64>,
-    ends: ArrayView1<i64>,
-    positions: ArrayView1<i64>,
-    booleans: ArrayView1<bool>,
-) -> Array1<i64> {
-    prod_positions_core_with_cast(arr, starts, ends, positions, booleans, |value| value)
-}
-
 fn prod_positions_core_with_cast<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,

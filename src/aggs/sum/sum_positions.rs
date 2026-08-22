@@ -4,17 +4,9 @@ use pyo3::prelude::*;
 
 use crate::aggs::{checked_index, checked_range};
 
-/// For every `(starts[i], ends[i])`, sum `arr[positions[nn]]` over `nn` in
-/// `[starts[i], ends[i])`, skipping `nn` where `positions[nn]` is not a
-/// valid index into `arr` (including the `-1` "no candidate" sentinel) or
-/// where the candidate's own position is null. Returns `0` (the additive
-/// identity) when the slot range is invalid or every candidate is skipped.
-///
-/// ELI5 (the guard): `checked_range(start, end, positions.len())` rejects a
-/// negative or out-of-bounds slot range *before* it's used to index
-/// `positions`; a row rejected here (e.g. `end == -1`, this crate's "no
-/// match" sentinel, cast to `usize` without a guard) would otherwise wrap
-/// to a huge `usize` and walk `positions` out of bounds. See issue #32.
+/// `#[cfg(test)]`-only entry point for direct, Python-free testing of
+/// [`sum_positions_core_with_cast`] (see its doc comment for the guard
+/// rationale) at the representative `i64` dtype.
 #[cfg(test)]
 pub(crate) fn sum_positions_core(
     arr: ArrayView1<i64>,
@@ -26,6 +18,17 @@ pub(crate) fn sum_positions_core(
     sum_positions_core_with_cast(arr, starts, ends, positions, booleans, |value| value)
 }
 
+/// For every `(starts[i], ends[i])`, sum `arr[positions[nn]]` over `nn` in
+/// `[starts[i], ends[i])`, skipping `nn` where `positions[nn]` is not a
+/// valid index into `arr` (including the `-1` "no candidate" sentinel) or
+/// where the candidate's own position is null. Returns `0` (the additive
+/// identity) when the slot range is invalid or every candidate is skipped.
+///
+/// ELI5 (the guard): `checked_range(start, end, positions.len())` rejects a
+/// negative or out-of-bounds slot range *before* it's used to index
+/// `positions`; a row rejected here (e.g. `end == -1`, this crate's "no
+/// match" sentinel, cast to `usize` without a guard) would otherwise wrap
+/// to a huge `usize` and walk `positions` out of bounds. See issue #32.
 fn sum_positions_core_with_cast<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
