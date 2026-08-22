@@ -24,6 +24,10 @@ pub(crate) fn sum_positions_core(
 /// where the candidate's own position is null. Returns `0` (the additive
 /// identity) when the slot range is invalid or every candidate is skipped.
 ///
+/// Caller contract: `starts` and `ends` are parallel arrays with equal
+/// lengths. As in the other aggregation kernels, this low-level core does not
+/// validate that whole-call invariant inside its hot loop.
+///
 /// ELI5 (the guard): `checked_range(start, end, positions.len())` rejects a
 /// negative or out-of-bounds slot range *before* it's used to index
 /// `positions`; a row rejected here (e.g. `end == -1`, this crate's "no
@@ -301,5 +305,63 @@ mod tests {
             booleans.view(),
         );
         assert_eq!(got, array![0.0]);
+    }
+
+    #[test]
+    fn integer_range_and_candidate_boundaries_are_safe() {
+        let arr = array![2_i64, 3, 4];
+        let booleans = array![false, false, false];
+        let positions = array![0_i64, 1, 2];
+        let starts = array![-2_i64, -1, 0, 0, 2, 3, 4, 2];
+        let ends = array![1_i64, 1, -2, -1, 2, 3, 4, 4];
+        let got = sum_positions_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![0, 0, 0, 0, 0, 0, 0, 0]);
+
+        let candidate_positions = array![-2_i64, -1, 0, 2, 3, 4];
+        let candidate_starts = array![0_i64];
+        let candidate_ends = array![candidate_positions.len() as i64];
+        let got = sum_positions_core(
+            arr.view(),
+            candidate_starts.view(),
+            candidate_ends.view(),
+            candidate_positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![6]);
+    }
+
+    #[test]
+    fn float_range_and_candidate_boundaries_are_safe() {
+        let arr = array![2.0_f64, 3.0, 4.0];
+        let booleans = array![false, false, false];
+        let positions = array![0_i64, 1, 2];
+        let starts = array![-2_i64, -1, 0, 0, 2, 3, 4, 2];
+        let ends = array![1_i64, 1, -2, -1, 2, 3, 4, 4];
+        let got = sum_positions_float_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+        let candidate_positions = array![-2_i64, -1, 0, 2, 3, 4];
+        let candidate_starts = array![0_i64];
+        let candidate_ends = array![candidate_positions.len() as i64];
+        let got = sum_positions_float_core(
+            arr.view(),
+            candidate_starts.view(),
+            candidate_ends.view(),
+            candidate_positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![6.0]);
     }
 }

@@ -25,13 +25,17 @@ pub(crate) fn prod_positions_core(
 /// multiplicative identity) when the slot range is empty or invalid, or
 /// when every candidate is skipped.
 ///
+/// Caller contract: `starts` and `ends` are parallel arrays with equal
+/// lengths. As in the other aggregation kernels, this low-level core does not
+/// validate that whole-call invariant inside its hot loop.
+///
 /// ELI5 (the guard): `checked_range(start, end, positions.len())` rejects a
 /// negative or out-of-bounds slot range *before* it's used to index
 /// `positions`; a row rejected here (e.g. `end == -1`, this crate's "no
 /// match" sentinel, cast to `usize` without a guard) would otherwise wrap
-/// to a huge `usize` and walk `positions` out of bounds. The result starts
-/// at `1`, so rejecting a bad ticket preserves the same product identity
-/// that an empty range returned before this guard was added. See issue #32.
+/// to a huge `usize` and walk `positions` out of bounds. The result starts at
+/// `1`, so rejecting a bad ticket preserves the same product identity that an
+/// empty range returned before this guard was added. See issue #32.
 fn prod_positions_core_with_cast<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -334,5 +338,63 @@ mod tests {
             booleans.view(),
         );
         assert_eq!(got, array![1.0]);
+    }
+
+    #[test]
+    fn integer_range_and_candidate_boundaries_are_safe() {
+        let arr = array![2_i64, 3, 4];
+        let booleans = array![false, false, false];
+        let positions = array![0_i64, 1, 2];
+        let starts = array![-2_i64, -1, 0, 0, 2, 3, 4, 2];
+        let ends = array![1_i64, 1, -2, -1, 2, 3, 4, 4];
+        let got = prod_positions_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![1, 1, 1, 1, 1, 1, 1, 1]);
+
+        let candidate_positions = array![-2_i64, -1, 0, 2, 3, 4];
+        let candidate_starts = array![0_i64];
+        let candidate_ends = array![candidate_positions.len() as i64];
+        let got = prod_positions_core(
+            arr.view(),
+            candidate_starts.view(),
+            candidate_ends.view(),
+            candidate_positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![8]);
+    }
+
+    #[test]
+    fn float_range_and_candidate_boundaries_are_safe() {
+        let arr = array![2.0_f64, 3.0, 4.0];
+        let booleans = array![false, false, false];
+        let positions = array![0_i64, 1, 2];
+        let starts = array![-2_i64, -1, 0, 0, 2, 3, 4, 2];
+        let ends = array![1_i64, 1, -2, -1, 2, 3, 4, 4];
+        let got = prod_positions_float_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+
+        let candidate_positions = array![-2_i64, -1, 0, 2, 3, 4];
+        let candidate_starts = array![0_i64];
+        let candidate_ends = array![candidate_positions.len() as i64];
+        let got = prod_positions_float_core(
+            arr.view(),
+            candidate_starts.view(),
+            candidate_ends.view(),
+            candidate_positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![8.0]);
     }
 }
