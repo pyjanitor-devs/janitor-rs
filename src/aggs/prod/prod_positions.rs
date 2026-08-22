@@ -48,7 +48,7 @@ macro_rules! generic_compute_ints {
 generic_compute_ints!(compute_prod_positions_int64, i64);
 generic_compute_ints!(compute_prod_positions_int32, i32);
 generic_compute_ints!(compute_prod_positions_int16, i16);
-generic_compute_ints!(compute_prod_positions_int8, i64);
+generic_compute_ints!(compute_prod_positions_int8, i8);
 generic_compute_ints!(compute_prod_positions_uint64, u64);
 generic_compute_ints!(compute_prod_positions_uint32, u32);
 generic_compute_ints!(compute_prod_positions_uint16, u16);
@@ -98,5 +98,42 @@ macro_rules! generic_compute_floats {
     };
 }
 
-generic_compute_floats!(compute_prod_positions_f32, f64);
+generic_compute_floats!(compute_prod_positions_f32, f32);
 generic_compute_floats!(compute_prod_positions_f64, f64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Int8PositionsFn = for<'py> fn(
+        Python<'py>,
+        PyReadonlyArray1<'py, i8>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, bool>,
+    ) -> Bound<'py, PyArray1<i64>>;
+
+    type F32PositionsFn = for<'py> fn(
+        Python<'py>,
+        PyReadonlyArray1<'py, f32>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, bool>,
+    ) -> Bound<'py, PyArray1<f64>>;
+
+    #[test]
+    fn int8_wrapper_accepts_an_int8_array() {
+        // ELI5: the typed slot only accepts a wrapper whose `arr` is really
+        // `i8`; changing the macro argument back to `i64` breaks compilation.
+        let _wrapper: Int8PositionsFn = compute_prod_positions_int8;
+    }
+
+    #[test]
+    fn f32_wrapper_accepts_an_f32_array() {
+        // ELI5: the typed slot only accepts a wrapper whose `arr` is really
+        // `f32`; changing the macro argument back to `f64` breaks compilation.
+        let _wrapper: F32PositionsFn = compute_prod_positions_f32;
+    }
+}
