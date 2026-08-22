@@ -40,7 +40,7 @@ where
             if booleans[nn] {
                 continue;
             }
-            total += to_i64(arr[nn]);
+            total = total.wrapping_add(to_i64(arr[nn]));
         }
         result[pos] = total;
     }

@@ -33,16 +33,6 @@ itertools = "0.14.0"
 default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]
 
-# The published wheel is a `release` build, where `overflow-checks` defaults
-# to `false` -- integer overflow in the aggregation kernels wraps (two's
-# complement) instead of panicking, matching plain NumPy/i64 arithmetic on
-# the Python side of the boundary. Cargo's `test` profile otherwise inherits
-# `dev`'s `overflow-checks = true`, which would make `cargo test` panic on
-# the exact overflow behavior the shipped extension relies on. This makes
-# `cargo test` exercise the same contract as what actually ships.
-[profile.test]
-overflow-checks = false
-
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 

@@ -64,10 +64,11 @@ summation, ints don't.
 - **Toolchain**: stable Rust (`rustup`), no nightly features used.
 - **Build tool for the actual wheel**: [`maturin`](https://www.maturin.rs/)
   (`.github/workflows/release.yml`), not plain `cargo build`.
-- **No Python needed to develop or test this crate** -- see "Testing" below.
-  You only need Python/pyjanitor to validate an end-to-end change that
-  crosses the Python/Rust boundary (dtype dispatch changes, new exported
-  functions, signature changes).
+- **No Python process or pyjanitor checkout is needed for direct Rust tests** --
+  see "Testing" below. PyO3 still needs a linkable Python library; macOS may
+  require the framework path documented under "Non-Obvious Gotchas". You
+  only need to run Python/pyjanitor to validate an end-to-end boundary change
+  (dtype dispatch changes, new exported functions, signature changes).
 
 ---
 
@@ -204,18 +205,14 @@ pattern above) is the only way to get full clippy coverage on it. This is
 also a real, incidental benefit of doing the extraction, not just a
 testing nicety.
 
-### 3. `cargo test`'s default profile panics on overflow; the shipped wheel doesn't
+### 3. Make intentional integer overflow explicit
 
-The published wheel is a `release` build, where `overflow-checks` defaults
-to `false` -- an aggregation kernel's `total += arr[nn]` wraps (two's
-complement) on overflow instead of panicking, matching plain NumPy/`i64`
-arithmetic on the pyjanitor side of the boundary. Cargo's `test` profile
-otherwise inherits `dev`'s `overflow-checks = true` by default, which makes
-any overflow test **panic** instead of exercising the real wraparound
-contract. Fixed via `[profile.test] overflow-checks = false` in
-`Cargo.toml` -- if you add a new profile or override it, keep this, or
-overflow tests will spuriously fail (panic) even though the shipped
-behavior they're checking is correct.
+The published wheel uses two's-complement wraparound for integer aggregation,
+matching NumPy `i64` arithmetic. Encode that contract locally with
+`wrapping_add`/`wrapping_sub`; do not disable overflow checks for the whole
+test profile. Keeping Rust's default checked test arithmetic lets unrelated
+index, counter, and allocation-length overflow fail loudly while the intended
+aggregation behavior stays identical in debug, test, and release builds.
 
 ### 4. `benches/` needs `rlib` crate-type and `pub mod`, not just `mod`
 
@@ -314,3 +311,13 @@ O(array length) work and allocates a full-size temporary array.
 **Recommendation**: Pass the original typed view into a generic internal
 loop and cast only values visited by the requested ranges. Keep regression
 tests that count conversions for tiny prefix, suffix, and interval queries.
+
+### [2026-08-22] Scope intentional overflow semantics locally
+
+**Context**: Re-reviewing the test-profile configuration in PR #28.
+**Learning**: Disabling overflow checks for the entire test profile makes
+aggregation wraparound tests pass but also hides accidental overflow in every
+other kernel and future test.
+**Recommendation**: Use explicit wrapping operations only where modular
+arithmetic is part of the contract, and retain Rust's checked test arithmetic
+everywhere else.

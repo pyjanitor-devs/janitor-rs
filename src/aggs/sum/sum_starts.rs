@@ -9,11 +9,8 @@ use pyo3::prelude::*;
 /// absent, not as zero" -- we skip it in the running total rather than
 /// adding it in.
 ///
-/// Overflow note: `total += arr[nn]` wraps on overflow (Rust release
-/// builds don't panic on integer overflow), matching plain `i64`
-/// arithmetic on the Python/NumPy side of the boundary -- this is a
-/// deliberate parity contract with `janitor/functions/_conditional_join`
-/// in pyjanitor, not an oversight.
+/// Overflow note: `wrapping_add` makes two's-complement wraparound explicit,
+/// matching NumPy `i64` arithmetic in debug, test, and release builds.
 pub fn sum_start_core(
     arr: ArrayView1<i64>,
     starts: ArrayView1<i64>,
@@ -41,7 +38,7 @@ where
             if booleans[nn] {
                 continue;
             }
-            total += to_i64(arr[nn]);
+            total = total.wrapping_add(to_i64(arr[nn]));
         }
         result[pos] = total;
     }

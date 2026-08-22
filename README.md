@@ -27,6 +27,17 @@ borrow symbols from, so it needs the feature off to link at all (a
 The real wheel build (via `maturin`) is unaffected -- `extension-module`
 is still the *default* feature, `maturin` doesn't pass `--no-default-features`.
 
+The tests do not start a Python interpreter, but PyO3 still needs a linkable
+Python library. On macOS, Xcode's framework Python can compile successfully
+and then fail at runtime with `Library not loaded: @rpath/Python3.framework`.
+Point the loader at Xcode's framework directory in that environment:
+
+```sh
+DYLD_FRAMEWORK_PATH="/Applications/Xcode.app/Contents/Developer/"\
+"Library/Frameworks" \
+  cargo test --no-default-features
+```
+
 Tests live as `#[cfg(test)] mod tests` at the bottom of the files that
 define the kernel they're testing (e.g. `src/bin_search/bin_search_lt.rs`),
 next to a `pub fn <name>_core(...)` -- a plain-Rust extraction of that
