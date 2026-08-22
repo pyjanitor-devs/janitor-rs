@@ -478,3 +478,15 @@ fixed ad hoc. Decide deliberately (validate once at the `#[pyfunction]`/
 `_core` boundary, or explicitly document the caller contract if
 pyjanitor's Python call sites already guarantee it) instead of leaving 49
 call sites relying on an implicit, unstated assumption.
+
+### [2026-08-23] Validate parallel-array shapes once before aggregation loops
+
+**Context**: Issue #36 hardens aggregation entry points that accept parallel
+`starts` and `ends` arrays. Their `zip` loops silently truncated to the shorter
+input and could return plausible partial results.
+**Learning**: Cross-array shape is a whole-call contract, not a per-row bounds
+condition. Checking two already-created ndarray views with `len()` is O(1) and
+keeps the validation cost outside the hot loop.
+**Recommendation**: Use the shared `ensure_equal_lengths` helper once at the
+PyO3 boundary and return `PyResult` so mismatches become a normal Python
+`ValueError`. Do not add the comparison inside a row or candidate loop.

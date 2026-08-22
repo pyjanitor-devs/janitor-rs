@@ -2,6 +2,8 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::ensure_equal_lengths;
+
 fn is_empty_or_sentinel_range(start: i64, end: i64) -> bool {
     start == -1 || end == -1 || start >= end
 }
@@ -110,17 +112,20 @@ macro_rules! generic_compute_ints {
             starts: PyReadonlyArray1<'py, i64>,
             ends: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> Bound<'py, PyArray1<i64>>
+        ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
+            let starts = starts.as_array();
+            let ends = ends.as_array();
+            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
             let result = sum_start_end_core_with_cast(
                 arr.as_array(),
-                starts.as_array(),
-                ends.as_array(),
+                starts,
+                ends,
                 booleans.as_array(),
                 |value| value as i64,
             );
-            result.into_pyarray(py)
+            Ok(result.into_pyarray(py))
         }
     };
 }
@@ -134,17 +139,20 @@ macro_rules! generic_compute_floats {
             starts: PyReadonlyArray1<'py, i64>,
             ends: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> Bound<'py, PyArray1<f64>>
+        ) -> PyResult<Bound<'py, PyArray1<f64>>>
         // The macro will expand into the contents of this block.
         {
+            let starts = starts.as_array();
+            let ends = ends.as_array();
+            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
             let result = sum_start_end_float_core_with_cast(
                 arr.as_array(),
-                starts.as_array(),
-                ends.as_array(),
+                starts,
+                ends,
                 booleans.as_array(),
                 |value| value as f64,
             );
-            result.into_pyarray(py)
+            Ok(result.into_pyarray(py))
         }
     };
 }

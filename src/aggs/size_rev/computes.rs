@@ -3,6 +3,10 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
+use crate::aggs::ensure_equal_lengths;
+
+type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
+
 #[pyfunction]
 pub fn compute_size_rev_end<'py>(
     py: Python<'py>,
@@ -145,9 +149,10 @@ pub fn compute_size_rev_start_end_matches<'py>(
     index: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
     length: i64,
-) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>) {
+) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
+    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let matches = matches.as_array();
     let length = length as usize;
@@ -176,7 +181,7 @@ pub fn compute_size_rev_start_end_matches<'py>(
         indexers[pos] = *key;
         result[pos] = *val;
     }
-    (indexers.into_pyarray(py), result.into_pyarray(py))
+    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
 #[pyfunction]
@@ -186,9 +191,10 @@ pub fn compute_size_rev_start_end<'py>(
     ends: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
     length: i64,
-) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>) {
+) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
+    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
@@ -209,7 +215,7 @@ pub fn compute_size_rev_start_end<'py>(
         indexers[pos] = *key;
         result[pos] = *val;
     }
-    (indexers.into_pyarray(py), result.into_pyarray(py))
+    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
 #[pyfunction]
@@ -220,9 +226,10 @@ pub fn compute_size_rev_positions<'py>(
     index: PyReadonlyArray1<'py, i64>,
     positions: PyReadonlyArray1<'py, i64>,
     length: i64,
-) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>) {
+) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
+    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let positions = positions.as_array();
     let length = length as usize;
@@ -248,5 +255,5 @@ pub fn compute_size_rev_positions<'py>(
         indexers[pos] = *key;
         result[pos] = *val;
     }
-    (indexers.into_pyarray(py), result.into_pyarray(py))
+    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
