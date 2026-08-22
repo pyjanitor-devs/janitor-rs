@@ -13,6 +13,12 @@ use pyo3::prelude::*;
 /// from here to the end", it's "everything from the beginning up to here".
 /// Same null-skip and overflow-wrap contract; see `sum_start_core` for the
 /// full explanation.
+///
+/// ELI5 (the `-1` guard): `-1 as usize` isn't "negative one" any more, a
+/// `usize` can't hold that -- it wraps around to the *largest* possible
+/// number instead (`usize::MAX`). So without checking `-1` first, "no
+/// match" would silently turn into "sum almost the whole address space",
+/// which reads past the array and crashes rather than just giving `0`.
 pub fn sum_end_core(
     arr: ArrayView1<i64>,
     ends: ArrayView1<i64>,

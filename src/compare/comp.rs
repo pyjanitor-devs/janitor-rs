@@ -39,6 +39,14 @@ fn binary_compare<T: std::cmp::PartialOrd>(left: &T, right: &T, op: i8) -> bool 
 /// crate's "no match" sentinel, or `start >= end`, checked in `i64` space
 /// before either bound is cast to `usize`) contributes zero ticks to the
 /// tape, matching a genuinely empty range.
+///
+/// ELI5 (why `-1` is checked before the cast, not after): a `usize` can't
+/// represent `-1`, so casting it doesn't keep it negative -- it wraps
+/// around to the *largest* possible `usize` instead. That's bigger than
+/// any real `start`, so a `start_ >= end_` check done *after* casting
+/// would think the row has a huge, valid range instead of no match at
+/// all, and the loop would walk `right`/`matches` straight past their
+/// real length.
 pub fn compare_start_end_core<T: PartialOrd + Copy>(
     left: ArrayView1<T>,
     right: ArrayView1<T>,

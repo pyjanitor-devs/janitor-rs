@@ -36,6 +36,16 @@ the bottom of this file.
   semantics, and dtype-widening rules here are load-bearing for pyjanitor's
   correctness, not incidental implementation details. See "Non-Obvious
   Gotchas".
+- **ELI5 code comments, generously**: any non-obvious logic gets a `///
+  ELI5: <plain-language analogy>` line (see existing examples throughout
+  `src/`) - not just on the one line of code that's tricky, but on
+  invariants, sentinel values, and *why a guard is safe* wherever a future
+  reader would otherwise have to re-derive it. Err on the side of adding
+  one rather than assuming the surrounding code is self-explanatory: this
+  crate's failure modes tend to be exactly the kind of off-by-one/cast/
+  sentinel subtlety that's obvious for five minutes after you fix it and
+  opaque forever after. This applies to doc comments on public functions
+  and to inline comments on guards/branches alike.
 
 ---
 
@@ -153,9 +163,10 @@ other kernels is expected to happen naturally as other issues touch them
 ### Adding a new dtype-generic kernel
 
 1. Write the `_core` function first, generic or `i64`-only as appropriate
-   (see existing examples for the pattern), with a short ELI5 comment on
-   any non-obvious logic (null-skip semantics, why an inverted range is
-   free, why a flat `matches` tape still advances on a skip, etc.).
+   (see existing examples for the pattern). Comment its non-obvious logic
+   per the "ELI5 code comments" Core Principle above (null-skip semantics,
+   why an inverted range is free, why a flat `matches` tape still advances
+   on a skip, etc.).
 2. Write `#[cfg(test)]` tests covering: empty input, zero matches,
    duplicate values, boundary positions (start=0, start=len, start>end),
    and -- for aggregation kernels specifically -- null masks and integer
@@ -321,3 +332,39 @@ other kernel and future test.
 **Recommendation**: Use explicit wrapping operations only where modular
 arithmetic is part of the contract, and retain Rust's checked test arithmetic
 everywhere else.
+
+### [2026-08-22] `-1` sentinel must be checked before, not after, the `usize` cast
+
+**Context**: Adversarial review of PR #28 found `sum_end_core`,
+`sum_start_end_core`, and `compare_start_end_core` cast `start`/`end` to
+`usize` unconditionally, then relied on a post-cast `start_ >= end_` check
+to catch invalid ranges "for free". A lone `-1` (this crate's established
+sentinel, already guarded in `binary_search_lt_core`) casts to
+`usize::MAX`, which is *larger* than any real `start`, so the post-cast
+check never fires and the loop walks off the end of the array.
+**Learning**: A doc comment claiming a range check is "free" because Rust
+ranges handle `start >= end` is only true if both bounds were compared
+*before* any lossy/reinterpreting cast. Checking the same-looking
+condition after casting to `usize` can silently invert it for sentinel
+values.
+**Recommendation**: Guard `start == -1 || end == -1 || start >= end` in
+`i64` space, before either bound is cast to `usize` - the same pattern
+`binary_search_lt_core` already uses. When extracting or reviewing a new
+`_core` function that takes `start`/`end` as `i64`, check for this pattern
+explicitly rather than trusting that an existing doc comment's safety
+claim was verified against the sentinel case.
+
+### [2026-08-22] Generalized the ELI5-comment convention to a Core Principle
+
+**Context**: The "ELI5 code comments" guidance previously lived only inside
+"Adding a new dtype-generic kernel," framed as something to do when writing
+a brand-new kernel.
+**Learning**: The same guidance applies just as much to fixes, guards, and
+refactors on existing code - e.g. the sentinel-cast fix above needed exactly
+this kind of comment, and had none before this review. Scoping the
+convention to "new kernels only" left every other kind of change without
+the same expectation.
+**Recommendation**: Keep ELI5-comment guidance as one canonical Core
+Principle, referenced (not restated) from narrower sections like "Adding a
+new dtype-generic kernel." If you find another place in this file
+restating it, consolidate rather than adding a third copy.

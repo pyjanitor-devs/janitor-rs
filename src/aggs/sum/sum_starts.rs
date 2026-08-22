@@ -66,6 +66,15 @@ macro_rules! generic_compute {
             // change; see `u64_values_above_i63_reinterpret_bits` below,
             // which locks it in and documents it now that it's
             // independently testable without a Python interpreter.
+            //
+            // ELI5: an i64 and a u64 are the same 64 bits of memory, just
+            // read with a different rulebook for what those bits mean.
+            // For a u64 value small enough that both rulebooks agree
+            // (< 2^63), the cast is a normal widen. Past that point the
+            // top bit means "huge positive number" under one rulebook and
+            // "negative number" under the other, so re-reading the same
+            // bits as i64 can flip the sign instead of preserving the
+            // value.
             let result = sum_start_core_with_cast(
                 arr.as_array(),
                 starts.as_array(),

@@ -9,11 +9,18 @@ use pyo3::prelude::*;
 /// "from the beginning" -- same null-skip/overflow-wrap contract as
 /// `sum_start_core`. An inverted or empty range (`start >= end`, checked
 /// in `i64` space before either bound is cast to `usize`) contributes `0`.
+///
 /// `start`/`end` of `-1` (the crate's sentinel for "invalid/no match")
 /// also contributes `0`, rather than being cast to `usize::MAX` and
-/// walked off the end of `arr` -- a naive `start_ >= end_` check *after*
-/// casting would miss this, since a lone `-1` end wraps to a value larger
-/// than any real start.
+/// walked off the end of `arr`.
+///
+/// ELI5 (why the check has to happen *before* the cast): `-1 as usize`
+/// wraps around to the *largest* possible `usize` instead of staying
+/// negative, so it's bigger than any real `start`. A `start_ >= end_`
+/// check done *after* casting would see a huge `end_` and conclude the
+/// range is fine, when the original `i64` value actually meant "no
+/// match" -- checking `-1` explicitly, before the cast, is the only way
+/// to catch it.
 pub fn sum_start_end_core(
     arr: ArrayView1<i64>,
     starts: ArrayView1<i64>,
