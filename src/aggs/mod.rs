@@ -13,17 +13,26 @@ pub mod sum_rev;
 /// Convert a signed position only when it names a real element.
 ///
 /// ELI5: negative sentinels and positions past the end never become huge
-/// `usize` values; they are rejected while they are still signed.
+/// `usize` values; they are rejected while they are still signed. Uses `<`
+/// (not `<=`) because this is an *index* -- `index == len` is out of
+/// bounds, unlike an exclusive end bound (see `checked_end`).
 pub(crate) fn checked_index(index: i64, len: usize) -> Option<usize> {
     usize::try_from(index).ok().filter(|&index| index < len)
 }
 
 /// Convert an exclusive signed end bound in the inclusive range `0..=len`.
+///
+/// ELI5: uses `<=` (not `<`) because `end` is a slice bound, not an index --
+/// `end == len` legitimately means "up to and including the last element".
 pub(crate) fn checked_end(end: i64, len: usize) -> Option<usize> {
     usize::try_from(end).ok().filter(|&end| end <= len)
 }
 
 /// Convert a non-empty signed half-open range contained in `0..len`.
+///
+/// ELI5: `start` only needs `usize::try_from` (no upper-bound check of its
+/// own) because it's compared against the already-validated `end` next;
+/// `start < end <= len` proves `start < len` for free.
 pub(crate) fn checked_range(start: i64, end: i64, len: usize) -> Option<(usize, usize)> {
     let start = usize::try_from(start).ok()?;
     let end = checked_end(end, len)?;

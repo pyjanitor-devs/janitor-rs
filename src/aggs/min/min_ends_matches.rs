@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::checked_end;
+use crate::aggs::checked_range;
 
 /// For every `ends[i]`, find the position (not the value) of the
 /// smallest element in `arr[..ends[i]]` among positions the caller has
@@ -10,9 +10,14 @@ use crate::aggs::checked_end;
 /// range back to back). Returns `-1` when `end` is invalid, `arr` is empty,
 /// the row has zero matches, or every candidate is skipped/null.
 ///
-/// ELI5 (the guard): validate the signed end before casting or reading the
-/// fixed seed `arr[0]`, while zero-match rows still advance over their part
-/// of the flat match tape. See issue #27.
+/// ELI5 (the guard): `checked_range(0, end, arr.len())` rejects a negative
+/// or too-large `end` *and* an empty `arr` in one call, since `0 < end`
+/// already fails when `arr.len() == 0`; that also means `arr[0]` below is
+/// never reached without a real element behind it. A row rejected here
+/// never had any of its own tape entries (the caller only emits entries
+/// for rows it already knows are valid), so `n` is left untouched --
+/// contrast with the `*count == 0` branch below, which *does* need to skip
+/// past this row's (nonzero-width) slice of the tape. See issue #27.
 pub fn min_end_match_core<T: PartialOrd + Copy>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
@@ -24,13 +29,9 @@ pub fn min_end_match_core<T: PartialOrd + Copy>(
     let mut n: usize = 0;
     let zipped = ends.into_iter().zip(counts);
     for (pos, (end, count)) in zipped.enumerate() {
-        let Some(end_) = checked_end(*end, arr.len()) else {
+        let Some((_, end_)) = checked_range(0, *end, arr.len()) else {
             continue;
         };
-        if arr.is_empty() {
-            n += end_;
-            continue;
-        }
         let mut base: i64 = -1;
         let mut base_val = arr[0];
         if *count == 0 {
