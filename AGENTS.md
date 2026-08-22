@@ -439,3 +439,42 @@ change the aggregation's empty-range identity while preventing a panic.
 **Recommendation**: Initialize product results to `1` (for both integer and
 float paths), use explicit `wrapping_mul` for integer accumulation, and test
 empty, sentinel, and overflow cases whenever extracting a product core.
+
+### [2026-08-23] ELI5/doc comments must live on the function that's actually compiled
+
+**Context**: A follow-up adversarial review of PR #33 found the guard
+rationale (why `checked_range`/`checked_index` reject a row before it's
+used to index) attached to `sum_positions_core`/`prod_positions_core`,
+which are `#[cfg(test)]`-only convenience wrappers around the real
+`..._core_with_cast` functions the production `#[pyfunction]` entry points
+actually call.
+**Learning**: `cargo doc` on a normal (non-test) build never sees
+`#[cfg(test)]` items, so the documentation was invisible to anyone reading
+generated docs or following the production code path -- exactly the
+audience ELI5 comments are for.
+**Recommendation**: When a kernel is split into a `#[cfg(test)]` typed
+wrapper plus an unconditionally-compiled `_with_cast`/generic
+implementation (see "Adding a new dtype-generic kernel"), put the doc/ELI5
+comment on the unconditionally-compiled function. The test-only wrapper
+should at most doc-link to it, not duplicate or hold the only copy of the
+rationale.
+
+### [2026-08-23] `booleans` null-mask length is an unvalidated whole-call assumption
+
+**Context**: Same PR #33 adversarial review pass: every aggregation kernel
+indexes `booleans[nn]` (or `booleans[indexer_]` in the `_positions`
+family) with a bound checked only against `arr.len()`, never against
+`booleans.len()` itself -- 49 call sites across every kernel family
+(min/max/sum/prod, forward and `_rev`), not just the files PR #33 touched.
+**Learning**: This is a different bug shape than the `-1`-sentinel
+guards in #27/#32: those are per-row bounds fixable with
+`checked_range`/`checked_index` inside the loop. `booleans.len() ==
+arr.len()` is a whole-call invariant, so validating it belongs once per
+call, not sprinkled into every row's loop body -- and retrofitting it
+kernel-by-kernel the way #27/#32 were fixed would be the wrong shape of
+fix here.
+**Recommendation**: Tracked as issue #34 rather than folded into #33 or
+fixed ad hoc. Decide deliberately (validate once at the `#[pyfunction]`/
+`_core` boundary, or explicitly document the caller contract if
+pyjanitor's Python call sites already guarantee it) instead of leaving 49
+call sites relying on an implicit, unstated assumption.
