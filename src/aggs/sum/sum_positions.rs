@@ -52,7 +52,57 @@ where
             if booleans[indexer_] {
                 continue;
             }
-            total += to_i64(arr[indexer_]);
+            total = total.wrapping_add(to_i64(arr[indexer_]));
+        }
+        result[pos] = total;
+    }
+    result
+}
+
+#[cfg(test)]
+pub(crate) fn sum_positions_float_core(
+    arr: ArrayView1<f64>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    positions: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+) -> Array1<f64> {
+    sum_positions_float_core_with_cast(arr, starts, ends, positions, booleans, |value| value)
+}
+
+fn sum_positions_float_core_with_cast<T, F>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    positions: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut to_f64: F,
+) -> Array1<f64>
+where
+    T: Copy,
+    F: FnMut(T) -> f64,
+{
+    let mut result = Array1::<f64>::zeros(starts.len());
+    for (pos, (start, end)) in starts.into_iter().zip(ends).enumerate() {
+        // ELI5: validate the shared slot range before either float dtype
+        // touches `positions`; `-1` means "no ticket", not a huge index.
+        let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+            continue;
+        };
+        let mut total = 0.0;
+        let mut compensation = 0.0;
+        for nn in start_..end_ {
+            let Some(indexer_) = checked_index(positions[nn], arr.len()) else {
+                continue;
+            };
+            if booleans[indexer_] {
+                continue;
+            }
+            let current = to_f64(arr[indexer_]);
+            let difference = current - compensation;
+            let increment = total + difference;
+            compensation = (increment - total) - difference;
+            total = increment;
         }
         result[pos] = total;
     }
@@ -107,38 +157,14 @@ macro_rules! generic_compute_floats {
         ) -> Bound<'py, PyArray1<f64>>
         // The macro will expand into the contents of this block.
         {
-            let arr = arr.as_array();
-            let starts = starts.as_array();
-            let ends = ends.as_array();
-            let positions = positions.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<f64>::zeros(starts.len());
-            let zipped = starts.into_iter().zip(ends);
-            for (pos, (start, end)) in zipped.enumerate() {
-                // ELI5 (the guard): same reasoning as the int path's
-                // `checked_range` call above -- a row with an invalid or
-                // sentinel-cast slot range must be rejected before it's
-                // used to index `positions`. See issue #32.
-                let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
-                    continue;
-                };
-                let mut total: f64 = 0.0;
-                let mut compensation: f64 = 0.0;
-                for nn in start_..end_ {
-                    let Some(indexer_) = checked_index(positions[nn], arr.len()) else {
-                        continue;
-                    };
-                    if booleans[indexer_] {
-                        continue;
-                    }
-                    let current: f64 = arr[indexer_] as f64;
-                    let difference = current - compensation;
-                    let increment = total + difference;
-                    compensation = (increment - total) - difference;
-                    total = increment;
-                }
-                result[pos] = total;
-            }
+            let result = sum_positions_float_core_with_cast(
+                arr.as_array(),
+                starts.as_array(),
+                ends.as_array(),
+                positions.as_array(),
+                booleans.as_array(),
+                |value| value as f64,
+            );
             result.into_pyarray(py)
         }
     };
@@ -238,5 +264,39 @@ mod tests {
             booleans.view(),
         );
         assert_eq!(got, array![10]);
+    }
+
+    #[test]
+    fn accumulation_overflow_wraps_instead_of_panicking() {
+        let arr = array![i64::MAX, 1];
+        let starts = array![0_i64];
+        let ends = array![2_i64];
+        let positions = array![0_i64, 1];
+        let booleans = array![false, false];
+        let got = sum_positions_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![i64::MIN]);
+    }
+
+    #[test]
+    fn float_end_sentinel_returns_zero_not_a_panic() {
+        let arr = array![1.0_f64, 2.0];
+        let starts = array![0_i64];
+        let ends = array![-1_i64];
+        let positions = array![0_i64, 1];
+        let booleans = array![false, false];
+        let got = sum_positions_float_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![0.0]);
     }
 }

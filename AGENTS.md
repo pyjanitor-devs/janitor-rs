@@ -427,3 +427,15 @@ value instead of a missing value.
 When skipping a zero-count row on a flat match tape, preserve `-1` while still
 advancing the tape by the row's candidate-range width, and test a following
 non-empty row to catch alignment regressions.
+
+### [2026-08-23] Empty product ranges preserve the identity value `1`
+
+**Context**: Adversarially reviewing sentinel guards for forward
+`prod_positions` kernels in PR #33.
+**Learning**: Zero-initializing the result and continuing on a rejected range
+changed valid empty ranges and the already-safe `start == -1` case from the
+established multiplicative identity `1` to `0`. A bounds guard must not silently
+change the aggregation's empty-range identity while preventing a panic.
+**Recommendation**: Initialize product results to `1` (for both integer and
+float paths), use explicit `wrapping_mul` for integer accumulation, and test
+empty, sentinel, and overflow cases whenever extracting a product core.

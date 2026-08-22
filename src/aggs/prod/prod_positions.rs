@@ -8,20 +8,16 @@ use crate::aggs::{checked_index, checked_range};
 /// in `[starts[i], ends[i])`, skipping `nn` where `positions[nn]` is not a
 /// valid index into `arr` (including the `-1` "no candidate" sentinel) or
 /// where the candidate's own position is null. Returns `1` (the
-/// multiplicative identity) when the slot range is valid but every
-/// candidate is skipped, or `0` (the result array's zero-initialized
-/// default) when the slot range itself is rejected outright.
+/// multiplicative identity) when the slot range is empty or invalid, or
+/// when every candidate is skipped.
 ///
 /// ELI5 (the guard): `checked_range(start, end, positions.len())` rejects a
 /// negative or out-of-bounds slot range *before* it's used to index
 /// `positions`; a row rejected here (e.g. `end == -1`, this crate's "no
 /// match" sentinel, cast to `usize` without a guard) would otherwise wrap
-/// to a huge `usize` and walk `positions` out of bounds. A rejected row's
-/// `continue` skips the `result[pos] = total` write entirely, so it's left
-/// at `0`, not `1` -- the two "nothing happened" cases are distinguishable
-/// in principle, but this function (like existing sibling kernels, e.g.
-/// `min_start_match_core`) doesn't currently distinguish them in its
-/// return value. See issue #32.
+/// to a huge `usize` and walk `positions` out of bounds. The result starts
+/// at `1`, so rejecting a bad ticket preserves the same product identity
+/// that an empty range returned before this guard was added. See issue #32.
 #[cfg(test)]
 pub(crate) fn prod_positions_core(
     arr: ArrayView1<i64>,
@@ -45,7 +41,7 @@ where
     T: Copy,
     F: FnMut(T) -> i64,
 {
-    let mut result = Array1::<i64>::zeros(starts.len());
+    let mut result = Array1::<i64>::from_elem(starts.len(), 1);
     let zipped = starts.into_iter().zip(ends);
     for (pos, (start, end)) in zipped.enumerate() {
         let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
@@ -59,7 +55,52 @@ where
             if booleans[indexer_] {
                 continue;
             }
-            total *= to_i64(arr[indexer_]);
+            total = total.wrapping_mul(to_i64(arr[indexer_]));
+        }
+        result[pos] = total;
+    }
+    result
+}
+
+#[cfg(test)]
+pub(crate) fn prod_positions_float_core(
+    arr: ArrayView1<f64>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    positions: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+) -> Array1<f64> {
+    prod_positions_float_core_with_cast(arr, starts, ends, positions, booleans, |value| value)
+}
+
+fn prod_positions_float_core_with_cast<T, F>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    positions: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut to_f64: F,
+) -> Array1<f64>
+where
+    T: Copy,
+    F: FnMut(T) -> f64,
+{
+    let mut result = Array1::<f64>::from_elem(starts.len(), 1.0);
+    for (pos, (start, end)) in starts.into_iter().zip(ends).enumerate() {
+        // ELI5: validate the shared slot range before either float dtype
+        // touches `positions`; a rejected ticket keeps product's identity.
+        let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+            continue;
+        };
+        let mut total = 1.0;
+        for nn in start_..end_ {
+            let Some(indexer_) = checked_index(positions[nn], arr.len()) else {
+                continue;
+            };
+            if booleans[indexer_] {
+                continue;
+            }
+            total *= to_f64(arr[indexer_]);
         }
         result[pos] = total;
     }
@@ -130,34 +171,14 @@ macro_rules! generic_compute_floats {
         ) -> Bound<'py, PyArray1<f64>>
         // The macro will expand into the contents of this block.
         {
-            let arr = arr.as_array();
-            let starts = starts.as_array();
-            let ends = ends.as_array();
-            let positions = positions.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<f64>::zeros(starts.len());
-            let zipped = starts.into_iter().zip(ends);
-            for (pos, (start, end)) in zipped.enumerate() {
-                // ELI5 (the guard): same reasoning as the int path's
-                // `checked_range` call above -- a row with an invalid or
-                // sentinel-cast slot range must be rejected before it's
-                // used to index `positions`. See issue #32.
-                let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
-                    continue;
-                };
-                let mut total: f64 = 1.;
-                for nn in start_..end_ {
-                    let Some(indexer_) = checked_index(positions[nn], arr.len()) else {
-                        continue;
-                    };
-                    if booleans[indexer_] {
-                        continue;
-                    }
-                    let current: f64 = arr[indexer_] as f64;
-                    total *= current;
-                }
-                result[pos] = total;
-            }
+            let result = prod_positions_float_core_with_cast(
+                arr.as_array(),
+                starts.as_array(),
+                ends.as_array(),
+                positions.as_array(),
+                booleans.as_array(),
+                |value| value as f64,
+            );
             result.into_pyarray(py)
         }
     };
@@ -190,12 +211,11 @@ mod tests {
     }
 
     #[test]
-    fn end_sentinel_returns_zero_not_a_panic() {
+    fn end_sentinel_returns_one_not_a_panic() {
         // The exact reproduction from issue #32: `end == -1` used to cast
         // to `usize::MAX` and walk `positions` out of bounds. A rejected
-        // row's `result[pos] = total` write is skipped entirely, leaving
-        // the zero-initialized array default (not `1`, the multiplicative
-        // identity a valid-but-empty range would produce).
+        // row keeps the product identity instead of changing the established
+        // empty-range result while fixing the panic.
         let arr = array![2_i64, 3, 4, 5, 6];
         let starts = array![0_i64];
         let ends = array![-1_i64];
@@ -208,11 +228,11 @@ mod tests {
             positions.view(),
             booleans.view(),
         );
-        assert_eq!(got, array![0]);
+        assert_eq!(got, array![1]);
     }
 
     #[test]
-    fn start_sentinel_returns_zero_not_a_panic() {
+    fn start_sentinel_returns_one_not_a_panic() {
         let arr = array![2_i64, 3, 4, 5, 6];
         let starts = array![-1_i64];
         let ends = array![3_i64];
@@ -225,7 +245,7 @@ mod tests {
             positions.view(),
             booleans.view(),
         );
-        assert_eq!(got, array![0]);
+        assert_eq!(got, array![1]);
     }
 
     #[test]
@@ -260,5 +280,56 @@ mod tests {
             booleans.view(),
         );
         assert_eq!(got, array![2]);
+    }
+
+    #[test]
+    fn empty_range_returns_multiplicative_identity() {
+        let arr = array![2_i64, 3];
+        let starts = array![1_i64];
+        let ends = array![1_i64];
+        let positions = array![0_i64, 1];
+        let booleans = array![false, false];
+        let got = prod_positions_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![1]);
+    }
+
+    #[test]
+    fn accumulation_overflow_wraps_instead_of_panicking() {
+        let arr = array![i64::MAX, 2];
+        let starts = array![0_i64];
+        let ends = array![2_i64];
+        let positions = array![0_i64, 1];
+        let booleans = array![false, false];
+        let got = prod_positions_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![-2]);
+    }
+
+    #[test]
+    fn float_end_sentinel_returns_one_not_a_panic() {
+        let arr = array![2.0_f64, 3.0];
+        let starts = array![0_i64];
+        let ends = array![-1_i64];
+        let positions = array![0_i64, 1];
+        let booleans = array![false, false];
+        let got = prod_positions_float_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            positions.view(),
+            booleans.view(),
+        );
+        assert_eq!(got, array![1.0]);
     }
 }
