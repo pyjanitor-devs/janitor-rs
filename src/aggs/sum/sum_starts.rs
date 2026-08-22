@@ -19,6 +19,20 @@ pub fn sum_start_core(
     sum_start_core_with_cast(arr, starts, booleans, |value| value)
 }
 
+/// `u32` benchmark entry point that follows the same cast-on-access path as
+/// the corresponding Python wrapper.
+///
+/// ELI5: this lets the benchmark count the cost of opening only the eight
+/// boxes a tiny query asks for, rather than first copying and relabelling
+/// every box in a large warehouse.
+pub fn sum_start_u32_core(
+    arr: ArrayView1<u32>,
+    starts: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+) -> Array1<i64> {
+    sum_start_core_with_cast(arr, starts, booleans, |value| value as i64)
+}
+
 fn sum_start_core_with_cast<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -128,11 +142,23 @@ generic_compute!(compute_sum_start_int32, i32);
 generic_compute!(compute_sum_start_int16, i16);
 generic_compute!(compute_sum_start_int8, i8);
 generic_compute!(compute_sum_start_uint64, u64);
-generic_compute!(compute_sum_start_uint32, u32);
 generic_compute!(compute_sum_start_uint16, u16);
 generic_compute!(compute_sum_start_uint8, u8);
 generic_compute_floats!(compute_sum_start_f32, f32);
 generic_compute_floats!(compute_sum_start_f64, f64);
+
+// ELI5: this representative wrapper walks through the exact same door as
+// the sparse benchmark, so timing that door also protects Python callers
+// from an accidental whole-column copy.
+#[pyfunction]
+pub fn compute_sum_start_uint32<'py>(
+    py: Python<'py>,
+    arr: PyReadonlyArray1<'py, u32>,
+    starts: PyReadonlyArray1<'py, i64>,
+    booleans: PyReadonlyArray1<'py, bool>,
+) -> Bound<'py, PyArray1<i64>> {
+    sum_start_u32_core(arr.as_array(), starts.as_array(), booleans.as_array()).into_pyarray(py)
+}
 
 #[cfg(test)]
 mod tests {

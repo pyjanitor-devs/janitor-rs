@@ -2,6 +2,10 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+fn is_empty_sentinel_end(end: i64) -> bool {
+    end == -1
+}
+
 /// For every `ends[i]`, sum `arr[..ends[i]]` (from the start of the array),
 /// skipping any position flagged `true` in `booleans` (a null mask). An
 /// `end` of `-1` (the crate's sentinel for "invalid/no match", e.g. as
@@ -40,7 +44,7 @@ where
     let mut result = Array1::<i64>::zeros(ends.len());
     let start_: usize = 0;
     for (pos, end) in ends.indexed_iter() {
-        if *end == -1 {
+        if is_empty_sentinel_end(*end) {
             continue; // result[pos] is already 0
         }
         let mut total: i64 = 0;
@@ -50,6 +54,38 @@ where
                 continue;
             }
             total = total.wrapping_add(to_i64(arr[nn]));
+        }
+        result[pos] = total;
+    }
+    result
+}
+
+fn sum_end_float_core_with_cast<T, F>(
+    arr: ArrayView1<T>,
+    ends: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut to_f64: F,
+) -> Array1<f64>
+where
+    T: Copy,
+    F: FnMut(T) -> f64,
+{
+    let mut result = Array1::<f64>::zeros(ends.len());
+    for (pos, end) in ends.indexed_iter() {
+        // ELI5: integers and floats receive the same list of slice ends.
+        // Check the "no match" card before either path turns it into an
+        // array position, so dtype cannot decide whether it returns 0 or
+        // crashes.
+        if is_empty_sentinel_end(*end) {
+            continue;
+        }
+        let mut total = 0.0;
+        let end_ = *end as usize;
+        for nn in 0..end_ {
+            if booleans[nn] {
+                continue;
+            }
+            total += to_f64(arr[nn]);
         }
         result[pos] = total;
     }
@@ -89,22 +125,12 @@ macro_rules! generic_compute_floats {
         ) -> Bound<'py, PyArray1<f64>>
         // The macro will expand into the contents of this block.
         {
-            let arr = arr.as_array();
-            let ends = ends.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<f64>::zeros(ends.len());
-            for (pos, end) in ends.indexed_iter() {
-                let mut total: f64 = 0.;
-                let end_ = *end as usize;
-                for nn in 0..end_ {
-                    if booleans[nn] {
-                        continue;
-                    }
-                    let current = arr[nn];
-                    total += current as f64;
-                }
-                result[pos] = total;
-            }
+            let result = sum_end_float_core_with_cast(
+                arr.as_array(),
+                ends.as_array(),
+                booleans.as_array(),
+                |value| value as f64,
+            );
             result.into_pyarray(py)
         }
     };
@@ -182,6 +208,16 @@ mod tests {
         let booleans = array![false, false, false];
         let got = sum_end_core(arr.view(), ends.view(), booleans.view());
         assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn float_sentinel_end_is_zero_not_a_panic() {
+        let arr = array![1.0_f64, 2.0, 3.0];
+        let ends = array![-1_i64];
+        let booleans = array![false, false, false];
+        let got =
+            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value);
+        assert_eq!(got, array![0.0]);
     }
 
     #[test]

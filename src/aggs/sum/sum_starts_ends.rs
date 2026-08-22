@@ -2,6 +2,10 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+fn is_empty_or_sentinel_range(start: i64, end: i64) -> bool {
+    start == -1 || end == -1 || start >= end
+}
+
 /// For every `(starts[i], ends[i])`, sum `arr[starts[i]..ends[i]]`,
 /// skipping any position flagged `true` in `booleans` (a null mask).
 ///
@@ -44,7 +48,7 @@ where
     let mut result = Array1::<i64>::zeros(starts.len());
     let zipped = starts.into_iter().zip(ends);
     for (pos, (start, end)) in zipped.enumerate() {
-        if *start == -1 || *end == -1 || *start >= *end {
+        if is_empty_or_sentinel_range(*start, *end) {
             continue; // result[pos] is already 0
         }
         let mut total: i64 = 0;
@@ -55,6 +59,42 @@ where
                 continue;
             }
             total = total.wrapping_add(to_i64(arr[nn]));
+        }
+        result[pos] = total;
+    }
+    result
+}
+
+fn sum_start_end_float_core_with_cast<T, F>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut to_f64: F,
+) -> Array1<f64>
+where
+    T: Copy,
+    F: FnMut(T) -> f64,
+{
+    let mut result = Array1::<f64>::zeros(starts.len());
+    for (pos, (start, end)) in starts.into_iter().zip(ends).enumerate() {
+        // ELI5: validate the range ticket once, before either dtype-specific
+        // path turns its signed numbers into array positions. That keeps a
+        // "no match" ticket worth zero for both integer and float columns.
+        if is_empty_or_sentinel_range(*start, *end) {
+            continue;
+        }
+        let mut total = 0.0;
+        let mut compensation = 0.0;
+        for nn in (*start as usize)..(*end as usize) {
+            if booleans[nn] {
+                continue;
+            }
+            let current = to_f64(arr[nn]);
+            let difference = current - compensation;
+            let increment = total + difference;
+            compensation = (increment - total) - difference;
+            total = increment;
         }
         result[pos] = total;
     }
@@ -97,29 +137,13 @@ macro_rules! generic_compute_floats {
         ) -> Bound<'py, PyArray1<f64>>
         // The macro will expand into the contents of this block.
         {
-            let arr = arr.as_array();
-            let starts = starts.as_array();
-            let ends = ends.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<f64>::zeros(starts.len());
-            let zipped = starts.into_iter().zip(ends);
-            for (pos, (start, end)) in zipped.enumerate() {
-                let mut total: f64 = 0.0;
-                let mut compensation: f64 = 0.0;
-                let start_ = *start as usize;
-                let end_ = *end as usize;
-                for nn in start_..end_ {
-                    if booleans[nn] {
-                        continue;
-                    }
-                    let current: f64 = arr[nn] as f64;
-                    let difference = current - compensation;
-                    let increment = total + difference;
-                    compensation = (increment - total) - difference;
-                    total = increment;
-                }
-                result[pos] = total;
-            }
+            let result = sum_start_end_float_core_with_cast(
+                arr.as_array(),
+                starts.as_array(),
+                ends.as_array(),
+                booleans.as_array(),
+                |value| value as f64,
+            );
             result.into_pyarray(py)
         }
     };
@@ -212,6 +236,22 @@ mod tests {
         let booleans = array![false, false, false, false, false];
         let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
         assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn float_sentinel_bounds_are_zero_not_a_panic() {
+        let arr = array![1.0_f64, 2.0, 3.0];
+        let starts = array![-1_i64, 0_i64];
+        let ends = array![2_i64, -1_i64];
+        let booleans = array![false, false, false];
+        let got = sum_start_end_float_core_with_cast(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            booleans.view(),
+            |value| value,
+        );
+        assert_eq!(got, array![0.0, 0.0]);
     }
 
     #[test]

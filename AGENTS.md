@@ -177,9 +177,10 @@ Where a kernel has been given test/benchmark coverage, the pattern is:
    to widen the whole input column before a potentially tiny range query.
 3. Add `#[cfg(test)] mod tests` at the bottom of the same file, testing the
    core function directly.
-4. If it's one of the four representative kernels in `benches/kernels.rs`,
-   the core function needs `pub` (not `pub(crate)`) visibility, and its
-   module needs `pub mod` in `lib.rs` -- see "Non-Obvious Gotchas".
+4. If it's one of the representative cores in `benches/kernels.rs`,
+   the core function needs `pub` (not `pub(crate)`) visibility and an explicit
+   re-export from `lib.rs`'s narrow `bench_support` facade -- see
+   "Non-Obvious Gotchas".
 
 **Not every kernel has been extracted this way** -- as of issue #21, only
 one or two representative kernels per family have (`binary_search_lt_core`,
@@ -253,16 +254,18 @@ test profile. Keeping Rust's default checked test arithmetic lets unrelated
 index, counter, and allocation-length overflow fail loudly while the intended
 aggregation behavior stays identical in debug, test, and release builds.
 
-### 4. `benches/` needs `rlib` crate-type and `pub mod`, not just `mod`
+### 4. `benches/` needs `rlib` and a narrow public facade
 
 `crate-type = ["cdylib"]` alone (the historical setting) can't be linked
 against by an external binary target like `benches/kernels.rs` -- Cargo
 needs an `rlib` artifact for that. Also, `pub(crate) fn` isn't visible
 across the crate boundary even with `rlib` added; a function a bench needs
-must be `pub`, and every module in its path (down from `lib.rs`) must be
-declared `pub mod`, not `mod`. Neither of these expose anything new to
-*Python* -- the Python-facing surface is only ever what `#[pymodule] fn
-janitor_rs(...)` registers in `lib.rs`, unchanged by this.
+must be `pub`. Do **not** make every implementation module in its path public:
+those trees already contain hundreds of public PyO3 wrappers, so doing that
+turns all of them into an accidental Rust API. Keep the trees private and
+re-export only benchmark targets through `lib.rs`'s `bench_support` module.
+None of this changes the *Python* surface, which remains only what
+`#[pymodule] fn janitor_rs(...)` registers.
 
 ### 5. macOS-only: Xcode's framework Python needs an explicit rpath locally
 
@@ -289,7 +292,10 @@ averaging width n/2) makes total work O(n²) -- at n=100,000 that's
 billions of element-touches and the benchmark effectively hangs. Keep
 per-row width bounded by a small constant regardless of `n` (see
 `SUM_BENCH_WIDTH` in `benches/kernels.rs`) unless you're deliberately
-benchmarking the dense/adaptive-crossover behavior itself.
+benchmarking the dense/adaptive-crossover behavior itself. Also keep a
+large-column, single-query case for a non-`i64` dtype: an `n`-query throughput
+fixture can hide an accidental O(array length) cast behind O(n * width) useful
+work, while one width-eight query makes that regression obvious.
 
 ---
 
@@ -396,3 +402,15 @@ the same expectation.
 Principle, referenced (not restated) from narrower sections like "Adding a
 new dtype-generic kernel." If you find another place in this file
 restating it, consolidate rather than adding a third copy.
+
+### [2026-08-22] Validate sentinel bounds before dtype-specific loops
+
+**Context**: A follow-up adversarial review found that integer range-sum
+wrappers handled the `-1` sentinel while their float siblings still cast it
+to `usize::MAX` and panicked.
+**Learning**: Fixing a shared index contract in only one dtype macro creates
+input-dependent behavior even when the public functions otherwise represent
+the same operation.
+**Recommendation**: Put sentinel/range validation in a helper shared by the
+integer and float paths, and add a direct regression test for each distinct
+loop implementation.

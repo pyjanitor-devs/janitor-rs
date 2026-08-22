@@ -1,15 +1,25 @@
 use pyo3::prelude::*;
-// `pub` here (rather than a private `mod`) only so `benches/kernels.rs`
-// can reach the handful of `pub` `*_core` algorithm functions inside these
-// modules -- everything else in them stays effectively private in
-// practice, since the only real entry point is the `#[pymodule]` below.
-// This is not a stable Rust API: it carries no semver guarantees, and
-// none of it is re-exported to Python beyond what `janitor_rs()` wires up.
-pub mod aggs;
-pub mod bin_search;
-pub mod compare;
-pub mod index_builder;
+mod aggs;
+mod bin_search;
+mod compare;
+mod index_builder;
 mod left_le_right;
+
+/// Narrow Rust-only surface used by `benches/kernels.rs`.
+///
+/// ELI5: Criterion benchmarks are separate Rust programs, so they need a
+/// public door into this library. This door exposes only the small set of
+/// algorithms they time instead of opening every implementation module and
+/// hundreds of Python wrappers.
+#[doc(hidden)]
+pub mod bench_support {
+    pub use crate::aggs::sum::sum_ends::sum_end_core;
+    pub use crate::aggs::sum::sum_starts::{sum_start_core, sum_start_u32_core};
+    pub use crate::aggs::sum::sum_starts_ends::sum_start_end_core;
+    pub use crate::bin_search::bin_search_lt::binary_search_lt_core;
+    pub use crate::compare::comp::compare_start_end_core;
+    pub use crate::index_builder::{repeat_index_core, trim_index_core};
+}
 
 /// Helper functions for PyJanitor implemented in Rust.
 #[pymodule]

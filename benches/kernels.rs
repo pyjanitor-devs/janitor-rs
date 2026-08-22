@@ -18,12 +18,10 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use numpy::ndarray::Array1;
 use std::hint::black_box;
 
-use janitor_rs::aggs::sum::sum_ends::sum_end_core;
-use janitor_rs::aggs::sum::sum_starts::sum_start_core;
-use janitor_rs::aggs::sum::sum_starts_ends::sum_start_end_core;
-use janitor_rs::bin_search::bin_search_lt::binary_search_lt_core;
-use janitor_rs::compare::comp::compare_start_end_core;
-use janitor_rs::index_builder::{repeat_index_core, trim_index_core};
+use janitor_rs::bench_support::{
+    binary_search_lt_core, compare_start_end_core, repeat_index_core, sum_end_core, sum_start_core,
+    sum_start_end_core, sum_start_u32_core, trim_index_core,
+};
 
 /// Every benchmark below builds its inputs via a small, purpose-built
 /// `<Kernel>Fixture::new(n)` -- one convention across the file, rather
@@ -199,6 +197,28 @@ struct SumFixture {
     sliding_ends: Array1<i64>,
 }
 
+/// A large column with one tiny suffix query, used to protect the
+/// cast-on-access optimization in non-i64 integer wrappers.
+///
+/// ELI5: the regular throughput fixture asks for eight values `n` times.
+/// This one asks once, so copying all `n` values before reading the final
+/// eight becomes glaringly expensive instead of hiding among useful work.
+struct SparseCastSumFixture {
+    arr: Array1<u32>,
+    booleans: Array1<bool>,
+    starts: Array1<i64>,
+}
+
+impl SparseCastSumFixture {
+    fn new(n: usize) -> Self {
+        Self {
+            arr: Array1::from_iter(0..n as u32),
+            booleans: Array1::from_elem(n, false),
+            starts: Array1::from_elem(1, (n as i64 - SUM_BENCH_WIDTH).max(0)),
+        }
+    }
+}
+
 impl SumFixture {
     fn new(n: usize) -> Self {
         let n64 = n as i64;
@@ -258,6 +278,19 @@ fn bench_sum_kernels(c: &mut Criterion) {
                     black_box(f.arr.view()),
                     black_box(f.sliding_starts.view()),
                     black_box(f.sliding_ends.view()),
+                    black_box(f.booleans.view()),
+                )
+            })
+        });
+    }
+
+    for n in [100, 100_000] {
+        let f = SparseCastSumFixture::new(n);
+        group.bench_function(format!("sum_start_u32 sparse arr_n={n} queries=1"), |b| {
+            b.iter(|| {
+                sum_start_u32_core(
+                    black_box(f.arr.view()),
+                    black_box(f.starts.view()),
                     black_box(f.booleans.view()),
                 )
             })

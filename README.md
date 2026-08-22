@@ -62,9 +62,11 @@ crate:
 
 Each covers: empty arrays, zero matches, duplicate values, boundary
 positions, integer overflow/wraparound, and (for the aggregation kernels)
-null masks. This is meant to be extended kernel-by-kernel as other issues
-touch them (see "Relationship to other issues" below) -- it is not a
-one-time exhaustive pass.
+null masks. Integer and float range-sum paths also lock in the same `-1`
+"no match" sentinel behavior: the range contributes zero before the signed
+bound can be cast into an invalid array position. This is meant to be
+extended kernel-by-kernel as other issues touch them (see "Relationship to
+other issues" below) -- it is not a one-time exhaustive pass.
 
 ### How this relates to pyjanitor's own tests
 
@@ -94,7 +96,10 @@ cargo bench --no-default-features
 Runs `benches/kernels.rs` (a [`criterion`](https://bheisler.github.io/criterion.rs/book/)
 harness) against the same `*_core` functions the unit tests cover, at a
 small (100-row) and large (100,000-row) size, with no Python interpreter
-or pyjanitor checkout required.
+or pyjanitor checkout required. The sum group also includes one tiny `u32`
+suffix query over each column size. That sparse case protects cast-on-access:
+an accidental whole-column widening is visible there instead of being hidden
+inside an `n`-query throughput workload.
 
 ### Benchmarking a change that moves the Python/Rust boundary
 
