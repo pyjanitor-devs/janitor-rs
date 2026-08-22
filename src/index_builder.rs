@@ -211,7 +211,7 @@ pub fn index_starts_only_keep_last<'py>(
     let mut pos: usize = 0;
     let mut val: i64;
     let end: usize = index.len();
-    for (start, count) in starts.into_iter().zip(counts.into_iter()) {
+    for (start, count) in starts.into_iter().zip(counts) {
         let start_: usize = *start as usize;
         if *count == 0 {
             let size = end - start_;
@@ -293,7 +293,7 @@ pub fn index_ends_only_keep_first<'py>(
     let mut pos: usize = 0;
     let mut val: i64;
     let start_: usize = 0;
-    for (end, count) in ends.into_iter().zip(counts.into_iter()) {
+    for (end, count) in ends.into_iter().zip(counts) {
         let end_: usize = *end as usize;
         if *count == 0 {
             let size = end_ - start_;
@@ -341,7 +341,7 @@ pub fn index_ends_only_keep_last<'py>(
     let mut pos: usize = 0;
     let mut val: i64;
     let start_: usize = 0;
-    for (end, count) in ends.into_iter().zip(counts.into_iter()) {
+    for (end, count) in ends.into_iter().zip(counts) {
         let end_: usize = *end as usize;
         if *count == 0 {
             let size = end_ - start_;
