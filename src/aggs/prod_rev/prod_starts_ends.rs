@@ -3,7 +3,7 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{checked_range, ensure_equal_lengths};
 use std::collections::HashMap;
 
 macro_rules! compute_ints {
@@ -24,8 +24,10 @@ macro_rules! compute_ints {
             let starts = starts.as_array();
             let ends = ends.as_array();
             ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let index = index.as_array();
             let booleans = booleans.as_array();
+            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let zipped = izip!(
@@ -35,8 +37,9 @@ macro_rules! compute_ints {
                 booleans.into_iter(),
             );
             for (current, start, end, boolean) in zipped {
-                let start_ = *start as usize;
-                let end_ = *end as usize;
+                let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
+                    continue;
+                };
                 let current_ = *current as i64;
                 for item in start_..end_ {
                     let pos = index[item];
@@ -86,8 +89,10 @@ macro_rules! compute_floats {
             let starts = starts.as_array();
             let ends = ends.as_array();
             ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let index = index.as_array();
             let booleans = booleans.as_array();
+            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let zipped = izip!(
@@ -97,8 +102,9 @@ macro_rules! compute_floats {
                 booleans.into_iter(),
             );
             for (current, start, end, boolean) in zipped {
-                let start_ = *start as usize;
-                let end_ = *end as usize;
+                let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
+                    continue;
+                };
                 let current_ = *current as f64;
                 for item in start_..end_ {
                     let pos = index[item];
