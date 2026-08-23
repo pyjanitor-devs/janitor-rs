@@ -2,6 +2,8 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::ensure_equal_lengths;
+
 use crate::aggs::checked_range;
 
 /// For every `(starts[i], ends[i])`, find the position (not the value) of
@@ -55,16 +57,14 @@ macro_rules! generic_compute {
             starts: PyReadonlyArray1<'py, i64>,
             ends: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> Bound<'py, PyArray1<i64>>
+        ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
-            let result = min_start_end_core(
-                arr.as_array(),
-                starts.as_array(),
-                ends.as_array(),
-                booleans.as_array(),
-            );
-            result.into_pyarray(py)
+            let starts = starts.as_array();
+            let ends = ends.as_array();
+            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            let result = min_start_end_core(arr.as_array(), starts, ends, booleans.as_array());
+            Ok(result.into_pyarray(py))
         }
     };
 }

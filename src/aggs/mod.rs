@@ -10,6 +10,28 @@ pub mod size_rev;
 pub mod sum;
 pub mod sum_rev;
 
+use pyo3::exceptions::PyValueError;
+use pyo3::PyResult;
+
+/// Reject parallel arrays that cannot describe the same number of rows.
+///
+/// ELI5: `zip` stops when either list runs out, so unequal lists can silently
+/// leave work undone. Check the two ticket books once before the hot loop and
+/// give Python a normal `ValueError` instead of plausible partial results.
+pub(crate) fn ensure_equal_lengths(
+    left_name: &str,
+    left_len: usize,
+    right_name: &str,
+    right_len: usize,
+) -> PyResult<()> {
+    if left_len == right_len {
+        return Ok(());
+    }
+    Err(PyValueError::new_err(format!(
+        "{left_name} and {right_name} must have equal lengths; got {left_len} and {right_len}"
+    )))
+}
+
 /// Convert a signed position only when it names a real element.
 ///
 /// ELI5: negative sentinels and positions past the end never become huge
@@ -51,19 +73,24 @@ pub(crate) fn checked_range(start: i64, end: i64, len: usize) -> Option<(usize, 
 /// file, so a future signature change (e.g. a new parameter) only needs
 /// updating here.
 #[cfg(test)]
-pub(crate) type PositionsFn<T, R> = for<'py> fn(
-    pyo3::Python<'py>,
-    numpy::PyReadonlyArray1<'py, T>,
-    numpy::PyReadonlyArray1<'py, i64>,
-    numpy::PyReadonlyArray1<'py, i64>,
-    numpy::PyReadonlyArray1<'py, i64>,
-    numpy::PyReadonlyArray1<'py, bool>,
-) -> pyo3::Bound<'py, numpy::PyArray1<R>>;
+pub(crate) type PositionsFn<T, R> =
+    for<'py> fn(
+        pyo3::Python<'py>,
+        numpy::PyReadonlyArray1<'py, T>,
+        numpy::PyReadonlyArray1<'py, i64>,
+        numpy::PyReadonlyArray1<'py, i64>,
+        numpy::PyReadonlyArray1<'py, i64>,
+        numpy::PyReadonlyArray1<'py, bool>,
+    ) -> pyo3::PyResult<pyo3::Bound<'py, numpy::PyArray1<R>>>;
 
 #[cfg(test)]
 mod adversarial_bounds_tests {
     use numpy::ndarray::array;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::exceptions::PyValueError;
+    use pyo3::Python;
 
+    use super::ensure_equal_lengths;
     use super::max::max_ends::max_end_core;
     use super::max::max_ends_matches::max_end_match_core;
     use super::max::max_positions::max_positions_core;
@@ -78,6 +105,93 @@ mod adversarial_bounds_tests {
     use super::min::min_starts_ends::min_start_end_core;
     use super::min::min_starts_ends_matches::min_start_end_match_core;
     use super::min::min_starts_matches::min_start_match_core;
+
+    #[test]
+    fn equal_length_validation_accepts_empty_and_non_empty_pairs() {
+        assert!(ensure_equal_lengths("starts", 0, "ends", 0).is_ok());
+        assert!(ensure_equal_lengths("starts", 3, "ends", 3).is_ok());
+    }
+
+    #[test]
+    fn equal_length_validation_rejects_both_mismatch_directions() {
+        Python::initialize();
+        for (starts_len, ends_len) in [(2, 1), (1, 2)] {
+            let error = ensure_equal_lengths("starts", starts_len, "ends", ends_len)
+                .expect_err("unequal parallel arrays must be rejected");
+            Python::attach(|py| {
+                assert!(error.is_instance_of::<PyValueError>(py));
+                assert_eq!(
+                    error.value(py).to_string(),
+                    format!(
+                        "starts and ends must have equal lengths; got {starts_len} and {ends_len}"
+                    )
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn representative_python_wrappers_reject_mismatched_lengths() {
+        Python::initialize();
+        Python::attach(|py| {
+            // The ordinary Rust test job does not install Python's NumPy
+            // module. Run this boundary test when NumPy is available, while
+            // keeping the core-only test suite usable in that lean setup.
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            for (starts_values, ends_values) in
+                [(vec![0_i64, 0], vec![1_i64]), (vec![0_i64], vec![1_i64, 1])]
+            {
+                let expected = format!(
+                    "starts and ends must have equal lengths; got {} and {}",
+                    starts_values.len(),
+                    ends_values.len()
+                );
+                let starts = PyArray1::from_vec(py, starts_values);
+                let ends = PyArray1::from_vec(py, ends_values);
+                let arr = PyArray1::from_vec(py, vec![1_i64, 2]);
+                let booleans = PyArray1::from_vec(py, vec![false, false]);
+                let index = PyArray1::from_vec(py, vec![0_i64, 1]);
+
+                let error = super::sum::sum_starts_ends::compute_sum_start_end_int64(
+                    py,
+                    arr.readonly(),
+                    starts.readonly(),
+                    ends.readonly(),
+                    booleans.readonly(),
+                )
+                .expect_err("forward wrapper must reject unequal lengths");
+                assert!(error.is_instance_of::<PyValueError>(py));
+                assert_eq!(error.value(py).to_string(), expected);
+
+                let error = super::min_rev::min_starts_ends::compute_min_rev_start_end_int64(
+                    py,
+                    arr.readonly(),
+                    starts.readonly(),
+                    ends.readonly(),
+                    index.readonly(),
+                    booleans.readonly(),
+                    2,
+                )
+                .expect_err("reverse wrapper must reject unequal lengths");
+                assert!(error.is_instance_of::<PyValueError>(py));
+                assert_eq!(error.value(py).to_string(), expected);
+
+                let error = super::size_rev::computes::compute_size_rev_start_end(
+                    py,
+                    starts.readonly(),
+                    ends.readonly(),
+                    index.readonly(),
+                    2,
+                )
+                .expect_err("reverse-size wrapper must reject unequal lengths");
+                assert!(error.is_instance_of::<PyValueError>(py));
+                assert_eq!(error.value(py).to_string(), expected);
+            }
+        });
+    }
 
     #[test]
     fn every_forward_core_rejects_signed_and_one_past_bounds() {

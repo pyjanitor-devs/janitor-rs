@@ -2,6 +2,8 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::ensure_equal_lengths;
+
 macro_rules! generic_compute_ints {
     ($fname:ident, $type:ty) => {
         #[pyfunction]
@@ -11,12 +13,13 @@ macro_rules! generic_compute_ints {
             starts: PyReadonlyArray1<'py, i64>,
             ends: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> Bound<'py, PyArray1<i64>>
+        ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
-            let arr = arr.as_array();
             let starts = starts.as_array();
             let ends = ends.as_array();
+            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            let arr = arr.as_array();
             let booleans = booleans.as_array();
             let mut result = Array1::<i64>::zeros(starts.len());
             let zipped = starts.into_iter().zip(ends.into_iter());
@@ -33,7 +36,7 @@ macro_rules! generic_compute_ints {
                 }
                 result[pos] = total;
             }
-            result.into_pyarray(py)
+            Ok(result.into_pyarray(py))
         }
     };
 }
@@ -47,12 +50,13 @@ macro_rules! generic_compute_floats {
             starts: PyReadonlyArray1<'py, i64>,
             ends: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> Bound<'py, PyArray1<f64>>
+        ) -> PyResult<Bound<'py, PyArray1<f64>>>
         // The macro will expand into the contents of this block.
         {
-            let arr = arr.as_array();
             let starts = starts.as_array();
             let ends = ends.as_array();
+            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            let arr = arr.as_array();
             let booleans = booleans.as_array();
             let mut result = Array1::<f64>::zeros(starts.len());
             let zipped = starts.into_iter().zip(ends.into_iter());
@@ -69,7 +73,7 @@ macro_rules! generic_compute_floats {
                 }
                 result[pos] = total;
             }
-            result.into_pyarray(py)
+            Ok(result.into_pyarray(py))
         }
     };
 }

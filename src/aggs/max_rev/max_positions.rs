@@ -2,6 +2,8 @@ use itertools::izip;
 use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+
+use crate::aggs::ensure_equal_lengths;
 use std::collections::HashMap;
 
 macro_rules! compute {
@@ -16,12 +18,13 @@ macro_rules! compute {
             positions: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
             length: i64,
-        ) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
         // The macro will expand into the contents of this block.
         {
             let arr = arr.as_array();
             let starts = starts.as_array();
             let ends = ends.as_array();
+            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
             let index = index.as_array();
             let positions = positions.as_array();
             let booleans = booleans.as_array();
@@ -61,7 +64,7 @@ macro_rules! compute {
                 indexers[pos] = *key;
                 result[pos] = *val;
             }
-            (indexers.into_pyarray(py), result.into_pyarray(py))
+            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
 }
