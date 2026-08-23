@@ -2,31 +2,21 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
-
-fn is_empty_or_sentinel_range(start: i64, end: i64) -> bool {
-    start == -1 || end == -1 || start >= end
-}
+use crate::aggs::{checked_range, ensure_equal_lengths};
 
 /// For every `(starts[i], ends[i])`, sum `arr[starts[i]..ends[i]]`,
 /// skipping any position flagged `true` in `booleans` (a null mask).
 ///
 /// ELI5: an arbitrary `[start, end)` slice instead of "to the end" or
 /// "from the beginning" -- same null-skip/overflow-wrap contract as
-/// `sum_start_core`. An inverted or empty range (`start >= end`, checked
-/// in `i64` space before either bound is cast to `usize`) contributes `0`.
-///
-/// `start`/`end` of `-1` (the crate's sentinel for "invalid/no match")
-/// also contributes `0`, rather than being cast to `usize::MAX` and
-/// walked off the end of `arr`.
-///
-/// ELI5 (why the check has to happen *before* the cast): `-1 as usize`
-/// wraps around to the *largest* possible `usize` instead of staying
-/// negative, so it's bigger than any real `start`. A `start_ >= end_`
-/// check done *after* casting would see a huge `end_` and conclude the
-/// range is fine, when the original `i64` value actually meant "no
-/// match" -- checking `-1` explicitly, before the cast, is the only way
-/// to catch it.
+/// `sum_start_core`. `checked_range(start, end, arr.len())` rejects an
+/// inverted/empty range, the `-1` "no match" sentinel (which would
+/// otherwise wrap to `usize::MAX` when cast), *and* an `end` that's
+/// simply too large for `arr` -- a plain `start == -1 || end == -1 ||
+/// start >= end` check (this function's original guard) caught the first
+/// two but not the third, so a valid-looking but oversized `end` still
+/// walked `arr`/`booleans` out of bounds. Any rejected row contributes
+/// `0`.
 pub fn sum_start_end_core(
     arr: ArrayView1<i64>,
     starts: ArrayView1<i64>,
@@ -50,12 +40,10 @@ where
     let mut result = Array1::<i64>::zeros(starts.len());
     let zipped = starts.into_iter().zip(ends);
     for (pos, (start, end)) in zipped.enumerate() {
-        if is_empty_or_sentinel_range(*start, *end) {
+        let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
             continue; // result[pos] is already 0
-        }
+        };
         let mut total: i64 = 0;
-        let start_ = *start as usize;
-        let end_ = *end as usize;
         for nn in start_..end_ {
             if booleans[nn] {
                 continue;
@@ -83,12 +71,12 @@ where
         // ELI5: validate the range ticket once, before either dtype-specific
         // path turns its signed numbers into array positions. That keeps a
         // "no match" ticket worth zero for both integer and float columns.
-        if is_empty_or_sentinel_range(*start, *end) {
+        let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
             continue;
-        }
+        };
         let mut total = 0.0;
         let mut compensation = 0.0;
-        for nn in (*start as usize)..(*end as usize) {
+        for nn in start_..end_ {
             if booleans[nn] {
                 continue;
             }
@@ -118,6 +106,12 @@ macro_rules! generic_compute_ints {
             let starts = starts.as_array();
             let ends = ends.as_array();
             ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
             let result = sum_start_end_core_with_cast(
                 arr.as_array(),
                 starts,
@@ -145,6 +139,12 @@ macro_rules! generic_compute_floats {
             let starts = starts.as_array();
             let ends = ends.as_array();
             ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
             let result = sum_start_end_float_core_with_cast(
                 arr.as_array(),
                 starts,
@@ -241,6 +241,21 @@ mod tests {
         let arr = array![1_i64, 2, 3, 4, 5];
         let starts = array![-1_i64];
         let ends = array![3_i64];
+        let booleans = array![false, false, false, false, false];
+        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn oversized_non_sentinel_end_is_zero_not_a_panic() {
+        // Found during an adversarial review of PR #37: the original guard
+        // here (`start == -1 || end == -1 || start >= end`) only caught the
+        // sentinel and inverted-range cases, not a plain positive `end`
+        // that's simply larger than `arr.len()`. `checked_range` closes
+        // that gap by validating the upper bound too.
+        let arr = array![1_i64, 2, 3, 4, 5];
+        let starts = array![0_i64];
+        let ends = array![1000_i64];
         let booleans = array![false, false, false, false, false];
         let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
         assert_eq!(got, array![0]);

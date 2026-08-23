@@ -4,6 +4,8 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
+use crate::aggs::{checked_range, ensure_equal_lengths};
+
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
         #[pyfunction]
@@ -14,19 +16,27 @@ macro_rules! compute {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
             length: i64,
-        ) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
         // The macro will expand into the contents of this block.
         {
             let arr = arr.as_array();
             let ends = ends.as_array();
+            ensure_equal_lengths("arr", arr.len(), "ends", ends.len())?;
             let index = index.as_array();
             let booleans = booleans.as_array();
+            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
             let zipped = izip!(arr.into_iter(), ends.into_iter(), booleans.into_iter());
             for (posn, (current, end, boolean)) in zipped.enumerate() {
-                let end_ = *end as usize;
+                // ELI5 (the guard): `end` indexes into `index`, not `arr`, so
+                // the bound to check against is `index.len()`; an unguarded
+                // cast of the `-1` "no match" sentinel wraps to `usize::MAX`
+                // and walks `index` out of bounds. See issue #34.
+                let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+                    continue;
+                };
                 for item in 0..end_ {
                     let pos = index[item];
                     let base = dictionary.entry(pos).or_insert(-1);
@@ -47,7 +57,7 @@ macro_rules! compute {
                 indexers[pos] = *key;
                 result[pos] = *val;
             }
-            (indexers.into_pyarray(py), result.into_pyarray(py))
+            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
 }

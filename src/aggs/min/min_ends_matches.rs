@@ -3,6 +3,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::checked_range;
+use crate::aggs::ensure_equal_lengths;
 
 /// For every `ends[i]`, find the position (not the value) of the
 /// smallest element in `arr[..ends[i]]` among positions the caller has
@@ -69,9 +70,15 @@ macro_rules! generic_compute {
             counts: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> Bound<'py, PyArray1<i64>>
+        ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
             let result = min_end_match_core(
                 arr.as_array(),
                 ends.as_array(),
@@ -79,7 +86,7 @@ macro_rules! generic_compute {
                 matches.as_array(),
                 booleans.as_array(),
             );
-            result.into_pyarray(py)
+            Ok(result.into_pyarray(py))
         }
     };
 }

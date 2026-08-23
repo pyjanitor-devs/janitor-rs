@@ -22,13 +22,13 @@ fn binary_compare<T: std::cmp::PartialOrd>(left: &T, right: &T, op: i8) -> bool 
 /// live in `matches` (a *flat* array covering every row's candidate range
 /// back to back, not one array per row).
 ///
-/// ELI5: `matches` is one long tape shared by every row. As we scan row
-/// `i`'s slice of `right`, we walk the tape forward one tick (`n += 1`) for
-/// every candidate position, whether or not that row actually claims it --
-/// that's how two rows' candidate ranges stay lined up with the single
-/// flat `matches`/`result` tape even though the ranges can be different
-/// widths. A `0` on the tape means "some earlier condition already ruled
-/// this position out"; we skip comparing it, but it still costs a tick.
+/// ELI5: `matches` is one long tape shared by every row. Each tape entry is
+/// one tiny yes/no flag for one candidate position: `1` means "this position
+/// is still in the running" and `0` means "an earlier condition already
+/// ruled it out". As we scan row `i`'s slice of `right`, we walk the tape
+/// forward one tick (`n += 1`) for every candidate position, even when the
+/// flag says to skip it. That keeps two rows lined up with the single flat
+/// tape even when their candidate ranges have different widths.
 ///
 /// Returns `(result, counts_array, total)`: `result[n]` is `1`/`0` for
 /// whether position `n` on the tape satisfies `op` (left as `0` when the

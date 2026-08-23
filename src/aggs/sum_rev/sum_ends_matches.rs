@@ -4,6 +4,8 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
+use crate::aggs::{checked_range, ensure_equal_lengths};
+
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
         #[pyfunction]
@@ -16,15 +18,18 @@ macro_rules! compute_ints {
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
             length: i64,
-        ) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
         // The macro will expand into the contents of this block.
         {
             let arr = arr.as_array();
             let index = index.as_array();
             let ends = ends.as_array();
+            ensure_equal_lengths("arr", arr.len(), "ends", ends.len())?;
             let matches = matches.as_array();
             let counts = counts.as_array();
+            ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let booleans = booleans.as_array();
+            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let mut n: usize = 0;
@@ -35,7 +40,14 @@ macro_rules! compute_ints {
                 booleans.into_iter()
             );
             for (current, end, count, boolean) in zipped {
-                let end_ = *end as usize;
+                // ELI5 (the guard): `matches` is one long row-by-row list of
+                // yes/no flags, one flag for each candidate position. `end`
+                // indexes into `index`, not `arr`; an invalid row contributes
+                // zero candidate positions, so it contributes zero tape
+                // entries and leaves `n` untouched. See issue #34.
+                let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+                    continue;
+                };
                 let current_ = *current as i64;
                 for item in 0..end_ {
                     if (matches[n] == 0) {
@@ -59,7 +71,7 @@ macro_rules! compute_ints {
                 indexers[pos] = *key;
                 result[pos] = *val;
             }
-            (indexers.into_pyarray(py), result.into_pyarray(py))
+            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
 }
@@ -85,15 +97,18 @@ macro_rules! compute_floats {
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
             length: i64,
-        ) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>
         // The macro will expand into the contents of this block.
         {
             let arr = arr.as_array();
             let index = index.as_array();
             let ends = ends.as_array();
+            ensure_equal_lengths("arr", arr.len(), "ends", ends.len())?;
             let matches = matches.as_array();
             let counts = counts.as_array();
+            ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let booleans = booleans.as_array();
+            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
@@ -105,7 +120,9 @@ macro_rules! compute_floats {
                 booleans.into_iter()
             );
             for (current, end, count, boolean) in zipped {
-                let end_ = *end as usize;
+                let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+                    continue;
+                };
                 let current_ = *current as f64;
                 for item in 0..end_ {
                     if (matches[n] == 0) {
@@ -143,7 +160,7 @@ macro_rules! compute_floats {
                 indexers[pos] = *key;
                 result[pos] = *val;
             }
-            (indexers.into_pyarray(py), result.into_pyarray(py))
+            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
 }

@@ -4,6 +4,8 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
+use crate::aggs::ensure_equal_lengths;
+
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
         #[pyfunction]
@@ -14,13 +16,15 @@ macro_rules! compute_ints {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
             length: i64,
-        ) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
         // The macro will expand into the contents of this block.
         {
             let arr = arr.as_array();
             let starts = starts.as_array();
+            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let index = index.as_array();
             let booleans = booleans.as_array();
+            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let end_: usize = index.len();
@@ -43,7 +47,7 @@ macro_rules! compute_ints {
                 indexers[pos] = *key;
                 result[pos] = *val;
             }
-            (indexers.into_pyarray(py), result.into_pyarray(py))
+            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
 }
@@ -67,13 +71,15 @@ macro_rules! compute_floats {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
             length: i64,
-        ) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>
         // The macro will expand into the contents of this block.
         {
             let arr = arr.as_array();
             let starts = starts.as_array();
+            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let index = index.as_array();
             let booleans = booleans.as_array();
+            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
@@ -97,7 +103,7 @@ macro_rules! compute_floats {
                 indexers[pos] = *key;
                 result[pos] = *val;
             }
-            (indexers.into_pyarray(py), result.into_pyarray(py))
+            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
 }

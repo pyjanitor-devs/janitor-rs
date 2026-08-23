@@ -3,7 +3,7 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{checked_index, checked_range, ensure_equal_lengths};
 use std::collections::HashMap;
 
 macro_rules! compute {
@@ -25,9 +25,11 @@ macro_rules! compute {
             let starts = starts.as_array();
             let ends = ends.as_array();
             ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let index = index.as_array();
             let positions = positions.as_array();
             let booleans = booleans.as_array();
+            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
@@ -38,14 +40,14 @@ macro_rules! compute {
                 booleans.into_iter()
             );
             for (posn, (current, start, end, boolean)) in zipped.enumerate() {
-                let start_ = *start as usize;
-                let end_ = *end as usize;
+                let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+                    continue;
+                };
                 for nn in start_..end_ {
-                    let indexer = positions[nn];
-                    if indexer == -1 {
+                    let Some(indexer_) = checked_index(positions[nn], index.len()) else {
                         continue;
-                    }
-                    let pos = index[indexer as usize];
+                    };
+                    let pos = index[indexer_];
                     let base = dictionary.entry(pos).or_insert(-1);
                     let base_val = mapping.entry(pos).or_insert(*current);
                     if *boolean {

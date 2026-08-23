@@ -3,7 +3,7 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{checked_range, ensure_equal_lengths};
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
@@ -22,17 +22,34 @@ macro_rules! generic_compute {
             let starts = starts.as_array();
             let ends = ends.as_array();
             ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
+            ensure_equal_lengths("starts", starts.len(), "counts", counts.as_array().len())?;
             let arr = arr.as_array();
             let counts = counts.as_array();
             let matches = matches.as_array();
             let booleans = booleans.as_array();
-            let mut result = Array1::<i64>::zeros(starts.len());
+            // ELI5: `1`, not `0` -- an empty or rejected range must
+            // preserve product's multiplicative identity, or a bounds
+            // guard would silently change the result for rows it rejects.
+            let mut result = Array1::<i64>::from_elem(starts.len(), 1);
             let zipped = izip!(starts.into_iter(), ends.into_iter(), counts.into_iter());
             let mut n: usize = 0;
             for (pos, (start, end, count)) in zipped.enumerate() {
+                // ELI5 (the guard): `checked_range` rejects a negative,
+                // inverted, or too-large range before it's cast to `usize`;
+                // an unguarded `-1` "no match" sentinel would otherwise
+                // wrap to `usize::MAX` and walk `arr`/`booleans` out of
+                // bounds. A row rejected here never had any of its own
+                // `matches` tape entries, so `n` is left untouched.
+                let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
+                    continue;
+                };
                 let mut total: i64 = 1;
-                let start_ = *start as usize;
-                let end_ = *end as usize;
                 if *count == 0 {
                     let size = end_ - start_;
                     n += size;
@@ -71,17 +88,25 @@ macro_rules! generic_compute_floats {
             let starts = starts.as_array();
             let ends = ends.as_array();
             ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
+            ensure_equal_lengths("starts", starts.len(), "counts", counts.as_array().len())?;
             let arr = arr.as_array();
             let counts = counts.as_array();
             let matches = matches.as_array();
             let booleans = booleans.as_array();
-            let mut result = Array1::<f64>::zeros(starts.len());
+            let mut result = Array1::<f64>::from_elem(starts.len(), 1.0);
             let zipped = izip!(starts.into_iter(), ends.into_iter(), counts.into_iter());
             let mut n: usize = 0;
             for (pos, (start, end, count)) in zipped.enumerate() {
+                let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
+                    continue;
+                };
                 let mut total: f64 = 1.;
-                let start_ = *start as usize;
-                let end_ = *end as usize;
                 if *count == 0 {
                     let size = end_ - start_;
                     n += size;

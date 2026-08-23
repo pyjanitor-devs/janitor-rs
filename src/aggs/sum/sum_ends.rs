@@ -2,6 +2,8 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::ensure_equal_lengths;
+
 fn is_empty_sentinel_end(end: i64) -> bool {
     end == -1
 }
@@ -100,16 +102,22 @@ macro_rules! generic_compute {
             arr: PyReadonlyArray1<'py, $type>,
             ends: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> Bound<'py, PyArray1<i64>>
+        ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
             let result = sum_end_core_with_cast(
                 arr.as_array(),
                 ends.as_array(),
                 booleans.as_array(),
                 |value| value as i64,
             );
-            result.into_pyarray(py)
+            Ok(result.into_pyarray(py))
         }
     };
 }
@@ -122,16 +130,22 @@ macro_rules! generic_compute_floats {
             arr: PyReadonlyArray1<'py, $type>,
             ends: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> Bound<'py, PyArray1<f64>>
+        ) -> PyResult<Bound<'py, PyArray1<f64>>>
         // The macro will expand into the contents of this block.
         {
+            ensure_equal_lengths(
+                "arr",
+                arr.as_array().len(),
+                "booleans",
+                booleans.as_array().len(),
+            )?;
             let result = sum_end_float_core_with_cast(
                 arr.as_array(),
                 ends.as_array(),
                 booleans.as_array(),
                 |value| value as f64,
             );
-            result.into_pyarray(py)
+            Ok(result.into_pyarray(py))
         }
     };
 }

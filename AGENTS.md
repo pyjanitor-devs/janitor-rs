@@ -490,3 +490,81 @@ keeps the validation cost outside the hot loop.
 **Recommendation**: Use the shared `ensure_equal_lengths` helper once at the
 PyO3 boundary and return `PyResult` so mismatches become a normal Python
 `ValueError`. Do not add the comparison inside a row or candidate loop.
+
+### [2026-08-23] Issue #34 resolved by reusing #36's `ensure_equal_lengths`, not a bespoke guard
+
+**Context**: Issue #34's initial fix (this branch, before rebasing onto #36)
+added a separate `booleans_len_ok` predicate that returned each kernel's own
+"nothing computed" value (`-1` for position kernels, `0` for `sum`, and a
+special-cased `1` fill for `prod`'s non-`_matches` shapes, since their
+empty-range identity isn't the zero-initialized default). That special-casing
+was itself a symptom: silently synthesizing a "nothing happened" result for a
+whole-call contract violation forces every family to separately re-derive what
+"nothing" means for its own accumulator.
+**Learning**: `booleans.len() == arr.len()` is the exact same shape of
+whole-call invariant as `starts.len() == ends.len()` (#36) -- `ensure_equal_lengths`
+doesn't care what the two lengths represent, only that a name/length pair
+matches another. Raising `PyValueError` via `?` sidesteps the identity-value
+problem entirely: there is no result to synthesize because the function never
+starts computing one.
+**Recommendation**: Rebase/stack a whole-call-invariant fix on top of any
+sibling fix already adding this kind of shared helper rather than developing
+a parallel one -- check `ensure_equal_lengths` (or its successor) for a name/
+length pair before inventing a new predicate. Call it once in the
+`#[pyfunction]` macro wrapper, before any `_core` function is invoked, not
+inside the `_core` function itself: the `_core` functions stay plain,
+PyO3-free, and directly Rust-testable (`ensure_equal_lengths` is covered by
+its own tests in `aggs::adversarial_bounds_tests`, generically -- there is no
+need to duplicate that coverage per call site or per kernel family).
+
+### [2026-08-23] The `_rev`/`size_rev` families never got #27/#32's per-row range guard
+
+**Context**: Adversarial review of #37 (touching `_rev`/`size_rev` `starts_ends`/
+`positions`/`starts_ends_matches` shapes to add the `starts`/`ends` length
+check) found that every one of those functions casts `start`/`end` straight to
+`usize` and indexes `index[item]` (or, for the `positions` shape, `positions[nn]`
+then `index[indexer as usize]`) with **no** bound against `index.len()` /
+`positions.len()` at all -- not even the `-1`-sentinel handling #27/#32 already
+established for the forward family's identical shapes. Reproduced directly:
+`compute_max_rev_start_end_int64(arr=[5], starts=[0], ends=[5], index=[0],
+booleans=[False], length=1)` panics (`ndarray: index out of bounds`) because
+`ends` is never checked against `index.len()`. Confirmed via `git show
+b6aa541:...` that this predates #33/#36/#37 entirely; #37 just happens to edit
+these exact functions without addressing it, the same way #33's review spun
+out #34 rather than folding it in.
+**Learning**: A negative/sentinel `start` self-protects here (casts to a huge
+`usize`, so `start_..end_` becomes empty -- no panic), but a negative/sentinel
+**`end`** does not: `start_=0, end_=(-1 as usize)` produces `0..usize::MAX`,
+which panics on `index[0]` almost immediately. This is the crate's own
+documented `-1`-sentinel-before-cast gotcha (see the entry above about
+`sum_end_core`/`sum_start_end_core`/`compare_start_end_core`), just
+rediscovered in a family that never got the fix. A whole-call min/max scan
+over `ends` can't safely replace `checked_range` here for the same reason --
+it would have to reimplement the same signed-before-cast check to be sound,
+while losing the ability to skip one bad row and still compute the valid
+ones.
+**Recommendation**: Fixed by reusing `checked_range(*start, *end, index.len())`
+(or `positions.len()` for the `positions` shape, plus `checked_index` for the
+`positions[nn]` -> `index[..]` indirection) exactly as the forward family
+already does, skipping the row (no `n` advancement, matching "a row rejected
+here never had any of its own tape entries") rather than failing the whole
+call -- this is a per-row bound, not a whole-call one, so `ensure_equal_lengths`
+cannot substitute for it. Also extended the equal-length checks in these same
+functions to cover `arr`/`starts`/`ends`/`booleans` (and `counts`, where
+present) as one mutually-consistent set, not just the `starts`/`ends` pair
+#37 added -- `izip!` over all of them would otherwise silently truncate on a
+mismatch, the exact #36 failure shape. While in the file, also found and fixed
+`compute_size_rev_end`/`compute_size_rev_start` sizing their output arrays
+from the `length` parameter (a capacity hint) instead of `dictionary.len()`
+like every sibling function -- an independent bug (an out-of-bounds *write*,
+not a read) that a naive fix to only the read side would have left live.
+`_rev`/`size_rev` functions have no extracted `_core` functions and no
+existing `Python::attach`-based test scaffolding; validated this fix
+end-to-end via `maturin develop` plus a Python script instead, per the
+"Kernels not yet extracted..." guidance above -- adding that scaffolding from
+scratch is a larger, separate undertaking, not part of this fix.
+**Follow-up**: The `_rev`/*_no_range.rs` shape (`arr[*index_left as usize]`,
+`booleans[*index_left as usize]`, indexed directly by caller-supplied
+`left_index`/`right_index` values with no bound check at all) has the same
+underlying problem but a different fix shape -- filed separately rather than
+folded in here.
