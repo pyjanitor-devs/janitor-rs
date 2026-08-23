@@ -41,11 +41,11 @@ macro_rules! compute {
                 booleans.into_iter()
             );
             for (posn, (current, end, count, boolean)) in zipped.enumerate() {
-                // ELI5 (the guard): same reasoning as `min_ends.rs` -- `end`
-                // indexes into `index`, not `arr`, and a row rejected here
-                // never had any of its own `matches` tape entries (the
-                // caller only emits entries for rows it already knows are
-                // valid), so `n` is left untouched. See issue #34.
+                // ELI5 (the guard): `matches` is one long row-by-row list of
+                // yes/no flags, one flag for each candidate position. `end`
+                // indexes into `index`, not `arr`; an invalid row contributes
+                // zero candidate positions, so it contributes zero tape
+                // entries and leaves `n` untouched. See issue #34.
                 let Some((_, end_)) = checked_range(0, *end, index.len()) else {
                     continue;
                 };
