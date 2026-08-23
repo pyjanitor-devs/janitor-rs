@@ -174,6 +174,25 @@ pub fn compute_sum_start_uint32<'py>(
     sum_start_u32_core(arr.as_array(), starts.as_array(), booleans.as_array()).into_pyarray(py)
 }
 
+/// Registers this file's dtype-specialized Python exports.
+///
+/// ELI5: this file owns a short guest list for just its own exported
+/// functions, instead of a central file trying to track every
+/// department's exports itself.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(compute_sum_start_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_sum_start_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_sum_start_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_sum_start_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_sum_start_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_sum_start_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_sum_start_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_sum_start_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_sum_start_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_sum_start_f64, m)?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -74,3 +74,22 @@ bin_search!(binary_search_gt_first_uint16, u16);
 bin_search!(binary_search_gt_first_uint8, u8);
 bin_search!(binary_search_gt_first_f64, f64);
 bin_search!(binary_search_gt_first_f32, f32);
+
+/// Registers this file's dtype-specialized Python exports.
+///
+/// ELI5: this file owns a short guest list for just its own exported
+/// functions, instead of a central file trying to track every
+/// department's exports itself.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(binary_search_gt_first_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(binary_search_gt_first_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(binary_search_gt_first_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(binary_search_gt_first_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(binary_search_gt_first_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(binary_search_gt_first_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(binary_search_gt_first_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(binary_search_gt_first_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(binary_search_gt_first_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(binary_search_gt_first_f64, m)?)?;
+    Ok(())
+}

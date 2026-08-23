@@ -66,3 +66,22 @@ generic_compare!(compare_first_end_uint16, u16);
 generic_compare!(compare_first_end_uint8, u8);
 generic_compare!(compare_first_end_f64, f64);
 generic_compare!(compare_first_end_f32, f32);
+
+/// Registers this file's dtype-specialized Python exports.
+///
+/// ELI5: this file owns a short guest list for just its own exported
+/// functions, instead of a central file trying to track every
+/// department's exports itself.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(compare_first_end_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(compare_first_end_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(compare_first_end_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(compare_first_end_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(compare_first_end_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(compare_first_end_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(compare_first_end_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(compare_first_end_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(compare_first_end_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(compare_first_end_f64, m)?)?;
+    Ok(())
+}

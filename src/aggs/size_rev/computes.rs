@@ -307,3 +307,19 @@ pub fn compute_size_rev_positions<'py>(
     }
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
+
+/// Registers this file's dtype-specialized Python exports.
+///
+/// ELI5: this file owns a short guest list for just its own exported
+/// functions, instead of a central file trying to track every
+/// department's exports itself.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(compute_size_rev_start, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_size_rev_end, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_size_rev_positions, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_size_rev_start_matches, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_size_rev_end_matches, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_size_rev_start_end, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_size_rev_start_end_matches, m)?)?;
+    Ok(())
+}
