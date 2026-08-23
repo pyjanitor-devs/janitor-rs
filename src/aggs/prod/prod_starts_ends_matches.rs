@@ -3,7 +3,7 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths};
+use crate::aggs::{checked_range, ensure_equal_lengths, ensure_tape_width};
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
@@ -33,6 +33,16 @@ macro_rules! generic_compute {
             let counts = counts.as_array();
             let matches = matches.as_array();
             let booleans = booleans.as_array();
+            // ELI5: `matches[n]` advances once per candidate position, summed
+            // across every row -- not comparable to any single array's length.
+            // Total that width up front and check it against `matches.len()`
+            // here, before the loop below ever indexes into the tape.
+            let expected_matches_width: usize = starts
+                .iter()
+                .zip(ends.iter())
+                .filter_map(|(s, e)| checked_range(*s, *e, arr.len()).map(|(s_, e_)| e_ - s_))
+                .sum();
+            ensure_tape_width(expected_matches_width, matches.len())?;
             // ELI5: `1`, not `0` -- an empty or rejected range must
             // preserve product's multiplicative identity, or a bounds
             // guard would silently change the result for rows it rejects.
@@ -99,6 +109,16 @@ macro_rules! generic_compute_floats {
             let counts = counts.as_array();
             let matches = matches.as_array();
             let booleans = booleans.as_array();
+            // ELI5: `matches[n]` advances once per candidate position, summed
+            // across every row -- not comparable to any single array's length.
+            // Total that width up front and check it against `matches.len()`
+            // here, before the loop below ever indexes into the tape.
+            let expected_matches_width: usize = starts
+                .iter()
+                .zip(ends.iter())
+                .filter_map(|(s, e)| checked_range(*s, *e, arr.len()).map(|(s_, e_)| e_ - s_))
+                .sum();
+            ensure_tape_width(expected_matches_width, matches.len())?;
             let mut result = Array1::<f64>::from_elem(starts.len(), 1.0);
             let zipped = izip!(starts.into_iter(), ends.into_iter(), counts.into_iter());
             let mut n: usize = 0;

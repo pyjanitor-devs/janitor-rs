@@ -4,7 +4,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-use crate::aggs::{checked_range, ensure_equal_lengths};
+use crate::aggs::{checked_range, ensure_equal_lengths, ensure_tape_width};
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
@@ -30,6 +30,15 @@ macro_rules! compute_ints {
             ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
+            // ELI5: `matches[n]` advances once per candidate position, summed
+            // across every row -- not comparable to any single array's length.
+            // Total that width up front and check it against `matches.len()`
+            // here, before the loop below ever indexes into the tape.
+            let expected_matches_width: usize = ends
+                .iter()
+                .filter_map(|e| checked_range(0, *e, index.len()).map(|(_, e_)| e_))
+                .sum();
+            ensure_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let mut n: usize = 0;
@@ -40,11 +49,18 @@ macro_rules! compute_ints {
                 booleans.into_iter()
             );
             for (current, end, count, boolean) in zipped {
-                // ELI5 (the guard): `matches` is one long row-by-row list of
-                // yes/no flags, one flag for each candidate position. `end`
-                // indexes into `index`, not `arr`; an invalid row contributes
-                // zero candidate positions, so it contributes zero tape
-                // entries and leaves `n` untouched. See issue #34.
+                // ELI5 (the guard): `end` indexes into `index`, not `arr`.
+                // Unlike the dual-bound `_starts_ends` shape, this single-
+                // bound producer (`src/compare/comp_ends.rs`) has no
+                // invalid-row concept of its own -- every `end` reaching
+                // here is already guaranteed `1 <= end <= index.len()`
+                // because `bin_search_lt_first`/`bin_search_gt_first` drop
+                // zero-match rows before `ends` is ever built. This
+                // `checked_range` is defense in depth against that
+                // cross-module invariant breaking, not a condition the
+                // real pyjanitor call path can trigger; see issue #40 for
+                // the full trace and issue #41 for the tape-width check
+                // above, which is what actually guards `matches[n]`.
                 let Some((_, end_)) = checked_range(0, *end, index.len()) else {
                     continue;
                 };
@@ -109,6 +125,15 @@ macro_rules! compute_floats {
             ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
+            // ELI5: `matches[n]` advances once per candidate position, summed
+            // across every row -- not comparable to any single array's length.
+            // Total that width up front and check it against `matches.len()`
+            // here, before the loop below ever indexes into the tape.
+            let expected_matches_width: usize = ends
+                .iter()
+                .filter_map(|e| checked_range(0, *e, index.len()).map(|(_, e_)| e_))
+                .sum();
+            ensure_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let mut n: usize = 0;

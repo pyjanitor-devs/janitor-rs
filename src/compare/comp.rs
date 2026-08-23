@@ -3,6 +3,8 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::ensure_tape_width;
+
 /// ELI5: instead of writing six near-identical functions for `>`, `>=`,
 /// `<`, `<=`, `==`, `!=`, we pass a small numeric code for "which sign to
 /// use" and look it up once here.
@@ -99,20 +101,34 @@ macro_rules! generic_compare {
             ends: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             op: i8,
-        ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
+        ) -> PyResult<(Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64)> {
+            let starts_view = starts.as_array();
+            let ends_view = ends.as_array();
+            // ELI5: mirrors `compare_start_end_core`'s own row-rejection
+            // condition exactly (`start`/`end` sentinel or inverted range),
+            // not `checked_range`'s -- the core here never bounds `end`
+            // against `right.len()`, so reusing `checked_range` would
+            // under-count the width a too-large `end` actually walks.
+            let expected_matches_width: usize = starts_view
+                .iter()
+                .zip(ends_view.iter())
+                .filter(|(s, e)| **s != -1 && **e != -1 && **s < **e)
+                .map(|(s, e)| (*e as usize) - (*s as usize))
+                .sum();
+            ensure_tape_width(expected_matches_width, matches.as_array().len())?;
             let (result, counts_array, total) = compare_start_end_core(
                 left.as_array(),
                 right.as_array(),
-                starts.as_array(),
-                ends.as_array(),
+                starts_view,
+                ends_view,
                 matches.as_array(),
                 op,
             );
-            (
+            Ok((
                 result.into_pyarray(py),
                 counts_array.into_pyarray(py),
                 total,
-            )
+            ))
         }
     };
 }

@@ -4,7 +4,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{ensure_equal_lengths, ensure_tape_width};
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
@@ -33,6 +33,12 @@ macro_rules! compute_ints {
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let end_: usize = index.len();
+            // ELI5: `matches[n]` advances once per candidate position, summed
+            // across every row -- not comparable to any single array's length.
+            // Total that width up front and check it against `matches.len()`
+            // here, before the loop below ever indexes into the tape.
+            let expected_matches_width: usize = starts.iter().map(|s| end_ - (*s as usize)).sum();
+            ensure_tape_width(expected_matches_width, matches.len())?;
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -113,6 +119,12 @@ macro_rules! compute_floats {
             );
             let mut n: usize = 0;
             let end_: usize = index.len();
+            // ELI5: `matches[n]` advances once per candidate position, summed
+            // across every row -- not comparable to any single array's length.
+            // Total that width up front and check it against `matches.len()`
+            // here, before the loop below ever indexes into the tape.
+            let expected_matches_width: usize = starts.iter().map(|s| end_ - (*s as usize)).sum();
+            ensure_tape_width(expected_matches_width, matches.len())?;
             for (current, start, count, boolean) in zipped {
                 let start_ = *start as usize;
                 let current_ = *current as f64;
