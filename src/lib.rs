@@ -82,4 +82,47 @@ mod registration_tests {
             }
         });
     }
+
+    /// Total `m.add_function(...)` call count across every family's
+    /// `register`, as of this PR (884 dtype-specialized exports across 89
+    /// leaf modules). Bump this alongside any PR that intentionally adds
+    /// or removes an export.
+    const EXPECTED_EXPORT_COUNT: usize = 884;
+
+    /// ELI5: the representative-export test above only proves each
+    /// department's guest list reports up the chain at all -- it would
+    /// still pass even if one department quietly dropped a single guest
+    /// from an otherwise-still-reporting list. This test instead counts
+    /// heads: every dunder-free (non-`__x__`) name on a freshly registered
+    /// module must be one of our own exports (Python/PyO3 module
+    /// machinery -- `__name__`, `__all__`, etc. -- all use `__`-wrapped
+    /// names), so counting just those catches a missing or duplicate
+    /// export without spelling out all 884 names here.
+    #[test]
+    fn total_registered_export_count_matches_expected() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "janitor_rs_export_count_test")
+                .expect("module creation must not fail");
+            janitor_rs(&module).expect("registration must not fail");
+
+            let export_count = module
+                .dir()
+                .expect("dir() must not fail")
+                .iter()
+                .filter(|name| {
+                    let name = name.to_string();
+                    !(name.starts_with("__") && name.ends_with("__"))
+                })
+                .count();
+
+            assert_eq!(
+                export_count, EXPECTED_EXPORT_COUNT,
+                "expected exactly {EXPECTED_EXPORT_COUNT} registered exports; got \
+                 {export_count}. If this PR intentionally added or removed an export, update \
+                 EXPECTED_EXPORT_COUNT to match -- otherwise a register() call went missing \
+                 somewhere in the chain."
+            );
+        });
+    }
 }
