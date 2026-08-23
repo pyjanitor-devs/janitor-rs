@@ -4,7 +4,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{ensure_equal_lengths, ensure_tape_width};
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
@@ -30,9 +30,18 @@ macro_rules! compute_ints {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
+            let end_: usize = index.len();
+            // ELI5: `matches[n]` advances once per candidate position, summed
+            // across every row -- not comparable to any single array's length.
+            // Total that width up front and check it against `matches.len()`
+            // here, before the loop below ever indexes into the tape.
+            let expected_matches_width: usize = starts
+                .iter()
+                .map(|s| end_.saturating_sub(*s as usize))
+                .sum();
+            ensure_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-            let end_: usize = index.len();
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -103,6 +112,16 @@ macro_rules! compute_floats {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
+            let end_: usize = index.len();
+            // ELI5: `matches[n]` advances once per candidate position, summed
+            // across every row -- not comparable to any single array's length.
+            // Total that width up front and check it against `matches.len()`
+            // here, before the loop below ever indexes into the tape.
+            let expected_matches_width: usize = starts
+                .iter()
+                .map(|s| end_.saturating_sub(*s as usize))
+                .sum();
+            ensure_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
@@ -113,7 +132,6 @@ macro_rules! compute_floats {
                 booleans.into_iter()
             );
             let mut n: usize = 0;
-            let end_: usize = index.len();
             for (current, start, count, boolean) in zipped {
                 let start_ = *start as usize;
                 let current_ = *current as f64;

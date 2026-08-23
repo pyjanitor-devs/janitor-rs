@@ -568,3 +568,91 @@ scratch is a larger, separate undertaking, not part of this fix.
 `left_index`/`right_index` values with no bound check at all) has the same
 underlying problem but a different fix shape -- filed separately rather than
 folded in here.
+
+### [2026-08-23] Issues #40/#41: a flat `matches` tape needs a whole-call width check, not a per-row one
+
+**Context**: Every kernel that consumes a flat "match tape" (`matches:
+ArrayView1<i8>`, one entry per candidate position across *every* row
+combined) indexed it as `matches[n]` with no check that `matches.len()`
+was actually large enough for the total tape width every row's
+`(start, end)`/`(0, end)`/`(start, len)` range implies -- 43 call sites
+across 27 files (24 aggregation `_matches` files, `comp.rs`,
+`index_builder.rs`'s 9 `matches`-consuming functions, and 3
+`size_rev/computes.rs` functions). `ensure_equal_lengths` (#34/#36) can't
+substitute: `matches.len()` isn't comparable to any *single* other array's
+length, only to the **sum of every row's own interval width**, which isn't
+known until every row has been looked at.
+**Learning**: The fix shape is neither `ensure_equal_lengths` nor
+`checked_range`/`checked_index` alone -- it's a new helper,
+`ensure_tape_width(expected_width, matches_len)`, fed a *pre-computed sum*.
+Each call site sums its own rows' widths with a small pre-pass that
+mirrors whatever per-row rejection that call site's main loop already
+applies (`checked_range`'s `Some`/`None`, `checked_index`, or no rejection
+at all where the loop has none) -- a row that contributes zero tape
+entries in the main loop must also contribute zero to the pre-pass sum, or
+the check would reject calls the main loop actually handles fine.
+`index_builder.rs`'s 9 functions had no `PyResult` return type or
+`ensure_equal_lengths` at all before this fix (unlike every aggregation
+family), so adding the check there also meant converting
+`Bound<'py, PyArray1<i64>>` returns to `PyResult<Bound<'py, PyArray1<i64>>>`
+-- a pure win for callers (panic becomes catchable `ValueError`) since
+PyO3's calling convention is unchanged on the success path.
+**Learning (perf)**: measured the pre-pass in isolation (`Instant`-timed,
+not committed as a permanent bench) at 1K/200K/2M rows: ~0.5-0.75 ns/row,
+constant per-row cost across three orders of magnitude -- i.e. genuinely
+`O(rows)`, not accidentally `O(rows^2)`. At 2M rows/10M tape entries it
+cost under 1ms against an 8.6ms full `index_starts_and_ends` call (the
+fastest affected function, no `HashMap`) and 663ms for a `HashMap`-based
+`_rev` aggregation -- negligible next to pre-existing work in every case.
+**Learning (docs)**: `#40` found the ELI5 comment borrowed onto the
+single-bound `_ends_matches` `_rev` guard ("a row rejected here never had
+any of its own tape entries... See issue #34") was wrong for that shape --
+it's accurate for the dual-bound `_starts_ends` shape (whose own producer,
+`compare_start_end_core`, really does have an invalid-row concept), but
+the single-bound producers (`comp_ends.rs`/`comp_starts.rs`) have none;
+what actually keeps `n` aligned there is `bin_search_gt_first`/
+`bin_search_lt_first` dropping zero-match rows before `ends`/`starts` is
+ever built, a cross-module invariant the local `checked_range` call is
+defense-in-depth for, not a condition the real call path can trigger.
+Fixed the comment in the 4 confirmed `_rev`/`*_ends_matches.rs` files
+(`sum_rev`, `max_rev`, `min_rev`, `prod_rev`) to describe that mechanism
+instead. Left the equivalent forward (`max`/`min`) comments alone -- they
+already attribute correctness to "the caller only emits entries for rows
+it already knows are valid" rather than claiming a local invalid-row
+concept, so they weren't actually wrong.
+**Recommendation**: When a new kernel consumes a flat multi-row tape
+indexed by a running cursor, validate the *total* expected cursor
+advancement against the tape's length once, before the loop -- not by
+bounds-checking the cursor inline on every iteration (which either panics
+or needs its own per-element error path) and not by comparing the tape's
+length to any single row-count-shaped array (wrong shape of check, per
+`ensure_tape_width`'s own doc comment). Reuse `ensure_tape_width`.
+
+**Follow-up (review of PR #43)**: 19 of the pre-pass sums above computed a
+row's width as plain `end - start` (or `end_ - start_`) for the *unguarded*
+shapes -- the ones whose main loop has no `checked_range`/`checked_index`
+call at all, just a raw `for x in start_..end_`. That's unsafe: the `-1`
+"no match" sentinel (or any `start` past `end`) casts to a huge `usize`,
+and unlike a real `Range<usize>` -- whose element count is `end.saturating_
+sub(start)`, i.e. simply `0` when `start >= end`, not a panic or a wrapped
+value -- plain `usize` subtraction either panics (debug) or silently wraps
+to a huge, wrong width (release). Confirmed via
+`janitor_rs.index_starts_only(index=[10,20], starts=[-1,1],
+matches=[1], length=1)`: the valid second row needs 1 tape entry, but the
+wrapped width from row 0 made the precheck demand 4, rejecting an
+otherwise-correct call. **Fixed** by replacing every such formula with
+`.saturating_sub(...)`, which is provably identical to the main loop's own
+`Range<usize>` element count for *any* input, sentinel or not -- not with
+`checked_range`/`checked_index` (the reviewer's suggested fix), since the
+unguarded main loops don't validate `start`/`end` against anything either;
+reusing those helpers would silently add validation the existing loop
+never had, a bigger behavior change than the bug needs. The 3 *guarded*
+shapes that already `filter_map`/`filter` through `checked_range` before
+subtracting (`comp.rs`, and any `_starts_ends_matches`/`_ends_matches`
+file using it) were never affected -- the filter already excludes exactly
+the rows that would underflow. **Recommendation**: when a pre-pass formula
+mirrors a `for x in a..b` loop that has no explicit bounds guard, use
+`b.saturating_sub(a)`, never plain `b - a` -- it is the actual definition
+of a `Range<usize>`'s length and the only way to match unguarded-loop
+semantics for every possible input, including cast-from-negative
+sentinels.

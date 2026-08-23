@@ -61,6 +61,29 @@ pub(crate) fn checked_range(start: i64, end: i64, len: usize) -> Option<(usize, 
     (start < end).then_some((start, end))
 }
 
+/// Reject a flat `matches` tape too short for the candidate positions every
+/// row's `(start, end)` range implies it must cover.
+///
+/// ELI5: unlike `ensure_equal_lengths`, `matches.len()` isn't compared
+/// against any *single* other array's length -- it has to be at least the
+/// **sum of every row's own interval width**, which isn't known until every
+/// row has been looked at. Callers sum that total themselves (respecting
+/// whatever per-row rejection -- `checked_range`/`checked_index`/no
+/// rejection at all -- their own loop already applies, so a row that
+/// contributes zero tape entries in the main loop also contributes zero
+/// here) and hand it to this helper as `expected_width`, once, before the
+/// loop that actually indexes `matches[n]`. A `matches` tape *longer* than
+/// needed is harmless (unused trailing entries) and not rejected here --
+/// only a too-short one, which is what walks `n` past `matches.len()`.
+pub(crate) fn ensure_tape_width(expected_width: usize, matches_len: usize) -> PyResult<()> {
+    if expected_width <= matches_len {
+        return Ok(());
+    }
+    Err(PyValueError::new_err(format!(
+        "matches must have length at least {expected_width} to cover every candidate position; got {matches_len}"
+    )))
+}
+
 /// Shared function-pointer shape for the `_positions` family's `#[cfg(test)]`
 /// dtype-signature checks, parameterized over the input element type `T`
 /// and the (already-fixed-per-macro) result element type `R`.
@@ -91,6 +114,7 @@ mod adversarial_bounds_tests {
     use pyo3::Python;
 
     use super::ensure_equal_lengths;
+    use super::ensure_tape_width;
     use super::max::max_ends::max_end_core;
     use super::max::max_ends_matches::max_end_match_core;
     use super::max::max_positions::max_positions_core;
@@ -128,6 +152,27 @@ mod adversarial_bounds_tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn tape_width_validation_accepts_exact_and_longer_tapes() {
+        assert!(ensure_tape_width(0, 0).is_ok());
+        assert!(ensure_tape_width(5, 5).is_ok());
+        assert!(ensure_tape_width(5, 8).is_ok()); // longer than needed is fine
+    }
+
+    #[test]
+    fn tape_width_validation_rejects_a_too_short_tape() {
+        Python::initialize();
+        let error = ensure_tape_width(5, 4)
+            .expect_err("a matches tape shorter than the total candidate width must be rejected");
+        Python::attach(|py| {
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                error.value(py).to_string(),
+                "matches must have length at least 5 to cover every candidate position; got 4"
+            );
+        });
     }
 
     #[test]
@@ -190,6 +235,156 @@ mod adversarial_bounds_tests {
                 assert!(error.is_instance_of::<PyValueError>(py));
                 assert_eq!(error.value(py).to_string(), expected);
             }
+        });
+    }
+
+    #[test]
+    fn representative_python_wrappers_reject_a_too_short_matches_tape() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+
+            // issue #41's own repro: a single row whose candidate range is
+            // [0, 5), against a `matches` tape only 1 wide. Before the fix
+            // this panicked (`pyo3_runtime.PanicException: index out of
+            // bounds`) instead of raising a catchable Python exception.
+            let arr = PyArray1::from_vec(py, vec![1_i64, 2, 3, 4, 5]);
+            let ends = PyArray1::from_vec(py, vec![5_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64]);
+            let matches = PyArray1::from_vec(py, vec![1_i8]);
+            let booleans = PyArray1::from_vec(py, vec![false; 5]);
+            let error = super::max::max_ends_matches::compute_max_end_match_int64(
+                py,
+                arr.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .expect_err("a matches tape shorter than the candidate range must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                error.value(py).to_string(),
+                "matches must have length at least 5 to cover every candidate position; got 1"
+            );
+
+            // Same shape of bug, unguarded single-bound family (no
+            // `checked_range` at all -- `sum`/`prod` forward `_ends_matches`
+            // never validated `end` against anything before this fix).
+            let arr = PyArray1::from_vec(py, vec![1_i64, 2, 3, 4, 5]);
+            let ends = PyArray1::from_vec(py, vec![5_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64]);
+            let matches = PyArray1::from_vec(py, vec![1_i8]);
+            let booleans = PyArray1::from_vec(py, vec![false; 5]);
+            let error = super::sum::sum_ends_matches::compute_sum_end_match_int64(
+                py,
+                arr.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .expect_err("a matches tape shorter than the candidate range must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                error.value(py).to_string(),
+                "matches must have length at least 5 to cover every candidate position; got 1"
+            );
+
+            // `index_builder.rs`'s 9 functions had no `matches` length
+            // check at all -- not even one comparable to `ensure_equal_lengths`.
+            let index = PyArray1::from_vec(py, vec![0_i64, 1, 2, 3, 4]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![5_i64]);
+            let matches = PyArray1::from_vec(py, vec![1_i8]);
+            let error = crate::index_builder::index_starts_and_ends(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                matches.readonly(),
+                5,
+            )
+            .expect_err("a matches tape shorter than the candidate range must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                error.value(py).to_string(),
+                "matches must have length at least 5 to cover every candidate position; got 1"
+            );
+
+            // A tape at least as long as the total candidate width must
+            // still succeed -- this fix only rejects too-short tapes.
+            let arr = PyArray1::from_vec(py, vec![1_i64, 9, 4]);
+            let ends = PyArray1::from_vec(py, vec![3_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1, 1]);
+            let booleans = PyArray1::from_vec(py, vec![false; 3]);
+            super::max::max_ends_matches::compute_max_end_match_int64(
+                py,
+                arr.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .expect("an exactly-sized matches tape must not be rejected");
+        });
+    }
+
+    #[test]
+    fn tape_width_precheck_does_not_underflow_on_a_sentinel_or_inverted_row() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+
+            // Regression for a bug in the initial #40/#41 fix: several
+            // `expected_matches_width` pre-passes summed `end - start`
+            // directly. The `-1` "no match" sentinel (or any `start` past
+            // `end`) casts to a huge `usize`, and unlike the main loop's
+            // `start_..end` range -- which is simply empty when
+            // `start_ >= end`, contributing zero tape entries -- plain
+            // subtraction on `usize` either panics (debug) or wraps to a
+            // huge, wrong width (release), which then made a perfectly
+            // valid call to `index_starts_only` spuriously reject a
+            // correctly-sized `matches` tape.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20]);
+            let starts = PyArray1::from_vec(py, vec![-1_i64, 1]);
+            let matches = PyArray1::from_vec(py, vec![1_i8]);
+            let result = crate::index_builder::index_starts_only(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("a sentinel-start row must contribute zero width, not underflow");
+            let got: Vec<i64> = result.readonly().as_array().to_vec();
+            assert_eq!(got, vec![20]);
+
+            // Same underflow shape, dual-bound family: an inverted
+            // `(start, end)` row (`start > end`, no `-1` sentinel
+            // involved) must also contribute zero, not a wrapped width.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
+            let starts = PyArray1::from_vec(py, vec![2_i64, 0]);
+            let ends = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1]);
+            let result = crate::index_builder::index_starts_and_ends(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                matches.readonly(),
+                2,
+            )
+            .expect("an inverted start>end row must contribute zero width, not underflow");
+            let got: Vec<i64> = result.readonly().as_array().to_vec();
+            assert_eq!(got, vec![10, 20]);
         });
     }
 

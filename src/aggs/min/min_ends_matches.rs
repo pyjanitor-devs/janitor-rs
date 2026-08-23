@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 
 use crate::aggs::checked_range;
 use crate::aggs::ensure_equal_lengths;
+use crate::aggs::ensure_tape_width;
 
 /// For every `ends[i]`, find the position (not the value) of the
 /// smallest element in `arr[..ends[i]]` among positions the caller has
@@ -79,6 +80,16 @@ macro_rules! generic_compute {
                 "booleans",
                 booleans.as_array().len(),
             )?;
+            // ELI5: `matches[n]` advances once per candidate position, summed
+            // across every row -- not comparable to any single array's length.
+            // Total that width up front and check it against `matches.len()`
+            // here, before the loop below ever indexes into the tape.
+            let expected_matches_width: usize = ends
+                .as_array()
+                .iter()
+                .filter_map(|e| checked_range(0, *e, arr.as_array().len()).map(|(_, e_)| e_))
+                .sum();
+            ensure_tape_width(expected_matches_width, matches.as_array().len())?;
             let result = min_end_match_core(
                 arr.as_array(),
                 ends.as_array(),

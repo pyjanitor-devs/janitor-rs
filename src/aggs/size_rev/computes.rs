@@ -3,7 +3,9 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-use crate::aggs::{checked_end, checked_index, checked_range, ensure_equal_lengths};
+use crate::aggs::{
+    checked_end, checked_index, checked_range, ensure_equal_lengths, ensure_tape_width,
+};
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
 
@@ -92,6 +94,15 @@ pub fn compute_size_rev_end_matches<'py>(
     let ends = ends.as_array();
     let index = index.as_array();
     let matches = matches.as_array();
+    // ELI5: `matches[n]` advances once per candidate position, summed
+    // across every row -- not comparable to any single array's length.
+    // Total that width up front and check it against `matches.len()`
+    // here, before the loop below ever indexes into the tape.
+    let expected_matches_width: usize = ends
+        .iter()
+        .filter_map(|e| checked_end(*e, index.len()))
+        .sum();
+    ensure_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
     let start_: usize = 0_usize;
@@ -128,13 +139,22 @@ pub fn compute_size_rev_start_matches<'py>(
     index: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
     length: i64,
-) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>) {
+) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let index = index.as_array();
     let matches = matches.as_array();
+    let end_: usize = index.len();
+    // ELI5: `matches[n]` advances once per candidate position, summed
+    // across every row -- not comparable to any single array's length.
+    // Total that width up front and check it against `matches.len()`
+    // here, before the loop below ever indexes into the tape.
+    let expected_matches_width: usize = starts
+        .iter()
+        .map(|s| end_.saturating_sub(*s as usize))
+        .sum();
+    ensure_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-    let end_: usize = index.len();
     let mut n: usize = 0;
     for start in starts.into_iter() {
         let start_ = *start as usize;
@@ -156,7 +176,7 @@ pub fn compute_size_rev_start_matches<'py>(
         indexers[pos] = *key;
         result[pos] = *val;
     }
-    (indexers.into_pyarray(py), result.into_pyarray(py))
+    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
 #[pyfunction]
@@ -173,6 +193,16 @@ pub fn compute_size_rev_start_end_matches<'py>(
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let matches = matches.as_array();
+    // ELI5: `matches[n]` advances once per candidate position, summed
+    // across every row -- not comparable to any single array's length.
+    // Total that width up front and check it against `matches.len()`
+    // here, before the loop below ever indexes into the tape.
+    let expected_matches_width: usize = starts
+        .iter()
+        .zip(ends.iter())
+        .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
+        .sum();
+    ensure_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
     let mut n: usize = 0;

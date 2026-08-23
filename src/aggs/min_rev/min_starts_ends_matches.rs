@@ -3,7 +3,7 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths};
+use crate::aggs::{checked_range, ensure_equal_lengths, ensure_tape_width};
 use std::collections::HashMap;
 
 macro_rules! compute {
@@ -33,6 +33,16 @@ macro_rules! compute {
             let matches = matches.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
+            // ELI5: `matches[n]` advances once per candidate position, summed
+            // across every row -- not comparable to any single array's length.
+            // Total that width up front and check it against `matches.len()`
+            // here, before the loop below ever indexes into the tape.
+            let expected_matches_width: usize = starts
+                .iter()
+                .zip(ends.iter())
+                .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
+                .sum();
+            ensure_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);

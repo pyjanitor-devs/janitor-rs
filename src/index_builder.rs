@@ -3,6 +3,8 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::ensure_tape_width;
+
 /// Replicates `numpy.repeat(index, counts)`: emit `index[i]`, `counts[i]`
 /// times, for every `i`, back to back.
 ///
@@ -116,15 +118,22 @@ pub fn index_starts_only<'py>(
     starts: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let index = index.as_array();
     let starts = starts.as_array();
     let matches = matches.as_array();
+    let end: usize = index.len();
+    // ELI5: `matches[n]` advances once per candidate position, summed
+    // across every row -- not comparable to any single array's length.
+    // Total that width up front and check it against `matches.len()`
+    // here, before the loop below ever indexes into the tape.
+    let expected_matches_width: usize =
+        starts.iter().map(|s| end.saturating_sub(*s as usize)).sum();
+    ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    let end: usize = index.len();
     for start in starts.into_iter() {
         if pos == length as usize {
             break;
@@ -141,7 +150,7 @@ pub fn index_starts_only<'py>(
             n += 1;
         }
     }
-    result.into_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -153,16 +162,23 @@ pub fn index_starts_only_keep_first<'py>(
     counts: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let index = index.as_array();
     let starts = starts.as_array();
     let counts = counts.as_array();
     let matches = matches.as_array();
+    let end: usize = index.len();
+    // ELI5: `matches[n]` advances once per candidate position, summed
+    // across every row -- not comparable to any single array's length.
+    // Total that width up front and check it against `matches.len()`
+    // here, before the loop below ever indexes into the tape.
+    let expected_matches_width: usize =
+        starts.iter().map(|s| end.saturating_sub(*s as usize)).sum();
+    ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    let end: usize = index.len();
     let zipped = starts.into_iter().zip(counts);
     for (start, count_) in zipped {
         let start_: usize = *start as usize;
@@ -189,7 +205,7 @@ pub fn index_starts_only_keep_first<'py>(
         result[pos] = base;
         pos += 1
     }
-    result.into_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -201,16 +217,23 @@ pub fn index_starts_only_keep_last<'py>(
     counts: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let index = index.as_array();
     let starts = starts.as_array();
     let counts = counts.as_array();
     let matches = matches.as_array();
+    let end: usize = index.len();
+    // ELI5: `matches[n]` advances once per candidate position, summed
+    // across every row -- not comparable to any single array's length.
+    // Total that width up front and check it against `matches.len()`
+    // here, before the loop below ever indexes into the tape.
+    let expected_matches_width: usize =
+        starts.iter().map(|s| end.saturating_sub(*s as usize)).sum();
+    ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    let end: usize = index.len();
     for (start, count) in starts.into_iter().zip(counts) {
         let start_: usize = *start as usize;
         if *count == 0 {
@@ -236,7 +259,7 @@ pub fn index_starts_only_keep_last<'py>(
         result[pos] = base;
         pos += 1
     }
-    result.into_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -247,10 +270,16 @@ pub fn index_ends_only<'py>(
     ends: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let index = index.as_array();
     let ends = ends.as_array();
     let matches = matches.as_array();
+    // ELI5: `matches[n]` advances once per candidate position, summed
+    // across every row -- not comparable to any single array's length.
+    // Total that width up front and check it against `matches.len()`
+    // here, before the loop below ever indexes into the tape.
+    let expected_matches_width: usize = ends.iter().map(|e| *e as usize).sum();
+    ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
@@ -271,7 +300,7 @@ pub fn index_ends_only<'py>(
             n += 1;
         }
     }
-    result.into_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -283,11 +312,17 @@ pub fn index_ends_only_keep_first<'py>(
     counts: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let index = index.as_array();
     let ends = ends.as_array();
     let counts = counts.as_array();
     let matches = matches.as_array();
+    // ELI5: `matches[n]` advances once per candidate position, summed
+    // across every row -- not comparable to any single array's length.
+    // Total that width up front and check it against `matches.len()`
+    // here, before the loop below ever indexes into the tape.
+    let expected_matches_width: usize = ends.iter().map(|e| *e as usize).sum();
+    ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
@@ -319,7 +354,7 @@ pub fn index_ends_only_keep_first<'py>(
         result[pos] = base;
         pos += 1
     }
-    result.into_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -331,11 +366,17 @@ pub fn index_ends_only_keep_last<'py>(
     counts: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let index = index.as_array();
     let ends = ends.as_array();
     let counts = counts.as_array();
     let matches = matches.as_array();
+    // ELI5: `matches[n]` advances once per candidate position, summed
+    // across every row -- not comparable to any single array's length.
+    // Total that width up front and check it against `matches.len()`
+    // here, before the loop below ever indexes into the tape.
+    let expected_matches_width: usize = ends.iter().map(|e| *e as usize).sum();
+    ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
@@ -367,7 +408,7 @@ pub fn index_ends_only_keep_last<'py>(
         result[pos] = base;
         pos += 1
     }
-    result.into_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -379,11 +420,21 @@ pub fn index_starts_and_ends<'py>(
     ends: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let index = index.as_array();
     let starts = starts.as_array();
     let ends = ends.as_array();
     let matches = matches.as_array();
+    // ELI5: `matches[n]` advances once per candidate position, summed
+    // across every row -- not comparable to any single array's length.
+    // Total that width up front and check it against `matches.len()`
+    // here, before the loop below ever indexes into the tape.
+    let expected_matches_width: usize = starts
+        .iter()
+        .zip(ends.iter())
+        .map(|(s, e)| (*e as usize).saturating_sub(*s as usize))
+        .sum();
+    ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
@@ -403,7 +454,7 @@ pub fn index_starts_and_ends<'py>(
             n += 1;
         }
     }
-    result.into_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -416,12 +467,22 @@ pub fn index_starts_and_ends_keep_first<'py>(
     counts: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let index = index.as_array();
     let starts = starts.as_array();
     let ends = ends.as_array();
     let counts = counts.as_array();
     let matches = matches.as_array();
+    // ELI5: `matches[n]` advances once per candidate position, summed
+    // across every row -- not comparable to any single array's length.
+    // Total that width up front and check it against `matches.len()`
+    // here, before the loop below ever indexes into the tape.
+    let expected_matches_width: usize = starts
+        .iter()
+        .zip(ends.iter())
+        .map(|(s, e)| (*e as usize).saturating_sub(*s as usize))
+        .sum();
+    ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
@@ -453,7 +514,7 @@ pub fn index_starts_and_ends_keep_first<'py>(
         result[pos] = base;
         pos += 1;
     }
-    result.into_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -466,12 +527,22 @@ pub fn index_starts_and_ends_keep_last<'py>(
     counts: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let index = index.as_array();
     let starts = starts.as_array();
     let ends = ends.as_array();
     let counts = counts.as_array();
     let matches = matches.as_array();
+    // ELI5: `matches[n]` advances once per candidate position, summed
+    // across every row -- not comparable to any single array's length.
+    // Total that width up front and check it against `matches.len()`
+    // here, before the loop below ever indexes into the tape.
+    let expected_matches_width: usize = starts
+        .iter()
+        .zip(ends.iter())
+        .map(|(s, e)| (*e as usize).saturating_sub(*s as usize))
+        .sum();
+    ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
@@ -504,7 +575,7 @@ pub fn index_starts_and_ends_keep_last<'py>(
         result[pos] = base;
         pos += 1;
     }
-    result.into_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 /// Build index based on positions
