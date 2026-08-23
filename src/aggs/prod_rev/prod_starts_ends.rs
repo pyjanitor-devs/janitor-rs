@@ -11,7 +11,7 @@ macro_rules! compute_ints {
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
-            arr: PyReadonlyArray1<'py, i64>,
+            arr: PyReadonlyArray1<'py, $type>,
             starts: PyReadonlyArray1<'py, i64>,
             ends: PyReadonlyArray1<'py, i64>,
             index: PyReadonlyArray1<'py, i64>,
@@ -76,7 +76,7 @@ macro_rules! compute_floats {
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
-            arr: PyReadonlyArray1<'py, i64>,
+            arr: PyReadonlyArray1<'py, $type>,
             starts: PyReadonlyArray1<'py, i64>,
             ends: PyReadonlyArray1<'py, i64>,
             index: PyReadonlyArray1<'py, i64>,
@@ -129,3 +129,62 @@ macro_rules! compute_floats {
 
 compute_floats!(compute_prod_rev_start_end_f64, f64);
 compute_floats!(compute_prod_rev_start_end_f32, f32);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ELI5: both macros above used to hardcode `arr`'s PyO3 type to `i64`
+    // regardless of `$type`, so every non-i64 int export and *both* float
+    // exports actually demanded an i64 numpy array at the Python boundary
+    // -- silently for ints, with a TypeError for floats. These fn-pointer
+    // typedefs make that a compile error again: reintroducing the hardcoded
+    // `i64` breaks compilation instead of only failing at runtime.
+    type Int8Fn = for<'py> fn(
+        Python<'py>,
+        PyReadonlyArray1<'py, i8>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, bool>,
+        i64,
+    )
+        -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
+
+    type F32Fn = for<'py> fn(
+        Python<'py>,
+        PyReadonlyArray1<'py, f32>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, bool>,
+        i64,
+    )
+        -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>;
+
+    type F64Fn = for<'py> fn(
+        Python<'py>,
+        PyReadonlyArray1<'py, f64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, bool>,
+        i64,
+    )
+        -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>;
+
+    #[test]
+    fn int8_wrapper_accepts_an_int8_array() {
+        let _wrapper: Int8Fn = compute_prod_rev_start_end_int8;
+    }
+
+    #[test]
+    fn f32_wrapper_accepts_an_f32_array() {
+        let _wrapper: F32Fn = compute_prod_rev_start_end_f32;
+    }
+
+    #[test]
+    fn f64_wrapper_accepts_an_f64_array() {
+        let _wrapper: F64Fn = compute_prod_rev_start_end_f64;
+    }
+}
