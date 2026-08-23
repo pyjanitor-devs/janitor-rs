@@ -39,7 +39,7 @@ macro_rules! generic_compute {
             let expected_matches_width: usize = starts
                 .iter()
                 .zip(ends.iter())
-                .map(|(s, e)| (*e as usize) - (*s as usize))
+                .map(|(s, e)| (*e as usize).saturating_sub(*s as usize))
                 .sum();
             ensure_tape_width(expected_matches_width, matches.len())?;
             let mut result = Array1::<i64>::zeros(starts.len());
@@ -104,7 +104,7 @@ macro_rules! generic_compute_floats {
             let expected_matches_width: usize = starts
                 .iter()
                 .zip(ends.iter())
-                .map(|(s, e)| (*e as usize) - (*s as usize))
+                .map(|(s, e)| (*e as usize).saturating_sub(*s as usize))
                 .sum();
             ensure_tape_width(expected_matches_width, matches.len())?;
             let mut result = Array1::<f64>::zeros(starts.len());

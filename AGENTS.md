@@ -627,3 +627,32 @@ bounds-checking the cursor inline on every iteration (which either panics
 or needs its own per-element error path) and not by comparing the tape's
 length to any single row-count-shaped array (wrong shape of check, per
 `ensure_tape_width`'s own doc comment). Reuse `ensure_tape_width`.
+
+**Follow-up (review of PR #43)**: 19 of the pre-pass sums above computed a
+row's width as plain `end - start` (or `end_ - start_`) for the *unguarded*
+shapes -- the ones whose main loop has no `checked_range`/`checked_index`
+call at all, just a raw `for x in start_..end_`. That's unsafe: the `-1`
+"no match" sentinel (or any `start` past `end`) casts to a huge `usize`,
+and unlike a real `Range<usize>` -- whose element count is `end.saturating_
+sub(start)`, i.e. simply `0` when `start >= end`, not a panic or a wrapped
+value -- plain `usize` subtraction either panics (debug) or silently wraps
+to a huge, wrong width (release). Confirmed via
+`janitor_rs.index_starts_only(index=[10,20], starts=[-1,1],
+matches=[1], length=1)`: the valid second row needs 1 tape entry, but the
+wrapped width from row 0 made the precheck demand 4, rejecting an
+otherwise-correct call. **Fixed** by replacing every such formula with
+`.saturating_sub(...)`, which is provably identical to the main loop's own
+`Range<usize>` element count for *any* input, sentinel or not -- not with
+`checked_range`/`checked_index` (the reviewer's suggested fix), since the
+unguarded main loops don't validate `start`/`end` against anything either;
+reusing those helpers would silently add validation the existing loop
+never had, a bigger behavior change than the bug needs. The 3 *guarded*
+shapes that already `filter_map`/`filter` through `checked_range` before
+subtracting (`comp.rs`, and any `_starts_ends_matches`/`_ends_matches`
+file using it) were never affected -- the filter already excludes exactly
+the rows that would underflow. **Recommendation**: when a pre-pass formula
+mirrors a `for x in a..b` loop that has no explicit bounds guard, use
+`b.saturating_sub(a)`, never plain `b - a` -- it is the actual definition
+of a `Range<usize>`'s length and the only way to match unguarded-loop
+semantics for every possible input, including cast-from-negative
+sentinels.

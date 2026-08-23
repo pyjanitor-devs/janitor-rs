@@ -335,6 +335,60 @@ mod adversarial_bounds_tests {
     }
 
     #[test]
+    fn tape_width_precheck_does_not_underflow_on_a_sentinel_or_inverted_row() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+
+            // Regression for a bug in the initial #40/#41 fix: several
+            // `expected_matches_width` pre-passes summed `end - start`
+            // directly. The `-1` "no match" sentinel (or any `start` past
+            // `end`) casts to a huge `usize`, and unlike the main loop's
+            // `start_..end` range -- which is simply empty when
+            // `start_ >= end`, contributing zero tape entries -- plain
+            // subtraction on `usize` either panics (debug) or wraps to a
+            // huge, wrong width (release), which then made a perfectly
+            // valid call to `index_starts_only` spuriously reject a
+            // correctly-sized `matches` tape.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20]);
+            let starts = PyArray1::from_vec(py, vec![-1_i64, 1]);
+            let matches = PyArray1::from_vec(py, vec![1_i8]);
+            let result = crate::index_builder::index_starts_only(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("a sentinel-start row must contribute zero width, not underflow");
+            let got: Vec<i64> = result.readonly().as_array().to_vec();
+            assert_eq!(got, vec![20]);
+
+            // Same underflow shape, dual-bound family: an inverted
+            // `(start, end)` row (`start > end`, no `-1` sentinel
+            // involved) must also contribute zero, not a wrapped width.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
+            let starts = PyArray1::from_vec(py, vec![2_i64, 0]);
+            let ends = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1]);
+            let result = crate::index_builder::index_starts_and_ends(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                matches.readonly(),
+                2,
+            )
+            .expect("an inverted start>end row must contribute zero width, not underflow");
+            let got: Vec<i64> = result.readonly().as_array().to_vec();
+            assert_eq!(got, vec![10, 20]);
+        });
+    }
+
+    #[test]
     fn every_forward_core_rejects_signed_and_one_past_bounds() {
         let arr = array![5_i64, 1, 4];
         let booleans = array![false, false, false];

@@ -35,7 +35,10 @@ macro_rules! generic_compute_ints {
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = starts.iter().map(|s| end_ - (*s as usize)).sum();
+            let expected_matches_width: usize = starts
+                .iter()
+                .map(|s| end_.saturating_sub(*s as usize))
+                .sum();
             ensure_tape_width(expected_matches_width, matches.len())?;
             let zipped = starts.into_iter().zip(counts.into_iter());
             for (pos, (start, count)) in zipped.enumerate() {
@@ -93,7 +96,10 @@ macro_rules! generic_compute_floats {
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = starts.iter().map(|s| end_ - (*s as usize)).sum();
+            let expected_matches_width: usize = starts
+                .iter()
+                .map(|s| end_.saturating_sub(*s as usize))
+                .sum();
             ensure_tape_width(expected_matches_width, matches.len())?;
             let zipped = starts.into_iter().zip(counts.into_iter());
             for (pos, (start, count)) in zipped.enumerate() {
