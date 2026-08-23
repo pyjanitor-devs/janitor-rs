@@ -2,7 +2,7 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{checked_range, ensure_equal_lengths};
 
 macro_rules! generic_compute_ints {
     ($fname:ident, $type:ty) => {
@@ -27,12 +27,21 @@ macro_rules! generic_compute_ints {
             )?;
             let arr = arr.as_array();
             let booleans = booleans.as_array();
-            let mut result = Array1::<i64>::zeros(starts.len());
+            // ELI5: `1`, not `0` -- an empty or rejected range must
+            // preserve product's multiplicative identity, or a bounds
+            // guard would silently change the result for rows it rejects.
+            let mut result = Array1::<i64>::from_elem(starts.len(), 1);
             let zipped = starts.into_iter().zip(ends.into_iter());
             for (pos, (start, end)) in zipped.enumerate() {
+                // ELI5 (the guard): `checked_range` rejects a negative,
+                // inverted, or too-large range before it's cast to `usize`;
+                // an unguarded `-1` "no match" sentinel would otherwise
+                // wrap to `usize::MAX` and walk `arr`/`booleans` out of
+                // bounds.
+                let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
+                    continue;
+                };
                 let mut total: i64 = 1;
-                let start_ = *start as usize;
-                let end_ = *end as usize;
                 for nn in start_..end_ {
                     if booleans[nn] {
                         continue;
@@ -70,12 +79,13 @@ macro_rules! generic_compute_floats {
             )?;
             let arr = arr.as_array();
             let booleans = booleans.as_array();
-            let mut result = Array1::<f64>::zeros(starts.len());
+            let mut result = Array1::<f64>::from_elem(starts.len(), 1.0);
             let zipped = starts.into_iter().zip(ends.into_iter());
             for (pos, (start, end)) in zipped.enumerate() {
+                let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
+                    continue;
+                };
                 let mut total: f64 = 1.0;
-                let start_ = *start as usize;
-                let end_ = *end as usize;
                 for nn in start_..end_ {
                     if booleans[nn] {
                         continue;
