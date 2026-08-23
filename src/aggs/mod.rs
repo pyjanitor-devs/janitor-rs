@@ -86,6 +86,7 @@ pub(crate) type PositionsFn<T, R> =
 #[cfg(test)]
 mod adversarial_bounds_tests {
     use numpy::ndarray::array;
+    use numpy::{PyArray1, PyArrayMethods};
     use pyo3::exceptions::PyValueError;
     use pyo3::Python;
 
@@ -127,6 +128,69 @@ mod adversarial_bounds_tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn representative_python_wrappers_reject_mismatched_lengths() {
+        Python::initialize();
+        Python::attach(|py| {
+            // The ordinary Rust test job does not install Python's NumPy
+            // module. Run this boundary test when NumPy is available, while
+            // keeping the core-only test suite usable in that lean setup.
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            for (starts_values, ends_values) in
+                [(vec![0_i64, 0], vec![1_i64]), (vec![0_i64], vec![1_i64, 1])]
+            {
+                let expected = format!(
+                    "starts and ends must have equal lengths; got {} and {}",
+                    starts_values.len(),
+                    ends_values.len()
+                );
+                let starts = PyArray1::from_vec(py, starts_values);
+                let ends = PyArray1::from_vec(py, ends_values);
+                let arr = PyArray1::from_vec(py, vec![1_i64, 2]);
+                let booleans = PyArray1::from_vec(py, vec![false, false]);
+                let index = PyArray1::from_vec(py, vec![0_i64, 1]);
+
+                let error = super::sum::sum_starts_ends::compute_sum_start_end_int64(
+                    py,
+                    arr.readonly(),
+                    starts.readonly(),
+                    ends.readonly(),
+                    booleans.readonly(),
+                )
+                .expect_err("forward wrapper must reject unequal lengths");
+                assert!(error.is_instance_of::<PyValueError>(py));
+                assert_eq!(error.value(py).to_string(), expected);
+
+                let error = super::min_rev::min_starts_ends::compute_min_rev_start_end_int64(
+                    py,
+                    arr.readonly(),
+                    starts.readonly(),
+                    ends.readonly(),
+                    index.readonly(),
+                    booleans.readonly(),
+                    2,
+                )
+                .expect_err("reverse wrapper must reject unequal lengths");
+                assert!(error.is_instance_of::<PyValueError>(py));
+                assert_eq!(error.value(py).to_string(), expected);
+
+                let error = super::size_rev::computes::compute_size_rev_start_end(
+                    py,
+                    starts.readonly(),
+                    ends.readonly(),
+                    index.readonly(),
+                    2,
+                )
+                .expect_err("reverse-size wrapper must reject unequal lengths");
+                assert!(error.is_instance_of::<PyValueError>(py));
+                assert_eq!(error.value(py).to_string(), expected);
+            }
+        });
     }
 
     #[test]
