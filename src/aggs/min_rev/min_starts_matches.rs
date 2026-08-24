@@ -1,9 +1,8 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
+use crate::aggs::dense::DenseSlots;
 use crate::aggs::{ensure_equal_lengths, ensure_tape_width};
 
 macro_rules! compute {
@@ -31,8 +30,7 @@ macro_rules! compute {
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let length = length as usize;
-            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-            let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
+            let mut slots: DenseSlots<(i64, $type)> = DenseSlots::new(length);
             let end_: usize = index.len();
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
@@ -57,9 +55,8 @@ macro_rules! compute {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    let base = dictionary.entry(pos).or_insert(-1);
-                    let base_val = mapping.entry(pos).or_insert(*current);
+                    let pos = index[item] as usize;
+                    let (base, base_val) = slots.touch(pos, (-1, *current));
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
@@ -71,13 +68,7 @@ macro_rules! compute {
                     n += 1;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<i64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let (indexers, result) = slots.to_arrays(|(base, _base_val)| *base);
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -111,4 +102,46 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_min_rev_start_match_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_min_rev_start_match_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod correctness_tests {
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    use super::compute_min_rev_start_match_int64;
+
+    #[test]
+    fn touched_row_positions_are_emitted_ascending_with_winning_row_index() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            // index = [4, 7]; row0 (start=0) walks index[0..2] = {4, 7}
+            // (tape width 2), row1 (start=1) walks index[1..2] = {7}
+            // (tape width 1) -- total tape width 3, all matching. Row0's
+            // value (3) beats row1's (6) at the shared position 7.
+            let arr = PyArray1::from_vec(py, vec![3_i64, 6]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let counts = PyArray1::from_vec(py, vec![1_i64, 1]);
+            let index = PyArray1::from_vec(py, vec![4_i64, 7]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1, 1]);
+            let booleans = PyArray1::from_vec(py, vec![false, false]);
+            let (indexers, result) = compute_min_rev_start_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+                8,
+            )
+            .expect("valid equal-length inputs must not error");
+            assert_eq!(indexers.readonly().to_vec().unwrap(), vec![4, 7]);
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![0, 0]);
+        });
+    }
 }
