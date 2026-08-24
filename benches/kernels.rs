@@ -1156,6 +1156,187 @@ fn bench_size_rev_end_old_vs_new(c: &mut Criterion) {
     group.finish();
 }
 
+/// A bench-only copy of `DenseSlots` as it existed after issue #69's fix
+/// but before issue #70's adaptive cap: `touch` grew the backing `Vec`s
+/// to fit *any* non-negative key, with no upper bound -- exactly the gap
+/// that let a single sparse match at an enormous row position allocate
+/// memory proportional to that *position*, not to the match count. Kept
+/// here (rather than restoring it in `src/`) so
+/// `bench_dense_sparse_high_position_old_vs_new` can demonstrate the fix
+/// directly, mirroring this file's other old-vs-new comparisons.
+struct UnboundedDenseSlots {
+    values: Vec<i64>,
+    seen: Vec<bool>,
+}
+
+impl UnboundedDenseSlots {
+    fn new(length: usize) -> Self {
+        UnboundedDenseSlots {
+            values: vec![0; length],
+            seen: vec![false; length],
+        }
+    }
+
+    fn touch(&mut self, key: usize, default: i64) -> &mut i64 {
+        if key >= self.values.len() {
+            let new_len = key + 1;
+            self.values.resize(new_len, 0);
+            self.seen.resize(new_len, false);
+        }
+        if !self.seen[key] {
+            self.seen[key] = true;
+            self.values[key] = default;
+        }
+        &mut self.values[key]
+    }
+
+    fn to_arrays(&self) -> (Vec<i64>, Vec<i64>) {
+        let mut indexers = Vec::new();
+        let mut result = Vec::new();
+        for (key, (&seen, &value)) in self.seen.iter().zip(self.values.iter()).enumerate() {
+            if seen {
+                indexers.push(key as i64);
+                result.push(value);
+            }
+        }
+        (indexers, result)
+    }
+}
+
+fn sum_rev_no_range_unbounded_dense(
+    arr: ArrayView1<i64>,
+    left_index: ArrayView1<i64>,
+    right_index: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    length: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut slots = UnboundedDenseSlots::new(length);
+    let zipped = left_index.into_iter().zip(right_index);
+    for (index_left, index_right) in zipped {
+        let Some(left) = usize::try_from(*index_left)
+            .ok()
+            .filter(|&left| left < arr.len())
+        else {
+            continue;
+        };
+        let current = arr[left];
+        let boolean = booleans[left];
+        let total = slots.touch(*index_right as usize, 0);
+        if boolean {
+            continue;
+        }
+        *total += current;
+    }
+    slots.to_arrays()
+}
+
+/// Inputs for `bench_dense_sparse_high_position_old_vs_new`: a single
+/// match, at a caller-chosen row `position` -- the exact shape of issue
+/// #70's report (one match near the end of a huge right dataframe gives a
+/// tiny match count but a huge row position).
+struct SparseHighPositionFixture {
+    arr: Array1<i64>,
+    left_index: Array1<i64>,
+    right_index: Array1<i64>,
+    booleans: Array1<bool>,
+}
+
+impl SparseHighPositionFixture {
+    fn new(position: i64) -> Self {
+        SparseHighPositionFixture {
+            arr: Array1::from_vec(vec![7]),
+            left_index: Array1::from_vec(vec![0]),
+            right_index: Array1::from_vec(vec![position]),
+            booleans: Array1::from_vec(vec![false]),
+        }
+    }
+}
+
+/// Direct old-(unbounded growth)-vs-new-(capped, sparse-fallback)
+/// comparison for issue #70: a single sparse match at a large row
+/// position. Timed at positions safe to run *both* implementations at
+/// repeatedly (criterion's timing loop calls each closure many times);
+/// the `eprintln!` allocation report additionally covers a position far
+/// too large to time the old (unbounded) path at repeatedly without
+/// spending the whole benchmark run re-allocating hundreds of MB per
+/// iteration, while the new path stays cheap enough to report at a
+/// position even more extreme than issue #70's own repro.
+fn bench_dense_sparse_high_position_old_vs_new(c: &mut Criterion) {
+    eprintln!(
+        "\ndense sparse-high-position old (unbounded grow) vs new (capped + sparse fallback) allocation report:"
+    );
+
+    // Single-call allocation reports at positions too large to time in a
+    // repeated loop for the old (unbounded) side -- see doc comment above.
+    let (bytes, calls, peak) = count_allocations(|| {
+        sum_rev_no_range_unbounded_dense(
+            Array1::from_vec(vec![7]).view(),
+            Array1::from_vec(vec![0_i64]).view(),
+            Array1::from_vec(vec![10_000_000_i64]).view(),
+            Array1::from_vec(vec![false]).view(),
+            1,
+        )
+    });
+    eprintln!(
+        "  old (unbounded) position=10,000,000:      {bytes:>12} bytes / {calls:>3} allocs / {peak:>12} peak"
+    );
+    let (bytes, calls, peak) = count_allocations(|| {
+        sum_rev_no_range_i64_core(
+            Array1::from_vec(vec![7]).view(),
+            Array1::from_vec(vec![0_i64]).view(),
+            Array1::from_vec(vec![10_000_000_i64]).view(),
+            Array1::from_vec(vec![false]).view(),
+            1,
+        )
+    });
+    eprintln!(
+        "  new (capped)     position=10,000,000:      {bytes:>12} bytes / {calls:>3} allocs / {peak:>12} peak"
+    );
+    let (bytes, calls, peak) = count_allocations(|| {
+        sum_rev_no_range_i64_core(
+            Array1::from_vec(vec![7]).view(),
+            Array1::from_vec(vec![0_i64]).view(),
+            Array1::from_vec(vec![1_000_000_000_i64]).view(),
+            Array1::from_vec(vec![false]).view(),
+            1,
+        )
+    });
+    eprintln!(
+        "  new (capped)     position=1,000,000,000:   {bytes:>12} bytes / {calls:>3} allocs / {peak:>12} peak"
+    );
+
+    let mut group = c.benchmark_group("dense_sparse_high_position_old_vs_new");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_millis(500));
+    for position in [10_000_i64, 100_000] {
+        let f = SparseHighPositionFixture::new(position);
+
+        group.bench_function(format!("old position={position}"), |b| {
+            b.iter(|| {
+                sum_rev_no_range_unbounded_dense(
+                    black_box(f.arr.view()),
+                    black_box(f.left_index.view()),
+                    black_box(f.right_index.view()),
+                    black_box(f.booleans.view()),
+                    1,
+                )
+            })
+        });
+        group.bench_function(format!("new position={position}"), |b| {
+            b.iter(|| {
+                sum_rev_no_range_i64_core(
+                    black_box(f.arr.view()),
+                    black_box(f.left_index.view()),
+                    black_box(f.right_index.view()),
+                    black_box(f.booleans.view()),
+                    1,
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bin_search_lt,
@@ -1168,6 +1349,7 @@ criterion_group!(
     bench_max_rev_no_range_old_vs_new,
     bench_min_rev_no_range_old_vs_new,
     bench_prod_rev_no_range_old_vs_new,
-    bench_size_rev_end_old_vs_new
+    bench_size_rev_end_old_vs_new,
+    bench_dense_sparse_high_position_old_vs_new
 );
 criterion_main!(benches);
