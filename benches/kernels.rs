@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
     binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, repeat_index_core,
-    sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core,
+    sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core, CompareOp,
 };
 
 /// Counts bytes, calls, and outstanding (live) bytes allocated through the
@@ -421,7 +421,7 @@ fn bench_compare_start_end(c: &mut Criterion) {
                     black_box(f.starts.view()),
                     black_box(f.ends.view()),
                     black_box(f.matches.view()),
-                    black_box(0), // op=0 -> `>`
+                    black_box(CompareOp::Gt),
                 )
             })
         });

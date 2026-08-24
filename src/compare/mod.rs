@@ -16,6 +16,7 @@ pub mod comp_no_range_ne;
 pub mod comp_posns;
 pub mod comp_posns_ne;
 pub mod comp_starts;
+pub mod op;
 
 /// Registers every export from this family's submodules with the
 /// PyO3 module.

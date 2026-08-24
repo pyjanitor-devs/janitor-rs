@@ -5,16 +5,7 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-fn binary_compare<T: std::cmp::PartialOrd>(left: &T, right: &T, op: i8) -> bool {
-    match op {
-        0 => left > right,
-        1 => left >= right,
-        2 => left < right,
-        3 => left <= right,
-        4 => left == right,
-        _ => left != right,
-    }
-}
+use super::op::CompareOp;
 
 macro_rules! generic_compare {
     ($fname:ident, $type:ty) => {
@@ -28,13 +19,15 @@ macro_rules! generic_compare {
             right_booleans: PyReadonlyArray1<'py, bool>,
             is_extension_array: bool,
             op: i8,
-        ) -> (Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64) {
+        ) -> PyResult<(Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64)> {
             let left_array = left.as_array();
             let right_array = right.as_array();
             let ends_array = ends.as_array();
             let left_booleans_array = left_booleans.as_array();
             let right_booleans_array = right_booleans.as_array();
             let length: i64 = ends_array.sum();
+            let op = CompareOp::try_from_code(op)?;
+            let cmp = op.comparator();
             let mut result = Array1::<i8>::zeros(length as usize);
             let mut counts_array = Array1::<i64>::zeros(left_array.len());
             let mut total: i64 = 0;
@@ -65,7 +58,7 @@ macro_rules! generic_compare {
                         continue;
                     }
                     let right_val = right_array[nn];
-                    let compare = binary_compare(left_val, &right_val, op);
+                    let compare = cmp(left_val, &right_val);
                     counter += compare as i64;
                     total += compare as i64;
                     result[n] = compare as i8;
@@ -73,11 +66,11 @@ macro_rules! generic_compare {
                 }
                 counts_array[position] = counter;
             }
-            (
+            Ok((
                 result.into_pyarray(py),
                 counts_array.into_pyarray(py),
                 total,
-            )
+            ))
         }
     };
 }

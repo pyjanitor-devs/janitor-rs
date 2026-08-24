@@ -5,16 +5,7 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-fn binary_compare<T: std::cmp::PartialOrd>(left: &T, right: &T, op: i8) -> bool {
-    match op {
-        0 => left > right,
-        1 => left >= right,
-        2 => left < right,
-        3 => left <= right,
-        4 => left == right,
-        _ => left != right,
-    }
-}
+use super::op::CompareOp;
 
 macro_rules! generic_compare {
     ($fname:ident, $type:ty) => {
@@ -27,12 +18,14 @@ macro_rules! generic_compare {
             positions: PyReadonlyArray1<'py, i64>,
             ends: PyReadonlyArray1<'py, i64>,
             op: i8,
-        ) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>, i64) {
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>, i64)> {
             let left = left.as_array();
             let right = right.as_array();
             let starts = starts.as_array();
             let positions = positions.as_array();
             let ends = ends.as_array();
+            let op = CompareOp::try_from_code(op)?;
+            let cmp = op.comparator();
             let mut result = Array1::<i64>::zeros(positions.len());
             let mut counts_array = Array1::<i64>::zeros(left.len());
             let mut total: i64 = 0;
@@ -51,7 +44,7 @@ macro_rules! generic_compare {
                     }
                     let indexer_ = indexer as usize;
                     let right_val = right[indexer_];
-                    let compare = binary_compare(left_val, &right_val, op);
+                    let compare = cmp(left_val, &right_val);
                     counter += compare as i64;
                     total += compare as i64;
                     indexer = if compare { indexer } else { -1 };
@@ -60,11 +53,11 @@ macro_rules! generic_compare {
                 }
                 counts_array[position] = counter;
             }
-            (
+            Ok((
                 result.into_pyarray(py),
                 counts_array.into_pyarray(py),
                 total,
-            )
+            ))
         }
     };
 }
