@@ -136,25 +136,24 @@ pub fn index_starts_only<'py>(
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
-    // here, before the loop below ever indexes into the tape.
-    let starts: Vec<Option<usize>> = starts
-        .iter()
-        .map(|start| checked_end(*start, end))
-        .collect();
+    // here, before the loop below ever indexes into the tape. `starts` is
+    // a cheap-to-reiterate view, so `checked_end` is recomputed in each
+    // pass instead of materializing a `Vec` of validated rows just to
+    // reuse it once.
     let expected_matches_width: usize = starts
         .iter()
-        .filter_map(|start| start.map(|start| end - start))
+        .filter_map(|start| checked_end(*start, end).map(|start| end - start))
         .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    for start in starts {
+    for start in starts.iter() {
         if pos == length as usize {
             break;
         }
-        let Some(start_) = start else {
+        let Some(start_) = checked_end(*start, end) else {
             continue;
         };
         for nn in start_..end {
@@ -189,22 +188,21 @@ pub fn index_starts_only_keep_first<'py>(
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
-    // here, before the loop below ever indexes into the tape.
-    let starts: Vec<Option<usize>> = starts
-        .iter()
-        .map(|start| checked_end(*start, end))
-        .collect();
+    // here, before the loop below ever indexes into the tape. `starts` is
+    // a cheap-to-reiterate view, so `checked_end` is recomputed in each
+    // pass instead of materializing a `Vec` of validated rows just to
+    // reuse it once.
     let expected_matches_width: usize = starts
         .iter()
-        .filter_map(|start| start.map(|start| end - start))
+        .filter_map(|start| checked_end(*start, end).map(|start| end - start))
         .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    let zipped = starts.into_iter().zip(counts);
-    for (start, count_) in zipped {
+    for (start, count_) in starts.iter().zip(counts) {
+        let start = checked_end(*start, end);
         if *count_ == 0 {
             let size = start.map_or(0, |start| end - start);
             n += size;
@@ -250,21 +248,21 @@ pub fn index_starts_only_keep_last<'py>(
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
-    // here, before the loop below ever indexes into the tape.
-    let starts: Vec<Option<usize>> = starts
-        .iter()
-        .map(|start| checked_end(*start, end))
-        .collect();
+    // here, before the loop below ever indexes into the tape. `starts` is
+    // a cheap-to-reiterate view, so `checked_end` is recomputed in each
+    // pass instead of materializing a `Vec` of validated rows just to
+    // reuse it once.
     let expected_matches_width: usize = starts
         .iter()
-        .filter_map(|start| start.map(|start| end - start))
+        .filter_map(|start| checked_end(*start, end).map(|start| end - start))
         .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    for (start, count) in starts.into_iter().zip(counts) {
+    for (start, count) in starts.iter().zip(counts) {
+        let start = checked_end(*start, end);
         if *count == 0 {
             let size = start.map_or(0, |start| end - start);
             n += size;
@@ -307,22 +305,24 @@ pub fn index_ends_only<'py>(
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
-    // here, before the loop below ever indexes into the tape.
-    let ends: Vec<Option<usize>> = ends
+    // here, before the loop below ever indexes into the tape. `ends` is
+    // a cheap-to-reiterate view, so `checked_end` is recomputed in each
+    // pass instead of materializing a `Vec` of validated rows just to
+    // reuse it once.
+    let expected_matches_width: usize = ends
         .iter()
-        .map(|end| checked_end(*end, index.len()))
-        .collect();
-    let expected_matches_width: usize = ends.iter().filter_map(|end| *end).sum();
+        .filter_map(|end| checked_end(*end, index.len()))
+        .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    for end in ends {
+    for end in ends.iter() {
         if pos == length as usize {
             break;
         }
-        let Some(end_) = end else {
+        let Some(end_) = checked_end(*end, index.len()) else {
             continue;
         };
         for nn in 0..end_ {
@@ -356,19 +356,22 @@ pub fn index_ends_only_keep_first<'py>(
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
-    // here, before the loop below ever indexes into the tape.
-    let ends: Vec<Option<usize>> = ends
+    // here, before the loop below ever indexes into the tape. `ends` is
+    // a cheap-to-reiterate view, so `checked_end` is recomputed in each
+    // pass instead of materializing a `Vec` of validated rows just to
+    // reuse it once.
+    let expected_matches_width: usize = ends
         .iter()
-        .map(|end| checked_end(*end, index.len()))
-        .collect();
-    let expected_matches_width: usize = ends.iter().filter_map(|end| *end).sum();
+        .filter_map(|end| checked_end(*end, index.len()))
+        .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
     let start_: usize = 0;
-    for (end, count) in ends.into_iter().zip(counts) {
+    for (end, count) in ends.iter().zip(counts) {
+        let end = checked_end(*end, index.len());
         if *count == 0 {
             let size = end.unwrap_or(start_);
             n += size;
@@ -414,19 +417,22 @@ pub fn index_ends_only_keep_last<'py>(
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
-    // here, before the loop below ever indexes into the tape.
-    let ends: Vec<Option<usize>> = ends
+    // here, before the loop below ever indexes into the tape. `ends` is
+    // a cheap-to-reiterate view, so `checked_end` is recomputed in each
+    // pass instead of materializing a `Vec` of validated rows just to
+    // reuse it once.
+    let expected_matches_width: usize = ends
         .iter()
-        .map(|end| checked_end(*end, index.len()))
-        .collect();
-    let expected_matches_width: usize = ends.iter().filter_map(|end| *end).sum();
+        .filter_map(|end| checked_end(*end, index.len()))
+        .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
     let start_: usize = 0;
-    for (end, count) in ends.into_iter().zip(counts) {
+    for (end, count) in ends.iter().zip(counts) {
+        let end = checked_end(*end, index.len());
         if *count == 0 {
             let size = end.unwrap_or(start_);
             n += size;
@@ -473,23 +479,24 @@ pub fn index_starts_and_ends<'py>(
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
-    // here, before the loop below ever indexes into the tape.
-    let ranges: Vec<Option<(usize, usize)>> = starts
+    // here, before the loop below ever indexes into the tape. `starts`/
+    // `ends` are cheap-to-reiterate views, so `checked_range_or_none` is
+    // recomputed in each pass instead of materializing a `Vec` of
+    // validated rows just to reuse it once.
+    let expected_matches_width: usize = starts
         .iter()
         .zip(ends.iter())
-        .map(|(start, end)| checked_range_or_none(*start, *end, index.len()))
-        .collect();
-    let expected_matches_width: usize = ranges
-        .iter()
-        .filter_map(|range| range.map(|(start, end)| end - start))
+        .filter_map(|(start, end)| {
+            checked_range_or_none(*start, *end, index.len()).map(|(start, end)| end - start)
+        })
         .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    for range in ranges {
-        let Some((start_, end_)) = range else {
+    for (start, end) in starts.iter().zip(ends.iter()) {
+        let Some((start_, end_)) = checked_range_or_none(*start, *end, index.len()) else {
             continue;
         };
         for nn in start_..end_ {
@@ -527,22 +534,24 @@ pub fn index_starts_and_ends_keep_first<'py>(
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
-    // here, before the loop below ever indexes into the tape.
-    let ranges: Vec<Option<(usize, usize)>> = starts
+    // here, before the loop below ever indexes into the tape. `starts`/
+    // `ends` are cheap-to-reiterate views, so `checked_range_or_none` is
+    // recomputed in each pass instead of materializing a `Vec` of
+    // validated rows just to reuse it once.
+    let expected_matches_width: usize = starts
         .iter()
         .zip(ends.iter())
-        .map(|(start, end)| checked_range_or_none(*start, *end, index.len()))
-        .collect();
-    let expected_matches_width: usize = ranges
-        .iter()
-        .filter_map(|range| range.map(|(start, end)| end - start))
+        .filter_map(|(start, end)| {
+            checked_range_or_none(*start, *end, index.len()).map(|(start, end)| end - start)
+        })
         .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    for (range, count_) in ranges.into_iter().zip(counts) {
+    for ((start, end), count_) in starts.iter().zip(ends.iter()).zip(counts) {
+        let range = checked_range_or_none(*start, *end, index.len());
         if *count_ == 0 {
             let size = range.map_or(0, |(start, end)| end - start);
             n += size;
@@ -591,22 +600,24 @@ pub fn index_starts_and_ends_keep_last<'py>(
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
-    // here, before the loop below ever indexes into the tape.
-    let ranges: Vec<Option<(usize, usize)>> = starts
+    // here, before the loop below ever indexes into the tape. `starts`/
+    // `ends` are cheap-to-reiterate views, so `checked_range_or_none` is
+    // recomputed in each pass instead of materializing a `Vec` of
+    // validated rows just to reuse it once.
+    let expected_matches_width: usize = starts
         .iter()
         .zip(ends.iter())
-        .map(|(start, end)| checked_range_or_none(*start, *end, index.len()))
-        .collect();
-    let expected_matches_width: usize = ranges
-        .iter()
-        .filter_map(|range| range.map(|(start, end)| end - start))
+        .filter_map(|(start, end)| {
+            checked_range_or_none(*start, *end, index.len()).map(|(start, end)| end - start)
+        })
         .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    for (range, count_) in ranges.into_iter().zip(counts) {
+    for ((start, end), count_) in starts.iter().zip(ends.iter()).zip(counts) {
+        let range = checked_range_or_none(*start, *end, index.len());
         if *count_ == 0 {
             let size = range.map_or(0, |(start, end)| end - start);
             n += size;
@@ -701,21 +712,20 @@ pub fn build_positional_index_first<'py>(
     let positions = positions.as_array();
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     ensure_equal_lengths("starts", starts.len(), "counts", counts.len())?;
-    let ranges: Vec<Option<(usize, usize)>> = starts
-        .iter()
-        .zip(ends.iter())
-        .map(|(start, end)| checked_range_or_none(*start, *end, positions.len()))
-        .collect();
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut pos: usize = 0;
-    for (range, count_) in ranges.into_iter().zip(counts) {
+    // ELI5: `starts`/`ends` are cheap-to-reiterate views, so there's no
+    // need to precompute a `Vec` of validated ranges before this loop --
+    // unlike the `index_*` family above, this function has no `matches`
+    // tape to width-check up front, so a single pass suffices.
+    for ((start, end), count_) in starts.iter().zip(ends.iter()).zip(counts) {
         if *count_ == 0 {
             continue;
         }
         if pos == length as usize {
             break;
         }
-        let (start_, end_) = range.unwrap_or((0, 0));
+        let (start_, end_) = checked_range_or_none(*start, *end, positions.len()).unwrap_or((0, 0));
         let mut base: i64 = -1;
         for nn in start_..end_ {
             let indexer = positions[nn];
@@ -756,21 +766,20 @@ pub fn build_positional_index_last<'py>(
     let positions = positions.as_array();
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     ensure_equal_lengths("starts", starts.len(), "counts", counts.len())?;
-    let ranges: Vec<Option<(usize, usize)>> = starts
-        .iter()
-        .zip(ends.iter())
-        .map(|(start, end)| checked_range_or_none(*start, *end, positions.len()))
-        .collect();
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut pos: usize = 0;
-    for (range, count_) in ranges.into_iter().zip(counts) {
+    // ELI5: `starts`/`ends` are cheap-to-reiterate views, so there's no
+    // need to precompute a `Vec` of validated ranges before this loop --
+    // unlike the `index_*` family above, this function has no `matches`
+    // tape to width-check up front, so a single pass suffices.
+    for ((start, end), count_) in starts.iter().zip(ends.iter()).zip(counts) {
         if *count_ == 0 {
             continue;
         }
         if pos == length as usize {
             break;
         }
-        let (start_, end_) = range.unwrap_or((0, 0));
+        let (start_, end_) = checked_range_or_none(*start, *end, positions.len()).unwrap_or((0, 0));
         let mut base: i64 = -1;
         for nn in start_..end_ {
             let indexer = positions[nn];
