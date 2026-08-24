@@ -765,7 +765,6 @@ pub fn reorder_index<'py>(
     // not as an error -- so this raises instead of skipping.
     let mut result = Array1::<i64>::from_elem(positions.len(), -1);
     let mut counts: Array1<i64> = Array1::zeros(starts.len());
-    let mut occupied = vec![false; positions.len()];
     for (index, val) in positions.indexed_iter() {
         let bucket = checked_index(*val, starts.len()).ok_or_else(|| {
             PyValueError::new_err(format!(
@@ -793,15 +792,14 @@ pub fn reorder_index<'py>(
                 result.len()
             ))
         })?;
-        if occupied[pos] {
+        if result[pos] != -1 {
             return Err(PyValueError::new_err(format!(
                 "computed position {pos} for positions[{index}] is already occupied"
             )));
         }
-        occupied[pos] = true;
         result[pos] = index as i64;
     }
-    if let Some(pos) = occupied.iter().position(|occupied| !occupied) {
+    if let Some(pos) = result.iter().position(|value| *value == -1) {
         return Err(PyValueError::new_err(format!(
             "reorder_index left result position {pos} unassigned"
         )));
