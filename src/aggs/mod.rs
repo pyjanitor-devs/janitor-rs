@@ -259,6 +259,128 @@ mod adversarial_bounds_tests {
     }
 
     #[test]
+    fn index_builder_starts_ends_functions_reject_mismatched_lengths() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+
+            // `index_starts_and_ends*`/`build_positional_index_first/last`
+            // zipped `starts` against `ends` (and `counts`) with no length
+            // check, silently truncating to the shorter array on a
+            // mismatch instead of raising -- unlike the `ensure_equal_lengths`
+            // guard this same PR added for the analogous `right`/
+            // `right_booleans` case in `comp_no_range_ne.rs`.
+            let index = PyArray1::from_vec(py, vec![0_i64, 1, 2]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let ends = PyArray1::from_vec(py, vec![3_i64]); // mismatched: len 1 vs starts' len 2
+            let counts = PyArray1::from_vec(py, vec![1_i64, 1]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1, 1]);
+            let positions = PyArray1::from_vec(py, vec![0_i64, 1, 2]);
+            let expected = "starts and ends must have equal lengths; got 2 and 1";
+
+            let error = crate::index_builder::index_starts_and_ends(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                matches.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/ends must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected);
+
+            let error = crate::index_builder::index_starts_and_ends_keep_first(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/ends must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected);
+
+            let error = crate::index_builder::index_starts_and_ends_keep_last(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/ends must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected);
+
+            let error = crate::index_builder::build_positional_index_first(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                positions.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/ends must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected);
+
+            let error = crate::index_builder::build_positional_index_last(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                positions.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/ends must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected);
+
+            // `starts`/`counts` mismatch, `_keep_first`/`_keep_last` and
+            // `build_positional_index_first/last` only.
+            let starts2 = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let ends2 = PyArray1::from_vec(py, vec![3_i64, 3]);
+            let counts2 = PyArray1::from_vec(py, vec![1_i64]); // mismatched: len 1 vs starts' len 2
+            let expected_counts = "starts and counts must have equal lengths; got 2 and 1";
+
+            let error = crate::index_builder::index_starts_and_ends_keep_first(
+                py,
+                index.readonly(),
+                starts2.readonly(),
+                ends2.readonly(),
+                counts2.readonly(),
+                matches.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/counts must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected_counts);
+
+            let error = crate::index_builder::build_positional_index_first(
+                py,
+                index.readonly(),
+                starts2.readonly(),
+                ends2.readonly(),
+                counts2.readonly(),
+                positions.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/counts must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected_counts);
+        });
+    }
+
+    #[test]
     fn representative_python_wrappers_reject_a_too_short_matches_tape() {
         Python::initialize();
         Python::attach(|py| {

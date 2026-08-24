@@ -3,17 +3,16 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_end, checked_index, ensure_tape_width};
+use crate::aggs::{checked_end, checked_index, ensure_equal_lengths, ensure_tape_width};
 
+/// Deliberate variant of `crate::aggs::checked_range`: allows `start == end`
+/// (an empty range) instead of rejecting it, because a candidate row with
+/// no matches is a valid "nothing here" result in this module, not an error.
 fn checked_range_or_none(start: i64, end: i64, len: usize) -> Option<(usize, usize)> {
     usize::try_from(start)
         .ok()
         .zip(checked_end(end, len))
         .filter(|(start, end)| start <= end)
-}
-
-fn checked_start_or_none(start: i64, len: usize) -> Option<usize> {
-    usize::try_from(start).ok().filter(|&start| start <= len)
 }
 
 /// Replicates `numpy.repeat(index, counts)`: emit `index[i]`, `counts[i]`
@@ -140,7 +139,7 @@ pub fn index_starts_only<'py>(
     // here, before the loop below ever indexes into the tape.
     let starts: Vec<Option<usize>> = starts
         .iter()
-        .map(|start| checked_start_or_none(*start, end))
+        .map(|start| checked_end(*start, end))
         .collect();
     let expected_matches_width: usize = starts
         .iter()
@@ -193,7 +192,7 @@ pub fn index_starts_only_keep_first<'py>(
     // here, before the loop below ever indexes into the tape.
     let starts: Vec<Option<usize>> = starts
         .iter()
-        .map(|start| checked_start_or_none(*start, end))
+        .map(|start| checked_end(*start, end))
         .collect();
     let expected_matches_width: usize = starts
         .iter()
@@ -254,7 +253,7 @@ pub fn index_starts_only_keep_last<'py>(
     // here, before the loop below ever indexes into the tape.
     let starts: Vec<Option<usize>> = starts
         .iter()
-        .map(|start| checked_start_or_none(*start, end))
+        .map(|start| checked_end(*start, end))
         .collect();
     let expected_matches_width: usize = starts
         .iter()
@@ -470,6 +469,7 @@ pub fn index_starts_and_ends<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let matches = matches.as_array();
+    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
@@ -522,6 +522,8 @@ pub fn index_starts_and_ends_keep_first<'py>(
     let ends = ends.as_array();
     let counts = counts.as_array();
     let matches = matches.as_array();
+    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+    ensure_equal_lengths("starts", starts.len(), "counts", counts.len())?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
@@ -584,6 +586,8 @@ pub fn index_starts_and_ends_keep_last<'py>(
     let ends = ends.as_array();
     let counts = counts.as_array();
     let matches = matches.as_array();
+    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+    ensure_equal_lengths("starts", starts.len(), "counts", counts.len())?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
@@ -695,6 +699,8 @@ pub fn build_positional_index_first<'py>(
     let ends = ends.as_array();
     let counts = counts.as_array();
     let positions = positions.as_array();
+    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+    ensure_equal_lengths("starts", starts.len(), "counts", counts.len())?;
     let ranges: Vec<Option<(usize, usize)>> = starts
         .iter()
         .zip(ends.iter())
@@ -748,6 +754,8 @@ pub fn build_positional_index_last<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let positions = positions.as_array();
+    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+    ensure_equal_lengths("starts", starts.len(), "counts", counts.len())?;
     let ranges: Vec<Option<(usize, usize)>> = starts
         .iter()
         .zip(ends.iter())

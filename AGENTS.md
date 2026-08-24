@@ -833,3 +833,29 @@ silently wrap in release) rather than ever emitting a `-1` into a result
 consumed by positional indexing. When adding a new guard, ask "does this
 function's output get positionally indexed downstream without a filter
 step first?" -- if yes, prefer erroring over sentinel-and-skip.
+
+### [2026-08-24] #45's own per-row bounds fix missed the whole-call `starts`/`ends`/`counts` shape check
+
+**Context**: Adversarial review of #45 (which added `checked_end`/`checked_range`-style
+per-row guards to `index_builder.rs`) found that `index_starts_and_ends`,
+`index_starts_and_ends_keep_first`, `index_starts_and_ends_keep_last`,
+`build_positional_index_first`, and `build_positional_index_last` all `zip`
+`starts` against `ends` (and, for four of the five, `counts` too) with no
+`ensure_equal_lengths` check -- the exact whole-call shape gap #36 closed for
+the `sum`/`min`/`max`/`prod` families and #34 reused rather than
+special-casing. A mismatched pair silently truncates to the shorter array
+instead of raising, unlike the `ensure_equal_lengths("right", ...,
+"right_booleans", ...)` guard this same PR added for the analogous
+`comp_no_range_ne.rs` case.
+**Learning**: Landing a per-row bounds fix (#38's `checked_end`/`checked_range`
+family) in a file does not automatically cover that file's whole-call
+`ensure_equal_lengths` shape contract (#36) -- they are separate invariants
+guarding separate failure modes, and a PR scoped to one can leave the other
+unaudited in the very same functions it touches.
+**Recommendation**: When a PR adds per-row (`checked_*`) guards to a function,
+also check every parallel array it zips for a whole-call `ensure_equal_lengths`
+guard, not just the arrays the per-row fix happens to bound. `index_builder.rs`
+now calls `ensure_equal_lengths("starts", ..., "ends", ...)` (and, where
+present, `"starts"`/`"counts"`) at the top of all five functions, matching the
+`prod_starts_ends.rs`-style call site pattern; regression coverage lives in
+`aggs::adversarial_bounds_tests::index_builder_starts_ends_functions_reject_mismatched_lengths`.
