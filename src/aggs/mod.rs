@@ -1,5 +1,7 @@
 use pyo3::prelude::*;
 
+pub(crate) mod dense;
+
 pub mod min;
 
 pub mod prod;

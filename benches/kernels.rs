@@ -17,14 +17,15 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use numpy::ndarray::{Array1, ArrayView1};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
     binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, repeat_index_core,
-    sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core,
-    CompareOp,
+    sum_end_core, sum_rev_no_range_i64_core, sum_start_core, sum_start_end_core,
+    sum_start_u32_core, trim_index_core, CompareOp,
 };
 
 /// Counts bytes, calls, and outstanding (live) bytes allocated through the
@@ -601,6 +602,143 @@ fn bench_sum_kernels(c: &mut Criterion) {
     group.finish();
 }
 
+/// A bench-only copy of the reverse-sum "no range" kernel as it existed
+/// before issue #23's dense-accumulator rewrite: a `HashMap<i64, i64>`
+/// keyed by `right_index`, with entries emitted in the map's own
+/// (unspecified, effectively random) iteration order. Kept here rather
+/// than in `src/` for the same reason as
+/// `binary_search_lt_first_core_with_capacity` above: it lets
+/// `bench_sum_rev_no_range_old_vs_new` time the old and new approaches
+/// back-to-back, on the same fixtures, in the same run.
+fn sum_rev_no_range_int_core_hashmap(
+    arr: ArrayView1<i64>,
+    left_index: ArrayView1<i64>,
+    right_index: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    length: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let zipped = left_index.into_iter().zip(right_index);
+    for (index_left, index_right) in zipped {
+        let Some(left) = usize::try_from(*index_left)
+            .ok()
+            .filter(|&left| left < arr.len())
+        else {
+            continue;
+        };
+        let current = arr[left];
+        let boolean = booleans[left];
+        let total = dictionary.entry(*index_right).or_insert(0);
+        if boolean {
+            continue;
+        }
+        *total += current;
+    }
+    let mut indexers = Vec::with_capacity(dictionary.len());
+    let mut result = Vec::with_capacity(dictionary.len());
+    for (key, val) in dictionary.iter() {
+        indexers.push(*key);
+        result.push(*val);
+    }
+    (indexers, result)
+}
+
+/// Inputs for `bench_sum_rev_no_range_old_vs_new`: `n` left rows feeding a
+/// conditional join's equi-join output, grouped into `n / 10` right-side
+/// row positions (at least 1) so the accumulator does real merging work
+/// rather than a trivial 1:1 pass-through -- representative of a
+/// `join_agg` with a moderate group size, not a degenerate case.
+struct SumRevFixture {
+    arr: Array1<i64>,
+    left_index: Array1<i64>,
+    right_index: Array1<i64>,
+    booleans: Array1<bool>,
+    length: usize,
+}
+
+impl SumRevFixture {
+    fn new(n: usize) -> Self {
+        let length = (n / 10).max(1);
+        let arr = Array1::from_iter((0..n as i64).map(|i| i % 997));
+        let left_index = Array1::from_iter(0..n as i64);
+        let right_index = Array1::from_iter((0..n as i64).map(|i| i % length as i64));
+        let booleans = Array1::from_elem(n, false);
+        SumRevFixture {
+            arr,
+            left_index,
+            right_index,
+            booleans,
+            length,
+        }
+    }
+}
+
+/// Direct old-(`HashMap`)-vs-new-(`DenseSlots`) comparison for the
+/// reverse-sum "no range" kernel -- the shape issue #23's reproduction
+/// case (`compute_sum_rev_no_range_int64`) used to demonstrate
+/// non-deterministic output order. Reports allocation/peak numbers via
+/// `eprintln!` (the primary signal here, alongside criterion's timing)
+/// since the whole point of the dense rewrite is fewer allocations and no
+/// hashing, not just wall time.
+fn bench_sum_rev_no_range_old_vs_new(c: &mut Criterion) {
+    eprintln!("\nsum_rev_no_range old (HashMap) vs new (DenseSlots) allocation report:");
+    let mut group = c.benchmark_group("sum_rev_no_range_old_vs_new");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_millis(500));
+    for n in [100, 100_000] {
+        let f = SumRevFixture::new(n);
+
+        let (bytes, calls, peak) = count_allocations(|| {
+            sum_rev_no_range_int_core_hashmap(
+                f.arr.view(),
+                f.left_index.view(),
+                f.right_index.view(),
+                f.booleans.view(),
+                f.length,
+            )
+        });
+        eprintln!(
+            "  old (HashMap)   n={n:>7}: {bytes:>9} bytes / {calls:>3} allocs / {peak:>9} peak"
+        );
+        group.bench_function(format!("old n={n}"), |b| {
+            b.iter(|| {
+                sum_rev_no_range_int_core_hashmap(
+                    black_box(f.arr.view()),
+                    black_box(f.left_index.view()),
+                    black_box(f.right_index.view()),
+                    black_box(f.booleans.view()),
+                    black_box(f.length),
+                )
+            })
+        });
+
+        let (bytes, calls, peak) = count_allocations(|| {
+            sum_rev_no_range_i64_core(
+                f.arr.view(),
+                f.left_index.view(),
+                f.right_index.view(),
+                f.booleans.view(),
+                f.length,
+            )
+        });
+        eprintln!(
+            "  new (DenseSlots) n={n:>7}: {bytes:>9} bytes / {calls:>3} allocs / {peak:>9} peak"
+        );
+        group.bench_function(format!("new n={n}"), |b| {
+            b.iter(|| {
+                sum_rev_no_range_i64_core(
+                    black_box(f.arr.view()),
+                    black_box(f.left_index.view()),
+                    black_box(f.right_index.view()),
+                    black_box(f.booleans.view()),
+                    black_box(f.length),
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bin_search_lt,
@@ -608,6 +746,7 @@ criterion_group!(
     bench_bin_search_first_old_vs_new,
     bench_compare_start_end,
     bench_index_builders,
-    bench_sum_kernels
+    bench_sum_kernels,
+    bench_sum_rev_no_range_old_vs_new
 );
 criterion_main!(benches);

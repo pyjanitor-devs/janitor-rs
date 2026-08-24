@@ -16,6 +16,9 @@ pub mod bench_support {
     pub use crate::aggs::sum::sum_ends::sum_end_core;
     pub use crate::aggs::sum::sum_starts::{sum_start_core, sum_start_u32_core};
     pub use crate::aggs::sum::sum_starts_ends::sum_start_end_core;
+    pub use crate::aggs::sum_rev::sum_no_range::{
+        sum_rev_no_range_f64_core, sum_rev_no_range_i64_core,
+    };
     pub use crate::bin_search::bin_search_ge_first::binary_search_ge_first_core;
     pub use crate::bin_search::bin_search_gt_first::binary_search_gt_first_core;
     pub use crate::bin_search::bin_search_le_first::binary_search_le_first_core;
