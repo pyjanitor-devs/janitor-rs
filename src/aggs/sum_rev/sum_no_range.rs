@@ -2,7 +2,7 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{checked_index, ensure_equal_lengths};
 use std::collections::HashMap;
 
 macro_rules! compute_ints {
@@ -32,8 +32,14 @@ macro_rules! compute_ints {
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let zipped = left_index.into_iter().zip(right_index.into_iter());
             for (index_left, index_right) in zipped {
-                let current = arr[*index_left as usize];
-                let boolean = booleans[*index_left as usize];
+                // ELI5: see `max_rev/max_no_range.rs`'s identical guard for
+                // the full rationale (`index_left` needs a bound check,
+                // `right_index` doesn't).
+                let Some(left) = checked_index(*index_left, arr.len()) else {
+                    continue;
+                };
+                let current = arr[left];
+                let boolean = booleans[left];
                 let current = current as i64;
                 let total = dictionary.entry(*index_right).or_insert(0);
                 if boolean {
@@ -90,8 +96,13 @@ macro_rules! compute_floats {
             let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
             let zipped = left_index.into_iter().zip(right_index.into_iter());
             for (index_left, index_right) in zipped {
-                let current = arr[*index_left as usize];
-                let boolean = booleans[*index_left as usize];
+                // ELI5: same guard as the integer macro above -- see its
+                // comment for why `index_left` must be checked before use.
+                let Some(left) = checked_index(*index_left, arr.len()) else {
+                    continue;
+                };
+                let current = arr[left];
+                let boolean = booleans[left];
                 let current = current as f64;
                 let total = dictionary.entry(*index_right).or_insert(0.);
                 let compensation = mapping.entry(*index_right).or_insert(0.);

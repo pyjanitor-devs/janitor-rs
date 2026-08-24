@@ -259,6 +259,128 @@ mod adversarial_bounds_tests {
     }
 
     #[test]
+    fn index_builder_starts_ends_functions_reject_mismatched_lengths() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+
+            // `index_starts_and_ends*`/`build_positional_index_first/last`
+            // zipped `starts` against `ends` (and `counts`) with no length
+            // check, silently truncating to the shorter array on a
+            // mismatch instead of raising -- unlike the `ensure_equal_lengths`
+            // guard this same PR added for the analogous `right`/
+            // `right_booleans` case in `comp_no_range_ne.rs`.
+            let index = PyArray1::from_vec(py, vec![0_i64, 1, 2]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let ends = PyArray1::from_vec(py, vec![3_i64]); // mismatched: len 1 vs starts' len 2
+            let counts = PyArray1::from_vec(py, vec![1_i64, 1]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1, 1]);
+            let positions = PyArray1::from_vec(py, vec![0_i64, 1, 2]);
+            let expected = "starts and ends must have equal lengths; got 2 and 1";
+
+            let error = crate::index_builder::index_starts_and_ends(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                matches.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/ends must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected);
+
+            let error = crate::index_builder::index_starts_and_ends_keep_first(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/ends must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected);
+
+            let error = crate::index_builder::index_starts_and_ends_keep_last(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/ends must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected);
+
+            let error = crate::index_builder::build_positional_index_first(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                positions.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/ends must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected);
+
+            let error = crate::index_builder::build_positional_index_last(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                positions.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/ends must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected);
+
+            // `starts`/`counts` mismatch, `_keep_first`/`_keep_last` and
+            // `build_positional_index_first/last` only.
+            let starts2 = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let ends2 = PyArray1::from_vec(py, vec![3_i64, 3]);
+            let counts2 = PyArray1::from_vec(py, vec![1_i64]); // mismatched: len 1 vs starts' len 2
+            let expected_counts = "starts and counts must have equal lengths; got 2 and 1";
+
+            let error = crate::index_builder::index_starts_and_ends_keep_first(
+                py,
+                index.readonly(),
+                starts2.readonly(),
+                ends2.readonly(),
+                counts2.readonly(),
+                matches.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/counts must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected_counts);
+
+            let error = crate::index_builder::build_positional_index_first(
+                py,
+                index.readonly(),
+                starts2.readonly(),
+                ends2.readonly(),
+                counts2.readonly(),
+                positions.readonly(),
+                3,
+            )
+            .expect_err("mismatched starts/counts must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).to_string(), expected_counts);
+        });
+    }
+
+    #[test]
     fn representative_python_wrappers_reject_a_too_short_matches_tape() {
         Python::initialize();
         Python::attach(|py| {
@@ -405,6 +527,286 @@ mod adversarial_bounds_tests {
             .expect("an inverted start>end row must contribute zero width, not underflow");
             let got: Vec<i64> = result.readonly().as_array().to_vec();
             assert_eq!(got, vec![10, 20]);
+        });
+    }
+
+    #[test]
+    fn no_range_and_positional_functions_reject_out_of_bounds_indices_without_panicking() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+
+            // issue #38: `arr[*index_left as usize]`/`booleans[...]` in the
+            // four `_rev/*_no_range.rs` files were indexed with no bound
+            // check at all. A `left_index` entry past `arr.len()` must now
+            // skip that row instead of panicking.
+            let arr = PyArray1::from_vec(py, vec![5_i64, 9]);
+            let left_index = PyArray1::from_vec(py, vec![0_i64, 99]); // 99 is out of bounds
+            let right_index = PyArray1::from_vec(py, vec![0_i64, 0]);
+            let booleans = PyArray1::from_vec(py, vec![false, false]);
+            let (keys, vals) = super::max_rev::max_no_range::compute_max_rev_no_range_int64(
+                py,
+                arr.readonly(),
+                left_index.readonly(),
+                right_index.readonly(),
+                booleans.readonly(),
+                1,
+            )
+            .expect("an out-of-bounds left_index row must be skipped, not panic");
+            assert_eq!(keys.readonly().as_array().to_vec(), vec![0_i64]);
+            // `vals` holds the *position* (index_left) of the winning
+            // value, not the value itself -- row 0 (index_left=0) is the
+            // only surviving row, so it wins by default.
+            assert_eq!(vals.readonly().as_array().to_vec(), vec![0_i64]);
+
+            // Adversarial-review finding folded into #38: `comp_no_range.rs`
+            // only guarded the `-1` sentinel, never the upper bound, before
+            // indexing `right[*right_pos as usize]`.
+            let left = PyArray1::from_vec(py, vec![3_i64]);
+            let right = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let positions = PyArray1::from_vec(py, vec![99_i64]); // out of bounds, not -1
+            let (result, total) = super::super::compare::comp_no_range::compare_no_range_int64(
+                py,
+                left.readonly(),
+                right.readonly(),
+                positions.readonly(),
+                0, // op: >
+            );
+            assert_eq!(result.readonly().as_array().to_vec(), vec![-1_i64]);
+            assert_eq!(total, 0);
+
+            // Same finding, `comp_no_range_ne.rs`: also gains an
+            // `ensure_equal_lengths("right", ..., "right_booleans", ...)`
+            // whole-call check, since both are indexed by the same
+            // `right_pos`.
+            let left = PyArray1::from_vec(py, vec![3_i64]);
+            let right = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let right_booleans = PyArray1::from_vec(py, vec![false]); // mismatched length
+            let positions = PyArray1::from_vec(py, vec![0_i64]);
+            let left_booleans = PyArray1::from_vec(py, vec![false]);
+            let error = super::super::compare::comp_no_range_ne::compare_no_range_ne_int64(
+                py,
+                left.readonly(),
+                right.readonly(),
+                positions.readonly(),
+                left_booleans.readonly(),
+                right_booleans.readonly(),
+                false,
+                0,
+            )
+            .expect_err("mismatched right/right_booleans lengths must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+
+            // Adversarial-review finding folded into #38:
+            // `index_builder::build_positional_index` only guarded
+            // `position < 0`, never the upper bound.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20]);
+            let positions = PyArray1::from_vec(py, vec![99_i64]); // out of bounds
+            let result = crate::index_builder::build_positional_index(
+                py,
+                index.readonly(),
+                positions.readonly(),
+                1,
+            );
+            assert_eq!(result.readonly().as_array().to_vec(), vec![0_i64]);
+
+            // Adversarial-review finding folded into #38: the write side
+            // (`result[n] = val`) was unguarded against `n >= result.len()`
+            // -- a `length` smaller than the number of in-bounds entries
+            // `positions` actually yields must break cleanly, not panic.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
+            let positions = PyArray1::from_vec(py, vec![0_i64, 1, 2]); // 3 valid entries
+            let result = crate::index_builder::build_positional_index(
+                py,
+                index.readonly(),
+                positions.readonly(),
+                1, // capacity for only 1
+            );
+            assert_eq!(result.readonly().as_array().to_vec(), vec![10_i64]);
+
+            // Adversarial review of PR #45 (P1): `index_builder::
+            // reorder_index` used to leave a rejected mapping as the
+            // crate's usual `-1` sentinel and return `Ok`, but pyjanitor's
+            // only caller does an unfiltered `right.iloc[reordered_
+            // positions]` on this output -- pandas treats `-1` as the
+            // *last* row, not "no match", so a malformed mapping silently
+            // duplicated a row into the result instead of surfacing as an
+            // error. A bucket id past `starts.len()` must now reject the
+            // whole call with `ValueError`, not return a `-1`-containing
+            // array.
+            let positions = PyArray1::from_vec(py, vec![99_i64]); // out of bounds bucket id
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let error =
+                crate::index_builder::reorder_index(py, positions.readonly(), starts.readonly())
+                    .expect_err(
+                        "an out-of-range positions[i] bucket id must be rejected, not \
+                         silently mapped to -1",
+                    );
+            assert!(error.is_instance_of::<PyValueError>(py));
+
+            // Adversarial review of PR #45 (P2): `starts[bucket] +
+            // counts[bucket]` used plain `+=`, so a `starts` value near
+            // `i64::MAX` overflowed on a later row sharing that bucket --
+            // panicking in debug builds, silently wrapping in release
+            // builds. `checked_add` must turn this into the same
+            // `ValueError` in every build profile, never a panic.
+            let positions = PyArray1::from_vec(py, vec![0_i64, 0_i64]);
+            let starts = PyArray1::from_vec(py, vec![i64::MAX]);
+            let error =
+                crate::index_builder::reorder_index(py, positions.readonly(), starts.readonly())
+                    .expect_err(
+                        "an overflowing starts[bucket] + counts[bucket] must be rejected, \
+                         not panic or wrap",
+                    );
+            assert!(error.is_instance_of::<PyValueError>(py));
+
+            // A valid bucket id and a non-overflowing position are not
+            // sufficient: duplicate starts can make two rows target the
+            // same output slot while leaving another slot untouched. That
+            // would leave a `-1` for pandas to reinterpret as its last row.
+            let positions = PyArray1::from_vec(py, vec![0_i64, 1_i64]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 0_i64]);
+            let error =
+                crate::index_builder::reorder_index(py, positions.readonly(), starts.readonly())
+                    .expect_err("overlapping reorder output positions must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+
+            // The positional first/last variants also receive raw indexer
+            // values from the caller. A positive out-of-bounds indexer must
+            // be skipped just like the existing -1 sentinel, not panic.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20_i64]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![1_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64]);
+            let positions = PyArray1::from_vec(py, vec![99_i64]);
+            let first = crate::index_builder::build_positional_index_first(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                positions.readonly(),
+                1,
+            )
+            .expect("an invalid first-position indexer must be skipped");
+            assert_eq!(first.readonly().as_array().to_vec(), vec![-1_i64]);
+            let last = crate::index_builder::build_positional_index_last(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                positions.readonly(),
+                1,
+            )
+            .expect("an invalid last-position indexer must be skipped");
+            assert_eq!(last.readonly().as_array().to_vec(), vec![-1_i64]);
+
+            // The starts/ends family must validate the range used to index
+            // `index` before touching it; the three variants share this
+            // same unchecked loop shape.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20_i64]);
+            let starts = PyArray1::from_vec(py, vec![99_i64]);
+            let ends = PyArray1::from_vec(py, vec![100_i64]);
+            let matches = PyArray1::from_vec(py, Vec::<i8>::new());
+            let result = crate::index_builder::index_starts_and_ends(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("an invalid starts/ends row must be skipped");
+            assert_eq!(result.readonly().as_array().to_vec(), vec![0_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64]);
+            let first = crate::index_builder::index_starts_and_ends_keep_first(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("an invalid keep-first starts/ends row must be skipped");
+            assert_eq!(first.readonly().as_array().to_vec(), vec![-1_i64]);
+            let last = crate::index_builder::index_starts_and_ends_keep_last(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("an invalid keep-last starts/ends row must be skipped");
+            assert_eq!(last.readonly().as_array().to_vec(), vec![-1_i64]);
+
+            // The ends-only siblings must reject an end beyond `index.len()`
+            // before their `index[nn]` loops can walk past the value array.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20_i64]);
+            let ends = PyArray1::from_vec(py, vec![3_i64]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1, 1]);
+            let result = crate::index_builder::index_ends_only(
+                py,
+                index.readonly(),
+                ends.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("an oversized end must be skipped");
+            assert_eq!(result.readonly().as_array().to_vec(), vec![0_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64]);
+            let first = crate::index_builder::index_ends_only_keep_first(
+                py,
+                index.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("an oversized keep-first end must be skipped");
+            assert_eq!(first.readonly().as_array().to_vec(), vec![-1_i64]);
+            let last = crate::index_builder::index_ends_only_keep_last(
+                py,
+                index.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("an oversized keep-last end must be skipped");
+            assert_eq!(last.readonly().as_array().to_vec(), vec![-1_i64]);
+
+            // A -1 start with a zero-count row must not cast to a huge
+            // usize and underflow while computing the skipped tape width.
+            let starts = PyArray1::from_vec(py, vec![-1_i64]);
+            let counts = PyArray1::from_vec(py, vec![0_i64]);
+            let matches = PyArray1::from_vec(py, Vec::<i8>::new());
+            let first = crate::index_builder::index_starts_only_keep_first(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("a sentinel zero-count start must not underflow");
+            assert_eq!(first.readonly().as_array().to_vec(), vec![0_i64]);
+            let last = crate::index_builder::index_starts_only_keep_last(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("a sentinel zero-count start must not underflow");
+            assert_eq!(last.readonly().as_array().to_vec(), vec![0_i64]);
         });
     }
 

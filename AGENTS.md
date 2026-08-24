@@ -755,3 +755,107 @@ dropped. This is scoped to
 one of #24's three opportunities (one-pass output); the shared/validated
 comparison-operator enum and the contiguous-array fast path are tracked
 separately and not addressed by this entry.
+
+### [2026-08-24] Issue #38: a raw caller-supplied index (not a range) has no natural "empty" fallback
+
+**Context**: `max_rev/max_no_range.rs`, `min_rev/min_no_range.rs`,
+`sum_rev/sum_no_range.rs`, and `prod_rev/prod_no_range.rs` each read
+`index_left` straight from a caller-supplied `left_index` array and used
+it to index `arr`/`booleans` (`arr[*index_left as usize]`) with no bound
+check at all -- `left_index` had already gained `arr`/`booleans`
+equal-length validation (`ensure_equal_lengths`, `PyResult`) from an
+earlier sweep, but nothing validated `index_left` itself before using it.
+While fixing this, a broader sweep for the same *shape* of gap (found
+folded into this PR rather than filed as a separate issue, per explicit
+direction) turned up four more:
+`compare/comp_no_range.rs` and `comp_no_range_ne.rs` only guarded the `-1`
+sentinel before indexing `right`/`right_booleans` by `right_pos`, never
+the upper bound; `index_builder::build_positional_index` only guarded
+`position < 0`, same gap; `index_builder::reorder_index` had no guard at
+all (not even `-1`), on *two* chained reads (`starts`/`counts` by `val`,
+then `result` by the `pos` derived from those reads).
+**Learning**: This is a different shape from both #27/#32's
+`start..end` range guard and #40/#41's tape-width pre-pass. A single index
+read from a caller-supplied array, used directly to index another array,
+has no natural "empty" fallback the way an inverted `Range<usize>` does
+(see the `saturating_sub` entry above) -- there's no arithmetic trick that
+makes an invalid single index safe, it must be rejected outright before
+use, via `checked_index`. Where the same `right_pos`-shaped value gates
+*two* separate arrays (`right`/`right_booleans` in `comp_no_range_ne.rs`),
+their lengths need a one-time `ensure_equal_lengths` check so a single
+`checked_index` call safely covers both, matching how `arr`/`booleans` are
+validated together elsewhere in `aggs/`.
+**Learning (perf)**: measured `checked_index`'s added cost directly (built
+wheel, timed from Python) across 100/1M/10M rows: `compare_no_range`,
+`build_positional_index`, and `reorder_index` held flat ~0.5-1.4 ns/row
+across all three sizes -- the guard is genuinely O(1) per element, not a
+hidden O(n) or O(n^2) cost. `max_rev_no_range`'s per-row cost grows with
+`n` (15 ns/row at 1M, 50 ns/row at 10M), but that's pre-existing
+`HashMap`-rehashing cost from its dictionary-based grouping as the number
+of distinct keys grows, not something this fix introduced -- confirmed by
+the other three (no `HashMap` involved) staying flat.
+**Recommendation**: When auditing for this class of bug, grep for
+`\[\*[a-zA-Z_]* as usize\]` across the whole tree, not just the specific
+files a filed issue names -- greenfield sentinel-only guards (`if *x ==
+-1`) are exactly as unsafe as no guard at all against a positive
+out-of-range value, and are easy to mistake for "already handled" on a
+skim. Prefer `checked_index`/`checked_range`/`checked_end` over a hand-
+rolled comparison so the missing-upper-bound mistake can't recur.
+
+### [2026-08-24] The `-1` sentinel isn't safe for every consumer -- check what the caller does with it
+
+**Context**: A first pass at guarding `index_builder::reorder_index`
+(issue #38 follow-up) rejected out-of-range mappings by leaving the
+crate's usual `-1` "no match" sentinel in the output and returning `Ok`,
+matching how most other kernels here skip a bad row. An adversarial
+review of that PR caught that this specific function's sole caller
+(pyjanitor) does an unfiltered `right.iloc[reordered_positions]` on the
+result -- and pandas treats `-1` as the *last* row, not "no match". A
+malformed mapping therefore produced a wrong-but-plausible reordered
+`DataFrame` (a duplicated row) instead of an error or an obviously broken
+one.
+**Learning**: The `-1` sentinel convention (see the `-1` sentinel entry
+earlier in this file) is safe when callers treat it as an opaque "no
+value" marker -- a boolean mask, an equality check, a Python-side `!= -1`
+filter. It is *not* safe wherever the crate's own output feeds directly
+into positional indexing (`.iloc`, `.take`, raw pointer/offset
+arithmetic) without the caller filtering `-1` out first, because those
+consumers reinterpret a negative index as "count from the end" rather
+than "absent". Before choosing "skip and sentinel" vs. "reject the whole
+call" for a new guard, check how the Python side actually consumes the
+function's output, not just what every sibling function in this crate
+happens to do.
+**Recommendation**: `reorder_index` now returns `PyResult` and raises
+`ValueError` on any unresolvable mapping (out-of-range bucket, or an
+overflowing `starts[bucket] + counts[bucket]` via `checked_add` instead
+of plain `+=`, which previously could panic in debug builds and
+silently wrap in release) rather than ever emitting a `-1` into a result
+consumed by positional indexing. When adding a new guard, ask "does this
+function's output get positionally indexed downstream without a filter
+step first?" -- if yes, prefer erroring over sentinel-and-skip.
+
+### [2026-08-24] #45's own per-row bounds fix missed the whole-call `starts`/`ends`/`counts` shape check
+
+**Context**: Adversarial review of #45 (which added `checked_end`/`checked_range`-style
+per-row guards to `index_builder.rs`) found that `index_starts_and_ends`,
+`index_starts_and_ends_keep_first`, `index_starts_and_ends_keep_last`,
+`build_positional_index_first`, and `build_positional_index_last` all `zip`
+`starts` against `ends` (and, for four of the five, `counts` too) with no
+`ensure_equal_lengths` check -- the exact whole-call shape gap #36 closed for
+the `sum`/`min`/`max`/`prod` families and #34 reused rather than
+special-casing. A mismatched pair silently truncates to the shorter array
+instead of raising, unlike the `ensure_equal_lengths("right", ...,
+"right_booleans", ...)` guard this same PR added for the analogous
+`comp_no_range_ne.rs` case.
+**Learning**: Landing a per-row bounds fix (#38's `checked_end`/`checked_range`
+family) in a file does not automatically cover that file's whole-call
+`ensure_equal_lengths` shape contract (#36) -- they are separate invariants
+guarding separate failure modes, and a PR scoped to one can leave the other
+unaudited in the very same functions it touches.
+**Recommendation**: When a PR adds per-row (`checked_*`) guards to a function,
+also check every parallel array it zips for a whole-call `ensure_equal_lengths`
+guard, not just the arrays the per-row fix happens to bound. `index_builder.rs`
+now calls `ensure_equal_lengths("starts", ..., "ends", ...)` (and, where
+present, `"starts"`/`"counts"`) at the top of all five functions, matching the
+`prod_starts_ends.rs`-style call site pattern; regression coverage lives in
+`aggs::adversarial_bounds_tests::index_builder_starts_ends_functions_reject_mismatched_lengths`.

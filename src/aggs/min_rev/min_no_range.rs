@@ -2,7 +2,7 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{checked_index, ensure_equal_lengths};
 use std::collections::HashMap;
 
 macro_rules! compute {
@@ -33,8 +33,14 @@ macro_rules! compute {
             let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
             let zipped = left_index.into_iter().zip(right_index.into_iter());
             for (index_left, index_right) in zipped {
-                let current = arr[*index_left as usize];
-                let boolean = booleans[*index_left as usize];
+                // ELI5: see `max_rev/max_no_range.rs`'s identical guard for
+                // the full rationale (`index_left` needs a bound check,
+                // `right_index` doesn't).
+                let Some(left) = checked_index(*index_left, arr.len()) else {
+                    continue;
+                };
+                let current = arr[left];
+                let boolean = booleans[left];
                 let base = dictionary.entry(*index_right).or_insert(-1);
                 let base_val = mapping.entry(*index_right).or_insert(current);
                 if boolean {
@@ -42,7 +48,7 @@ macro_rules! compute {
                 }
                 if (*base == -1) || (current < *base_val) {
                     *base_val = current;
-                    *base = *index_left as i64;
+                    *base = left as i64;
                 }
             }
             let length = dictionary.len();
