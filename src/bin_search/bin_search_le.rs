@@ -3,6 +3,12 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+/// Find, for every `left[i]`, the first position in `right[starts[i]..ends[i])`
+/// whose value is greater than or equal to `left[i]` (`right` is assumed
+/// sorted ascending within each `[start, end)` slice, which in particular
+/// means NaN-free -- see the contiguous-fast-path note below for what that
+/// rules out and why it matters).
+///
 /// A row with a malformed range (`start` negative, `end` the `-1` sentinel,
 /// `start >= end`, or `end` beyond `right.len()`) resolves to `-1`, matching
 /// a genuinely empty range, instead of casting a negative bound to `usize`

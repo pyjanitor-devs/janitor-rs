@@ -4,6 +4,19 @@ use pyo3::prelude::*;
 
 macro_rules! bin_search {
     ($fname:ident, $type:ty) => {
+        /// For every `left[i]`, binary searches the *whole* `right` array
+        /// (unlike `binary_search_gt_core`, which searches a per-row
+        /// `[start, end)` slice) for the first position whose value is
+        /// greater than or equal to `left[i]`, then reports how many
+        /// positions from there to the end of `right` there are --
+        /// dropping rows where that count would be zero.
+        ///
+        /// `right` is assumed sorted ascending, which in particular means
+        /// NaN-free: NaN cannot occupy a valid position in a sort order.
+        /// The contiguous fast path below and its fallback are only
+        /// guaranteed to agree for input meeting that precondition -- see
+        /// `bin_search_lt.rs`'s core for why (and `nan_in_right_does_not_panic_but_parity_is_not_guaranteed`
+        /// below for what happens, and doesn't, when it's violated).
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

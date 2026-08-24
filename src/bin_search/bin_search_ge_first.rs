@@ -4,7 +4,9 @@ use pyo3::prelude::*;
 
 /// For every `left[i]`, find the last position in all of `right` whose
 /// value is less than or equal to `left[i]`, returned as one past that
-/// position (`right` is assumed sorted ascending). Rows with no such
+/// position (`right` is assumed sorted ascending, which in particular
+/// means NaN-free -- see the contiguous-fast-path note below for what
+/// that rules out and why it matters). Rows with no such
 /// position are dropped entirely rather than represented with a sentinel;
 /// only the surviving `(search index, left_index[i])` pairs are returned,
 /// in row order.

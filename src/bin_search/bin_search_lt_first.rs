@@ -4,7 +4,9 @@ use pyo3::prelude::*;
 
 /// For every `left[i]`, find the first position in all of `right` whose
 /// value is strictly greater than `left[i]` (`right` is assumed sorted
-/// ascending) -- the one-pass sibling of `binary_search_lt_core`, which
+/// ascending, which in particular means NaN-free -- see the
+/// contiguous-fast-path note below for what that rules out and why it
+/// matters) -- the one-pass sibling of `binary_search_lt_core`, which
 /// searches a per-row `[start, end)` slice instead of the whole array.
 /// Rows with no such position (or, defensively, one that happens to equal
 /// `left[i]` -- cannot happen when `right` is truly sorted) are dropped

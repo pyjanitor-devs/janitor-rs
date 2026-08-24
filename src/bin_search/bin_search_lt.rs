@@ -6,8 +6,9 @@ use pyo3::prelude::*;
 /// Find, for every `left[i]`, the first position in `right[starts[i]..ends[i])`
 /// whose value is strictly greater than `left[i]` -- the start of the match
 /// region for a `<` join (`right` is assumed sorted ascending within each
-/// `[start, end)` slice -- see the contiguous-fast-path note below for what
-/// that precondition rules out and why it matters). Returns `-1` for an
+/// `[start, end)` slice, which in particular means NaN-free -- see the
+/// contiguous-fast-path note below for what that precondition rules out
+/// and why it matters). Returns `-1` for an
 /// invalid/empty range (`start` negative, `end` the `-1` sentinel, an
 /// inverted `start`/`end` pair, or `end` beyond `right.len()`), when no
 /// element in the range is greater than `left[i]`, or when the first such
