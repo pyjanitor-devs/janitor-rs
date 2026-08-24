@@ -59,8 +59,12 @@ macro_rules! generic_compare {
                 // into `right_booleans[...]`/`right[...]` unchecked; treat
                 // every unresolvable position the same way the sentinel
                 // already was, as "no match".
-                let checked_position = checked_index(*right_pos, right.len());
-                if checked_position.is_none() || (*left_bool && is_extension_array) {
+                let Some(pos) = checked_index(*right_pos, right.len()) else {
+                    result[n] = -1;
+                    n += 1;
+                    continue;
+                };
+                if *left_bool && is_extension_array {
                     result[n] = -1;
                     n += 1;
                     continue;
@@ -71,7 +75,6 @@ macro_rules! generic_compare {
                     total += 1;
                     continue;
                 }
-                let pos = checked_position.expect("checked_position.is_none() handled above");
                 let right_bool = right_booleans[pos];
                 if right_bool && is_extension_array {
                     result[n] = -1;

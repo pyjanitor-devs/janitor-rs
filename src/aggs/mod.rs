@@ -540,6 +540,89 @@ mod adversarial_bounds_tests {
                          not panic or wrap",
                     );
             assert!(error.is_instance_of::<PyValueError>(py));
+
+            // A valid bucket id and a non-overflowing position are not
+            // sufficient: duplicate starts can make two rows target the
+            // same output slot while leaving another slot untouched. That
+            // would leave a `-1` for pandas to reinterpret as its last row.
+            let positions = PyArray1::from_vec(py, vec![0_i64, 1_i64]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 0_i64]);
+            let error =
+                crate::index_builder::reorder_index(py, positions.readonly(), starts.readonly())
+                    .expect_err("overlapping reorder output positions must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+
+            // The positional first/last variants also receive raw indexer
+            // values from the caller. A positive out-of-bounds indexer must
+            // be skipped just like the existing -1 sentinel, not panic.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20_i64]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![1_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64]);
+            let positions = PyArray1::from_vec(py, vec![99_i64]);
+            let first = crate::index_builder::build_positional_index_first(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                positions.readonly(),
+                1,
+            )
+            .expect("an invalid first-position indexer must be skipped");
+            assert_eq!(first.readonly().as_array().to_vec(), vec![-1_i64]);
+            let last = crate::index_builder::build_positional_index_last(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                positions.readonly(),
+                1,
+            )
+            .expect("an invalid last-position indexer must be skipped");
+            assert_eq!(last.readonly().as_array().to_vec(), vec![-1_i64]);
+
+            // The starts/ends family must validate the range used to index
+            // `index` before touching it; the three variants share this
+            // same unchecked loop shape.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20_i64]);
+            let starts = PyArray1::from_vec(py, vec![99_i64]);
+            let ends = PyArray1::from_vec(py, vec![100_i64]);
+            let matches = PyArray1::from_vec(py, Vec::<i8>::new());
+            let result = crate::index_builder::index_starts_and_ends(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("an invalid starts/ends row must be skipped");
+            assert_eq!(result.readonly().as_array().to_vec(), vec![0_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64]);
+            let first = crate::index_builder::index_starts_and_ends_keep_first(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("an invalid keep-first starts/ends row must be skipped");
+            assert_eq!(first.readonly().as_array().to_vec(), vec![-1_i64]);
+            let last = crate::index_builder::index_starts_and_ends_keep_last(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("an invalid keep-last starts/ends row must be skipped");
+            assert_eq!(last.readonly().as_array().to_vec(), vec![-1_i64]);
         });
     }
 

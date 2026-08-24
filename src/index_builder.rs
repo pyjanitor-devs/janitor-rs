@@ -1,10 +1,16 @@
-use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_index, ensure_tape_width};
+use crate::aggs::{checked_end, checked_index, ensure_tape_width};
+
+fn checked_range_or_none(start: i64, end: i64, len: usize) -> Option<(usize, usize)> {
+    usize::try_from(start)
+        .ok()
+        .zip(checked_end(end, len))
+        .filter(|(start, end)| start <= end)
+}
 
 /// Replicates `numpy.repeat(index, counts)`: emit `index[i]`, `counts[i]`
 /// times, for every `i`, back to back.
@@ -430,20 +436,24 @@ pub fn index_starts_and_ends<'py>(
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize = starts
+    let ranges: Vec<Option<(usize, usize)>> = starts
         .iter()
         .zip(ends.iter())
-        .map(|(s, e)| (*e as usize).saturating_sub(*s as usize))
+        .map(|(start, end)| checked_range_or_none(*start, *end, index.len()))
+        .collect();
+    let expected_matches_width: usize = ranges
+        .iter()
+        .filter_map(|range| range.map(|(start, end)| end - start))
         .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    let zipped = starts.into_iter().zip(ends);
-    for (start, end) in zipped {
-        let start_: usize = *start as usize;
-        let end_: usize = *end as usize;
+    for range in ranges {
+        let Some((start_, end_)) = range else {
+            continue;
+        };
         for nn in start_..end_ {
             if matches[n] == 0 {
                 n += 1;
@@ -478,28 +488,30 @@ pub fn index_starts_and_ends_keep_first<'py>(
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize = starts
+    let ranges: Vec<Option<(usize, usize)>> = starts
         .iter()
         .zip(ends.iter())
-        .map(|(s, e)| (*e as usize).saturating_sub(*s as usize))
+        .map(|(start, end)| checked_range_or_none(*start, *end, index.len()))
+        .collect();
+    let expected_matches_width: usize = ranges
+        .iter()
+        .filter_map(|range| range.map(|(start, end)| end - start))
         .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    let zipped = izip!(starts.into_iter(), ends.into_iter(), counts.into_iter());
-    for (start, end, count_) in zipped {
-        let start_: usize = *start as usize;
-        let end_: usize = *end as usize;
+    for (range, count_) in ranges.into_iter().zip(counts) {
         if *count_ == 0 {
-            let size = end_ - start_;
+            let size = range.map_or(0, |(start, end)| end - start);
             n += size;
             continue;
         }
         if pos == length as usize {
             break;
         }
+        let (start_, end_) = range.unwrap_or((0, 0));
         let mut base: i64 = -1;
         for nn in start_..end_ {
             if matches[n] == 0 {
@@ -538,22 +550,23 @@ pub fn index_starts_and_ends_keep_last<'py>(
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize = starts
+    let ranges: Vec<Option<(usize, usize)>> = starts
         .iter()
         .zip(ends.iter())
-        .map(|(s, e)| (*e as usize).saturating_sub(*s as usize))
+        .map(|(start, end)| checked_range_or_none(*start, *end, index.len()))
+        .collect();
+    let expected_matches_width: usize = ranges
+        .iter()
+        .filter_map(|range| range.map(|(start, end)| end - start))
         .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    let zipped = izip!(starts.into_iter(), ends.into_iter(), counts.into_iter());
-    for (start, end, count_) in zipped {
-        let start_: usize = *start as usize;
-        let end_: usize = *end as usize;
+    for (range, count_) in ranges.into_iter().zip(counts) {
         if *count_ == 0 {
-            let size = end_ - start_;
+            let size = range.map_or(0, |(start, end)| end - start);
             n += size;
             continue;
         }
@@ -561,6 +574,7 @@ pub fn index_starts_and_ends_keep_last<'py>(
             break;
         }
 
+        let (start_, end_) = range.unwrap_or((0, 0));
         let mut base: i64 = -1;
         for nn in start_..end_ {
             if matches[n] == 0 {
@@ -637,32 +651,34 @@ pub fn build_positional_index_first<'py>(
     counts: PyReadonlyArray1<'py, i64>,
     positions: PyReadonlyArray1<'py, i64>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let index = index.as_array();
     let starts = starts.as_array();
     let ends = ends.as_array();
     let counts = counts.as_array();
     let positions = positions.as_array();
+    let ranges: Vec<Option<(usize, usize)>> = starts
+        .iter()
+        .zip(ends.iter())
+        .map(|(start, end)| checked_range_or_none(*start, *end, positions.len()))
+        .collect();
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut pos: usize = 0;
-    let zipped = izip!(starts.into_iter(), ends.into_iter(), counts.into_iter());
-    for (start, end, count_) in zipped.into_iter() {
+    for (range, count_) in ranges.into_iter().zip(counts) {
         if *count_ == 0 {
             continue;
         }
         if pos == length as usize {
             break;
         }
-        let start_ = *start as usize;
-        let end_ = *end as usize;
+        let (start_, end_) = range.unwrap_or((0, 0));
         let mut base: i64 = -1;
         for nn in start_..end_ {
             let indexer = positions[nn];
-            if indexer == -1 {
+            let Some(indexer) = checked_index(indexer, index.len()) else {
                 continue;
-            }
-            let indexer_: usize = indexer as usize;
-            let val: i64 = index[indexer_];
+            };
+            let val: i64 = index[indexer];
             if (base < 0) || (val < base) {
                 base = val;
             }
@@ -670,7 +686,7 @@ pub fn build_positional_index_first<'py>(
         result[pos] = base;
         pos += 1;
     }
-    result.into_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 /// Build index based on positions
@@ -688,32 +704,34 @@ pub fn build_positional_index_last<'py>(
     counts: PyReadonlyArray1<'py, i64>,
     positions: PyReadonlyArray1<'py, i64>,
     length: i64,
-) -> Bound<'py, PyArray1<i64>> {
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let index = index.as_array();
     let counts = counts.as_array();
     let starts = starts.as_array();
     let ends = ends.as_array();
     let positions = positions.as_array();
+    let ranges: Vec<Option<(usize, usize)>> = starts
+        .iter()
+        .zip(ends.iter())
+        .map(|(start, end)| checked_range_or_none(*start, *end, positions.len()))
+        .collect();
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut pos: usize = 0;
-    let zipped = izip!(starts.into_iter(), ends.into_iter(), counts.into_iter());
-    for (start, end, count_) in zipped.into_iter() {
+    for (range, count_) in ranges.into_iter().zip(counts) {
         if *count_ == 0 {
             continue;
         }
         if pos == length as usize {
             break;
         }
-        let start_ = *start as usize;
-        let end_ = *end as usize;
+        let (start_, end_) = range.unwrap_or((0, 0));
         let mut base: i64 = -1;
         for nn in start_..end_ {
             let indexer = positions[nn];
-            if indexer == -1 {
+            let Some(indexer) = checked_index(indexer, index.len()) else {
                 continue;
-            }
-            let indexer_: usize = indexer as usize;
-            let val: i64 = index[indexer_];
+            };
+            let val: i64 = index[indexer];
             if base < val {
                 base = val;
             }
@@ -721,7 +739,7 @@ pub fn build_positional_index_last<'py>(
         result[pos] = base;
         pos += 1;
     }
-    result.into_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -747,6 +765,7 @@ pub fn reorder_index<'py>(
     // not as an error -- so this raises instead of skipping.
     let mut result = Array1::<i64>::from_elem(positions.len(), -1);
     let mut counts: Array1<i64> = Array1::zeros(starts.len());
+    let mut occupied = vec![false; positions.len()];
     for (index, val) in positions.indexed_iter() {
         let bucket = checked_index(*val, starts.len()).ok_or_else(|| {
             PyValueError::new_err(format!(
@@ -774,7 +793,18 @@ pub fn reorder_index<'py>(
                 result.len()
             ))
         })?;
+        if occupied[pos] {
+            return Err(PyValueError::new_err(format!(
+                "computed position {pos} for positions[{index}] is already occupied"
+            )));
+        }
+        occupied[pos] = true;
         result[pos] = index as i64;
+    }
+    if let Some(pos) = occupied.iter().position(|occupied| !occupied) {
+        return Err(PyValueError::new_err(format!(
+            "reorder_index left result position {pos} unassigned"
+        )));
     }
     Ok(result.into_pyarray(py))
 }
