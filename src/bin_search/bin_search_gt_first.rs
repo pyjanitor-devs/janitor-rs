@@ -28,7 +28,17 @@ pub fn binary_search_gt_first_core<T: PartialOrd + Copy>(
     let mut index_left = Vec::new();
     for (pos, left_value) in left.into_iter().enumerate() {
         let min_idx = if let Some(slice) = right_slice {
-            slice.partition_point(|v| *v < *left_value)
+            // Written as `!(*v >= *left_value)`, the literal negation of
+            // the manual loop's "max side" condition below, not the
+            // algebraically-equivalent `*v < *left_value` -- those two
+            // differ for NaN (see bin_search_gt.rs's core for the full
+            // explanation), and this function accepts float dtypes
+            // without validating them as NaN-free. The negation is
+            // deliberate (clippy::neg_cmp_op_on_partial_ord suppressed
+            // below), not the anti-pattern that lint normally flags.
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
+            let p = slice.partition_point(|v| !(*v >= *left_value));
+            p
         } else {
             let mut min_idx = 0;
             let mut max_idx = len_right;
@@ -128,6 +138,25 @@ mod tests {
 
         let left = array![0_i64, 5, 100];
         let left_index = array![10_i64, 20, 30];
+        let fast = binary_search_gt_first_core(left.view(), right_dense.view(), left_index.view());
+        let fallback = binary_search_gt_first_core(left.view(), right_strided, left_index.view());
+        assert_eq!(fast, fallback);
+    }
+
+    #[test]
+    fn contiguous_and_strided_paths_agree_on_a_nan_containing_array() {
+        // Regression test: the fast path used to be written as
+        // `*v < *left_value`, which is only equal to the fallback's
+        // literal `!(*v >= *left_value)` for totally-ordered values --
+        // see bin_search_gt.rs's core for the full explanation.
+        let right_dense = array![1.0_f64, 2.0, 3.0, 4.0];
+        assert!(right_dense.view().as_slice().is_some());
+        let right_padded = array![1.0_f64, -1.0, 2.0, -1.0, 3.0, -1.0, 4.0, -1.0];
+        let right_strided = right_padded.slice(s![..;2]);
+        assert!(right_strided.as_slice().is_none());
+
+        let left = array![f64::NAN];
+        let left_index = array![0_i64];
         let fast = binary_search_gt_first_core(left.view(), right_dense.view(), left_index.view());
         let fallback = binary_search_gt_first_core(left.view(), right_strided, left_index.view());
         assert_eq!(fast, fallback);

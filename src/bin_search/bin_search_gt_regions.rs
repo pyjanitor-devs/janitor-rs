@@ -19,7 +19,19 @@ macro_rules! bin_search {
             let mut total: usize = left.len();
             for (pos, left_value) in left.into_iter().enumerate() {
                 let min_idx = if let Some(slice) = right_slice {
-                    slice.partition_point(|v| *v < *left_value)
+                    // Written as `!(*v >= *left_value)`, the literal
+                    // negation of the manual loop's "max side" condition
+                    // below, not the algebraically-equivalent
+                    // `*v < *left_value` -- those two differ for NaN
+                    // (see bin_search_gt.rs's core for the full
+                    // explanation), and this function accepts float
+                    // dtypes without validating them as NaN-free. The
+                    // negation is deliberate (clippy::neg_cmp_op_on_partial_ord
+                    // suppressed below), not the anti-pattern that lint
+                    // normally flags.
+                    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+                    let p = slice.partition_point(|v| !(*v >= *left_value));
+                    p
                 } else {
                     let mut min_idx = 0;
                     let mut max_idx = right.len();
@@ -150,6 +162,63 @@ mod tests {
                 left_index.readonly(),
             );
             let (fallback_search, fallback_left, fallback_total) = binary_search_gt_regions_int64(
+                py,
+                left.readonly(),
+                right_strided,
+                left_index.readonly(),
+            );
+            assert_eq!(
+                fast_search.readonly().as_array().to_vec(),
+                fallback_search.readonly().as_array().to_vec()
+            );
+            assert_eq!(
+                fast_left.readonly().as_array().to_vec(),
+                fallback_left.readonly().as_array().to_vec()
+            );
+            assert_eq!(fast_total, fallback_total);
+        });
+    }
+
+    #[test]
+    fn contiguous_and_strided_paths_agree_on_a_nan_containing_array() {
+        // Regression test: the fast path used to be written as
+        // `*v < *left_value`, which is only equal to the fallback's
+        // literal `!(*v >= *left_value)` for totally-ordered values --
+        // see bin_search_gt.rs's core for the full explanation.
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let right_values = [1.0_f64, 2.0, 3.0, 4.0];
+            let right_dense = PyArray1::from_vec(py, right_values.to_vec());
+            assert!(right_dense.readonly().as_array().as_slice().is_some());
+            let padded: Vec<f64> = right_values.iter().flat_map(|v| [*v, -1.0]).collect();
+            let numpy = py.import("numpy").unwrap();
+            let full = numpy.call_method1("array", (padded,)).unwrap();
+            let right_strided: PyReadonlyArray1<'_, f64> = full
+                .get_item(pyo3::types::PySlice::new(
+                    py,
+                    0,
+                    (right_values.len() * 2) as isize,
+                    2,
+                ))
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(right_strided.as_array().as_slice().is_none());
+
+            let left = PyArray1::from_vec(py, vec![f64::NAN]);
+            let left_index = PyArray1::from_vec(py, vec![0_i64]);
+
+            let (fast_search, fast_left, fast_total) = binary_search_gt_regions_f64(
+                py,
+                left.readonly(),
+                right_dense.readonly(),
+                left_index.readonly(),
+            );
+            let (fallback_search, fallback_left, fallback_total) = binary_search_gt_regions_f64(
                 py,
                 left.readonly(),
                 right_strided,

@@ -42,15 +42,32 @@ pub fn binary_search_gt_core<T: PartialOrd + Copy>(
             continue;
         }
         // ELI5: `partition_point` runs the identical half-interval search
-        // as the manual `while` loop below (same predicate, same
-        // direction), so it's a drop-in replacement, not a different
-        // algorithm -- the fast path exists because a `&[T]` slice gives
-        // the compiler bounds-check-elision and vectorization
-        // opportunities a manual `ArrayView1` index can't. Both paths are
-        // computed against the same `[start, end)` sub-range regardless of
-        // which one runs.
+        // as the manual `while` loop below -- same predicate, same
+        // direction -- so it's a drop-in replacement, not a different
+        // algorithm. The predicate is written as `!(*v >= *left_value)`,
+        // the literal negation of the manual loop's "max side" condition
+        // below, not the algebraically-equivalent `*v < *left_value`:
+        // those two differ for `f32`/`f64` when NaN is involved (any
+        // comparison with NaN is `false`, so `!(a >= b)` is `true` while
+        // `a < b` is `false`), and this function accepts float dtypes
+        // without validating them as NaN-free. Using the exact negation
+        // keeps the fast path bit-for-bit identical to the fallback for
+        // every input, not just totally-ordered ones -- the fast path
+        // exists because a `&[T]` slice gives the compiler bounds-check-
+        // elision and vectorization opportunities a manual `ArrayView1`
+        // index can't, not because the comparison itself changes. Both
+        // paths are computed against the same `[start, end)` sub-range
+        // regardless of which one runs.
         let min_idx = if let Some(slice) = right_slice {
-            let rel = slice[*start as usize..*end as usize].partition_point(|v| *v < *left_value);
+            // clippy's neg_cmp_op_on_partial_ord exists to flag exactly
+            // this kind of NaN footgun -- but here the negation *is* the
+            // fix, deliberately mirroring the fallback loop's `else`
+            // branch (`!(current_value >= left_value)`) bit-for-bit
+            // rather than the algebraically-"cleaner" `<`, which is what
+            // silently diverged from it for NaN in the first place.
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
+            let rel =
+                slice[*start as usize..*end as usize].partition_point(|v| !(*v >= *left_value));
             *start + rel as i64
         } else {
             let mut min_idx = *start;
@@ -158,7 +175,34 @@ mod tests {
         let ends = array![4_i64, 4, 4];
         let fast =
             binary_search_gt_core(left.view(), right_dense.view(), starts.view(), ends.view());
-        let fallback = binary_search_gt_core(left.view(), right_strided, starts.view(), ends.view());
+        let fallback =
+            binary_search_gt_core(left.view(), right_strided, starts.view(), ends.view());
+        assert_eq!(fast, fallback);
+    }
+
+    #[test]
+    fn contiguous_and_strided_paths_agree_on_a_nan_containing_array() {
+        // Regression test: the fast path used to be written as
+        // `*v < *left_value`, which is only equal to the fallback's
+        // literal `!(*v >= *left_value)` for totally-ordered values --
+        // any comparison with NaN is `false`, so `!(a >= b)` is `true`
+        // while `a < b` is `false` when either side is NaN. Comparing
+        // the two paths directly (not against a hand-derived "expected"
+        // value, since NaN ordering has no independent ground truth)
+        // proves the fix restores parity.
+        let right_dense = array![1.0_f64, 2.0, 3.0, 4.0];
+        assert!(right_dense.view().as_slice().is_some());
+        let right_padded = array![1.0_f64, -1.0, 2.0, -1.0, 3.0, -1.0, 4.0, -1.0];
+        let right_strided = right_padded.slice(s![..;2]);
+        assert!(right_strided.as_slice().is_none());
+
+        let left = array![f64::NAN];
+        let starts = array![0_i64];
+        let ends = array![4_i64];
+        let fast =
+            binary_search_gt_core(left.view(), right_dense.view(), starts.view(), ends.view());
+        let fallback =
+            binary_search_gt_core(left.view(), right_strided, starts.view(), ends.view());
         assert_eq!(fast, fallback);
     }
 

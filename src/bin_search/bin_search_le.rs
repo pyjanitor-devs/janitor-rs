@@ -152,7 +152,8 @@ mod tests {
         let ends = array![4_i64, 4, 4];
         let fast =
             binary_search_le_core(left.view(), right_dense.view(), starts.view(), ends.view());
-        let fallback = binary_search_le_core(left.view(), right_strided, starts.view(), ends.view());
+        let fallback =
+            binary_search_le_core(left.view(), right_strided, starts.view(), ends.view());
         assert_eq!(fast, fallback);
     }
 
