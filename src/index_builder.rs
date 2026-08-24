@@ -1,6 +1,7 @@
 use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::aggs::{checked_index, ensure_tape_width};
@@ -729,39 +730,53 @@ pub fn reorder_index<'py>(
     py: Python<'py>,
     positions: PyReadonlyArray1<'py, i64>,
     starts: PyReadonlyArray1<'py, i64>,
-) -> Bound<'py, PyArray1<i64>> {
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
     let positions = positions.as_array();
     let starts = starts.as_array();
-    // ELI5: zero-initializing `result` would make a skipped slot
-    // (rejected below) indistinguishable from a legitimate mapping to row
-    // 0 -- pyjanitor's only caller does an unfiltered positional reindex
-    // on this output, so a `0` there silently duplicates row 0 into the
-    // slot instead of surfacing as the crate's established "no value"
-    // sentinel. `-1` matches how every other position/index result in
-    // this crate marks "no match".
+    // ELI5: a well-formed call fills every slot in `result` exactly once
+    // -- `starts`/`counts` partition all of `positions` into contiguous,
+    // non-overlapping runs that together span `0..positions.len()`. So
+    // unlike most `-1`-sentinel guards elsewhere in this crate (which
+    // gracefully skip a malformed *row* and leave its own slot as "no
+    // match"), a bucket/position that fails to resolve here means the
+    // *whole call's* input was malformed, not just one row: pyjanitor's
+    // only caller does an unfiltered `right.iloc[reordered_positions]` on
+    // this output, and pandas treats `-1` as a real (last-row) position,
+    // not a "no match" marker. Silently leaving a `-1` in `result` would
+    // therefore surface as a wrong row being duplicated into the output,
+    // not as an error -- so this raises instead of skipping.
     let mut result = Array1::<i64>::from_elem(positions.len(), -1);
     let mut counts: Array1<i64> = Array1::zeros(starts.len());
     for (index, val) in positions.indexed_iter() {
-        // ELI5: `val` is a raw bucket id read straight from the
-        // caller-supplied `positions` array, used to index `starts`/
-        // `counts` -- previously with no check at all, not even the
-        // crate's usual `-1` sentinel handling. `pos` (the write target
-        // into `result`) is then derived from that same unchecked read, so
-        // it needs its own guard too: a malformed `starts` entry could
-        // otherwise produce a `pos` that walks `result` out of bounds on
-        // the write below.
-        let Some(bucket) = checked_index(*val, starts.len()) else {
-            continue;
-        };
-        let mut pos = starts[bucket];
-        pos += counts[bucket];
+        let bucket = checked_index(*val, starts.len()).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "positions[{index}] = {val} does not name a valid starts/counts bucket \
+                 (starts has length {})",
+                starts.len()
+            ))
+        })?;
+        // ELI5: `starts[bucket]` and `counts[bucket]` are both caller-
+        // controlled (indirectly, via `positions`/`starts` values), so
+        // their sum could in principle overflow `i64` -- `checked_add`
+        // turns that into the same reported error as any other malformed
+        // mapping, instead of panicking (debug) or silently wrapping to a
+        // bogus position (release).
+        let pos = starts[bucket].checked_add(counts[bucket]).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "computed position for positions[{index}] (bucket {bucket}) overflowed i64"
+            ))
+        })?;
         counts[bucket] += 1;
-        let Some(pos) = checked_index(pos, result.len()) else {
-            continue;
-        };
+        let pos = checked_index(pos, result.len()).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "computed position {pos} for positions[{index}] is out of bounds for a result \
+                 of length {}",
+                result.len()
+            ))
+        })?;
         result[pos] = index as i64;
     }
-    result.into_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 /// Registers this file's dtype-specialized Python exports.

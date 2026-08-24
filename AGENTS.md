@@ -801,3 +801,35 @@ files a filed issue names -- greenfield sentinel-only guards (`if *x ==
 out-of-range value, and are easy to mistake for "already handled" on a
 skim. Prefer `checked_index`/`checked_range`/`checked_end` over a hand-
 rolled comparison so the missing-upper-bound mistake can't recur.
+
+### [2026-08-24] The `-1` sentinel isn't safe for every consumer -- check what the caller does with it
+
+**Context**: A first pass at guarding `index_builder::reorder_index`
+(issue #38 follow-up) rejected out-of-range mappings by leaving the
+crate's usual `-1` "no match" sentinel in the output and returning `Ok`,
+matching how most other kernels here skip a bad row. An adversarial
+review of that PR caught that this specific function's sole caller
+(pyjanitor) does an unfiltered `right.iloc[reordered_positions]` on the
+result -- and pandas treats `-1` as the *last* row, not "no match". A
+malformed mapping therefore produced a wrong-but-plausible reordered
+`DataFrame` (a duplicated row) instead of an error or an obviously broken
+one.
+**Learning**: The `-1` sentinel convention (see the `-1` sentinel entry
+earlier in this file) is safe when callers treat it as an opaque "no
+value" marker -- a boolean mask, an equality check, a Python-side `!= -1`
+filter. It is *not* safe wherever the crate's own output feeds directly
+into positional indexing (`.iloc`, `.take`, raw pointer/offset
+arithmetic) without the caller filtering `-1` out first, because those
+consumers reinterpret a negative index as "count from the end" rather
+than "absent". Before choosing "skip and sentinel" vs. "reject the whole
+call" for a new guard, check how the Python side actually consumes the
+function's output, not just what every sibling function in this crate
+happens to do.
+**Recommendation**: `reorder_index` now returns `PyResult` and raises
+`ValueError` on any unresolvable mapping (out-of-range bucket, or an
+overflowing `starts[bucket] + counts[bucket]` via `checked_add` instead
+of plain `+=`, which previously could panic in debug builds and
+silently wrap in release) rather than ever emitting a `-1` into a result
+consumed by positional indexing. When adding a new guard, ask "does this
+function's output get positionally indexed downstream without a filter
+step first?" -- if yes, prefer erroring over sentinel-and-skip.

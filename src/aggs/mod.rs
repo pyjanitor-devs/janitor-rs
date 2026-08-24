@@ -505,16 +505,41 @@ mod adversarial_bounds_tests {
             );
             assert_eq!(result.readonly().as_array().to_vec(), vec![10_i64]);
 
-            // Adversarial-review finding folded into #38:
-            // `index_builder::reorder_index` had no check at all, and a
-            // rejected slot must land on the crate's `-1` sentinel, not
-            // the zero-initialized default (indistinguishable from a
-            // legitimate mapping to row 0).
+            // Adversarial review of PR #45 (P1): `index_builder::
+            // reorder_index` used to leave a rejected mapping as the
+            // crate's usual `-1` sentinel and return `Ok`, but pyjanitor's
+            // only caller does an unfiltered `right.iloc[reordered_
+            // positions]` on this output -- pandas treats `-1` as the
+            // *last* row, not "no match", so a malformed mapping silently
+            // duplicated a row into the result instead of surfacing as an
+            // error. A bucket id past `starts.len()` must now reject the
+            // whole call with `ValueError`, not return a `-1`-containing
+            // array.
             let positions = PyArray1::from_vec(py, vec![99_i64]); // out of bounds bucket id
             let starts = PyArray1::from_vec(py, vec![0_i64]);
-            let result =
-                crate::index_builder::reorder_index(py, positions.readonly(), starts.readonly());
-            assert_eq!(result.readonly().as_array().to_vec(), vec![-1_i64]);
+            let error =
+                crate::index_builder::reorder_index(py, positions.readonly(), starts.readonly())
+                    .expect_err(
+                        "an out-of-range positions[i] bucket id must be rejected, not \
+                         silently mapped to -1",
+                    );
+            assert!(error.is_instance_of::<PyValueError>(py));
+
+            // Adversarial review of PR #45 (P2): `starts[bucket] +
+            // counts[bucket]` used plain `+=`, so a `starts` value near
+            // `i64::MAX` overflowed on a later row sharing that bucket --
+            // panicking in debug builds, silently wrapping in release
+            // builds. `checked_add` must turn this into the same
+            // `ValueError` in every build profile, never a panic.
+            let positions = PyArray1::from_vec(py, vec![0_i64, 0_i64]);
+            let starts = PyArray1::from_vec(py, vec![i64::MAX]);
+            let error =
+                crate::index_builder::reorder_index(py, positions.readonly(), starts.readonly())
+                    .expect_err(
+                        "an overflowing starts[bucket] + counts[bucket] must be rejected, \
+                         not panic or wrap",
+                    );
+            assert!(error.is_instance_of::<PyValueError>(py));
         });
     }
 
