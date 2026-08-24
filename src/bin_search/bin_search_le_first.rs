@@ -21,22 +21,28 @@ pub fn binary_search_le_first_core<T: PartialOrd + Copy>(
     left_index: ArrayView1<i64>,
 ) -> (Vec<i64>, Vec<i64>) {
     let len_right = right.len();
+    let right_slice = right.as_slice();
     let mut search_indices = Vec::new();
     let mut index_left = Vec::new();
     for (pos, left_value) in left.into_iter().enumerate() {
-        let mut min_idx = 0;
-        let mut max_idx = len_right;
-        while min_idx < max_idx {
-            // to avoid overflow
-            // adapted from numba's implementation
-            let mid_idx = min_idx + ((max_idx - min_idx) >> 1);
-            let current_value = right[mid_idx];
-            if current_value < *left_value {
-                min_idx = mid_idx + 1;
-            } else {
-                max_idx = mid_idx;
+        let min_idx = if let Some(slice) = right_slice {
+            slice.partition_point(|v| *v < *left_value)
+        } else {
+            let mut min_idx = 0;
+            let mut max_idx = len_right;
+            while min_idx < max_idx {
+                // to avoid overflow
+                // adapted from numba's implementation
+                let mid_idx = min_idx + ((max_idx - min_idx) >> 1);
+                let current_value = right[mid_idx];
+                if current_value < *left_value {
+                    min_idx = mid_idx + 1;
+                } else {
+                    max_idx = mid_idx;
+                }
             }
-        }
+            min_idx
+        };
         if min_idx == len_right {
             continue;
         }
@@ -103,7 +109,22 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use numpy::ndarray::array;
+    use numpy::ndarray::{array, s};
+
+    #[test]
+    fn contiguous_and_strided_paths_agree() {
+        let right_dense = array![1_i64, 3, 5, 5, 5, 9];
+        assert!(right_dense.view().as_slice().is_some());
+        let right_padded = array![1_i64, -1, 3, -1, 5, -1, 5, -1, 5, -1, 9, -1];
+        let right_strided = right_padded.slice(s![..;2]);
+        assert!(right_strided.as_slice().is_none());
+
+        let left = array![0_i64, 5, 100];
+        let left_index = array![10_i64, 20, 30];
+        let fast = binary_search_le_first_core(left.view(), right_dense.view(), left_index.view());
+        let fallback = binary_search_le_first_core(left.view(), right_strided, left_index.view());
+        assert_eq!(fast, fallback);
+    }
 
     #[test]
     fn empty_input_returns_nothing() {

@@ -21,6 +21,11 @@ pub fn binary_search_le_core<T: PartialOrd + Copy>(
     starts: ArrayView1<i64>,
     ends: ArrayView1<i64>,
 ) -> Array1<i64> {
+    // ELI5: `.as_slice()` only returns `Some` when `right` is contiguous in
+    // standard (C) order -- true for a plain NumPy array, false for one
+    // sliced with a non-1 step. Checked once per call, not per row, since
+    // contiguity doesn't change mid-call.
+    let right_slice = right.as_slice();
     let mut result = Array1::<i64>::zeros(left.len());
     // Widen right.len() up to i64 instead of narrowing `end` down to
     // usize: on a 32-bit target, `*end as usize` truncates rather than
@@ -36,19 +41,33 @@ pub fn binary_search_le_core<T: PartialOrd + Copy>(
             result[pos] = -1;
             continue;
         }
-        let mut min_idx = *start;
-        let mut max_idx = *end;
-        while min_idx < max_idx {
-            // to avoid overflow
-            // adapted from numba's implementation
-            let mid_idx = min_idx + ((max_idx - min_idx) >> 1);
-            let current_value = right[mid_idx as usize];
-            if current_value < *left_value {
-                min_idx = mid_idx + 1;
-            } else {
-                max_idx = mid_idx;
+        // ELI5: `partition_point` runs the identical half-interval search
+        // as the manual `while` loop below (same predicate, same
+        // direction), so it's a drop-in replacement, not a different
+        // algorithm -- the fast path exists because a `&[T]` slice gives
+        // the compiler bounds-check-elision and vectorization
+        // opportunities a manual `ArrayView1` index can't. Both paths are
+        // computed against the same `[start, end)` sub-range regardless of
+        // which one runs.
+        let min_idx = if let Some(slice) = right_slice {
+            let rel = slice[*start as usize..*end as usize].partition_point(|v| *v < *left_value);
+            *start + rel as i64
+        } else {
+            let mut min_idx = *start;
+            let mut max_idx = *end;
+            while min_idx < max_idx {
+                // to avoid overflow
+                // adapted from numba's implementation
+                let mid_idx = min_idx + ((max_idx - min_idx) >> 1);
+                let current_value = right[mid_idx as usize];
+                if current_value < *left_value {
+                    min_idx = mid_idx + 1;
+                } else {
+                    max_idx = mid_idx;
+                }
             }
-        }
+            min_idx
+        };
         if min_idx == *end {
             result[pos] = -1;
             continue;
@@ -112,7 +131,30 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use numpy::ndarray::array;
+    use numpy::ndarray::{array, s};
+
+    #[test]
+    fn contiguous_and_strided_paths_agree() {
+        // `right_dense` is contiguous (fast path); `right_strided` reads
+        // the identical values through a stride-2 view over a padded
+        // array, so `.as_slice()` returns `None` and the fallback loop
+        // runs instead. Comparing the two directly proves they agree
+        // without needing to hand-derive an expected value independently
+        // of either.
+        let right_dense = array![10_i64, 20, 20, 30];
+        assert!(right_dense.view().as_slice().is_some());
+        let right_padded = array![10_i64, -1, 20, -1, 20, -1, 30, -1];
+        let right_strided = right_padded.slice(s![..;2]);
+        assert!(right_strided.as_slice().is_none());
+
+        let left = array![5_i64, 20, 35];
+        let starts = array![0_i64, 0, 0];
+        let ends = array![4_i64, 4, 4];
+        let fast =
+            binary_search_le_core(left.view(), right_dense.view(), starts.view(), ends.view());
+        let fallback = binary_search_le_core(left.view(), right_strided, starts.view(), ends.view());
+        assert_eq!(fast, fallback);
+    }
 
     #[test]
     fn both_bounds_negative_but_start_less_than_end_returns_minus_one_not_a_panic() {
