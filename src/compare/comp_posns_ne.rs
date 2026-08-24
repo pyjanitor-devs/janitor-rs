@@ -30,7 +30,6 @@ macro_rules! generic_compare {
             let left_booleans = left_booleans.as_array();
             let right_booleans = right_booleans.as_array();
             let op = CompareOp::try_from_code(op)?;
-            let cmp = op.comparator();
             let mut result = Array1::<i64>::zeros(positions.len());
             let mut counts_array = Array1::<i64>::zeros(left.len());
             let mut total: i64 = 0;
@@ -77,7 +76,7 @@ macro_rules! generic_compare {
                         continue;
                     }
                     let right_val = right[indexer as usize];
-                    let compare = cmp(left_val, &right_val);
+                    let compare = op.apply(left_val, &right_val);
                     counter += compare as i64;
                     total += compare as i64;
                     indexer = if compare { indexer } else { -1 };

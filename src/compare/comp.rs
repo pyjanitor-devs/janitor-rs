@@ -44,7 +44,6 @@ pub fn compare_start_end_core<T: PartialOrd + Copy>(
     matches: ArrayView1<i8>,
     op: CompareOp,
 ) -> (Array1<i8>, Array1<i64>, i64) {
-    let cmp = op.comparator();
     let mut result = Array1::<i8>::zeros(matches.len());
     let mut counts_array = Array1::<i64>::zeros(left.len());
     let mut total: i64 = 0;
@@ -67,7 +66,7 @@ pub fn compare_start_end_core<T: PartialOrd + Copy>(
                 continue;
             }
             let right_val = right[nn];
-            let compare = cmp(left_val, &right_val);
+            let compare = op.apply(left_val, &right_val);
             counter += compare as i64;
             total += compare as i64;
             result[n] = compare as i8;

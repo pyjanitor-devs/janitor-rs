@@ -574,7 +574,8 @@ mod adversarial_bounds_tests {
                 right.readonly(),
                 positions.readonly(),
                 0, // op: >
-            );
+            )
+            .expect("a valid op code with an out-of-bounds position must still succeed");
             assert_eq!(result.readonly().as_array().to_vec(), vec![-1_i64]);
             assert_eq!(total, 0);
 

@@ -21,7 +21,6 @@ macro_rules! generic_compare {
             let ends = ends.as_array();
             let length = ends.sum();
             let op = CompareOp::try_from_code(op)?;
-            let cmp = op.comparator();
             let mut result = Array1::<i8>::zeros(length as usize);
             let mut counts_array = Array1::<i64>::zeros(left.len());
             let mut total: i64 = 0;
@@ -32,7 +31,7 @@ macro_rules! generic_compare {
                 let mut counter: i64 = 0;
                 for nn in 0..end_ {
                     let right_val = right[nn];
-                    let compare = cmp(left_val, &right_val);
+                    let compare = op.apply(left_val, &right_val);
                     counter += compare as i64;
                     total += compare as i64;
                     result[n] = compare as i8;

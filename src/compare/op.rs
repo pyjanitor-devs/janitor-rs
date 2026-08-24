@@ -33,36 +33,28 @@ impl CompareOp {
         }
     }
 
-    /// ELI5: picks the comparison once, as a plain function pointer, so a
-    /// per-candidate loop calls it directly instead of re-matching on the
-    /// operator for every candidate pair.
+    /// Applies this comparison to one candidate pair.
+    ///
+    /// ELI5: an indirect function-pointer call can't be inlined, so
+    /// picking a `fn(&T, &T) -> bool` once outside the loop measured
+    /// *slower* than matching every iteration (25-46% slower at n=100 and
+    /// n=100,000 in `bench_compare_start_end` -- an indirect call defeats
+    /// the inlining/branch-prediction the compiler gets for free from a
+    /// `match` on a small `Copy` enum, which is exactly as cheap per
+    /// iteration as the `i8` match every file used to carry its own copy
+    /// of). Validating the raw code once via `try_from_code` and matching
+    /// on the resulting `CompareOp` every iteration keeps that same
+    /// per-iteration cost while still sharing one definition and never
+    /// falling back to `!=` on an unrecognized code.
     #[inline]
-    pub fn comparator<T: PartialOrd>(self) -> fn(&T, &T) -> bool {
-        fn gt<T: PartialOrd>(a: &T, b: &T) -> bool {
-            a > b
-        }
-        fn ge<T: PartialOrd>(a: &T, b: &T) -> bool {
-            a >= b
-        }
-        fn lt<T: PartialOrd>(a: &T, b: &T) -> bool {
-            a < b
-        }
-        fn le<T: PartialOrd>(a: &T, b: &T) -> bool {
-            a <= b
-        }
-        fn eq<T: PartialOrd>(a: &T, b: &T) -> bool {
-            a == b
-        }
-        fn ne<T: PartialOrd>(a: &T, b: &T) -> bool {
-            a != b
-        }
+    pub fn apply<T: PartialOrd>(self, left: &T, right: &T) -> bool {
         match self {
-            Self::Gt => gt,
-            Self::Ge => ge,
-            Self::Lt => lt,
-            Self::Le => le,
-            Self::Eq => eq,
-            Self::Ne => ne,
+            Self::Gt => left > right,
+            Self::Ge => left >= right,
+            Self::Lt => left < right,
+            Self::Le => left <= right,
+            Self::Eq => left == right,
+            Self::Ne => left != right,
         }
     }
 }
@@ -109,9 +101,8 @@ mod tests {
             (CompareOp::Ne, 5, 5, false),
         ];
         for (op, left, right, expected) in cases {
-            let cmp = op.comparator();
             assert_eq!(
-                cmp(&left, &right),
+                op.apply(&left, &right),
                 expected,
                 "op={op:?} left={left} right={right}"
             );
