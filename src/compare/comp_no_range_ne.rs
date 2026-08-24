@@ -3,18 +3,8 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use super::op::CompareOp;
 use crate::aggs::{checked_index, ensure_equal_lengths};
-
-fn binary_compare<T: std::cmp::PartialOrd>(left: &T, right: &T, op: i64) -> bool {
-    match op {
-        0 => left > right,
-        1 => left >= right,
-        2 => left < right,
-        3 => left <= right,
-        4 => left == right,
-        _ => left != right,
-    }
-}
 
 macro_rules! generic_compare {
     ($fname:ident, $type:ty) => {
@@ -37,6 +27,7 @@ macro_rules! generic_compare {
             let left = left.as_array();
             let positions = positions.as_array();
             let left_booleans = left_booleans.as_array();
+            let op = CompareOp::try_from_code(op)?;
             let mut result = Array1::<i64>::zeros(positions.len());
             let mut total: i64 = 0;
             let mut n: usize = 0;
@@ -88,7 +79,7 @@ macro_rules! generic_compare {
                     continue;
                 }
                 let right_val = right[pos];
-                let compare = binary_compare(left_val, &right_val, op);
+                let compare = op.apply(left_val, &right_val);
                 total += compare as i64;
                 result[n] = if compare { *right_pos } else { -1 };
                 n += 1;

@@ -4,20 +4,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::ensure_tape_width;
-
-/// ELI5: instead of writing six near-identical functions for `>`, `>=`,
-/// `<`, `<=`, `==`, `!=`, we pass a small numeric code for "which sign to
-/// use" and look it up once here.
-fn binary_compare<T: std::cmp::PartialOrd>(left: &T, right: &T, op: i8) -> bool {
-    match op {
-        0 => left > right,
-        1 => left >= right,
-        2 => left < right,
-        3 => left <= right,
-        4 => left == right,
-        _ => left != right,
-    }
-}
+use crate::compare::op::CompareOp;
 
 /// For every left row `i`, compare `left[i]` against `right[starts[i]..ends[i])`
 /// under `op`, but only at positions the caller has already flagged as
@@ -55,7 +42,7 @@ pub fn compare_start_end_core<T: PartialOrd + Copy>(
     starts: ArrayView1<i64>,
     ends: ArrayView1<i64>,
     matches: ArrayView1<i8>,
-    op: i8,
+    op: CompareOp,
 ) -> (Array1<i8>, Array1<i64>, i64) {
     let mut result = Array1::<i8>::zeros(matches.len());
     let mut counts_array = Array1::<i64>::zeros(left.len());
@@ -79,7 +66,7 @@ pub fn compare_start_end_core<T: PartialOrd + Copy>(
                 continue;
             }
             let right_val = right[nn];
-            let compare = binary_compare(left_val, &right_val, op);
+            let compare = op.apply(left_val, &right_val);
             counter += compare as i64;
             total += compare as i64;
             result[n] = compare as i8;
@@ -116,6 +103,7 @@ macro_rules! generic_compare {
                 .map(|(s, e)| (*e as usize) - (*s as usize))
                 .sum();
             ensure_tape_width(expected_matches_width, matches.as_array().len())?;
+            let op = CompareOp::try_from_code(op)?;
             let (result, counts_array, total) = compare_start_end_core(
                 left.as_array(),
                 right.as_array(),
@@ -168,13 +156,7 @@ mod tests {
     use super::*;
     use numpy::ndarray::array;
 
-    // op codes, per `binary_compare`: 0=`>` 1=`>=` 2=`<` 3=`<=` 4=`==` 5=`!=`
-    const GT: i8 = 0;
-    const GE: i8 = 1;
-    const LT: i8 = 2;
-    const LE: i8 = 3;
-    const EQ: i8 = 4;
-    const NE: i8 = 5;
+    use CompareOp::{Eq as EQ, Ge as GE, Gt as GT, Le as LE, Lt as LT, Ne as NE};
 
     #[test]
     fn each_op_code_matches_its_operator() {
@@ -201,10 +183,10 @@ mod tests {
                 matches.view(),
                 op,
             );
-            assert_eq!(result, Array1::from_vec(expected.to_vec()), "op={op}");
+            assert_eq!(result, Array1::from_vec(expected.to_vec()), "op={op:?}");
             let expected_count: i64 = expected.iter().map(|&v| v as i64).sum();
-            assert_eq!(counts, array![expected_count], "op={op}");
-            assert_eq!(total, expected_count, "op={op}");
+            assert_eq!(counts, array![expected_count], "op={op:?}");
+            assert_eq!(total, expected_count, "op={op:?}");
         }
     }
 

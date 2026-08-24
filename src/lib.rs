@@ -22,6 +22,7 @@ pub mod bench_support {
     pub use crate::bin_search::bin_search_lt::binary_search_lt_core;
     pub use crate::bin_search::bin_search_lt_first::binary_search_lt_first_core;
     pub use crate::compare::comp::compare_start_end_core;
+    pub use crate::compare::op::CompareOp;
     pub use crate::index_builder::{repeat_index_core, trim_index_core};
 }
 
