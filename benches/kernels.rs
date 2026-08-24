@@ -16,12 +16,53 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use numpy::ndarray::Array1;
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use janitor_rs::bench_support::{
-    binary_search_lt_core, compare_start_end_core, repeat_index_core, sum_end_core, sum_start_core,
-    sum_start_end_core, sum_start_u32_core, trim_index_core,
+    binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
+    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, repeat_index_core,
+    sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core,
 };
+
+/// Counts bytes and calls allocated through the global allocator, so
+/// `bench_bin_search_first` can report an allocation delta for a single
+/// call alongside criterion's timing -- criterion itself only measures
+/// wall time, and the whole point of the one-pass conversion (issue #24)
+/// is fewer allocations, not just less time.
+struct CountingAllocator;
+
+static BYTES_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        BYTES_ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
+        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAllocator = CountingAllocator;
+
+/// Runs `f` once and returns `(bytes allocated, allocation calls)` charged
+/// to it specifically, isolated from whatever the harness itself has
+/// already allocated by taking a before/after delta rather than an
+/// absolute count.
+fn count_allocations<T>(f: impl FnOnce() -> T) -> (usize, usize) {
+    let bytes_before = BYTES_ALLOCATED.load(Ordering::Relaxed);
+    let calls_before = ALLOC_CALLS.load(Ordering::Relaxed);
+    black_box(f());
+    (
+        BYTES_ALLOCATED.load(Ordering::Relaxed) - bytes_before,
+        ALLOC_CALLS.load(Ordering::Relaxed) - calls_before,
+    )
+}
 
 /// Every benchmark below builds its inputs via a small, purpose-built
 /// `<Kernel>Fixture::new(n)` -- one convention across the file, rather
@@ -70,6 +111,94 @@ fn bench_bin_search_lt(c: &mut Criterion) {
                     black_box(f.right.view()),
                     black_box(f.starts.view()),
                     black_box(f.ends.view()),
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
+/// Inputs for `bench_bin_search_first`: every `left[i]` is guaranteed to
+/// find a match somewhere in `right` (worst case for the one-pass `Vec`s'
+/// `with_capacity` -- every row survives, so both grow to exactly
+/// `left.len()`), which is the scenario the one-pass conversion (issue
+/// #24) specifically targets.
+struct BinarySearchFirstFixture {
+    right: Array1<i64>,
+    left: Array1<i64>,
+    left_index: Array1<i64>,
+}
+
+impl BinarySearchFirstFixture {
+    fn new(n: usize) -> Self {
+        let right = Array1::from_iter((0..n as i64).map(|i| i * 2));
+        let left = Array1::from_iter((0..n as i64).map(|i| i * 2 + 1));
+        let left_index = Array1::from_iter(0..n as i64);
+        BinarySearchFirstFixture {
+            right,
+            left,
+            left_index,
+        }
+    }
+}
+
+/// ELI5: for every value in `left`, find its match position in `right`
+/// and keep only the rows that actually matched -- the one-pass version
+/// (issue #24) does this by pushing straight into two `Vec`s instead of
+/// writing a full-length array with an internal marker and then filtering
+/// it in a second pass. Covers all four operator directions (`<`, `>`,
+/// `>=`, `<=`), since each uses a different internal marker convention.
+fn bench_bin_search_first(c: &mut Criterion) {
+    // One-time allocation report (not per criterion iteration -- criterion
+    // runs each closure many times, and printing on every run would be
+    // noise, not a report). See `count_allocations`'s doc comment for why
+    // this needs its own instrumentation rather than criterion's built-in
+    // timing.
+    eprintln!("\nbin_search_first allocation report (single call, bytes / alloc count):");
+    for n in [100, 100_000] {
+        let f = BinarySearchFirstFixture::new(n);
+        let (bytes, calls) = count_allocations(|| {
+            binary_search_lt_first_core(f.left.view(), f.right.view(), f.left_index.view())
+        });
+        eprintln!("  lt_first n={n:>7}: {bytes:>9} bytes / {calls:>3} allocs");
+    }
+
+    let mut group = c.benchmark_group("bin_search_first");
+    for n in [100, 100_000] {
+        let f = BinarySearchFirstFixture::new(n);
+        group.bench_function(format!("lt n={n}"), |b| {
+            b.iter(|| {
+                binary_search_lt_first_core(
+                    black_box(f.left.view()),
+                    black_box(f.right.view()),
+                    black_box(f.left_index.view()),
+                )
+            })
+        });
+        group.bench_function(format!("gt n={n}"), |b| {
+            b.iter(|| {
+                binary_search_gt_first_core(
+                    black_box(f.left.view()),
+                    black_box(f.right.view()),
+                    black_box(f.left_index.view()),
+                )
+            })
+        });
+        group.bench_function(format!("ge n={n}"), |b| {
+            b.iter(|| {
+                binary_search_ge_first_core(
+                    black_box(f.left.view()),
+                    black_box(f.right.view()),
+                    black_box(f.left_index.view()),
+                )
+            })
+        });
+        group.bench_function(format!("le n={n}"), |b| {
+            b.iter(|| {
+                binary_search_le_first_core(
+                    black_box(f.left.view()),
+                    black_box(f.right.view()),
+                    black_box(f.left_index.view()),
                 )
             })
         });
@@ -302,6 +431,7 @@ fn bench_sum_kernels(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_bin_search_lt,
+    bench_bin_search_first,
     bench_compare_start_end,
     bench_index_builders,
     bench_sum_kernels

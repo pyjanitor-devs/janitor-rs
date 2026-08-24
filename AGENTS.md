@@ -718,3 +718,39 @@ When adding a new leaf module, register it in its own file, wire it into
 the parent `mod.rs`'s `register`, and never add a `wrap_pyfunction!` call
 to `lib.rs` directly. Before assuming a Python export name matches a Rust
 function name, grep the file for `#[pyfunction(name = ...)]`.
+
+### [2026-08-24] Issue #24 (part 1): one-pass `*_first` output, no marker needed
+
+**Context**: `binary_search_{lt,gt,ge,le}_first.rs` each searched every row
+into a `left.len()`-sized `Array1` using an internal "no match" marker (`0`
+or `right.len()`, whichever value that specific operator's search can
+never produce as a genuine result), then made a second pass over that
+array to copy only the surviving rows into exactly-sized output arrays.
+**Learning**: The marker step is unnecessary. Since the loop already knows,
+at the exact moment it decides a row didn't match, whether to keep it, it
+can just not add it: push `(search index, left_index[i])` straight into
+two `Vec::with_capacity(left.len())`s (the only valid upper bound -- at
+most one match per row) instead of writing into a full-length array and
+filtering it later. This also removes the marker-value bookkeeping (whether
+`0` or `right.len()` is safe to reuse as "no match" isn't obvious on its
+own -- it depends on that specific operator's algorithm always keeping
+genuine results away from that boundary).
+**Learning (perf)**: measured with a custom `#[global_allocator]` wrapper
+in `benches/kernels.rs` (`count_allocations`, before/after byte delta
+around a single un-criterion'd call -- criterion itself only reports
+timing, not allocation): the one-pass version does exactly 2 allocations
+per call (one per output `Vec`), each sized exactly right, confirmed at
+n=100 (1,600 bytes) and n=100,000 (1,600,000 bytes) with every row
+surviving (the worst case for `with_capacity` -- both `Vec`s grow to
+exactly `left.len()`). The old shape needed up to 4 (`Array1::zeros`
+twice for the full-length pass, `Array1::zeros` twice more for the
+compacted pass).
+**Recommendation**: When a kernel's row-processing loop already knows at
+decision time whether a row survives, prefer pushing into a
+`Vec::with_capacity`-bounded output over writing a full-length array with
+an internal sentinel and filtering it in a second pass -- the sentinel
+approach costs an extra full allocation and an extra full scan for no
+benefit once the loop can just skip the row directly. This is scoped to
+one of #24's three opportunities (one-pass output); the shared/validated
+comparison-operator enum and the contiguous-array fast path are tracked
+separately and not addressed by this entry.
