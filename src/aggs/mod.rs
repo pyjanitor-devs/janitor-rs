@@ -491,13 +491,30 @@ mod adversarial_bounds_tests {
             );
             assert_eq!(result.readonly().as_array().to_vec(), vec![0_i64]);
 
+            // Adversarial-review finding folded into #38: the write side
+            // (`result[n] = val`) was unguarded against `n >= result.len()`
+            // -- a `length` smaller than the number of in-bounds entries
+            // `positions` actually yields must break cleanly, not panic.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
+            let positions = PyArray1::from_vec(py, vec![0_i64, 1, 2]); // 3 valid entries
+            let result = crate::index_builder::build_positional_index(
+                py,
+                index.readonly(),
+                positions.readonly(),
+                1, // capacity for only 1
+            );
+            assert_eq!(result.readonly().as_array().to_vec(), vec![10_i64]);
+
             // Adversarial-review finding folded into #38:
-            // `index_builder::reorder_index` had no check at all.
+            // `index_builder::reorder_index` had no check at all, and a
+            // rejected slot must land on the crate's `-1` sentinel, not
+            // the zero-initialized default (indistinguishable from a
+            // legitimate mapping to row 0).
             let positions = PyArray1::from_vec(py, vec![99_i64]); // out of bounds bucket id
             let starts = PyArray1::from_vec(py, vec![0_i64]);
             let result =
                 crate::index_builder::reorder_index(py, positions.readonly(), starts.readonly());
-            assert_eq!(result.readonly().as_array().to_vec(), vec![0_i64]);
+            assert_eq!(result.readonly().as_array().to_vec(), vec![-1_i64]);
         });
     }
 

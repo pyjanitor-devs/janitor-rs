@@ -597,6 +597,15 @@ pub fn build_positional_index<'py>(
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     for position in positions.into_iter() {
+        // ELI5: `n` only ever grows, so once it reaches `result`'s
+        // capacity (the caller-supplied `length`, independent of how many
+        // in-bounds entries `positions` actually yields) every further
+        // write would also be out of bounds -- break instead of walking
+        // `result[n]` out of bounds below, matching the equivalent
+        // capacity guard on the sibling `index_*_only` functions above.
+        if n == result.len() {
+            break;
+        }
         // ELI5: `position` is a raw index read straight from the
         // caller-supplied `positions` array, not derived from a validated
         // `start..end` range. The old `< 0` check only caught the `-1`
@@ -723,7 +732,14 @@ pub fn reorder_index<'py>(
 ) -> Bound<'py, PyArray1<i64>> {
     let positions = positions.as_array();
     let starts = starts.as_array();
-    let mut result = Array1::<i64>::zeros(positions.len());
+    // ELI5: zero-initializing `result` would make a skipped slot
+    // (rejected below) indistinguishable from a legitimate mapping to row
+    // 0 -- pyjanitor's only caller does an unfiltered positional reindex
+    // on this output, so a `0` there silently duplicates row 0 into the
+    // slot instead of surfacing as the crate's established "no value"
+    // sentinel. `-1` matches how every other position/index result in
+    // this crate marks "no match".
+    let mut result = Array1::<i64>::from_elem(positions.len(), -1);
     let mut counts: Array1<i64> = Array1::zeros(starts.len());
     for (index, val) in positions.indexed_iter() {
         // ELI5: `val` is a raw bucket id read straight from the

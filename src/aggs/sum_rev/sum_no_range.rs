@@ -32,13 +32,9 @@ macro_rules! compute_ints {
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let zipped = left_index.into_iter().zip(right_index.into_iter());
             for (index_left, index_right) in zipped {
-                // ELI5: `index_left` names a position in `arr`/`booleans`,
-                // read straight from the caller-supplied `left_index`
-                // array -- unlike a `start..end` range, there's no natural
-                // "empty" fallback here, so an out-of-bounds or negative
-                // value must be rejected before it's used to index
-                // anything. `right_index` is never used to index an array
-                // (only as a `HashMap` key), so it needs no such guard.
+                // ELI5: see `max_rev/max_no_range.rs`'s identical guard for
+                // the full rationale (`index_left` needs a bound check,
+                // `right_index` doesn't).
                 let Some(left) = checked_index(*index_left, arr.len()) else {
                     continue;
                 };
