@@ -66,6 +66,15 @@ pub fn binary_search_ge_first_core<T: PartialOrd + Copy>(
 
 macro_rules! bin_search {
     ($fname:ident, $type:ty) => {
+        /// For every `left[i]`, the last position in all of `right`
+        /// whose value is less than or equal to `left[i]`, returned as
+        /// one past that position. `right` is assumed sorted ascending,
+        /// which in particular means NaN-free: for a `right` that
+        /// contains NaN, this function will not panic, but its result is
+        /// not guaranteed to be the same for a contiguous `right` array
+        /// as for a non-contiguous (e.g. sliced with a step) one. See
+        /// `binary_search_ge_first_core`'s doc comment (in the Rust
+        /// source) for why.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

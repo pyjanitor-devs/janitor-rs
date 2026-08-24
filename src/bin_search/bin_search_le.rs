@@ -89,6 +89,15 @@ pub fn binary_search_le_core<T: PartialOrd + Copy>(
 
 macro_rules! bin_search {
     ($fname:ident, $type:ty) => {
+        /// For every `left[i]`, the first position in `right[starts[i]..ends[i])`
+        /// whose value is greater than or equal to `left[i]`. `right` is
+        /// assumed sorted ascending within each `[start, end)` slice, which
+        /// in particular means NaN-free: for a `right` that contains NaN,
+        /// this function will not panic, but its result is not guaranteed
+        /// to be the same for a contiguous `right` array as for a
+        /// non-contiguous (e.g. sliced with a step) one. See
+        /// `binary_search_le_core`'s doc comment (in the Rust source) for
+        /// why.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
