@@ -180,11 +180,15 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_and_strided_paths_agree_on_a_nan_containing_array() {
+    fn contiguous_and_strided_paths_agree_when_the_query_is_nan() {
         // Regression test: the fast path used to be written as
         // `*v < *left_value`, which is only equal to the fallback's
         // literal `!(*v >= *left_value)` for totally-ordered values --
-        // see bin_search_gt.rs's core for the full explanation.
+        // see bin_search_gt.rs's core for the full explanation. `right`
+        // itself stays genuinely sorted here (only the query is NaN),
+        // which is in-contract input, unlike a `right` that itself
+        // contains NaN (see `nan_in_right_does_not_panic_but_parity_is_not_guaranteed`
+        // below).
         Python::initialize();
         Python::attach(|py| {
             if py.import("numpy").is_err() {
@@ -233,6 +237,65 @@ mod tests {
                 fallback_left.readonly().as_array().to_vec()
             );
             assert_eq!(fast_total, fallback_total);
+        });
+    }
+
+    #[test]
+    fn nan_in_right_does_not_panic_but_parity_is_not_guaranteed() {
+        // See bin_search_lt.rs's core for the full explanation: a `right`
+        // containing NaN violates "sorted ascending," and the fast path's
+        // branchless partition_point can then probe different elements
+        // than the manual fallback loop even with an identical predicate,
+        // landing on a genuinely different (but still in-bounds) answer.
+        // Deliberately not asserting fast == fallback -- that's exactly
+        // the parity this out-of-contract input isn't guaranteed to have.
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let right_values = [-1.0_f64, f64::NAN, 0.0, 1.0, 2.0, 3.0, 4.0];
+            let right_dense = PyArray1::from_vec(py, right_values.to_vec());
+            assert!(right_dense.readonly().as_array().as_slice().is_some());
+            let padded: Vec<f64> = right_values.iter().flat_map(|v| [*v, -99.0]).collect();
+            let numpy = py.import("numpy").unwrap();
+            let full = numpy.call_method1("array", (padded,)).unwrap();
+            let right_strided: PyReadonlyArray1<'_, f64> = full
+                .get_item(pyo3::types::PySlice::new(
+                    py,
+                    0,
+                    (right_values.len() * 2) as isize,
+                    2,
+                ))
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(right_strided.as_array().as_slice().is_none());
+
+            let left = PyArray1::from_vec(py, vec![0.0_f64]);
+            let left_index = PyArray1::from_vec(py, vec![0_i64]);
+
+            let (fast_search, ..) = binary_search_gt_regions_f64(
+                py,
+                left.readonly(),
+                right_dense.readonly(),
+                left_index.readonly(),
+            );
+            let (fallback_search, ..) = binary_search_gt_regions_f64(
+                py,
+                left.readonly(),
+                right_strided,
+                left_index.readonly(),
+            );
+            for search in [fast_search, fallback_search] {
+                for got in search.readonly().as_array().to_vec() {
+                    assert!(
+                        (0..=7).contains(&got),
+                        "expected an index in 0..=7, got {got}"
+                    );
+                }
+            }
         });
     }
 }

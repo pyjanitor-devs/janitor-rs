@@ -41,14 +41,18 @@ pub fn binary_search_le_core<T: PartialOrd + Copy>(
             result[pos] = -1;
             continue;
         }
-        // ELI5: `partition_point` runs the identical half-interval search
-        // as the manual `while` loop below (same predicate, same
-        // direction), so it's a drop-in replacement, not a different
-        // algorithm -- the fast path exists because a `&[T]` slice gives
-        // the compiler bounds-check-elision and vectorization
-        // opportunities a manual `ArrayView1` index can't. Both paths are
-        // computed against the same `[start, end)` sub-range regardless of
-        // which one runs.
+        // ELI5: `partition_point` uses the same predicate, same direction,
+        // as the manual `while` loop below -- but is only guaranteed to
+        // land on the same answer for a genuinely sorted, NaN-free `right`
+        // (this function's documented precondition). `slice::partition_point`
+        // is std's "branchless" binary search: it shrinks the search width
+        // by a fixed `size / 2` every step regardless of the comparison
+        // outcome, unlike the manual loop's comparison-driven width shrink
+        // -- for a `right` that violates the precondition (most notably
+        // one containing NaN) the two can probe different elements and
+        // land on different, but never out-of-bounds, answers. See
+        // `bin_search_lt.rs`'s core for the full explanation and a
+        // worked counterexample.
         let min_idx = if let Some(slice) = right_slice {
             let rel = slice[*start as usize..*end as usize].partition_point(|v| *v < *left_value);
             *start + rel as i64
@@ -155,6 +159,52 @@ mod tests {
         let fallback =
             binary_search_le_core(left.view(), right_strided, starts.view(), ends.view());
         assert_eq!(fast, fallback);
+    }
+
+    #[test]
+    fn nan_in_right_does_not_panic_but_parity_is_not_guaranteed() {
+        // See bin_search_lt.rs's core for the full explanation: a `right`
+        // containing NaN violates "sorted ascending," and the fast path's
+        // branchless partition_point can then probe different elements
+        // than the manual fallback loop even with an identical predicate,
+        // landing on a genuinely different (but never out-of-bounds)
+        // answer. Deliberately not asserting fast == fallback -- that's
+        // exactly the parity this out-of-contract input isn't guaranteed
+        // to have.
+        let right_dense = array![-1.0_f64, f64::NAN, 0.0, 1.0, 2.0, 3.0, 4.0];
+        assert!(right_dense.view().as_slice().is_some());
+        let right_padded = array![
+            -1.0_f64,
+            -99.0,
+            f64::NAN,
+            -99.0,
+            0.0,
+            -99.0,
+            1.0,
+            -99.0,
+            2.0,
+            -99.0,
+            3.0,
+            -99.0,
+            4.0,
+            -99.0
+        ];
+        let right_strided = right_padded.slice(s![..;2]);
+        assert!(right_strided.as_slice().is_none());
+
+        let left = array![0.0_f64];
+        let starts = array![0_i64];
+        let ends = array![7_i64];
+        let fast =
+            binary_search_le_core(left.view(), right_dense.view(), starts.view(), ends.view());
+        let fallback =
+            binary_search_le_core(left.view(), right_strided, starts.view(), ends.view());
+        for got in [fast[0], fallback[0]] {
+            assert!(
+                got == -1 || (0..=7).contains(&got),
+                "expected -1 or an index in 0..=7, got {got}"
+            );
+        }
     }
 
     #[test]

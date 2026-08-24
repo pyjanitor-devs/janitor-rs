@@ -26,6 +26,11 @@ pub fn binary_search_le_first_core<T: PartialOrd + Copy>(
     let mut index_left = Vec::new();
     for (pos, left_value) in left.into_iter().enumerate() {
         let min_idx = if let Some(slice) = right_slice {
+            // Only guaranteed to match the fallback below for a
+            // genuinely sorted, NaN-free `right` (this function's
+            // documented precondition) -- see bin_search_lt.rs's core
+            // for why `partition_point`'s branchless search can probe
+            // differently than a manual loop when that's violated.
             slice.partition_point(|v| *v < *left_value)
         } else {
             let mut min_idx = 0;
@@ -124,6 +129,52 @@ mod tests {
         let fast = binary_search_le_first_core(left.view(), right_dense.view(), left_index.view());
         let fallback = binary_search_le_first_core(left.view(), right_strided, left_index.view());
         assert_eq!(fast, fallback);
+    }
+
+    #[test]
+    fn nan_in_right_does_not_panic_but_parity_is_not_guaranteed() {
+        // See bin_search_lt.rs's core for the full explanation: a `right`
+        // containing NaN violates "sorted ascending," and the fast path's
+        // branchless partition_point can then probe different elements
+        // than the manual fallback loop even with an identical predicate,
+        // landing on a genuinely different (but still in-bounds) answer.
+        // Deliberately not asserting fast == fallback -- that's exactly
+        // the parity this out-of-contract input isn't guaranteed to have.
+        let right_dense = array![-1.0_f64, f64::NAN, 0.0, 1.0, 2.0, 3.0, 4.0];
+        assert!(right_dense.view().as_slice().is_some());
+        let right_padded = array![
+            -1.0_f64,
+            -99.0,
+            f64::NAN,
+            -99.0,
+            0.0,
+            -99.0,
+            1.0,
+            -99.0,
+            2.0,
+            -99.0,
+            3.0,
+            -99.0,
+            4.0,
+            -99.0
+        ];
+        let right_strided = right_padded.slice(s![..;2]);
+        assert!(right_strided.as_slice().is_none());
+
+        let left = array![0.0_f64];
+        let left_index = array![0_i64];
+        let (fast_indices, _) =
+            binary_search_le_first_core(left.view(), right_dense.view(), left_index.view());
+        let (fallback_indices, _) =
+            binary_search_le_first_core(left.view(), right_strided, left_index.view());
+        for indices in [&fast_indices, &fallback_indices] {
+            for &idx in indices {
+                assert!(
+                    (0..7).contains(&idx),
+                    "expected an index in 0..7, got {idx}"
+                );
+            }
+        }
     }
 
     #[test]
