@@ -29,14 +29,47 @@ macro_rules! generic_compare {
             let mut counts_array = Array1::<i64>::zeros(left.len());
             let mut total: i64 = 0;
             let mut n: usize = 0;
+            let positions_len = positions.len();
+            let right_len = right.len();
             let zipped = izip!(left.into_iter(), starts.into_iter(), ends.into_iter(),);
             for (position, (left_val, start, end)) in zipped.enumerate() {
+                // `result` is presized to `positions.len()` (not derived
+                // from this row's width), so an invalid row can be
+                // silently skipped -- same convention as comp.rs/
+                // comp_first.rs -- as long as `start`/`end` index into
+                // `positions`, not `right` (a different array, and this
+                // file's own outer range indexes `positions[nn]`, not
+                // `right[nn]`, unlike every sibling file fixed so far).
+                // Compares `positions_len as i64` against `end` rather
+                // than casting `end` down to `usize` first -- on a
+                // 32-bit target a genuinely oversized `end` would
+                // truncate to a small value before this check ever saw
+                // it, silently passing validation.
+                if *start < 0 || *start >= *end || *end > positions_len as i64 {
+                    continue;
+                }
                 let start_ = *start as usize;
                 let end_ = *end as usize;
                 let mut counter: i64 = 0;
                 for nn in start_..end_ {
                     let mut indexer = positions[nn];
-                    if indexer == -1 {
+                    // `-1` is the crate's existing "no match" sentinel for
+                    // an individual position; broadened here (issue #56)
+                    // to reject *any* out-of-bounds `indexer` the same
+                    // way, not just the literal `-1` -- a `positions`
+                    // entry with some other negative or oversized value
+                    // used to survive unchanged into `right[indexer_]`,
+                    // out of bounds. Mirrors `comp_no_range.rs`'s
+                    // `checked_index` in spirit, as a plain comparison
+                    // (this loop runs once per candidate position, the
+                    // same hot-loop frequency #55 found checked_range
+                    // costly at) -- and, like the check above, compares
+                    // `right_len as i64` against `indexer` rather than
+                    // casting `indexer` down to `usize` first, so a
+                    // genuinely oversized indexer can't truncate to an
+                    // in-range value and silently select the wrong row on
+                    // a 32-bit target.
+                    if indexer < 0 || indexer >= right_len as i64 {
                         result[n] = -1;
                         n += 1;
                         continue;
@@ -89,4 +122,95 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compare_posns_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compare_posns_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    type CompareResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>, i64)>;
+
+    fn run(py: Python<'_>, start: i64, end: i64, indexer: i64) -> CompareResult<'_> {
+        let left = PyArray1::from_vec(py, vec![2_i64]);
+        let right = PyArray1::from_vec(py, vec![1_i64]);
+        let starts = PyArray1::from_vec(py, vec![start]);
+        let positions = PyArray1::from_vec(py, vec![indexer]);
+        let ends = PyArray1::from_vec(py, vec![end]);
+        compare_posns_int64(
+            py,
+            left.readonly(),
+            right.readonly(),
+            starts.readonly(),
+            positions.readonly(),
+            ends.readonly(),
+            0, // CompareOp::Gt
+        )
+    }
+
+    #[test]
+    fn out_of_bounds_indexer_is_treated_as_no_match_not_a_panic() {
+        // right has length 1; positions=[5] used to index right[5] once
+        // the row's start..end range reached it.
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 0, 1, 5).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![-1_i64]);
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
+
+    #[test]
+    fn negative_non_sentinel_indexer_is_treated_as_no_match_not_a_panic() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 0, 1, -5).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![-1_i64]);
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
+
+    #[test]
+    fn end_beyond_positions_len_contributes_nothing_not_a_panic() {
+        // positions has length 1; end=2 walks start_..end_ = 0..2 and
+        // indexes positions[1], out of bounds.
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 0, 2, 0).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
+
+    #[test]
+    fn valid_indexer_compares_normally() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 0, 1, 0).expect("must not panic");
+            // left=[2], right=[1], op=Gt: 2 > 1 is true, indexer stays 0.
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![1_i64]);
+            assert_eq!(total, 1);
+        });
+    }
 }

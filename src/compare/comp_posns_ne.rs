@@ -34,6 +34,8 @@ macro_rules! generic_compare {
             let mut counts_array = Array1::<i64>::zeros(left.len());
             let mut total: i64 = 0;
             let mut n: usize = 0;
+            let positions_len = positions.len();
+            let right_len = right.len();
             let zipped = izip!(
                 left.into_iter(),
                 left_booleans.into_iter(),
@@ -41,6 +43,15 @@ macro_rules! generic_compare {
                 ends.into_iter(),
             );
             for (position, (left_val, left_bool, start, end)) in zipped.enumerate() {
+                // See comp_posns.rs: result is presized to positions.len(),
+                // so an invalid row (indexing into positions, not right)
+                // is silently skipped rather than rejected. Compares in
+                // i64 space rather than casting `end` down to `usize`
+                // first, so an oversized `end` can't truncate past this
+                // check on a 32-bit target.
+                if *start < 0 || *start >= *end || *end > positions_len as i64 {
+                    continue;
+                }
                 let start_ = *start as usize;
                 let end_ = *end as usize;
                 let mut counter: i64 = 0;
@@ -50,7 +61,22 @@ macro_rules! generic_compare {
                     // pd.NA != anything returns pd.NA, which defaults to False
                     // whereas np.nan != np.nan returns True
                     // np.nan != anything returns True
-                    if (indexer == -1) || (*left_bool && is_extension_array) {
+                    //
+                    // Broadened (issue #56) from `indexer == -1` to any
+                    // out-of-bounds indexer, same reasoning as
+                    // comp_posns.rs -- a `positions` entry that is some
+                    // other negative or oversized value used to survive
+                    // into `right_booleans[indexer as usize]`/
+                    // `right[indexer as usize]` below, out of bounds.
+                    // Compares `right_len as i64` against `indexer`
+                    // rather than casting `indexer` down to `usize`
+                    // first, so it can't truncate to an in-range value
+                    // and silently select the wrong row on a 32-bit
+                    // target.
+                    if indexer < 0
+                        || indexer >= right_len as i64
+                        || (*left_bool && is_extension_array)
+                    {
                         result[n] = -1;
                         n += 1;
                         continue;
@@ -122,4 +148,83 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compare_posns_ne_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compare_posns_ne_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    type CompareResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>, i64)>;
+
+    fn run(py: Python<'_>, start: i64, end: i64, indexer: i64) -> CompareResult<'_> {
+        let left = PyArray1::from_vec(py, vec![2_i64]);
+        let right = PyArray1::from_vec(py, vec![1_i64]);
+        let starts = PyArray1::from_vec(py, vec![start]);
+        let ends = PyArray1::from_vec(py, vec![end]);
+        let positions = PyArray1::from_vec(py, vec![indexer]);
+        let left_booleans = PyArray1::from_vec(py, vec![false]);
+        let right_booleans = PyArray1::from_vec(py, vec![false]);
+        compare_posns_ne_int64(
+            py,
+            left.readonly(),
+            right.readonly(),
+            starts.readonly(),
+            ends.readonly(),
+            positions.readonly(),
+            left_booleans.readonly(),
+            right_booleans.readonly(),
+            false,
+            5, // CompareOp::Ne
+        )
+    }
+
+    #[test]
+    fn out_of_bounds_indexer_is_treated_as_no_match_not_a_panic() {
+        // right (and right_booleans) have length 1; positions=[5] used
+        // to index right_booleans[5]/right[5].
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 0, 1, 5).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![-1_i64]);
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
+
+    #[test]
+    fn end_beyond_positions_len_contributes_nothing_not_a_panic() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 0, 2, 0).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
+
+    #[test]
+    fn valid_indexer_compares_normally() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 0, 1, 0).expect("must not panic");
+            // left=[2], right=[1], op=Ne: 2 != 1 is true, indexer stays 0.
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![1_i64]);
+            assert_eq!(total, 1);
+        });
+    }
 }

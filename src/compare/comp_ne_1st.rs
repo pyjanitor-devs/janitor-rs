@@ -27,13 +27,27 @@ macro_rules! generic_compare {
             let ends_array = ends.as_array();
             let left_booleans_array = left_booleans.as_array();
             let right_booleans_array = right_booleans.as_array();
-            let length: i64 = ends_array
+            let right_len = right_array.len();
+            // No caller-supplied `matches` tape here (unlike comp_ne.rs),
+            // so -- mirroring comp_first.rs/comp.rs -- an invalid row can
+            // be silently skipped rather than rejecting the whole call,
+            // as long as the length precomputation and the main loop's
+            // skip condition agree on which rows that is. The raw `e - s`
+            // sum this replaces let a negative-start or inverted row wrap
+            // `length as usize` to a huge value before any indexing even
+            // started.
+            // Compares `right_len as i64` against `end` rather than
+            // casting `end` down to `usize` first -- on a 32-bit target a
+            // genuinely oversized `end` would truncate to a small value
+            // before either check below ever saw it.
+            let length: usize = starts_array
                 .iter()
-                .zip(starts_array.iter())
-                .map(|(e, s)| e - s)
+                .zip(ends_array.iter())
+                .filter(|(s, e)| **s >= 0 && **s < **e && **e <= right_len as i64)
+                .map(|(s, e)| (*e as usize) - (*s as usize))
                 .sum();
             let op = CompareOp::try_from_code(op)?;
-            let mut result = Array1::<i8>::zeros(length as usize);
+            let mut result = Array1::<i8>::zeros(length);
             let mut counts_array = Array1::<i64>::zeros(left_array.len());
             let mut total: i64 = 0;
             let mut n: usize = 0;
@@ -44,6 +58,9 @@ macro_rules! generic_compare {
                 ends_array.into_iter(),
             );
             for (position, (left_val, left_bool, start, end)) in zipped.enumerate() {
+                if *start < 0 || *start >= *end || *end > right_len as i64 {
+                    continue;
+                }
                 let start_ = *start as usize;
                 let end_ = *end as usize;
                 let mut counter: i64 = 0;
@@ -110,4 +127,78 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compare_start_end_ne_1st_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compare_start_end_ne_1st_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    type CompareResult<'py> = PyResult<(Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64)>;
+
+    fn run(py: Python<'_>, start: i64, end: i64) -> CompareResult<'_> {
+        let left = PyArray1::from_vec(py, vec![1_i64]);
+        let right = PyArray1::from_vec(py, vec![1_i64]);
+        let starts = PyArray1::from_vec(py, vec![start]);
+        let ends = PyArray1::from_vec(py, vec![end]);
+        let left_booleans = PyArray1::from_vec(py, vec![false]);
+        let right_booleans = PyArray1::from_vec(py, vec![false]);
+        compare_start_end_ne_1st_int64(
+            py,
+            left.readonly(),
+            right.readonly(),
+            starts.readonly(),
+            ends.readonly(),
+            left_booleans.readonly(),
+            right_booleans.readonly(),
+            false,
+            5, // CompareOp::Ne
+        )
+    }
+
+    #[test]
+    fn end_beyond_right_len_contributes_nothing_not_a_panic() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 0, 2).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), Vec::<i8>::new());
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
+
+    #[test]
+    fn both_bounds_negative_contributes_nothing_not_a_panic() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, -3, -2).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), Vec::<i8>::new());
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
+
+    #[test]
+    fn end_equal_to_right_len_is_valid() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 0, 1).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![0_i8]);
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
 }

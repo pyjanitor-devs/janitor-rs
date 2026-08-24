@@ -18,7 +18,30 @@ macro_rules! generic_compare {
             let right = right.as_array();
             let starts = starts.as_array();
             let end: usize = right.len();
-            let length: usize = starts.iter().map(|x| end - (*x as usize)).sum();
+            // `end - (*x as usize)` used to underflow for any `start` that
+            // wraps to (or already is) a `usize` greater than `end` --
+            // most obviously a negative `start`, but also a merely
+            // oversized positive one.
+            //
+            // The old fix here leaned on `start_..end` (a plain `Range`)
+            // already being well-defined and empty whenever `start_ > end`
+            // -- true in isolation, but only once `start_` itself
+            // faithfully represents `start`. On a 32-bit target `usize` is
+            // 32 bits, so a genuinely oversized `start` (e.g. 2^32 + 1)
+            // can *truncate* to a small `start_` that ends up **less**
+            // than `end`, silently turning an out-of-range row into a
+            // seemingly valid non-empty one instead of contributing
+            // nothing. Comparing `*x` against `end as i64` in i64 space,
+            // before any cast to `usize`, closes that gap.
+            let length: usize = starts
+                .iter()
+                .map(|x| {
+                    if *x < 0 || *x > end as i64 {
+                        return 0;
+                    }
+                    end - (*x as usize)
+                })
+                .sum();
             let op = CompareOp::try_from_code(op)?;
             let mut result = Array1::<i8>::zeros(length);
             let mut counts_array = Array1::<i64>::zeros(left.len());
@@ -26,6 +49,9 @@ macro_rules! generic_compare {
             let mut n: usize = 0;
             let zipped = left.into_iter().zip(starts.into_iter());
             for (position, (left_val, start)) in zipped.enumerate() {
+                if *start < 0 || *start > end as i64 {
+                    continue;
+                }
                 let start_ = *start as usize;
                 let mut counter: i64 = 0;
                 for nn in start_..end {
@@ -75,4 +101,67 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compare_first_start_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compare_first_start_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    type CompareResult<'py> = PyResult<(Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64)>;
+
+    fn run(py: Python<'_>, start: i64) -> CompareResult<'_> {
+        let left = PyArray1::from_vec(py, vec![1_i64]);
+        let right = PyArray1::from_vec(py, vec![1_i64]);
+        let starts = PyArray1::from_vec(py, vec![start]);
+        compare_first_start_int64(py, left.readonly(), right.readonly(), starts.readonly(), 0)
+    }
+
+    #[test]
+    fn negative_start_contributes_nothing_not_a_panic() {
+        // The old `end - (*x as usize)` length precomputation underflowed
+        // for a negative start (wraps to a huge usize > end).
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, -2).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), Vec::<i8>::new());
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
+
+    #[test]
+    fn start_beyond_right_len_contributes_nothing_not_a_panic() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 2).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), Vec::<i8>::new());
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
+
+    #[test]
+    fn start_equal_to_right_len_is_valid_empty_range() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 1).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), Vec::<i8>::new());
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
 }
