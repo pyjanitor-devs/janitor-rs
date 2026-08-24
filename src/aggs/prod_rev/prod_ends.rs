@@ -1,9 +1,8 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
+use crate::aggs::dense::DenseSlots;
 use crate::aggs::{checked_range, ensure_equal_lengths};
 
 macro_rules! compute_ints {
@@ -26,7 +25,7 @@ macro_rules! compute_ints {
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let length = length as usize;
-            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+            let mut slots: DenseSlots<i64> = DenseSlots::new(length);
             let zipped = izip!(arr.into_iter(), ends.into_iter(), booleans.into_iter());
             for (current, end, boolean) in zipped {
                 // ELI5 (the guard): `end` indexes into `index`, not `arr`, so
@@ -38,21 +37,15 @@ macro_rules! compute_ints {
                 };
                 let current_ = *current as i64;
                 for item in 0..end_ {
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(1);
+                    let pos = index[item] as usize;
+                    let total = slots.touch(pos, 1);
                     if *boolean {
                         continue;
                     }
                     *total *= current_;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<i64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let (indexers, result) = slots.to_arrays(|value| *value);
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -87,7 +80,7 @@ macro_rules! compute_floats {
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let length = length as usize;
-            let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
+            let mut slots: DenseSlots<f64> = DenseSlots::new(length);
             let zipped = izip!(arr.into_iter(), ends.into_iter(), booleans.into_iter());
             for (current, end, boolean) in zipped {
                 let Some((_, end_)) = checked_range(0, *end, index.len()) else {
@@ -95,21 +88,15 @@ macro_rules! compute_floats {
                 };
                 let current_ = *current as f64;
                 for item in 0..end_ {
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(1.);
+                    let pos = index[item] as usize;
+                    let total = slots.touch(pos, 1.);
                     if *boolean {
                         continue;
                     }
                     *total *= current_;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<f64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let (indexers, result) = slots.to_arrays(|value| *value);
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -135,4 +122,41 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_prod_rev_end_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_prod_rev_end_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod correctness_tests {
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    use super::compute_prod_rev_end_int64;
+
+    #[test]
+    fn touched_row_positions_are_emitted_ascending_with_products() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            // index = [5, 3]; row0 (end=1) only reaches index[0]=5, row1
+            // (end=2) reaches index[0..2] = {5, 3}. Position 5 gets both
+            // rows' values: 2*3=6.
+            let arr = PyArray1::from_vec(py, vec![2_i64, 3]);
+            let ends = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let index = PyArray1::from_vec(py, vec![5_i64, 3]);
+            let booleans = PyArray1::from_vec(py, vec![false, false]);
+            let (indexers, result) = compute_prod_rev_end_int64(
+                py,
+                arr.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                booleans.readonly(),
+                6,
+            )
+            .expect("valid equal-length inputs must not error");
+            assert_eq!(indexers.readonly().to_vec().unwrap(), vec![3, 5]);
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![3, 6]);
+        });
+    }
 }
