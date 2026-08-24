@@ -409,6 +409,99 @@ mod adversarial_bounds_tests {
     }
 
     #[test]
+    fn no_range_and_positional_functions_reject_out_of_bounds_indices_without_panicking() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+
+            // issue #38: `arr[*index_left as usize]`/`booleans[...]` in the
+            // four `_rev/*_no_range.rs` files were indexed with no bound
+            // check at all. A `left_index` entry past `arr.len()` must now
+            // skip that row instead of panicking.
+            let arr = PyArray1::from_vec(py, vec![5_i64, 9]);
+            let left_index = PyArray1::from_vec(py, vec![0_i64, 99]); // 99 is out of bounds
+            let right_index = PyArray1::from_vec(py, vec![0_i64, 0]);
+            let booleans = PyArray1::from_vec(py, vec![false, false]);
+            let (keys, vals) = super::max_rev::max_no_range::compute_max_rev_no_range_int64(
+                py,
+                arr.readonly(),
+                left_index.readonly(),
+                right_index.readonly(),
+                booleans.readonly(),
+                1,
+            )
+            .expect("an out-of-bounds left_index row must be skipped, not panic");
+            assert_eq!(keys.readonly().as_array().to_vec(), vec![0_i64]);
+            // `vals` holds the *position* (index_left) of the winning
+            // value, not the value itself -- row 0 (index_left=0) is the
+            // only surviving row, so it wins by default.
+            assert_eq!(vals.readonly().as_array().to_vec(), vec![0_i64]);
+
+            // Adversarial-review finding folded into #38: `comp_no_range.rs`
+            // only guarded the `-1` sentinel, never the upper bound, before
+            // indexing `right[*right_pos as usize]`.
+            let left = PyArray1::from_vec(py, vec![3_i64]);
+            let right = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let positions = PyArray1::from_vec(py, vec![99_i64]); // out of bounds, not -1
+            let (result, total) = super::super::compare::comp_no_range::compare_no_range_int64(
+                py,
+                left.readonly(),
+                right.readonly(),
+                positions.readonly(),
+                0, // op: >
+            );
+            assert_eq!(result.readonly().as_array().to_vec(), vec![-1_i64]);
+            assert_eq!(total, 0);
+
+            // Same finding, `comp_no_range_ne.rs`: also gains an
+            // `ensure_equal_lengths("right", ..., "right_booleans", ...)`
+            // whole-call check, since both are indexed by the same
+            // `right_pos`.
+            let left = PyArray1::from_vec(py, vec![3_i64]);
+            let right = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let right_booleans = PyArray1::from_vec(py, vec![false]); // mismatched length
+            let positions = PyArray1::from_vec(py, vec![0_i64]);
+            let left_booleans = PyArray1::from_vec(py, vec![false]);
+            let error = super::super::compare::comp_no_range_ne::compare_no_range_ne_int64(
+                py,
+                left.readonly(),
+                right.readonly(),
+                positions.readonly(),
+                left_booleans.readonly(),
+                right_booleans.readonly(),
+                false,
+                0,
+            )
+            .expect_err("mismatched right/right_booleans lengths must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+
+            // Adversarial-review finding folded into #38:
+            // `index_builder::build_positional_index` only guarded
+            // `position < 0`, never the upper bound.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20]);
+            let positions = PyArray1::from_vec(py, vec![99_i64]); // out of bounds
+            let result = crate::index_builder::build_positional_index(
+                py,
+                index.readonly(),
+                positions.readonly(),
+                1,
+            );
+            assert_eq!(result.readonly().as_array().to_vec(), vec![0_i64]);
+
+            // Adversarial-review finding folded into #38:
+            // `index_builder::reorder_index` had no check at all.
+            let positions = PyArray1::from_vec(py, vec![99_i64]); // out of bounds bucket id
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let result =
+                crate::index_builder::reorder_index(py, positions.readonly(), starts.readonly());
+            assert_eq!(result.readonly().as_array().to_vec(), vec![0_i64]);
+        });
+    }
+
+    #[test]
     fn every_forward_core_rejects_signed_and_one_past_bounds() {
         let arr = array![5_i64, 1, 4];
         let booleans = array![false, false, false];

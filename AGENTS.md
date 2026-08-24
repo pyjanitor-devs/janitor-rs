@@ -755,3 +755,49 @@ dropped. This is scoped to
 one of #24's three opportunities (one-pass output); the shared/validated
 comparison-operator enum and the contiguous-array fast path are tracked
 separately and not addressed by this entry.
+
+### [2026-08-24] Issue #38: a raw caller-supplied index (not a range) has no natural "empty" fallback
+
+**Context**: `max_rev/max_no_range.rs`, `min_rev/min_no_range.rs`,
+`sum_rev/sum_no_range.rs`, and `prod_rev/prod_no_range.rs` each read
+`index_left` straight from a caller-supplied `left_index` array and used
+it to index `arr`/`booleans` (`arr[*index_left as usize]`) with no bound
+check at all -- `left_index` had already gained `arr`/`booleans`
+equal-length validation (`ensure_equal_lengths`, `PyResult`) from an
+earlier sweep, but nothing validated `index_left` itself before using it.
+While fixing this, a broader sweep for the same *shape* of gap (found
+folded into this PR rather than filed as a separate issue, per explicit
+direction) turned up four more:
+`compare/comp_no_range.rs` and `comp_no_range_ne.rs` only guarded the `-1`
+sentinel before indexing `right`/`right_booleans` by `right_pos`, never
+the upper bound; `index_builder::build_positional_index` only guarded
+`position < 0`, same gap; `index_builder::reorder_index` had no guard at
+all (not even `-1`), on *two* chained reads (`starts`/`counts` by `val`,
+then `result` by the `pos` derived from those reads).
+**Learning**: This is a different shape from both #27/#32's
+`start..end` range guard and #40/#41's tape-width pre-pass. A single index
+read from a caller-supplied array, used directly to index another array,
+has no natural "empty" fallback the way an inverted `Range<usize>` does
+(see the `saturating_sub` entry above) -- there's no arithmetic trick that
+makes an invalid single index safe, it must be rejected outright before
+use, via `checked_index`. Where the same `right_pos`-shaped value gates
+*two* separate arrays (`right`/`right_booleans` in `comp_no_range_ne.rs`),
+their lengths need a one-time `ensure_equal_lengths` check so a single
+`checked_index` call safely covers both, matching how `arr`/`booleans` are
+validated together elsewhere in `aggs/`.
+**Learning (perf)**: measured `checked_index`'s added cost directly (built
+wheel, timed from Python) across 100/1M/10M rows: `compare_no_range`,
+`build_positional_index`, and `reorder_index` held flat ~0.5-1.4 ns/row
+across all three sizes -- the guard is genuinely O(1) per element, not a
+hidden O(n) or O(n^2) cost. `max_rev_no_range`'s per-row cost grows with
+`n` (15 ns/row at 1M, 50 ns/row at 10M), but that's pre-existing
+`HashMap`-rehashing cost from its dictionary-based grouping as the number
+of distinct keys grows, not something this fix introduced -- confirmed by
+the other three (no `HashMap` involved) staying flat.
+**Recommendation**: When auditing for this class of bug, grep for
+`\[\*[a-zA-Z_]* as usize\]` across the whole tree, not just the specific
+files a filed issue names -- greenfield sentinel-only guards (`if *x ==
+-1`) are exactly as unsafe as no guard at all against a positive
+out-of-range value, and are easy to mistake for "already handled" on a
+skim. Prefer `checked_index`/`checked_range`/`checked_end` over a hand-
+rolled comparison so the missing-upper-bound mistake can't recur.

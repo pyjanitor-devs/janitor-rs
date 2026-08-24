@@ -2,7 +2,7 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{checked_index, ensure_equal_lengths};
 use std::collections::HashMap;
 
 macro_rules! compute_ints {
@@ -32,8 +32,18 @@ macro_rules! compute_ints {
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let zipped = left_index.into_iter().zip(right_index.into_iter());
             for (index_left, index_right) in zipped {
-                let current = arr[*index_left as usize];
-                let boolean = booleans[*index_left as usize];
+                // ELI5: `index_left` names a position in `arr`/`booleans`,
+                // read straight from the caller-supplied `left_index`
+                // array -- unlike a `start..end` range, there's no natural
+                // "empty" fallback here, so an out-of-bounds or negative
+                // value must be rejected before it's used to index
+                // anything. `right_index` is never used to index an array
+                // (only as a `HashMap` key), so it needs no such guard.
+                let Some(left) = checked_index(*index_left, arr.len()) else {
+                    continue;
+                };
+                let current = arr[left];
+                let boolean = booleans[left];
                 let total = dictionary.entry(*index_right).or_insert(1);
                 if boolean {
                     continue;
@@ -89,8 +99,13 @@ macro_rules! compute_floats {
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let zipped = left_index.into_iter().zip(right_index.into_iter());
             for (index_left, index_right) in zipped {
-                let current = arr[*index_left as usize];
-                let boolean = booleans[*index_left as usize];
+                // ELI5: same guard as the integer macro above -- see its
+                // comment for why `index_left` must be checked before use.
+                let Some(left) = checked_index(*index_left, arr.len()) else {
+                    continue;
+                };
+                let current = arr[left];
+                let boolean = booleans[left];
                 let total = dictionary.entry(*index_right).or_insert(1.);
                 if boolean {
                     continue;

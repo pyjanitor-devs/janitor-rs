@@ -3,7 +3,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_tape_width;
+use crate::aggs::{checked_index, ensure_tape_width};
 
 /// Replicates `numpy.repeat(index, counts)`: emit `index[i]`, `counts[i]`
 /// times, for every `i`, back to back.
@@ -597,10 +597,15 @@ pub fn build_positional_index<'py>(
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     for position in positions.into_iter() {
-        if *position < 0 {
+        // ELI5: `position` is a raw index read straight from the
+        // caller-supplied `positions` array, not derived from a validated
+        // `start..end` range. The old `< 0` check only caught the `-1`
+        // sentinel; a positive value `>= index.len()` fell straight into
+        // `index[...]` unchecked. `checked_index` catches both.
+        let Some(pos) = checked_index(*position, index.len()) else {
             continue;
-        }
-        let val: i64 = index[*position as usize];
+        };
+        let val: i64 = index[pos];
         result[n] = val;
         n += 1;
     }
@@ -721,10 +726,24 @@ pub fn reorder_index<'py>(
     let mut result = Array1::<i64>::zeros(positions.len());
     let mut counts: Array1<i64> = Array1::zeros(starts.len());
     for (index, val) in positions.indexed_iter() {
-        let mut pos = starts[*val as usize];
-        pos += counts[*val as usize];
-        counts[*val as usize] += 1;
-        result[pos as usize] = index as i64;
+        // ELI5: `val` is a raw bucket id read straight from the
+        // caller-supplied `positions` array, used to index `starts`/
+        // `counts` -- previously with no check at all, not even the
+        // crate's usual `-1` sentinel handling. `pos` (the write target
+        // into `result`) is then derived from that same unchecked read, so
+        // it needs its own guard too: a malformed `starts` entry could
+        // otherwise produce a `pos` that walks `result` out of bounds on
+        // the write below.
+        let Some(bucket) = checked_index(*val, starts.len()) else {
+            continue;
+        };
+        let mut pos = starts[bucket];
+        pos += counts[bucket];
+        counts[bucket] += 1;
+        let Some(pos) = checked_index(pos, result.len()) else {
+            continue;
+        };
+        result[pos] = index as i64;
     }
     result.into_pyarray(py)
 }
