@@ -92,14 +92,27 @@ macro_rules! generic_compare {
             let starts_view = starts.as_array();
             let ends_view = ends.as_array();
             // ELI5: mirrors `compare_start_end_core`'s own row-rejection
-            // condition exactly (`start`/`end` sentinel or inverted range),
+            // condition (sentinel or inverted range contributes zero ticks),
             // not `checked_range`'s -- the core here never bounds `end`
             // against `right.len()`, so reusing `checked_range` would
             // under-count the width a too-large `end` actually walks.
+            //
+            // ELI5 (why `>= 0`, not just `!= -1`): the old filter only
+            // rejected the exact `-1` sentinel, so a malformed but
+            // non-sentinel negative `start` (e.g. `-2`) slipped through
+            // whenever it still satisfied `start < end` in `i64` space
+            // (e.g. `starts=[-2], ends=[1]`). The next line then cast both
+            // to `usize` and subtracted -- `-2i64 as usize` wraps to a huge
+            // number, so `(1usize) - (huge number)` underflows before
+            // `ensure_tape_width` ever runs. Requiring both bounds to
+            // already be non-negative rules that out; it doesn't change
+            // which rows the core itself treats as empty, since the core's
+            // own cast-then-range-index naturally contributes zero ticks
+            // for any row a real caller wouldn't produce.
             let expected_matches_width: usize = starts_view
                 .iter()
                 .zip(ends_view.iter())
-                .filter(|(s, e)| **s != -1 && **e != -1 && **s < **e)
+                .filter(|(s, e)| **s >= 0 && **e >= 0 && **s < **e)
                 .map(|(s, e)| (*e as usize) - (*s as usize))
                 .sum();
             ensure_tape_width(expected_matches_width, matches.as_array().len())?;
@@ -318,5 +331,57 @@ mod tests {
         assert_eq!(result, array![1_i8, 0, 1, 0]);
         assert_eq!(counts, array![1, 1]);
         assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn non_sentinel_negative_start_does_not_underflow_the_width_precheck() {
+        use numpy::{PyArray1, PyArrayMethods};
+        use pyo3::exceptions::PyValueError;
+        use pyo3::Python;
+
+        // starts=[-2], ends=[1]: -2 isn't the `-1` sentinel, and -2 < 1
+        // holds in i64 space, so the old `!= -1`-only filter let this row
+        // through and then underflowed `(1usize) - ((-2i64) as usize)`
+        // before `ensure_tape_width` ever ran (panicking in debug builds,
+        // silently producing a bogus width in release). It must now be
+        // rejected as cleanly as any other malformed range, not panic.
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let left = PyArray1::from_vec(py, vec![3_i64]);
+            let right = PyArray1::from_vec(py, vec![1_i64]);
+            let starts = PyArray1::from_vec(py, vec![-2_i64]);
+            let ends = PyArray1::from_vec(py, vec![1_i64]);
+            let matches = PyArray1::from_vec(py, vec![1_i8]);
+            let result = compare_start_end_int64(
+                py,
+                left.readonly(),
+                right.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                matches.readonly(),
+                // `compare_start_end_int64` is the `#[pyfunction]` wrapper,
+                // which still takes `CompareOp::try_from_code`'s raw i8
+                // code (not the `GT`/`LT`/... `CompareOp` aliases this
+                // module's other tests use against `compare_start_end_core`
+                // directly) -- 0 is `CompareOp::Gt`, matching the mapping
+                // in `wrapper_op_validation_tests` in `compare/mod.rs`.
+                0,
+            );
+            // Whether this is accepted (because the row is now correctly
+            // excluded from the width sum) or rejected with a clean
+            // PyValueError is both fine -- what must never happen is a
+            // panic (an unrecoverable `pyo3_runtime.PanicException` on the
+            // Python side instead of a catchable exception).
+            if let Err(error) = result {
+                assert!(
+                    error.is_instance_of::<PyValueError>(py),
+                    "expected a PyValueError, got {error:?}"
+                );
+            }
+        });
     }
 }
