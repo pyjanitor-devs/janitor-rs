@@ -22,10 +22,17 @@ pub fn binary_search_ge_core<T: PartialOrd + Copy>(
     ends: ArrayView1<i64>,
 ) -> Array1<i64> {
     let mut result = Array1::<i64>::zeros(left.len());
-    let right_len = right.len();
+    // Widen right.len() up to i64 instead of narrowing `end` down to
+    // usize: on a 32-bit target, `*end as usize` truncates rather than
+    // saturates, so an oversized `end` (e.g. usize::MAX + 2, which still
+    // fits comfortably in i64) could wrap back into a small, seemingly
+    // in-bounds usize and slip past this guard. right.len() casts up
+    // losslessly on every real target (an array can never hold i64::MAX
+    // elements), so comparing in i64 space is always correct.
+    let right_len = right.len() as i64;
     let zipped = izip!(left.into_iter(), starts.into_iter(), ends.into_iter());
     for (pos, (left_value, start, end)) in zipped.enumerate() {
-        if *start < 0 || *end == -1 || *start >= *end || *end as usize > right_len {
+        if *start < 0 || *end == -1 || *start >= *end || *end > right_len {
             result[pos] = -1;
             continue;
         }
@@ -137,6 +144,23 @@ mod tests {
         let right = array![1_i64];
         let starts = array![0_i64];
         let ends = array![2_i64]; // right.len() + 1
+        let got = binary_search_ge_core(left.view(), right.view(), starts.view(), ends.view());
+        assert_eq!(got, array![-1]);
+    }
+
+    #[test]
+    fn end_near_a_32_bit_usize_wraparound_point_is_still_rejected() {
+        // On a 32-bit target, `usize` is 32 bits wide, so a narrowing
+        // `*end as usize` truncates rather than saturates: this exact
+        // `end` (u32::MAX + 2) would cast down to `1`, which is `<=`
+        // right.len() and would wrongly slip past a guard phrased as
+        // `*end as usize > right_len`. Comparing in `i64` space (widening
+        // `right.len()` up instead of narrowing `end` down) rejects it on
+        // every target, including this 64-bit test host.
+        let left = array![1_i64];
+        let right = array![1_i64];
+        let starts = array![0_i64];
+        let ends = array![(u32::MAX as i64) + 2];
         let got = binary_search_ge_core(left.view(), right.view(), starts.view(), ends.view());
         assert_eq!(got, array![-1]);
     }
