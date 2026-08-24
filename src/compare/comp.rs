@@ -42,20 +42,25 @@ use crate::compare::op::CompareOp;
 /// `end` is provably positive too, so no separate `end < 0` check is
 /// needed to reach that guarantee.
 ///
-/// ELI5 (`end as usize > right_len`, issue #53): a *positive* but oversized
+/// ELI5 (`end > right_len as i64`, issue #53): a *positive* but oversized
 /// `end` (e.g. `end = right.len() + 1`) survives every check above
 /// unchanged -- it's non-negative and `start < end` holds fine -- and then
 /// indexes `right[nn]` out of bounds once the loop reaches `nn ==
-/// right_len`. This one extra comparison, using the same already-cast
-/// `start_`/`end_` this function needs regardless, is deliberately kept as
-/// a plain condition here rather than routed through `checked_range` (used
-/// for the same `0 <= start <= end <= len` contract elsewhere, e.g.
+/// right_len`. This one extra comparison is deliberately kept as a plain
+/// condition here rather than routed through `checked_range` (used for
+/// the same `0 <= start <= end <= len` contract elsewhere, e.g.
 /// `index_builder`): benchmarking this specific per-row hot loop showed
 /// `checked_range`'s `Option`-returning `usize::try_from` calls cost
 /// ~25-30% more wall time here than the equivalent plain comparisons (see
 /// `benches/kernels.rs`'s `compare_start_end` group) -- consistent with
 /// `compare::op`'s own doc comment on indirection being measurably costly
-/// in this same per-row-comparison hot path.
+/// in this same per-row-comparison hot path. Compares `right_len as i64`
+/// against `end` (a lossless widening cast) rather than casting `end`
+/// down to `usize` first -- on a 32-bit target (this crate's release
+/// matrix includes x86/armv7, see `.github/workflows/release.yml`)
+/// `usize` is 32 bits, so a genuinely oversized `end` would truncate to a
+/// small value before a `end as usize > right_len` comparison ever saw
+/// it, silently passing validation instead of being rejected.
 pub fn compare_start_end_core<T: PartialOrd + Copy>(
     left: ArrayView1<T>,
     right: ArrayView1<T>,
@@ -71,7 +76,12 @@ pub fn compare_start_end_core<T: PartialOrd + Copy>(
     let right_len = right.len();
     let zipped = izip!(left.into_iter(), starts.into_iter(), ends.into_iter());
     for (position, (left_val, start, end)) in zipped.enumerate() {
-        if *start < 0 || *end == -1 || *start >= *end || *end as usize > right_len {
+        // Compares `right_len as i64` against `end` rather than casting
+        // `end` down to `usize` first: on a 32-bit target `usize` is 32
+        // bits, so a genuinely oversized `end` (e.g. 2**32 + 1) would
+        // truncate to a small value before this check ever saw it,
+        // silently passing validation instead of being rejected.
+        if *start < 0 || *end == -1 || *start >= *end || *end > right_len as i64 {
             continue;
         }
         let start_ = *start as usize;
@@ -114,12 +124,15 @@ macro_rules! generic_compare {
             // routed through `checked_range` here either) -- a row the
             // core skips contributes zero ticks there, so it must also
             // contribute zero here, not its raw (possibly huge or
-            // negative) `e - s`.
+            // negative) `e - s`. Compares `right_len as i64` against `e`
+            // rather than casting `e` down to `usize` first, so this
+            // agrees with the core's check on a 32-bit target too (see
+            // that function's doc comment on `end > right_len as i64`).
             let right_len = right.as_array().len();
             let expected_matches_width: usize = starts_view
                 .iter()
                 .zip(ends_view.iter())
-                .filter(|(s, e)| **s >= 0 && **e != -1 && **s < **e && **e as usize <= right_len)
+                .filter(|(s, e)| **s >= 0 && **e != -1 && **s < **e && **e <= right_len as i64)
                 .map(|(s, e)| (*e as usize) - (*s as usize))
                 .sum();
             ensure_tape_width(expected_matches_width, matches.as_array().len())?;
@@ -450,7 +463,7 @@ mod tests {
         // bounds. `end` is positive and `start < end` holds, so the
         // pre-#53 checks (start >= 0, start < end) both passed this row
         // through unchanged -- only bounding `end` against `right.len()`
-        // (via `checked_range`) catches it.
+        // catches it.
         let left = array![1_i64];
         let right = array![1_i64];
         let starts = array![0_i64];
@@ -465,6 +478,39 @@ mod tests {
             GT,
         );
         assert_eq!(result, Array1::<i8>::zeros(2));
+        assert_eq!(counts, array![0]);
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn oversized_end_beyond_u32_max_contributes_nothing_not_a_panic() {
+        // Issue #61: `end as usize > right_len` (the pre-fix shape of this
+        // check) narrows `end` to `usize` before comparing. On a 32-bit
+        // target (this crate ships x86/armv7 wheels, see
+        // .github/workflows/release.yml) that narrowing truncates instead
+        // of saturating, so `end = (u32::MAX as i64) + 2` -- ordinary,
+        // well within i64, nowhere near i64::MAX -- wraps to `1`, which
+        // then passes `1 > right_len (1)` as false, wrongly accepting a
+        // row that should be rejected. Comparing `end > right_len as i64`
+        // (widening `right_len` instead of narrowing `end`) doesn't
+        // truncate on any pointer width; this test can only exercise the
+        // guard logic on this (64-bit) host, not the actual truncation,
+        // but pins the boundary value so a regression back to a narrowing
+        // cast would be caught the moment it's run on a 32-bit target.
+        let left = array![1_i64];
+        let right = array![1_i64];
+        let starts = array![0_i64];
+        let ends = array![(u32::MAX as i64) + 2];
+        let matches = array![1_i8];
+        let (result, counts, total) = compare_start_end_core(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            matches.view(),
+            GT,
+        );
+        assert_eq!(result, Array1::<i8>::zeros(1));
         assert_eq!(counts, array![0]);
         assert_eq!(total, 0);
     }
@@ -503,6 +549,45 @@ mod tests {
             // As with the negative-start case: accepted (row now correctly
             // excluded) or a clean PyValueError are both fine. A panic is
             // the one outcome issue #53 is about closing off.
+            if let Err(error) = result {
+                assert!(
+                    error.is_instance_of::<PyValueError>(py),
+                    "expected a PyValueError, got {error:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn oversized_end_beyond_u32_max_does_not_panic_through_the_python_wrapper() {
+        use numpy::{PyArray1, PyArrayMethods};
+        use pyo3::exceptions::PyValueError;
+        use pyo3::Python;
+
+        // Issue #61's exact repro value, through the `#[pyfunction]`
+        // wrapper -- this is the path that exercises the wrapper's own
+        // `expected_matches_width` precheck (the second of the two sites
+        // #61 flagged), not just `compare_start_end_core`'s row check.
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let left = PyArray1::from_vec(py, vec![1_i64]);
+            let right = PyArray1::from_vec(py, vec![1_i64]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![(u32::MAX as i64) + 2]);
+            let matches = PyArray1::from_vec(py, vec![1_i8]);
+            let result = compare_start_end_int64(
+                py,
+                left.readonly(),
+                right.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                matches.readonly(),
+                0, // CompareOp::Gt
+            );
             if let Err(error) = result {
                 assert!(
                     error.is_instance_of::<PyValueError>(py),
