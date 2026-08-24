@@ -16,7 +16,11 @@ pub mod bench_support {
     pub use crate::aggs::sum::sum_ends::sum_end_core;
     pub use crate::aggs::sum::sum_starts::{sum_start_core, sum_start_u32_core};
     pub use crate::aggs::sum::sum_starts_ends::sum_start_end_core;
+    pub use crate::bin_search::bin_search_ge_first::binary_search_ge_first_core;
+    pub use crate::bin_search::bin_search_gt_first::binary_search_gt_first_core;
+    pub use crate::bin_search::bin_search_le_first::binary_search_le_first_core;
     pub use crate::bin_search::bin_search_lt::binary_search_lt_core;
+    pub use crate::bin_search::bin_search_lt_first::binary_search_lt_first_core;
     pub use crate::compare::comp::compare_start_end_core;
     pub use crate::index_builder::{repeat_index_core, trim_index_core};
 }

@@ -1,6 +1,50 @@
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+
+/// For every `left[i]`, find the first position in all of `right` whose
+/// value is greater than or equal to `left[i]` (`right` is assumed sorted
+/// ascending). Rows with no such position are dropped entirely rather
+/// than represented with a sentinel; only the surviving `(search index,
+/// left_index[i])` pairs are returned, in row order.
+///
+/// ELI5: see `binary_search_lt_first_core`'s comment for why a single pass
+/// pushing into two `Vec`s replaces the old "full-length array with an
+/// internal no-match marker, then a second filtering pass" shape. Here
+/// `right.len()` is the value no genuine match can ever produce (a real
+/// match always leaves `min_idx < right.len()`), which is why the old
+/// code used it as that marker; the one-pass version does not need a
+/// marker at all.
+pub fn binary_search_le_first_core<T: PartialOrd + Copy>(
+    left: ArrayView1<T>,
+    right: ArrayView1<T>,
+    left_index: ArrayView1<i64>,
+) -> (Vec<i64>, Vec<i64>) {
+    let len_right = right.len();
+    let mut search_indices = Vec::new();
+    let mut index_left = Vec::new();
+    for (pos, left_value) in left.into_iter().enumerate() {
+        let mut min_idx = 0;
+        let mut max_idx = len_right;
+        while min_idx < max_idx {
+            // to avoid overflow
+            // adapted from numba's implementation
+            let mid_idx = min_idx + ((max_idx - min_idx) >> 1);
+            let current_value = right[mid_idx];
+            if current_value < *left_value {
+                min_idx = mid_idx + 1;
+            } else {
+                max_idx = mid_idx;
+            }
+        }
+        if min_idx == len_right {
+            continue;
+        }
+        search_indices.push(min_idx as i64);
+        index_left.push(left_index[pos]);
+    }
+    (search_indices, index_left)
+}
 
 macro_rules! bin_search {
     ($fname:ident, $type:ty) => {
@@ -11,48 +55,16 @@ macro_rules! bin_search {
             right: PyReadonlyArray1<'py, $type>,
             left_index: PyReadonlyArray1<'py, i64>,
         ) -> (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>, i64) {
-            let left = left.as_array();
-            let right = right.as_array();
-            let left_index = left_index.as_array();
-            let mut result = Array1::<i64>::zeros(left.len());
-            let mut total: usize = left.len();
-            let len_right: usize = right.len();
-            for (pos, left_value) in left.into_iter().enumerate() {
-                let mut min_idx = 0;
-                let mut max_idx = len_right;
-                while min_idx < max_idx {
-                    // to avoid overflow
-                    // adapted from numba's implementation
-                    let mid_idx = min_idx + ((max_idx - min_idx) >> 1);
-                    let current_value = right[mid_idx as usize];
-                    if current_value < *left_value {
-                        min_idx = mid_idx + 1;
-                    } else {
-                        max_idx = mid_idx;
-                    }
-                }
-                result[pos as usize] = min_idx as i64;
-                if min_idx == len_right {
-                    total -= 1;
-                    continue;
-                }
-            }
-            let mut index_left = Array1::<i64>::zeros(total as usize);
-            let mut search_indices = Array1::<i64>::zeros(total as usize);
-            let mut n = 0;
-            for (pos, item) in result.into_iter().enumerate() {
-                if item == len_right as i64 {
-                    continue;
-                }
-                search_indices[n] = item;
-                let ind = left_index[pos];
-                index_left[n] = ind;
-                n += 1;
-            }
+            let (search_indices, index_left) = binary_search_le_first_core(
+                left.as_array(),
+                right.as_array(),
+                left_index.as_array(),
+            );
+            let total = search_indices.len() as i64;
             (
-                search_indices.into_pyarray(py),
-                index_left.into_pyarray(py),
-                total as i64,
+                Array1::from_vec(search_indices).into_pyarray(py),
+                Array1::from_vec(index_left).into_pyarray(py),
+                total,
             )
         }
     };
@@ -86,4 +98,57 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(binary_search_le_first_f32, m)?)?;
     m.add_function(wrap_pyfunction!(binary_search_le_first_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn empty_input_returns_nothing() {
+        let left: Array1<i64> = array![];
+        let right: Array1<i64> = array![];
+        let left_index: Array1<i64> = array![];
+        let (indices, index_left) =
+            binary_search_le_first_core(left.view(), right.view(), left_index.view());
+        assert!(indices.is_empty());
+        assert!(index_left.is_empty());
+    }
+
+    #[test]
+    fn left_value_above_the_last_element_is_dropped() {
+        let right = array![10_i64, 20, 30];
+        let left = array![35_i64];
+        let left_index = array![1_i64];
+        let (indices, index_left) =
+            binary_search_le_first_core(left.view(), right.view(), left_index.view());
+        assert!(indices.is_empty());
+        assert!(index_left.is_empty());
+    }
+
+    #[test]
+    fn mixed_rows_keep_only_matches_with_their_own_left_index() {
+        let right = array![10_i64, 20, 30];
+        // row 0 (left=5, index=100): kept, search index 0
+        // row 1 (left=35, index=200): min_idx==len_right -> dropped
+        // row 2 (left=30, index=300): kept, search index 2
+        let left = array![5_i64, 35, 30];
+        let left_index = array![100_i64, 200, 300];
+        let (indices, index_left) =
+            binary_search_le_first_core(left.view(), right.view(), left_index.view());
+        assert_eq!(indices, vec![0, 2]);
+        assert_eq!(index_left, vec![100, 300]);
+    }
+
+    #[test]
+    fn generic_over_float_dtype() {
+        let left = array![3.0_f64];
+        let right = array![1.0_f64, 2.0, 3.0, 4.0];
+        let left_index = array![9_i64];
+        let (indices, index_left) =
+            binary_search_le_first_core(left.view(), right.view(), left_index.view());
+        assert_eq!(indices, vec![2]);
+        assert_eq!(index_left, vec![9]);
+    }
 }

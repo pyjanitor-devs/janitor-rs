@@ -718,3 +718,40 @@ When adding a new leaf module, register it in its own file, wire it into
 the parent `mod.rs`'s `register`, and never add a `wrap_pyfunction!` call
 to `lib.rs` directly. Before assuming a Python export name matches a Rust
 function name, grep the file for `#[pyfunction(name = ...)]`.
+
+### [2026-08-24] Issue #24 (part 1): one-pass `*_first` output, no marker needed
+
+**Context**: `binary_search_{lt,gt,ge,le}_first.rs` each searched every row
+into a `left.len()`-sized `Array1` using an internal "no match" marker (`0`
+or `right.len()`, whichever value that specific operator's search can
+never produce as a genuine result), then made a second pass over that
+array to copy only the surviving rows into exactly-sized output arrays.
+**Learning**: The marker step is unnecessary. Since the loop already knows,
+at the exact moment it decides a row didn't match, whether to keep it, it
+can just not add it: push `(search index, left_index[i])` straight into
+two grow-on-demand `Vec`s instead of writing into a full-length array and
+filtering it later. Do not eagerly reserve `left.len()` for both outputs:
+sparse/no-match workloads would otherwise allocate twice as much space as
+the old marker array before discovering that most rows are dropped. This
+also removes the marker-value bookkeeping (whether
+`0` or `right.len()` is safe to reuse as "no match" isn't obvious on its
+own -- it depends on that specific operator's algorithm always keeping
+genuine results away from that boundary).
+**Learning (perf)**: measured with a custom `#[global_allocator]` wrapper
+in `benches/kernels.rs` (`count_allocations`, before/after byte delta
+around a single un-criterion'd call -- criterion itself only reports
+timing, not allocation): the one-pass version grows only as rows survive,
+so sparse/no-match inputs do not pay for two full output buffers. The
+all-match case may perform several geometric `Vec` growth allocations,
+but still avoids the old full-length marker plus compacted arrays. The
+benchmark should report both sparse and dense cases; a dense-only result
+does not characterize memory use for the common sparse case.
+**Recommendation**: When a kernel's row-processing loop already knows at
+decision time whether a row survives, prefer pushing into grow-on-demand
+output `Vec`s over writing a full-length array with an internal sentinel
+and filtering it in a second pass -- the sentinel approach costs an extra
+full scan and can retain a large marker allocation for rows that are all
+dropped. This is scoped to
+one of #24's three opportunities (one-pass output); the shared/validated
+comparison-operator enum and the contiguous-array fast path are tracked
+separately and not addressed by this entry.
