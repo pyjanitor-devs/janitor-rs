@@ -12,6 +12,10 @@ fn checked_range_or_none(start: i64, end: i64, len: usize) -> Option<(usize, usi
         .filter(|(start, end)| start <= end)
 }
 
+fn checked_start_or_none(start: i64, len: usize) -> Option<usize> {
+    usize::try_from(start).ok().filter(|&start| start <= len)
+}
+
 /// Replicates `numpy.repeat(index, counts)`: emit `index[i]`, `counts[i]`
 /// times, for every `i`, back to back.
 ///
@@ -134,18 +138,26 @@ pub fn index_starts_only<'py>(
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize =
-        starts.iter().map(|s| end.saturating_sub(*s as usize)).sum();
+    let starts: Vec<Option<usize>> = starts
+        .iter()
+        .map(|start| checked_start_or_none(*start, end))
+        .collect();
+    let expected_matches_width: usize = starts
+        .iter()
+        .filter_map(|start| start.map(|start| end - start))
+        .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    for start in starts.into_iter() {
+    for start in starts {
         if pos == length as usize {
             break;
         }
-        let start_: usize = *start as usize;
+        let Some(start_) = start else {
+            continue;
+        };
         for nn in start_..end {
             if matches[n] == 0 {
                 n += 1;
@@ -179,8 +191,14 @@ pub fn index_starts_only_keep_first<'py>(
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize =
-        starts.iter().map(|s| end.saturating_sub(*s as usize)).sum();
+    let starts: Vec<Option<usize>> = starts
+        .iter()
+        .map(|start| checked_start_or_none(*start, end))
+        .collect();
+    let expected_matches_width: usize = starts
+        .iter()
+        .filter_map(|start| start.map(|start| end - start))
+        .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
@@ -188,12 +206,12 @@ pub fn index_starts_only_keep_first<'py>(
     let mut val: i64;
     let zipped = starts.into_iter().zip(counts);
     for (start, count_) in zipped {
-        let start_: usize = *start as usize;
         if *count_ == 0 {
-            let size = end - start_;
+            let size = start.map_or(0, |start| end - start);
             n += size;
             continue;
         }
+        let start_ = start.unwrap_or(end);
         if pos == length as usize {
             break;
         }
@@ -234,20 +252,26 @@ pub fn index_starts_only_keep_last<'py>(
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize =
-        starts.iter().map(|s| end.saturating_sub(*s as usize)).sum();
+    let starts: Vec<Option<usize>> = starts
+        .iter()
+        .map(|start| checked_start_or_none(*start, end))
+        .collect();
+    let expected_matches_width: usize = starts
+        .iter()
+        .filter_map(|start| start.map(|start| end - start))
+        .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
     for (start, count) in starts.into_iter().zip(counts) {
-        let start_: usize = *start as usize;
         if *count == 0 {
-            let size = end - start_;
+            let size = start.map_or(0, |start| end - start);
             n += size;
             continue;
         }
+        let start_ = start.unwrap_or(end);
         if pos == length as usize {
             break;
         }
@@ -285,17 +309,23 @@ pub fn index_ends_only<'py>(
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize = ends.iter().map(|e| *e as usize).sum();
+    let ends: Vec<Option<usize>> = ends
+        .iter()
+        .map(|end| checked_end(*end, index.len()))
+        .collect();
+    let expected_matches_width: usize = ends.iter().filter_map(|end| *end).sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
     let mut pos: usize = 0;
     let mut val: i64;
-    for end in ends.into_iter() {
+    for end in ends {
         if pos == length as usize {
             break;
         }
-        let end_: usize = *end as usize;
+        let Some(end_) = end else {
+            continue;
+        };
         for nn in 0..end_ {
             if matches[n] == 0 {
                 n += 1;
@@ -328,7 +358,11 @@ pub fn index_ends_only_keep_first<'py>(
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize = ends.iter().map(|e| *e as usize).sum();
+    let ends: Vec<Option<usize>> = ends
+        .iter()
+        .map(|end| checked_end(*end, index.len()))
+        .collect();
+    let expected_matches_width: usize = ends.iter().filter_map(|end| *end).sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
@@ -336,12 +370,12 @@ pub fn index_ends_only_keep_first<'py>(
     let mut val: i64;
     let start_: usize = 0;
     for (end, count) in ends.into_iter().zip(counts) {
-        let end_: usize = *end as usize;
         if *count == 0 {
-            let size = end_ - start_;
+            let size = end.unwrap_or(start_);
             n += size;
             continue;
         }
+        let end_ = end.unwrap_or(start_);
         if pos == length as usize {
             break;
         }
@@ -382,7 +416,11 @@ pub fn index_ends_only_keep_last<'py>(
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize = ends.iter().map(|e| *e as usize).sum();
+    let ends: Vec<Option<usize>> = ends
+        .iter()
+        .map(|end| checked_end(*end, index.len()))
+        .collect();
+    let expected_matches_width: usize = ends.iter().filter_map(|end| *end).sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut result = Array1::<i64>::zeros(length as usize);
     let mut n: usize = 0;
@@ -390,12 +428,12 @@ pub fn index_ends_only_keep_last<'py>(
     let mut val: i64;
     let start_: usize = 0;
     for (end, count) in ends.into_iter().zip(counts) {
-        let end_: usize = *end as usize;
         if *count == 0 {
-            let size = end_ - start_;
+            let size = end.unwrap_or(start_);
             n += size;
             continue;
         }
+        let end_ = end.unwrap_or(start_);
         if pos == length as usize {
             break;
         }

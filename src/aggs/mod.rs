@@ -623,6 +623,68 @@ mod adversarial_bounds_tests {
             )
             .expect("an invalid keep-last starts/ends row must be skipped");
             assert_eq!(last.readonly().as_array().to_vec(), vec![-1_i64]);
+
+            // The ends-only siblings must reject an end beyond `index.len()`
+            // before their `index[nn]` loops can walk past the value array.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20_i64]);
+            let ends = PyArray1::from_vec(py, vec![3_i64]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1, 1]);
+            let result = crate::index_builder::index_ends_only(
+                py,
+                index.readonly(),
+                ends.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("an oversized end must be skipped");
+            assert_eq!(result.readonly().as_array().to_vec(), vec![0_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64]);
+            let first = crate::index_builder::index_ends_only_keep_first(
+                py,
+                index.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("an oversized keep-first end must be skipped");
+            assert_eq!(first.readonly().as_array().to_vec(), vec![-1_i64]);
+            let last = crate::index_builder::index_ends_only_keep_last(
+                py,
+                index.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("an oversized keep-last end must be skipped");
+            assert_eq!(last.readonly().as_array().to_vec(), vec![-1_i64]);
+
+            // A -1 start with a zero-count row must not cast to a huge
+            // usize and underflow while computing the skipped tape width.
+            let starts = PyArray1::from_vec(py, vec![-1_i64]);
+            let counts = PyArray1::from_vec(py, vec![0_i64]);
+            let matches = PyArray1::from_vec(py, Vec::<i8>::new());
+            let first = crate::index_builder::index_starts_only_keep_first(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("a sentinel zero-count start must not underflow");
+            assert_eq!(first.readonly().as_array().to_vec(), vec![0_i64]);
+            let last = crate::index_builder::index_starts_only_keep_last(
+                py,
+                index.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("a sentinel zero-count start must not underflow");
+            assert_eq!(last.readonly().as_array().to_vec(), vec![0_i64]);
         });
     }
 
