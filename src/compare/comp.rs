@@ -24,18 +24,25 @@ use crate::compare::op::CompareOp;
 /// tape said skip), `counts_array[i]` is how many positions row `i`
 /// matched, and `total` is the grand total across every row.
 ///
-/// A row with an invalid/inverted range (`start` or `end` is `-1`, the
-/// crate's "no match" sentinel, or `start >= end`, checked in `i64` space
-/// before either bound is cast to `usize`) contributes zero ticks to the
-/// tape, matching a genuinely empty range.
+/// A row with an invalid/inverted range (`start` or `end` negative -- not
+/// just the crate's `-1` "no match" sentinel, any negative value -- or
+/// `start >= end`, checked in `i64` space before either bound is cast to
+/// `usize`) contributes zero ticks to the tape, matching a genuinely
+/// empty range.
 ///
-/// ELI5 (why `-1` is checked before the cast, not after): a `usize` can't
-/// represent `-1`, so casting it doesn't keep it negative -- it wraps
-/// around to the *largest* possible `usize` instead. That's bigger than
-/// any real `start`, so a `start_ >= end_` check done *after* casting
-/// would think the row has a huge, valid range instead of no match at
-/// all, and the loop would walk `right`/`matches` straight past their
-/// real length.
+/// ELI5 (why negativity is checked before the cast, not after): a `usize`
+/// can't represent a negative number, so casting one doesn't keep it
+/// negative -- it wraps around to a huge positive `usize` instead. A
+/// `start_ >= end_` check done only *after* casting would miss exactly
+/// the case where *both* bounds are negative but still satisfy
+/// `start < end` in `i64` space (e.g. `start=-3, end=-2`): both wrap to
+/// huge-but-still-ordered `usize` values, so the post-cast comparison
+/// would see a small, genuine-looking non-empty range and walk
+/// `right`/`matches` far past their real length instead of recognizing
+/// the row as invalid. Requiring both bounds non-negative *before* the
+/// cast closes that gap -- once `start >= 0` and `start < end` both hold,
+/// `end` is provably positive too, so no separate `end < 0` check is
+/// needed to reach that guarantee.
 pub fn compare_start_end_core<T: PartialOrd + Copy>(
     left: ArrayView1<T>,
     right: ArrayView1<T>,
@@ -50,7 +57,7 @@ pub fn compare_start_end_core<T: PartialOrd + Copy>(
     let mut n: usize = 0;
     let zipped = izip!(left.into_iter(), starts.into_iter(), ends.into_iter());
     for (position, (left_val, start, end)) in zipped.enumerate() {
-        if *start == -1 || *end == -1 || *start >= *end {
+        if *start < 0 || *end == -1 || *start >= *end {
             // No candidates for this row: 0 ticks on the shared `matches`
             // tape, matching a genuinely empty [start, end) range. A lone
             // `-1` sentinel cast to `usize` would otherwise wrap past
@@ -170,6 +177,32 @@ mod tests {
     use numpy::ndarray::array;
 
     use CompareOp::{Eq as EQ, Ge as GE, Gt as GT, Le as LE, Lt as LT, Ne as NE};
+
+    #[test]
+    fn both_bounds_negative_but_start_less_than_end_contributes_nothing_not_a_panic() {
+        // start=-3, end=-2 aren't the `-1` sentinel, and -3 < -2 holds in
+        // i64 space, so the old `start == -1`-only check let this row
+        // through. Both bounds then cast to *huge*, still-ordered usize
+        // values (start_ < end_ survives the cast), so the loop walked
+        // `right`/`matches` far out of bounds instead of contributing
+        // zero ticks.
+        let left = array![5_i64];
+        let right = array![1_i64];
+        let starts = array![-3_i64];
+        let ends = array![-2_i64];
+        let matches = array![1_i8];
+        let (result, counts, total) = compare_start_end_core(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            matches.view(),
+            GT,
+        );
+        assert_eq!(result, Array1::<i8>::zeros(1));
+        assert_eq!(counts, array![0]);
+        assert_eq!(total, 0);
+    }
 
     #[test]
     fn each_op_code_matches_its_operator() {
