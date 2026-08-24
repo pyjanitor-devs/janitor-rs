@@ -1,13 +1,38 @@
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
+use crate::aggs::dense::DenseSlots;
 use crate::aggs::{
     checked_end, checked_index, checked_range, ensure_equal_lengths, ensure_tape_width,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
+
+/// Pure-Rust reverse-size core for the "end" shape: for every row's
+/// `0..end` span, count one hit per row position it touches in `index`,
+/// skipping rows whose `end` doesn't name a valid range. Takes plain
+/// `ArrayView1`s, not PyO3 types, so it can be tested and benchmarked
+/// without a Python interpreter -- see `benches/kernels.rs`.
+pub fn size_rev_end_core(
+    ends: ArrayView1<i64>,
+    index: ArrayView1<i64>,
+    length: usize,
+) -> (Array1<i64>, Array1<i64>) {
+    let mut slots: DenseSlots<i64> = DenseSlots::new(length);
+    let start_: usize = 0_usize;
+    for end in ends.into_iter() {
+        let Some(end_) = checked_end(*end, index.len()) else {
+            continue;
+        };
+        for item in start_..end_ {
+            let pos = index[item] as usize;
+            let total = slots.touch(pos, 0);
+            *total += 1;
+        }
+    }
+    slots.to_arrays(|value| *value)
+}
 
 #[pyfunction]
 pub fn compute_size_rev_end<'py>(
@@ -16,36 +41,7 @@ pub fn compute_size_rev_end<'py>(
     index: PyReadonlyArray1<'py, i64>,
     length: i64,
 ) -> SizeRevResult<'py> {
-    let ends = ends.as_array();
-    let index = index.as_array();
-    let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-    let start_: usize = 0_usize;
-    for end in ends.into_iter() {
-        let Some(end_) = checked_end(*end, index.len()) else {
-            continue;
-        };
-        for item in start_..end_ {
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
-            *total += 1;
-        }
-    }
-    // ELI5: `length` above is only a capacity hint for `with_capacity`; the
-    // real output size is however many distinct keys the loop actually
-    // found. Sizing `indexers`/`result` from the hint instead of
-    // `dictionary.len()` panics (out-of-bounds write below) whenever more
-    // keys were found than the hint promised, and silently pads with
-    // bogus zero entries whenever fewer were found. Every sibling
-    // `_rev`/`size_rev` function re-derives `length` from the dictionary
-    // for exactly this reason.
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let (indexers, result) = size_rev_end_core(ends.as_array(), index.as_array(), length as usize);
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
@@ -59,27 +55,17 @@ pub fn compute_size_rev_start<'py>(
     let starts = starts.as_array();
     let index = index.as_array();
     let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let mut slots: DenseSlots<i64> = DenseSlots::new(length);
     let end_: usize = index.len();
     for start in starts.into_iter() {
         let start_ = *start as usize;
         for item in start_..end_ {
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
+            let pos = index[item] as usize;
+            let total = slots.touch(pos, 0);
             *total += 1;
         }
     }
-    // See the matching comment in `compute_size_rev_end`: the output must
-    // be sized from the dictionary's actual key count, not the capacity
-    // hint, or writing `indexers[pos]`/`result[pos]` below can walk off
-    // the end of a too-small array.
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let (indexers, result) = slots.to_arrays(|value| *value);
     (indexers.into_pyarray(py), result.into_pyarray(py))
 }
 
@@ -104,7 +90,7 @@ pub fn compute_size_rev_end_matches<'py>(
         .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let mut slots: DenseSlots<i64> = DenseSlots::new(length);
     let start_: usize = 0_usize;
     let mut n: usize = 0;
     for end in ends.into_iter() {
@@ -116,19 +102,13 @@ pub fn compute_size_rev_end_matches<'py>(
                 n += 1;
                 continue;
             }
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
+            let pos = index[item] as usize;
+            let total = slots.touch(pos, 0);
             *total += 1;
             n += 1;
         }
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let (indexers, result) = slots.to_arrays(|value| *value);
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
@@ -154,7 +134,7 @@ pub fn compute_size_rev_start_matches<'py>(
         .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let mut slots: DenseSlots<i64> = DenseSlots::new(length);
     let mut n: usize = 0;
     for start in starts.into_iter() {
         let start_ = *start as usize;
@@ -163,19 +143,13 @@ pub fn compute_size_rev_start_matches<'py>(
                 n += 1;
                 continue;
             }
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
+            let pos = index[item] as usize;
+            let total = slots.touch(pos, 0);
             *total += 1;
             n += 1;
         }
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let (indexers, result) = slots.to_arrays(|value| *value);
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
@@ -204,7 +178,7 @@ pub fn compute_size_rev_start_end_matches<'py>(
         .sum();
     ensure_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let mut slots: DenseSlots<i64> = DenseSlots::new(length);
     let mut n: usize = 0;
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
@@ -216,20 +190,13 @@ pub fn compute_size_rev_start_end_matches<'py>(
                 n += 1;
                 continue;
             }
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
+            let pos = index[item] as usize;
+            let total = slots.touch(pos, 0);
             *total += 1;
             n += 1;
         }
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let (indexers, result) = slots.to_arrays(|value| *value);
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
@@ -246,25 +213,19 @@ pub fn compute_size_rev_start_end<'py>(
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let mut slots: DenseSlots<i64> = DenseSlots::new(length);
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
         let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
             continue;
         };
         for item in start_..end_ {
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
+            let pos = index[item] as usize;
+            let total = slots.touch(pos, 0);
             *total += 1;
         }
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let (indexers, result) = slots.to_arrays(|value| *value);
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
@@ -283,7 +244,7 @@ pub fn compute_size_rev_positions<'py>(
     let index = index.as_array();
     let positions = positions.as_array();
     let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let mut slots: DenseSlots<i64> = DenseSlots::new(length);
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
         let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
@@ -293,18 +254,12 @@ pub fn compute_size_rev_positions<'py>(
             let Some(indexer_) = checked_index(positions[item], index.len()) else {
                 continue;
             };
-            let pos = index[indexer_];
-            let total = dictionary.entry(pos).or_insert(0);
+            let pos = index[indexer_] as usize;
+            let total = slots.touch(pos, 0);
             *total += 1;
         }
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let (indexers, result) = slots.to_arrays(|value| *value);
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
@@ -322,4 +277,189 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_size_rev_start_end, m)?)?;
     m.add_function(wrap_pyfunction!(compute_size_rev_start_end_matches, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod correctness_tests {
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    use super::*;
+
+    #[test]
+    fn size_rev_end_counts_touched_row_positions_ascending() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            // index = [5, 3]; row0 (end=1) touches index[0..1] = {5},
+            // row1 (end=2) touches index[0..2] = {5, 3} -- position 5 is
+            // counted twice, position 3 once.
+            let ends = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let index = PyArray1::from_vec(py, vec![5_i64, 3]);
+            let (indexers, result) = compute_size_rev_end(py, ends.readonly(), index.readonly(), 6)
+                .expect("valid inputs must not error");
+            assert_eq!(indexers.readonly().to_vec().unwrap(), vec![3, 5]);
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![1, 2]);
+        });
+    }
+
+    #[test]
+    fn size_rev_start_counts_touched_row_positions_ascending() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            // index = [7, 2, 9]; row0 (start=1) touches index[1..3] =
+            // {2, 9}, row1 (start=0) touches index[0..3] = {7, 2, 9}.
+            let starts = PyArray1::from_vec(py, vec![1_i64, 0]);
+            let index = PyArray1::from_vec(py, vec![7_i64, 2, 9]);
+            let (indexers, result) =
+                compute_size_rev_start(py, starts.readonly(), index.readonly(), 10);
+            assert_eq!(indexers.readonly().to_vec().unwrap(), vec![2, 7, 9]);
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![2, 1, 2]);
+        });
+    }
+
+    #[test]
+    fn size_rev_end_matches_counts_only_matching_positions_ascending() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            // index = [2, 5]; row0 (end=1) consumes 1 match-tape slot,
+            // row1 (end=2) consumes 2 more -- tape width 3, all matching.
+            let ends = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let index = PyArray1::from_vec(py, vec![2_i64, 5]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1, 1]);
+            let (indexers, result) = compute_size_rev_end_matches(
+                py,
+                ends.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                6,
+            )
+            .expect("valid inputs must not error");
+            assert_eq!(indexers.readonly().to_vec().unwrap(), vec![2, 5]);
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![2, 1]);
+        });
+    }
+
+    #[test]
+    fn size_rev_start_matches_counts_only_matching_positions_ascending() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            // index = [4, 7]; row0 (start=0) consumes tape width 2, row1
+            // (start=1) consumes tape width 1 -- total tape width 3, all
+            // matching.
+            let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let index = PyArray1::from_vec(py, vec![4_i64, 7]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1, 1]);
+            let (indexers, result) = compute_size_rev_start_matches(
+                py,
+                starts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                8,
+            )
+            .expect("valid inputs must not error");
+            assert_eq!(indexers.readonly().to_vec().unwrap(), vec![4, 7]);
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![1, 2]);
+        });
+    }
+
+    #[test]
+    fn size_rev_start_end_matches_counts_only_matching_positions_ascending() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            // index = [1, 4, 9]; row0 (0..2) and row1 (1..3) each
+            // contribute tape width 2 -- total tape width 4, all
+            // matching.
+            let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let ends = PyArray1::from_vec(py, vec![2_i64, 3]);
+            let index = PyArray1::from_vec(py, vec![1_i64, 4, 9]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1, 1, 1]);
+            let (indexers, result) = compute_size_rev_start_end_matches(
+                py,
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                10,
+            )
+            .expect("valid inputs must not error");
+            assert_eq!(indexers.readonly().to_vec().unwrap(), vec![1, 4, 9]);
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![1, 2, 1]);
+        });
+    }
+
+    #[test]
+    fn size_rev_start_end_counts_touched_row_positions_ascending() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            // index = [4, 1, 8]; row0 (0..2) touches index[0..2] =
+            // {4, 1}, row1 (1..3) touches index[1..3] = {1, 8}.
+            let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let ends = PyArray1::from_vec(py, vec![2_i64, 3]);
+            let index = PyArray1::from_vec(py, vec![4_i64, 1, 8]);
+            let (indexers, result) = compute_size_rev_start_end(
+                py,
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                9,
+            )
+            .expect("valid inputs must not error");
+            assert_eq!(indexers.readonly().to_vec().unwrap(), vec![1, 4, 8]);
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![2, 1, 1]);
+        });
+    }
+
+    #[test]
+    fn size_rev_positions_counts_touched_row_positions_ascending() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            // positions = [1, 0, 2], index = [6, 3, 9]. row0 (0..2) walks
+            // positions[0..2] = {1, 0} -> index positions {3, 6}; row1
+            // (1..3) walks positions[1..3] = {0, 2} -> index positions
+            // {6, 9}.
+            let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let ends = PyArray1::from_vec(py, vec![2_i64, 3]);
+            let index = PyArray1::from_vec(py, vec![6_i64, 3, 9]);
+            let positions = PyArray1::from_vec(py, vec![1_i64, 0, 2]);
+            let (indexers, result) = compute_size_rev_positions(
+                py,
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                positions.readonly(),
+                10,
+            )
+            .expect("valid inputs must not error");
+            assert_eq!(indexers.readonly().to_vec().unwrap(), vec![3, 6, 9]);
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![1, 2, 1]);
+        });
+    }
 }

@@ -25,7 +25,7 @@ use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
     binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core,
     max_rev_no_range_core, min_rev_no_range_core, prod_rev_no_range_i64_core, repeat_index_core,
-    sum_end_core, sum_rev_no_range_i64_core, sum_start_core, sum_start_end_core,
+    size_rev_end_core, sum_end_core, sum_rev_no_range_i64_core, sum_start_core, sum_start_end_core,
     sum_start_u32_core, trim_index_core, CompareOp,
 };
 
@@ -1052,6 +1052,110 @@ fn bench_prod_rev_no_range_old_vs_new(c: &mut Criterion) {
     group.finish();
 }
 
+/// Inputs for `bench_size_rev_end_old_vs_new`: `n` candidate positions in
+/// `index`, cycling through `n / 10` distinct row positions (at least 1)
+/// -- the same grouping density as `SumRevFixture`. Each row's `end` is
+/// bounded to `SUM_BENCH_WIDTH` (like `SumFixture`'s `ends_for_sum_end`)
+/// so the total scanned work stays `O(n * WIDTH)`: `compute_size_rev_end`
+/// always scans `index[0..end]` from a fixed start of 0, so an
+/// unbounded `end` would make this `O(n^2)`.
+struct SizeRevFixture {
+    ends: Array1<i64>,
+    index: Array1<i64>,
+    length: usize,
+}
+
+impl SizeRevFixture {
+    fn new(n: usize) -> Self {
+        let length = (n / 10).max(1);
+        let index = Array1::from_iter((0..n as i64).map(|i| i % length as i64));
+        let ends = Array1::from_elem(n, SUM_BENCH_WIDTH.min(n as i64));
+        SizeRevFixture {
+            ends,
+            index,
+            length,
+        }
+    }
+}
+
+/// A bench-only copy of the reverse-size "end" kernel as it existed
+/// before issue #23's dense-accumulator rewrite: a single
+/// `HashMap<i64, i64>`, with entries emitted in the map's own
+/// (unspecified, effectively random) iteration order. Kept here for the
+/// same reason as `sum_rev_no_range_int_core_hashmap` above.
+fn size_rev_end_core_hashmap(
+    ends: ArrayView1<i64>,
+    index: ArrayView1<i64>,
+    length: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let start_: usize = 0;
+    for end in ends.into_iter() {
+        let Some(end_) = usize::try_from(*end)
+            .ok()
+            .filter(|&end_| end_ <= index.len())
+        else {
+            continue;
+        };
+        for item in start_..end_ {
+            let pos = index[item];
+            let total = dictionary.entry(pos).or_insert(0);
+            *total += 1;
+        }
+    }
+    let mut indexers = Vec::with_capacity(dictionary.len());
+    let mut result = Vec::with_capacity(dictionary.len());
+    for (key, val) in dictionary.iter() {
+        indexers.push(*key);
+        result.push(*val);
+    }
+    (indexers, result)
+}
+
+/// Direct old-(`HashMap`)-vs-new-(`DenseSlots`) comparison for the
+/// reverse-size "end" kernel.
+fn bench_size_rev_end_old_vs_new(c: &mut Criterion) {
+    eprintln!("\nsize_rev_end old (HashMap) vs new (DenseSlots) allocation report:");
+    let mut group = c.benchmark_group("size_rev_end_old_vs_new");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_millis(500));
+    for n in [100, 100_000] {
+        let f = SizeRevFixture::new(n);
+
+        let (bytes, calls, peak) = count_allocations(|| {
+            size_rev_end_core_hashmap(f.ends.view(), f.index.view(), f.length)
+        });
+        eprintln!(
+            "  old (HashMap)   n={n:>7}: {bytes:>9} bytes / {calls:>3} allocs / {peak:>9} peak"
+        );
+        group.bench_function(format!("old n={n}"), |b| {
+            b.iter(|| {
+                size_rev_end_core_hashmap(
+                    black_box(f.ends.view()),
+                    black_box(f.index.view()),
+                    black_box(f.length),
+                )
+            })
+        });
+
+        let (bytes, calls, peak) =
+            count_allocations(|| size_rev_end_core(f.ends.view(), f.index.view(), f.length));
+        eprintln!(
+            "  new (DenseSlots) n={n:>7}: {bytes:>9} bytes / {calls:>3} allocs / {peak:>9} peak"
+        );
+        group.bench_function(format!("new n={n}"), |b| {
+            b.iter(|| {
+                size_rev_end_core(
+                    black_box(f.ends.view()),
+                    black_box(f.index.view()),
+                    black_box(f.length),
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bin_search_lt,
@@ -1063,6 +1167,7 @@ criterion_group!(
     bench_sum_rev_no_range_old_vs_new,
     bench_max_rev_no_range_old_vs_new,
     bench_min_rev_no_range_old_vs_new,
-    bench_prod_rev_no_range_old_vs_new
+    bench_prod_rev_no_range_old_vs_new,
+    bench_size_rev_end_old_vs_new
 );
 criterion_main!(benches);
