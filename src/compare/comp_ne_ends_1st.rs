@@ -25,9 +25,17 @@ macro_rules! generic_compare {
             let ends_array = ends.as_array();
             let left_booleans_array = left_booleans.as_array();
             let right_booleans_array = right_booleans.as_array();
-            let length: i64 = ends_array.sum();
+            let right_len = right_array.len();
+            // See comp_first_ends.rs: no caller-supplied `matches` tape,
+            // so an invalid row is silently skipped, consistently between
+            // this length precomputation and the main loop below.
+            let length: usize = ends_array
+                .iter()
+                .filter(|e| **e >= 0 && (**e as usize) <= right_len)
+                .map(|e| *e as usize)
+                .sum();
             let op = CompareOp::try_from_code(op)?;
-            let mut result = Array1::<i8>::zeros(length as usize);
+            let mut result = Array1::<i8>::zeros(length);
             let mut counts_array = Array1::<i64>::zeros(left_array.len());
             let mut total: i64 = 0;
             let mut n: usize = 0;
@@ -37,6 +45,9 @@ macro_rules! generic_compare {
                 ends_array.into_iter(),
             );
             for (position, (left_val, left_bool, end)) in zipped.enumerate() {
+                if *end < 0 || (*end as usize) > right_len {
+                    continue;
+                }
                 let end_ = *end as usize;
                 let mut counter: i64 = 0;
                 for nn in 0..end_ {
@@ -102,4 +113,76 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compare_end_ne_1st_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compare_end_ne_1st_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    type CompareResult<'py> = PyResult<(Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64)>;
+
+    fn run(py: Python<'_>, end: i64) -> CompareResult<'_> {
+        let left = PyArray1::from_vec(py, vec![1_i64]);
+        let right = PyArray1::from_vec(py, vec![1_i64]);
+        let ends = PyArray1::from_vec(py, vec![end]);
+        let left_booleans = PyArray1::from_vec(py, vec![false]);
+        let right_booleans = PyArray1::from_vec(py, vec![false]);
+        compare_end_ne_1st_int64(
+            py,
+            left.readonly(),
+            right.readonly(),
+            ends.readonly(),
+            left_booleans.readonly(),
+            right_booleans.readonly(),
+            false,
+            5, // CompareOp::Ne
+        )
+    }
+
+    #[test]
+    fn end_beyond_right_len_contributes_nothing_not_a_panic() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 2).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), Vec::<i8>::new());
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
+
+    #[test]
+    fn negative_end_contributes_nothing_not_a_panic() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, -2).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), Vec::<i8>::new());
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
+
+    #[test]
+    fn end_equal_to_right_len_is_valid() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 1).expect("must not panic");
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![0_i8]);
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
 }
