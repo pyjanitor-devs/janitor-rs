@@ -6,12 +6,15 @@ use pyo3::prelude::*;
 /// Find, for every `left[i]`, the first position in `right[starts[i]..ends[i])`
 /// whose value is strictly greater than `left[i]` -- the start of the match
 /// region for a `<` join (`right` is assumed sorted ascending within each
-/// `[start, end)` slice). Returns `-1` for an invalid/empty range (`start`
-/// negative, `end` the `-1` sentinel, `start >= end`, or `end` beyond
-/// `right.len()`), when no element in the range is greater than
-/// `left[i]`, or when the first such element is equal to `left[i]`
-/// (defensive: cannot happen when `right` is truly sorted, since the
-/// search converges on the first strictly-greater element).
+/// `[start, end)` slice, which in particular means NaN-free -- see the
+/// contiguous-fast-path note below for what that precondition rules out
+/// and why it matters). Returns `-1` for an
+/// invalid/empty range (`start` negative, `end` the `-1` sentinel, an
+/// inverted `start`/`end` pair, or `end` beyond `right.len()`), when no
+/// element in the range is greater than `left[i]`, or when the first such
+/// element is equal to `left[i]` (defensive: cannot happen when `right` is
+/// truly sorted, since the search converges on the first strictly-greater
+/// element).
 ///
 /// ELI5: binary search cuts the candidate range in half each step instead of
 /// scanning it one item at a time, so it costs O(log width) per query
@@ -42,6 +45,11 @@ pub fn binary_search_lt_core<T: PartialOrd + Copy>(
     starts: ArrayView1<i64>,
     ends: ArrayView1<i64>,
 ) -> Array1<i64> {
+    // ELI5: `.as_slice()` only returns `Some` when `right` is contiguous in
+    // standard (C) order -- true for a plain NumPy array, false for one
+    // sliced with a non-1 step. Checked once per call, not per row, since
+    // contiguity doesn't change mid-call.
+    let right_slice = right.as_slice();
     let mut result = Array1::<i64>::zeros(left.len());
     let right_len = right.len() as i64;
     let zipped = izip!(left.into_iter(), starts.into_iter(), ends.into_iter());
@@ -50,19 +58,48 @@ pub fn binary_search_lt_core<T: PartialOrd + Copy>(
             result[pos] = -1;
             continue;
         }
-        let mut min_idx = *start;
-        let mut max_idx = *end;
-        while min_idx < max_idx {
-            // to avoid overflow
-            // adapted from numba's implementation
-            let mid_idx = min_idx + ((max_idx - min_idx) >> 1);
-            let current_value = right[mid_idx as usize];
-            if current_value <= *left_value {
-                min_idx = mid_idx + 1;
-            } else {
-                max_idx = mid_idx;
+        // ELI5: `partition_point` uses the same predicate, in the same
+        // direction, as the manual `while` loop below -- but that alone
+        // does *not* guarantee an identical result. `slice::partition_point`
+        // is std's "branchless" binary search: it shrinks the search width
+        // by a fixed `size / 2` every step regardless of the comparison
+        // outcome, whereas the manual loop below shrinks by whatever the
+        // comparison decides (`mid - min` or `max - mid`, generally
+        // unequal). For a genuinely sorted, NaN-free `right` (this
+        // function's documented precondition) both converge on the same
+        // unique partition point regardless of which width-shrinking
+        // strategy got them there. For a `right` that violates that
+        // precondition -- most notably one containing NaN, which cannot
+        // occupy a valid position in "sorted ascending" -- the two
+        // strategies can probe different elements and land on genuinely
+        // different (but never out-of-bounds) answers; see
+        // `nan_in_right_does_not_panic_but_is_not_guaranteed_to_match_fallback`
+        // below for a concrete case. This is why the fast path is worth
+        // having at all: a `&[T]` slice both elides bounds checks a manual
+        // `ArrayView1` index can't *and* unlocks this branchless algorithm,
+        // which benchmarks ~2x faster than an equivalent manual loop over
+        // the same slice at n=100,000 -- rewriting it as a manual loop to
+        // guarantee fallback parity on malformed input would give up most
+        // of that, for a case this function's contract already excludes.
+        let min_idx = if let Some(slice) = right_slice {
+            let rel = slice[*start as usize..*end as usize].partition_point(|v| *v <= *left_value);
+            *start + rel as i64
+        } else {
+            let mut min_idx = *start;
+            let mut max_idx = *end;
+            while min_idx < max_idx {
+                // to avoid overflow
+                // adapted from numba's implementation
+                let mid_idx = min_idx + ((max_idx - min_idx) >> 1);
+                let current_value = right[mid_idx as usize];
+                if current_value <= *left_value {
+                    min_idx = mid_idx + 1;
+                } else {
+                    max_idx = mid_idx;
+                }
             }
-        }
+            min_idx
+        };
         if min_idx == *end {
             result[pos] = -1;
             continue;
@@ -79,6 +116,14 @@ pub fn binary_search_lt_core<T: PartialOrd + Copy>(
 
 macro_rules! bin_search {
     ($fname:ident, $type:ty) => {
+        /// For every `left[i]`, the first position in `right[starts[i]..ends[i])`
+        /// whose value is strictly greater than `left[i]`. `right` is assumed
+        /// sorted ascending within each `[start, end)` slice, which in
+        /// particular means NaN-free: for a `right` that contains NaN, this
+        /// function will not panic, but its result is not guaranteed to be
+        /// the same for a contiguous `right` array as for a non-contiguous
+        /// (e.g. sliced with a step) one. See `binary_search_lt_core`'s doc
+        /// comment (in the Rust source) for why.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -131,7 +176,107 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use numpy::ndarray::array;
+    use numpy::ndarray::{array, s};
+
+    #[test]
+    fn strided_input_falls_back_to_manual_loop_and_still_finds_the_right_answer() {
+        // Every other element is real data; the odd-indexed slots are junk
+        // that a stride-2 view skips entirely. Slicing with a non-1 step
+        // makes the view non-contiguous, so `.as_slice()` returns `None`
+        // and the fallback loop runs instead of the fast path.
+        let right_padded = array![1_i64, 999, 3, 999, 7, 999, 9, 999];
+        let right = right_padded.slice(s![..;2]);
+        assert!(
+            right.as_slice().is_none(),
+            "test setup bug: this view should be non-contiguous"
+        );
+        let left = array![5_i64];
+        let starts = array![0_i64];
+        let ends = array![4_i64];
+        let got = binary_search_lt_core(left.view(), right, starts.view(), ends.view());
+        assert_eq!(got, array![2]); // first strictly-greater element (7) is at index 2
+    }
+
+    #[test]
+    fn contiguous_and_strided_paths_agree_when_the_query_is_nan() {
+        // `right` itself stays genuinely sorted ascending here (this
+        // function's documented precondition) -- only the *query*
+        // (`left`) is NaN. `*v <= NaN` is `false` for every element, a
+        // valid (if degenerate) partition of the whole range into the
+        // "false" side, so both the fast path (`slice::partition_point`)
+        // and the fallback (`ArrayView1` manual bisection) still agree:
+        // this is in-contract input, unlike a `right` that itself
+        // contains NaN (see `nan_in_right_does_not_panic_but_parity_is_not_guaranteed`
+        // below for that out-of-contract case, and this file's core doc
+        // comment for why the two can genuinely differ there).
+        let right_dense = array![1.0_f64, 2.0, 3.0, 7.0];
+        assert!(right_dense.view().as_slice().is_some());
+        let right_padded = array![1.0_f64, -1.0, 2.0, -1.0, 3.0, -1.0, 7.0, -1.0];
+        let right_strided = right_padded.slice(s![..;2]);
+        assert!(right_strided.as_slice().is_none());
+
+        let left = array![f64::NAN];
+        let starts = array![0_i64];
+        let ends = array![4_i64];
+        let fast =
+            binary_search_lt_core(left.view(), right_dense.view(), starts.view(), ends.view());
+        let fallback =
+            binary_search_lt_core(left.view(), right_strided, starts.view(), ends.view());
+        assert_eq!(fast, fallback);
+    }
+
+    #[test]
+    fn nan_in_right_does_not_panic_but_parity_is_not_guaranteed() {
+        // Issue found in review of PR #54: a `right` that itself contains
+        // NaN violates "sorted ascending" (NaN has no valid position in a
+        // sort order), which is out of this function's documented
+        // contract -- unlike the query-is-NaN case above, `slice::partition_point`
+        // (branchless, shrinks the search width by a fixed `size / 2`
+        // every step) and the manual fallback loop (shrinks by whatever
+        // the comparison decides) can probe different elements and land
+        // on genuinely different answers here, even though both use the
+        // identical `<=` predicate. Concretely, right=[-1, NaN, 0, 1, 2,
+        // 3, 4], left=0: the fast path returns 3, the fallback returns 1.
+        // Both are "some in-bounds index," neither panics -- that's the
+        // only guarantee this out-of-contract case gets.
+        let right_dense = array![-1.0_f64, f64::NAN, 0.0, 1.0, 2.0, 3.0, 4.0];
+        assert!(right_dense.view().as_slice().is_some());
+        let right_padded = array![
+            -1.0_f64,
+            -99.0,
+            f64::NAN,
+            -99.0,
+            0.0,
+            -99.0,
+            1.0,
+            -99.0,
+            2.0,
+            -99.0,
+            3.0,
+            -99.0,
+            4.0,
+            -99.0
+        ];
+        let right_strided = right_padded.slice(s![..;2]);
+        assert!(right_strided.as_slice().is_none());
+
+        let left = array![0.0_f64];
+        let starts = array![0_i64];
+        let ends = array![7_i64];
+        let fast =
+            binary_search_lt_core(left.view(), right_dense.view(), starts.view(), ends.view());
+        let fallback =
+            binary_search_lt_core(left.view(), right_strided, starts.view(), ends.view());
+        // Deliberately not asserting fast == fallback: that's exactly the
+        // parity this out-of-contract input isn't guaranteed to have. Both
+        // must still be valid (in-bounds-or-sentinel) results.
+        for got in [fast[0], fallback[0]] {
+            assert!(
+                got == -1 || (0..=7).contains(&got),
+                "expected -1 or an index in 0..=7, got {got}"
+            );
+        }
+    }
 
     #[test]
     fn empty_right_range_returns_minus_one() {

@@ -114,19 +114,67 @@ impl BinarySearchFixture {
     }
 }
 
+/// Same logical content as `BinarySearchFixture`, but `right` is stored at
+/// double width with a junk value interleaved after each real one, so a
+/// stride-2 view over it is non-contiguous (`.as_slice()` returns `None`)
+/// while still reading the identical `0, 2, 4, ...` sequence
+/// `BinarySearchFixture` does -- letting `bench_bin_search_lt` compare the
+/// `slice::partition_point` fast path against the `ArrayView1` manual-loop
+/// fallback on otherwise-identical data.
+struct StridedBinarySearchFixture {
+    right_padded: Array1<i64>,
+    left: Array1<i64>,
+    starts: Array1<i64>,
+    ends: Array1<i64>,
+}
+
+impl StridedBinarySearchFixture {
+    fn new(n: usize) -> Self {
+        let right_padded = Array1::from_iter((0..n as i64).flat_map(|i| [i * 2, -1]));
+        let left = Array1::from_iter((0..n as i64).map(|i| i * 2 + 1));
+        let starts = Array1::from_iter(0..n as i64);
+        let ends = Array1::from_elem(n, n as i64);
+        StridedBinarySearchFixture {
+            right_padded,
+            left,
+            starts,
+            ends,
+        }
+    }
+
+    fn right_view(&self) -> ArrayView1<'_, i64> {
+        self.right_padded.slice(numpy::ndarray::s![..;2])
+    }
+}
+
 /// ELI5: for every value in `left`, find where it would slot into the
-/// sorted `right` array -- the building block behind a `<` join.
+/// sorted `right` array -- the building block behind a `<` join. Run
+/// against both a contiguous `right` (the fast path) and a strided one
+/// (the fallback loop), so a regression in either isn't hidden by only
+/// ever benchmarking the other.
 fn bench_bin_search_lt(c: &mut Criterion) {
     let mut group = c.benchmark_group("bin_search_lt");
     for n in [100, 100_000] {
         let f = BinarySearchFixture::new(n);
-        group.bench_function(format!("n={n}"), |b| {
+        group.bench_function(format!("n={n} (contiguous)"), |b| {
             b.iter(|| {
                 binary_search_lt_core(
                     black_box(f.left.view()),
                     black_box(f.right.view()),
                     black_box(f.starts.view()),
                     black_box(f.ends.view()),
+                )
+            })
+        });
+
+        let sf = StridedBinarySearchFixture::new(n);
+        group.bench_function(format!("n={n} (strided)"), |b| {
+            b.iter(|| {
+                binary_search_lt_core(
+                    black_box(sf.left.view()),
+                    black_box(sf.right_view()),
+                    black_box(sf.starts.view()),
+                    black_box(sf.ends.view()),
                 )
             })
         });
