@@ -125,3 +125,13 @@ pub fn region_positions<'py>(
         total,
     )
 }
+
+/// Registers this file's dtype-specialized Python exports.
+///
+/// ELI5: this file owns a short guest list for just its own exported
+/// functions, instead of a central file trying to track every
+/// department's exports itself.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(region_positions, m)?)?;
+    Ok(())
+}

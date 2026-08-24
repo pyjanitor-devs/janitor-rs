@@ -127,3 +127,22 @@ macro_rules! generic_compute_floats {
 
 generic_compute_floats!(compute_prod_end_match_f64, f64);
 generic_compute_floats!(compute_prod_end_match_f32, f32);
+
+/// Registers this file's dtype-specialized Python exports.
+///
+/// ELI5: this file owns a short guest list for just its own exported
+/// functions, instead of a central file trying to track every
+/// department's exports itself.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(compute_prod_end_match_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_end_match_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_end_match_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_end_match_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_end_match_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_end_match_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_end_match_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_end_match_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_end_match_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_end_match_int64, m)?)?;
+    Ok(())
+}

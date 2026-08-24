@@ -112,3 +112,22 @@ macro_rules! compute_floats {
 
 compute_floats!(compute_prod_rev_no_range_f64, f64);
 compute_floats!(compute_prod_rev_no_range_f32, f32);
+
+/// Registers this file's dtype-specialized Python exports.
+///
+/// ELI5: this file owns a short guest list for just its own exported
+/// functions, instead of a central file trying to track every
+/// department's exports itself.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(compute_prod_rev_no_range_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_rev_no_range_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_rev_no_range_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_rev_no_range_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_rev_no_range_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_rev_no_range_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_rev_no_range_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_rev_no_range_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_rev_no_range_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_prod_rev_no_range_f64, m)?)?;
+    Ok(())
+}

@@ -729,6 +729,31 @@ pub fn reorder_index<'py>(
     result.into_pyarray(py)
 }
 
+/// Registers this file's dtype-specialized Python exports.
+///
+/// ELI5: this file owns a short guest list for just its own exported
+/// functions, instead of a central file trying to track every
+/// department's exports itself.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(repeat_index, m)?)?;
+    m.add_function(wrap_pyfunction!(trim_index, m)?)?;
+    m.add_function(wrap_pyfunction!(reorder_index, m)?)?;
+    m.add_function(wrap_pyfunction!(index_trim_positions, m)?)?;
+    m.add_function(wrap_pyfunction!(build_positional_index, m)?)?;
+    m.add_function(wrap_pyfunction!(build_positional_index_first, m)?)?;
+    m.add_function(wrap_pyfunction!(build_positional_index_last, m)?)?;
+    m.add_function(wrap_pyfunction!(index_starts_only, m)?)?;
+    m.add_function(wrap_pyfunction!(index_starts_only_keep_first, m)?)?;
+    m.add_function(wrap_pyfunction!(index_starts_only_keep_last, m)?)?;
+    m.add_function(wrap_pyfunction!(index_ends_only, m)?)?;
+    m.add_function(wrap_pyfunction!(index_ends_only_keep_first, m)?)?;
+    m.add_function(wrap_pyfunction!(index_ends_only_keep_last, m)?)?;
+    m.add_function(wrap_pyfunction!(index_starts_and_ends, m)?)?;
+    m.add_function(wrap_pyfunction!(index_starts_and_ends_keep_first, m)?)?;
+    m.add_function(wrap_pyfunction!(index_starts_and_ends_keep_last, m)?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

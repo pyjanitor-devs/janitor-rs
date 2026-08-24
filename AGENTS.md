@@ -133,9 +133,9 @@ the `extension-module` PyO3 linker gotcha below).
 ```text
 janitor-rs/
 ├── src/
-│   ├── lib.rs              # #[pymodule] registration -- one add_function
-│   │                        # call per exported dtype variant (huge, ~2000
-│   │                        # lines; issue #22 tracks modularizing this)
+│   ├── lib.rs              # top-level composition point only -- calls each
+│   │                        # family's own `register(m)` (issue #22); no
+│   │                        # per-function add_function calls live here
 │   ├── bin_search/          # binary search kernels (lt, gt, ge, le, ...
 │   │                        # x first/regions variants)
 │   ├── compare/              # ragged comparison kernels (op-coded: 0=`>`
@@ -202,8 +202,41 @@ other kernels is expected to happen naturally as other issues touch them
    overflow/wraparound.
 3. Wrap it in the `macro_rules!` per-dtype boilerplate, same as existing
    siblings in the file.
-4. Register each dtype instantiation in `src/lib.rs`'s `#[pymodule]`
-   function (follow the existing `wrap_pyfunction!` pattern nearby).
+4. Register each dtype instantiation in that same file's own `register(m)`
+   function (see "Module registration" below) -- not in `src/lib.rs`, which
+   only composes each family's top-level `register` call.
+
+### Module registration (issue #22)
+
+Python export registration is owned by the file/module that defines the
+functions, not by `src/lib.rs`. Three layers, each a `pub(crate) fn
+register(m: &Bound<'_, PyModule>) -> PyResult<()>`:
+
+1. **Leaf file** (e.g. `aggs/sum/sum_starts.rs`, `bin_search/bin_search_lt.rs`,
+   `index_builder.rs`): one `m.add_function(wrap_pyfunction!(..., m)?)?;`
+   per dtype variant it defines, same names/order as before -- just moved
+   out of `lib.rs` into the file that owns the functions.
+2. **Family `mod.rs`** (e.g. `aggs/sum/mod.rs`, `bin_search/mod.rs`,
+   `compare/mod.rs`): calls `child::register(m)?;` once per `pub mod`
+   child declared in that file.
+3. **`aggs/mod.rs`**: an extra layer above (2) for the aggregation
+   family specifically, since it has sum/sum_rev/min/min_rev/max/max_rev/
+   prod/prod_rev/size_rev as its own `pub mod` children, each of which is
+   itself a directory following (2).
+
+`src/lib.rs`'s `#[pymodule] fn janitor_rs` only calls the five top-level
+family registers (`bin_search`, `compare`, `index_builder`, `left_le_right`,
+`aggs`) -- it never names an individual dtype-specialized function.
+`index_builder.rs` and `left_le_right.rs` are single files (not
+directories), so their `register` lives directly in that file with no
+extra layer.
+
+When adding a brand-new leaf file (a new kernel shape, not just a new
+dtype instantiation of an existing one), remember to also add its
+`pub mod <name>;` declaration to the parent `mod.rs` and a
+`<name>::register(m)?;` call to that parent's own `register` function --
+a new leaf file with no caller anywhere in this chain compiles fine but
+silently never reaches Python.
 
 ---
 
@@ -316,9 +349,11 @@ work, while one width-eight query makes that regression obvious.
   contract), **#26** (adaptive dense/sparse range-sum kernels). Expect
   those PRs to extend or modify the `*_core` functions and tests this file
   describes -- they are foundation, not a frozen contract.
-- **#22** (modularizing `#[pymodule]` registration in `lib.rs`) is
-  unrelated to the `*_core` extraction pattern above; don't conflate the
-  two when touching `lib.rs`.
+- **#22** (modularizing `#[pymodule]` registration) landed: `lib.rs` is now
+  a ~40-line composition point, and each family owns its own `register(m)`
+  (see "Module registration" above). It was unrelated to the `*_core`
+  extraction pattern above; don't conflate the two when touching `lib.rs`
+  or a family's `register` function.
 
 ---
 
@@ -656,3 +691,30 @@ mirrors a `for x in a..b` loop that has no explicit bounds guard, use
 of a `Range<usize>`'s length and the only way to match unguarded-loop
 semantics for every possible input, including cast-from-negative
 sentinels.
+
+### [2026-08-24] Modularized `#[pymodule]` registration (issue #22)
+
+**Context**: `src/lib.rs` had grown to ~3,570 lines, almost entirely
+`m.add_function(wrap_pyfunction!(<fully-qualified-path>, m)?)?;` calls, one
+per dtype-specialized export (884 total across 89 leaf modules).
+**Learning**: The registrations were purely mechanical -- grouped by
+leaf-module path and always in the same per-dtype order as the file's
+`macro_rules!` instantiations -- which made this a safe fit for a scripted
+transform rather than hand-editing 90 files: extract every
+`(module_path, fn_name)` pair from `lib.rs` in order, group by module
+path, and generate a `pub(crate) fn register(m: &Bound<'_, PyModule>) ->
+PyResult<()>` in the file that already owns those functions. Two gotchas
+the first pass missed: (1) directory `mod.rs` files that previously
+contained only `pub mod x;` declarations had no `use pyo3::prelude::*;`,
+so the generated `register` signature didn't compile until that import was
+added; (2) `left_le_right.rs`'s single export uses
+`#[pyfunction(name = "get_positions_where_left_le_right")]`, so its
+Python-visible name differs from the Rust item name -- a register-writing
+script (or reviewer) that assumes item name == exported name will get this
+one wrong.
+**Recommendation**: `lib.rs` is now a ~40-line composition point calling
+five family-level `register` functions (see "Module registration" above).
+When adding a new leaf module, register it in its own file, wire it into
+the parent `mod.rs`'s `register`, and never add a `wrap_pyfunction!` call
+to `lib.rs` directly. Before assuming a Python export name matches a Rust
+function name, grep the file for `#[pyfunction(name = ...)]`.

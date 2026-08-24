@@ -1,3 +1,5 @@
+use pyo3::prelude::*;
+
 pub mod min;
 
 pub mod prod;
@@ -11,7 +13,6 @@ pub mod sum;
 pub mod sum_rev;
 
 use pyo3::exceptions::PyValueError;
-use pyo3::PyResult;
 
 /// Reject parallel arrays that cannot describe the same number of rows.
 ///
@@ -105,6 +106,25 @@ pub(crate) type PositionsFn<T, R> =
         numpy::PyReadonlyArray1<'py, i64>,
         numpy::PyReadonlyArray1<'py, bool>,
     ) -> pyo3::PyResult<pyo3::Bound<'py, numpy::PyArray1<R>>>;
+
+/// Registers every export from this family's submodules with the
+/// PyO3 module.
+///
+/// ELI5: a department manager collects the guest lists from each of
+/// their teams and hands one combined list up the chain, instead of
+/// the front door needing to know every team by name.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    min::register(m)?;
+    prod::register(m)?;
+    max::register(m)?;
+    max_rev::register(m)?;
+    min_rev::register(m)?;
+    prod_rev::register(m)?;
+    size_rev::register(m)?;
+    sum::register(m)?;
+    sum_rev::register(m)?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod adversarial_bounds_tests {
