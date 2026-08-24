@@ -36,10 +36,14 @@ macro_rules! generic_compare {
             // sum this replaces let a negative-start or inverted row wrap
             // `length as usize` to a huge value before any indexing even
             // started.
+            // Compares `right_len as i64` against `end` rather than
+            // casting `end` down to `usize` first -- on a 32-bit target a
+            // genuinely oversized `end` would truncate to a small value
+            // before either check below ever saw it.
             let length: usize = starts_array
                 .iter()
                 .zip(ends_array.iter())
-                .filter(|(s, e)| **s >= 0 && **s < **e && (**e as usize) <= right_len)
+                .filter(|(s, e)| **s >= 0 && **s < **e && **e <= right_len as i64)
                 .map(|(s, e)| (*e as usize) - (*s as usize))
                 .sum();
             let op = CompareOp::try_from_code(op)?;
@@ -54,7 +58,7 @@ macro_rules! generic_compare {
                 ends_array.into_iter(),
             );
             for (position, (left_val, left_bool, start, end)) in zipped.enumerate() {
-                if *start < 0 || *start >= *end || (*end as usize) > right_len {
+                if *start < 0 || *start >= *end || *end > right_len as i64 {
                     continue;
                 }
                 let start_ = *start as usize;

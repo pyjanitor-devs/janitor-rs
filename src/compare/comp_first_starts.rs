@@ -21,20 +21,25 @@ macro_rules! generic_compare {
             // `end - (*x as usize)` used to underflow for any `start` that
             // wraps to (or already is) a `usize` greater than `end` --
             // most obviously a negative `start`, but also a merely
-            // oversized positive one. The `start_..end` loop below is
-            // actually safe as-is for such a row (a `Range` with
-            // `start > end` just iterates zero times), so contributing 0
-            // to `length` here keeps `length` consistent with what the
-            // loop will actually produce, without needing to touch the
-            // loop itself.
+            // oversized positive one.
+            //
+            // The old fix here leaned on `start_..end` (a plain `Range`)
+            // already being well-defined and empty whenever `start_ > end`
+            // -- true in isolation, but only once `start_` itself
+            // faithfully represents `start`. On a 32-bit target `usize` is
+            // 32 bits, so a genuinely oversized `start` (e.g. 2^32 + 1)
+            // can *truncate* to a small `start_` that ends up **less**
+            // than `end`, silently turning an out-of-range row into a
+            // seemingly valid non-empty one instead of contributing
+            // nothing. Comparing `*x` against `end as i64` in i64 space,
+            // before any cast to `usize`, closes that gap.
             let length: usize = starts
                 .iter()
                 .map(|x| {
-                    if *x < 0 {
+                    if *x < 0 || *x > end as i64 {
                         return 0;
                     }
-                    let start_ = *x as usize;
-                    end.saturating_sub(start_)
+                    end - (*x as usize)
                 })
                 .sum();
             let op = CompareOp::try_from_code(op)?;
@@ -44,11 +49,9 @@ macro_rules! generic_compare {
             let mut n: usize = 0;
             let zipped = left.into_iter().zip(starts.into_iter());
             for (position, (left_val, start)) in zipped.enumerate() {
-                // No extra guard needed here: a negative `start` wraps to
-                // a huge `usize`, and `start_..end` (a plain `Range`) is
-                // already well-defined and empty whenever `start_ > end`
-                // -- it's only the `length` precomputation above that
-                // needed fixing.
+                if *start < 0 || *start > end as i64 {
+                    continue;
+                }
                 let start_ = *start as usize;
                 let mut counter: i64 = 0;
                 for nn in start_..end {

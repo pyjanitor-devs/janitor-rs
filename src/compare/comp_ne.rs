@@ -40,10 +40,14 @@ macro_rules! generic_compare {
             // it. `start >= 0 && start < end` already proves `end > 0`,
             // so no separate `end < 0` check is needed.
             let right_len = right_array.len();
+            // Compares `right_len as i64` against `end` rather than
+            // casting `end` down to `usize` first -- on a 32-bit target a
+            // genuinely oversized `end` would truncate to a small value
+            // before this check ever saw it, silently passing validation.
             if let Some((bad_start, bad_end)) = starts_array
                 .iter()
                 .zip(ends_array.iter())
-                .find(|(s, e)| **s < 0 || **s >= **e || (**e as usize) > right_len)
+                .find(|(s, e)| **s < 0 || **s >= **e || **e > right_len as i64)
             {
                 return Err(PyValueError::new_err(format!(
                     "start ({bad_start}) and end ({bad_end}) must satisfy 0 <= start < end <= {right_len}"

@@ -33,11 +33,10 @@ macro_rules! generic_compare {
             let end_: usize = right_array.len();
             // See comp_starts.rs for why an invalid row is rejected here
             // rather than silently skipped: `matches` is externally sized
-            // by the caller.
-            if let Some(bad_start) = starts_array
-                .iter()
-                .find(|s| **s < 0 || (**s as usize) > end_)
-            {
+            // by the caller. Compares in i64 space rather than casting
+            // `start` down to `usize` first, so an oversized `start`
+            // can't truncate past this check on a 32-bit target.
+            if let Some(bad_start) = starts_array.iter().find(|s| **s < 0 || **s > end_ as i64) {
                 return Err(PyValueError::new_err(format!(
                     "start must be within 0..={end_}; got {bad_start}"
                 )));

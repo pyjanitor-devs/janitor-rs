@@ -45,8 +45,11 @@ macro_rules! generic_compare {
             for (position, (left_val, left_bool, start, end)) in zipped.enumerate() {
                 // See comp_posns.rs: result is presized to positions.len(),
                 // so an invalid row (indexing into positions, not right)
-                // is silently skipped rather than rejected.
-                if *start < 0 || *start >= *end || (*end as usize) > positions_len {
+                // is silently skipped rather than rejected. Compares in
+                // i64 space rather than casting `end` down to `usize`
+                // first, so an oversized `end` can't truncate past this
+                // check on a 32-bit target.
+                if *start < 0 || *start >= *end || *end > positions_len as i64 {
                     continue;
                 }
                 let start_ = *start as usize;
@@ -65,8 +68,13 @@ macro_rules! generic_compare {
                     // other negative or oversized value used to survive
                     // into `right_booleans[indexer as usize]`/
                     // `right[indexer as usize]` below, out of bounds.
+                    // Compares `right_len as i64` against `indexer`
+                    // rather than casting `indexer` down to `usize`
+                    // first, so it can't truncate to an in-range value
+                    // and silently select the wrong row on a 32-bit
+                    // target.
                     if indexer < 0
-                        || (indexer as usize) >= right_len
+                        || indexer >= right_len as i64
                         || (*left_bool && is_extension_array)
                     {
                         result[n] = -1;

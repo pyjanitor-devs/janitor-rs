@@ -33,10 +33,12 @@ macro_rules! generic_compare {
             // `usize`, and `size = end - start_` (the `count == 0` fast
             // path below) underflows for it -- as does any `start >
             // right.len()`, even a non-negative one. Reject up front.
-            if let Some(bad_start) = starts_array
-                .iter()
-                .find(|s| **s < 0 || (**s as usize) > end)
-            {
+            //
+            // Compares in i64 space (`end as i64`) rather than casting
+            // `start` down to `usize` first -- on a 32-bit target a
+            // genuinely oversized `start` would truncate to a small value
+            // before this check ever saw it, silently passing validation.
+            if let Some(bad_start) = starts_array.iter().find(|s| **s < 0 || **s > end as i64) {
                 return Err(PyValueError::new_err(format!(
                     "start must be within 0..={end}; got {bad_start}"
                 )));

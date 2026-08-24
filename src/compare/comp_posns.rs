@@ -40,7 +40,12 @@ macro_rules! generic_compare {
                 // `positions`, not `right` (a different array, and this
                 // file's own outer range indexes `positions[nn]`, not
                 // `right[nn]`, unlike every sibling file fixed so far).
-                if *start < 0 || *start >= *end || (*end as usize) > positions_len {
+                // Compares `positions_len as i64` against `end` rather
+                // than casting `end` down to `usize` first -- on a
+                // 32-bit target a genuinely oversized `end` would
+                // truncate to a small value before this check ever saw
+                // it, silently passing validation.
+                if *start < 0 || *start >= *end || *end > positions_len as i64 {
                     continue;
                 }
                 let start_ = *start as usize;
@@ -58,8 +63,13 @@ macro_rules! generic_compare {
                     // `checked_index` in spirit, as a plain comparison
                     // (this loop runs once per candidate position, the
                     // same hot-loop frequency #55 found checked_range
-                    // costly at).
-                    if indexer < 0 || (indexer as usize) >= right_len {
+                    // costly at) -- and, like the check above, compares
+                    // `right_len as i64` against `indexer` rather than
+                    // casting `indexer` down to `usize` first, so a
+                    // genuinely oversized indexer can't truncate to an
+                    // in-range value and silently select the wrong row on
+                    // a 32-bit target.
+                    if indexer < 0 || indexer >= right_len as i64 {
                         result[n] = -1;
                         n += 1;
                         continue;

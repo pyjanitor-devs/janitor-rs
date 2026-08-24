@@ -30,9 +30,14 @@ macro_rules! generic_compare {
             // bounds; the raw `ends.sum()` this `length` used to be also
             // let a negative row corrupt every other row's `Array1::zeros`
             // sizing.
+            // Compares in i64 space (`right_len as i64`) rather than
+            // casting `end` down to `usize` first -- on a 32-bit target a
+            // genuinely oversized `end` would truncate to a small value
+            // before either check below ever saw it, silently passing
+            // validation instead of being skipped.
             let length: usize = ends
                 .iter()
-                .filter(|e| **e >= 0 && (**e as usize) <= right_len)
+                .filter(|e| **e >= 0 && **e <= right_len as i64)
                 .map(|e| *e as usize)
                 .sum();
             let op = CompareOp::try_from_code(op)?;
@@ -42,7 +47,7 @@ macro_rules! generic_compare {
             let mut n: usize = 0;
             let zipped = left.into_iter().zip(ends.into_iter());
             for (position, (left_val, end)) in zipped.enumerate() {
-                if *end < 0 || (*end as usize) > right_len {
+                if *end < 0 || *end > right_len as i64 {
                     continue;
                 }
                 let end_ = *end as usize;

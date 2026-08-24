@@ -29,9 +29,12 @@ macro_rules! generic_compare {
             // See comp_first_ends.rs: no caller-supplied `matches` tape,
             // so an invalid row is silently skipped, consistently between
             // this length precomputation and the main loop below.
+            // Compares in i64 space (see comp_first_ends.rs) rather than
+            // casting `end` down to `usize` first, so an oversized `end`
+            // can't truncate past either check on a 32-bit target.
             let length: usize = ends_array
                 .iter()
-                .filter(|e| **e >= 0 && (**e as usize) <= right_len)
+                .filter(|e| **e >= 0 && **e <= right_len as i64)
                 .map(|e| *e as usize)
                 .sum();
             let op = CompareOp::try_from_code(op)?;
@@ -45,7 +48,7 @@ macro_rules! generic_compare {
                 ends_array.into_iter(),
             );
             for (position, (left_val, left_bool, end)) in zipped.enumerate() {
-                if *end < 0 || (*end as usize) > right_len {
+                if *end < 0 || *end > right_len as i64 {
                     continue;
                 }
                 let end_ = *end as usize;

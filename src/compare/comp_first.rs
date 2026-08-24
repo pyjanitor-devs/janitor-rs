@@ -31,10 +31,16 @@ macro_rules! generic_compare {
             // wrap `length as usize` to a huge value and corrupt every
             // other row's `Array1::zeros` sizing; `e - s` alone also never
             // bounded `end` against `right.len()`.
+            // Compares `right_len as i64` (a lossless widening cast)
+            // against `end` rather than casting `end` down to `usize`
+            // first -- on a 32-bit target a genuinely oversized `end`
+            // would truncate to a small value before either check below
+            // ever saw it, silently passing validation instead of being
+            // skipped.
             let length: usize = starts_array
                 .iter()
                 .zip(ends_array.iter())
-                .filter(|(s, e)| **s >= 0 && **e != -1 && **s < **e && (**e as usize) <= right_len)
+                .filter(|(s, e)| **s >= 0 && **e != -1 && **s < **e && **e <= right_len as i64)
                 .map(|(s, e)| (*e as usize) - (*s as usize))
                 .sum();
             let op = CompareOp::try_from_code(op)?;
@@ -48,7 +54,7 @@ macro_rules! generic_compare {
                 ends_array.into_iter(),
             );
             for (position, (left_val, start, end)) in zipped.enumerate() {
-                if *start < 0 || *end == -1 || *start >= *end || (*end as usize) > right_len {
+                if *start < 0 || *end == -1 || *start >= *end || *end > right_len as i64 {
                     continue;
                 }
                 let start_ = *start as usize;

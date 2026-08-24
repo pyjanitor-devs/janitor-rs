@@ -28,16 +28,21 @@ macro_rules! generic_compare {
             let end_: usize = right_array.len();
             // See comp_first_starts.rs: the raw `end_ - (*x as usize)`
             // this replaces underflowed for any start that wraps to (or
-            // already is) a usize greater than end_. The start_..end_
-            // loop below is already safe as-is for such a row (an empty
-            // Range), so contributing 0 to `length` here is enough.
+            // already is) a usize greater than end_. The old fix leaned
+            // on `start_..end_` (a plain Range) already being empty
+            // whenever `start_ > end_` -- true in isolation, but only
+            // once `start_` faithfully represents `start`, which breaks
+            // on a 32-bit target: a genuinely oversized `start` (e.g.
+            // 2^32 + 1) can truncate to a small `start_` that ends up
+            // *less* than `end_`. Comparing `*x` against `end_ as i64` in
+            // i64 space, before any cast to `usize`, closes that gap.
             let length: usize = starts_array
                 .iter()
                 .map(|x| {
-                    if *x < 0 {
+                    if *x < 0 || *x > end_ as i64 {
                         return 0;
                     }
-                    end_.saturating_sub(*x as usize)
+                    end_ - (*x as usize)
                 })
                 .sum();
             let op = CompareOp::try_from_code(op)?;
@@ -51,6 +56,9 @@ macro_rules! generic_compare {
                 starts_array.into_iter(),
             );
             for (position, (left_val, left_bool, start)) in zipped.enumerate() {
+                if *start < 0 || *start > end_ as i64 {
+                    continue;
+                }
                 let start_ = *start as usize;
                 let mut counter: i64 = 0;
                 for nn in start_..end_ {

@@ -34,9 +34,12 @@ macro_rules! generic_compare {
             // rather than silently skipped: `matches` is externally sized
             // by the caller.
             let right_len = right_array.len();
+            // Compares in i64 space (see comp_ends.rs) rather than
+            // casting `end` down to `usize` first, so an oversized `end`
+            // can't truncate past this check on a 32-bit target.
             if let Some(bad_end) = ends_array
                 .iter()
-                .find(|e| **e < 0 || (**e as usize) > right_len)
+                .find(|e| **e < 0 || **e > right_len as i64)
             {
                 return Err(PyValueError::new_err(format!(
                     "end must be within 0..={right_len}; got {bad_end}"
