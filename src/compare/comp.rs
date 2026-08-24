@@ -24,18 +24,25 @@ use crate::compare::op::CompareOp;
 /// tape said skip), `counts_array[i]` is how many positions row `i`
 /// matched, and `total` is the grand total across every row.
 ///
-/// A row with an invalid/inverted range (`start` or `end` is `-1`, the
-/// crate's "no match" sentinel, or `start >= end`, checked in `i64` space
-/// before either bound is cast to `usize`) contributes zero ticks to the
-/// tape, matching a genuinely empty range.
+/// A row with an invalid/inverted range (`start` or `end` negative -- not
+/// just the crate's `-1` "no match" sentinel, any negative value -- or
+/// `start >= end`, checked in `i64` space before either bound is cast to
+/// `usize`) contributes zero ticks to the tape, matching a genuinely
+/// empty range.
 ///
-/// ELI5 (why `-1` is checked before the cast, not after): a `usize` can't
-/// represent `-1`, so casting it doesn't keep it negative -- it wraps
-/// around to the *largest* possible `usize` instead. That's bigger than
-/// any real `start`, so a `start_ >= end_` check done *after* casting
-/// would think the row has a huge, valid range instead of no match at
-/// all, and the loop would walk `right`/`matches` straight past their
-/// real length.
+/// ELI5 (why negativity is checked before the cast, not after): a `usize`
+/// can't represent a negative number, so casting one doesn't keep it
+/// negative -- it wraps around to a huge positive `usize` instead. A
+/// `start_ >= end_` check done only *after* casting would miss exactly
+/// the case where *both* bounds are negative but still satisfy
+/// `start < end` in `i64` space (e.g. `start=-3, end=-2`): both wrap to
+/// huge-but-still-ordered `usize` values, so the post-cast comparison
+/// would see a small, genuine-looking non-empty range and walk
+/// `right`/`matches` far past their real length instead of recognizing
+/// the row as invalid. Requiring both bounds non-negative *before* the
+/// cast closes that gap -- once `start >= 0` and `start < end` both hold,
+/// `end` is provably positive too, so no separate `end < 0` check is
+/// needed to reach that guarantee.
 pub fn compare_start_end_core<T: PartialOrd + Copy>(
     left: ArrayView1<T>,
     right: ArrayView1<T>,
@@ -50,7 +57,7 @@ pub fn compare_start_end_core<T: PartialOrd + Copy>(
     let mut n: usize = 0;
     let zipped = izip!(left.into_iter(), starts.into_iter(), ends.into_iter());
     for (position, (left_val, start, end)) in zipped.enumerate() {
-        if *start == -1 || *end == -1 || *start >= *end {
+        if *start < 0 || *end == -1 || *start >= *end {
             // No candidates for this row: 0 ticks on the shared `matches`
             // tape, matching a genuinely empty [start, end) range. A lone
             // `-1` sentinel cast to `usize` would otherwise wrap past
@@ -92,14 +99,27 @@ macro_rules! generic_compare {
             let starts_view = starts.as_array();
             let ends_view = ends.as_array();
             // ELI5: mirrors `compare_start_end_core`'s own row-rejection
-            // condition exactly (`start`/`end` sentinel or inverted range),
+            // condition (sentinel or inverted range contributes zero ticks),
             // not `checked_range`'s -- the core here never bounds `end`
             // against `right.len()`, so reusing `checked_range` would
             // under-count the width a too-large `end` actually walks.
+            //
+            // ELI5 (why `>= 0`, not just `!= -1`): the old filter only
+            // rejected the exact `-1` sentinel, so a malformed but
+            // non-sentinel negative `start` (e.g. `-2`) slipped through
+            // whenever it still satisfied `start < end` in `i64` space
+            // (e.g. `starts=[-2], ends=[1]`). The next line then cast both
+            // to `usize` and subtracted -- `-2i64 as usize` wraps to a huge
+            // number, so `(1usize) - (huge number)` underflows before
+            // `ensure_tape_width` ever runs. Requiring both bounds to
+            // already be non-negative rules that out; it doesn't change
+            // which rows the core itself treats as empty, since the core's
+            // own cast-then-range-index naturally contributes zero ticks
+            // for any row a real caller wouldn't produce.
             let expected_matches_width: usize = starts_view
                 .iter()
                 .zip(ends_view.iter())
-                .filter(|(s, e)| **s != -1 && **e != -1 && **s < **e)
+                .filter(|(s, e)| **s >= 0 && **e >= 0 && **s < **e)
                 .map(|(s, e)| (*e as usize) - (*s as usize))
                 .sum();
             ensure_tape_width(expected_matches_width, matches.as_array().len())?;
@@ -157,6 +177,32 @@ mod tests {
     use numpy::ndarray::array;
 
     use CompareOp::{Eq as EQ, Ge as GE, Gt as GT, Le as LE, Lt as LT, Ne as NE};
+
+    #[test]
+    fn both_bounds_negative_but_start_less_than_end_contributes_nothing_not_a_panic() {
+        // start=-3, end=-2 aren't the `-1` sentinel, and -3 < -2 holds in
+        // i64 space, so the old `start == -1`-only check let this row
+        // through. Both bounds then cast to *huge*, still-ordered usize
+        // values (start_ < end_ survives the cast), so the loop walked
+        // `right`/`matches` far out of bounds instead of contributing
+        // zero ticks.
+        let left = array![5_i64];
+        let right = array![1_i64];
+        let starts = array![-3_i64];
+        let ends = array![-2_i64];
+        let matches = array![1_i8];
+        let (result, counts, total) = compare_start_end_core(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            matches.view(),
+            GT,
+        );
+        assert_eq!(result, Array1::<i8>::zeros(1));
+        assert_eq!(counts, array![0]);
+        assert_eq!(total, 0);
+    }
 
     #[test]
     fn each_op_code_matches_its_operator() {
@@ -318,5 +364,57 @@ mod tests {
         assert_eq!(result, array![1_i8, 0, 1, 0]);
         assert_eq!(counts, array![1, 1]);
         assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn non_sentinel_negative_start_does_not_underflow_the_width_precheck() {
+        use numpy::{PyArray1, PyArrayMethods};
+        use pyo3::exceptions::PyValueError;
+        use pyo3::Python;
+
+        // starts=[-2], ends=[1]: -2 isn't the `-1` sentinel, and -2 < 1
+        // holds in i64 space, so the old `!= -1`-only filter let this row
+        // through and then underflowed `(1usize) - ((-2i64) as usize)`
+        // before `ensure_tape_width` ever ran (panicking in debug builds,
+        // silently producing a bogus width in release). It must now be
+        // rejected as cleanly as any other malformed range, not panic.
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let left = PyArray1::from_vec(py, vec![3_i64]);
+            let right = PyArray1::from_vec(py, vec![1_i64]);
+            let starts = PyArray1::from_vec(py, vec![-2_i64]);
+            let ends = PyArray1::from_vec(py, vec![1_i64]);
+            let matches = PyArray1::from_vec(py, vec![1_i8]);
+            let result = compare_start_end_int64(
+                py,
+                left.readonly(),
+                right.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                matches.readonly(),
+                // `compare_start_end_int64` is the `#[pyfunction]` wrapper,
+                // which still takes `CompareOp::try_from_code`'s raw i8
+                // code (not the `GT`/`LT`/... `CompareOp` aliases this
+                // module's other tests use against `compare_start_end_core`
+                // directly) -- 0 is `CompareOp::Gt`, matching the mapping
+                // in `wrapper_op_validation_tests` in `compare/mod.rs`.
+                0,
+            );
+            // Whether this is accepted (because the row is now correctly
+            // excluded from the width sum) or rejected with a clean
+            // PyValueError is both fine -- what must never happen is a
+            // panic (an unrecoverable `pyo3_runtime.PanicException` on the
+            // Python side instead of a catchable exception).
+            if let Err(error) = result {
+                assert!(
+                    error.is_instance_of::<PyValueError>(py),
+                    "expected a PyValueError, got {error:?}"
+                );
+            }
+        });
     }
 }
