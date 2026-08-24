@@ -14,17 +14,17 @@ use pyo3::prelude::*;
 /// ELI5: the old shape searched every row into a full `left.len()`-sized
 /// array using an internal "no match" marker (a value no real match could
 /// ever produce), then made a second pass over that array to copy out only
-/// the real matches. Pushing straight into two `Vec`s sized to the only
-/// upper bound that exists -- at most one match per row -- does the same
-/// work in one pass, with no throwaway marker and no second scan.
+/// the real matches. Pushing straight into two grow-on-demand `Vec`s does
+/// the same work in one pass, with no throwaway marker, no second scan, and
+/// no eager allocation for rows that do not survive.
 pub fn binary_search_lt_first_core<T: PartialOrd + Copy>(
     left: ArrayView1<T>,
     right: ArrayView1<T>,
     left_index: ArrayView1<i64>,
 ) -> (Vec<i64>, Vec<i64>) {
     let len_right = right.len();
-    let mut search_indices = Vec::with_capacity(left.len());
-    let mut index_left = Vec::with_capacity(left.len());
+    let mut search_indices = Vec::new();
+    let mut index_left = Vec::new();
     for (pos, left_value) in left.into_iter().enumerate() {
         let mut min_idx = 0;
         let mut max_idx = len_right;

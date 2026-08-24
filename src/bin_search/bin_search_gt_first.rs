@@ -23,8 +23,8 @@ pub fn binary_search_gt_first_core<T: PartialOrd + Copy>(
     left_index: ArrayView1<i64>,
 ) -> (Vec<i64>, Vec<i64>) {
     let len_right = right.len();
-    let mut search_indices = Vec::with_capacity(left.len());
-    let mut index_left = Vec::with_capacity(left.len());
+    let mut search_indices = Vec::new();
+    let mut index_left = Vec::new();
     for (pos, left_value) in left.into_iter().enumerate() {
         let mut min_idx = 0;
         let mut max_idx = len_right;

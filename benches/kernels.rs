@@ -119,10 +119,8 @@ fn bench_bin_search_lt(c: &mut Criterion) {
 }
 
 /// Inputs for `bench_bin_search_first`: every `left[i]` is guaranteed to
-/// find a match somewhere in `right` (worst case for the one-pass `Vec`s'
-/// `with_capacity` -- every row survives, so both grow to exactly
-/// `left.len()`), which is the scenario the one-pass conversion (issue
-/// #24) specifically targets.
+/// find a match somewhere in `right`, exercising the high-survival case
+/// for the grow-on-demand output vectors.
 struct BinarySearchFirstFixture {
     right: Array1<i64>,
     left: Array1<i64>,
@@ -161,6 +159,23 @@ fn bench_bin_search_first(c: &mut Criterion) {
             binary_search_lt_first_core(f.left.view(), f.right.view(), f.left_index.view())
         });
         eprintln!("  lt_first n={n:>7}: {bytes:>9} bytes / {calls:>3} allocs");
+
+        // A deliberately sparse case: every query is above `right`, so no
+        // row survives the strict-less-than-first search. This guards the
+        // memory claim that dropped rows do not trigger two full buffers.
+        let sparse = BinarySearchFirstFixture {
+            right: Array1::from_iter((0..n as i64).map(|i| i * 2)),
+            left: Array1::from_elem(n, n as i64 * 2 + 1),
+            left_index: Array1::from_iter(0..n as i64),
+        };
+        let (bytes, calls) = count_allocations(|| {
+            binary_search_lt_first_core(
+                sparse.left.view(),
+                sparse.right.view(),
+                sparse.left_index.view(),
+            )
+        });
+        eprintln!("  lt_first sparse n={n:>7}: {bytes:>9} bytes / {calls:>3} allocs");
     }
 
     let mut group = c.benchmark_group("bin_search_first");
