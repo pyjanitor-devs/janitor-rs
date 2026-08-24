@@ -55,8 +55,11 @@ macro_rules! compute {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item] as usize;
-                    let (base, base_val) = slots.touch(pos, (-1, *current));
+                    let pos = index[item];
+                    let Some((base, base_val)) = slots.touch(pos, (-1, *current)) else {
+                        n += 1;
+                        continue;
+                    };
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;

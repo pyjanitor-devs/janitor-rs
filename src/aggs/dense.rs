@@ -5,12 +5,21 @@ use numpy::ndarray::Array1;
 ///
 /// ELI5: the old code wrote each answer on an envelope labeled with its
 /// apartment number and tossed it into a shuffled mail bin, then read the
-/// bin back out in whatever order the envelopes happened to land in that's
-/// how `HashMap` iteration works. Apartment numbers here are never
-/// arbitrary, though: they're dense row positions in `0..length`, hedge to
-/// hedge. So instead we use a mailbox rack -- slot `i` for row `i` -- and
-/// read the rack back out in slot order. No hashing, no shuffling, and the
-/// same output every time for the same input. See issue #23.
+/// bin back out in whatever order the envelopes happened to land in --
+/// that's how `HashMap` iteration works. So instead we use a mailbox rack
+/// -- slot `i` for row `i` -- and read the rack back out in slot order. No
+/// hashing, no shuffling, and the same output every time for the same
+/// input. See issue #23.
+///
+/// Correctness note (see issue #69): the `length` passed to `new` is only
+/// a *capacity hint*, exactly like the old code's `HashMap::with_capacity
+/// (length)` -- it is never a promise that every key touched will be
+/// `< length`. pyjanitor's equi-join caller, for one, passes
+/// `right_index.size` (the match *count*) as `length`, while `right_index`
+/// itself holds actual right-dataframe row positions that can run far
+/// past that count on a sparse join. `touch` grows the backing storage on
+/// demand instead of trusting the hint, so an out-of-range key resizes
+/// rather than panics.
 // ELI5 (`Vec`, not `Array1`, for these two fields): `Array1`/`ArrayView1`
 // are the shipping containers this crate uses to hand data to and from
 // Python/numpy -- built to match exactly what numpy expects on the other
@@ -28,11 +37,11 @@ pub(crate) struct DenseSlots<T> {
     seen: Vec<bool>,
 }
 
-impl<T: Copy> DenseSlots<T> {
-    pub(crate) fn new(length: usize) -> Self
-    where
-        T: Default,
-    {
+impl<T: Copy + Default> DenseSlots<T> {
+    /// `length` is a capacity hint (sized to avoid reallocation in the
+    /// common case where every key really does land `< length`), not a
+    /// bound -- `touch` grows past it safely if a key doesn't fit.
+    pub(crate) fn new(length: usize) -> Self {
         DenseSlots {
             values: vec![T::default(); length],
             seen: vec![false; length],
@@ -46,13 +55,27 @@ impl<T: Copy> DenseSlots<T> {
     /// checking any row filter, and callers here preserve that by calling
     /// `touch` unconditionally too); later touches just hand back the
     /// slot's current value.
+    ///
+    /// `key` is the *raw*, signed row position -- not yet cast or bounds
+    /// checked -- so this can reject a negative key (returning `None`, the
+    /// same "skip this row" signal `checked_index` gives its callers)
+    /// instead of letting `as usize` wrap it into a huge positive index.
+    /// A non-negative key beyond current capacity grows the backing
+    /// storage to fit rather than panicking; see the struct-level doc
+    /// comment for why `length` in `new` can't be trusted as a hard bound.
     #[inline]
-    pub(crate) fn touch(&mut self, key: usize, default: T) -> &mut T {
+    pub(crate) fn touch(&mut self, key: i64, default: T) -> Option<&mut T> {
+        let key = usize::try_from(key).ok()?;
+        if key >= self.values.len() {
+            let new_len = key + 1;
+            self.values.resize(new_len, T::default());
+            self.seen.resize(new_len, false);
+        }
         if !self.seen[key] {
             self.seen[key] = true;
             self.values[key] = default;
         }
-        &mut self.values[key]
+        Some(&mut self.values[key])
     }
 
     /// Ascending row-position order over slots touched at least once --
@@ -89,8 +112,8 @@ mod tests {
     #[test]
     fn touch_seeds_default_once_and_keeps_later_updates() {
         let mut slots: DenseSlots<i64> = DenseSlots::new(3);
-        *slots.touch(1, 0) += 5;
-        *slots.touch(1, 0) += 2;
+        *slots.touch(1, 0).unwrap() += 5;
+        *slots.touch(1, 0).unwrap() += 2;
         assert_eq!(slots.iter_touched().collect::<Vec<_>>(), vec![(1, &7)]);
     }
 
@@ -110,7 +133,7 @@ mod tests {
     fn untouched_slots_are_absent_and_order_is_ascending_by_row_position() {
         let mut slots: DenseSlots<i64> = DenseSlots::new(5);
         for key in [3, 0, 4] {
-            *slots.touch(key, 0) += 1;
+            *slots.touch(key, 0).unwrap() += 1;
         }
         let (indexers, result) = slots.to_arrays(|v| *v);
         assert_eq!(indexers.to_vec(), vec![0, 3, 4]);
@@ -122,9 +145,48 @@ mod tests {
         // Models the sum_rev float shape: (total, compensation) stored
         // together, only `total` emitted.
         let mut slots: DenseSlots<(f64, f64)> = DenseSlots::new(2);
-        *slots.touch(0, (0., 0.)) = (1.5, 0.25);
+        *slots.touch(0, (0., 0.)).unwrap() = (1.5, 0.25);
         let (indexers, result) = slots.to_arrays(|(total, _compensation)| *total);
         assert_eq!(indexers.to_vec(), vec![0]);
         assert_eq!(result.to_vec(), vec![1.5]);
+    }
+
+    // --- issue #69 regression coverage ---------------------------------
+
+    #[test]
+    fn a_key_far_beyond_the_capacity_hint_grows_instead_of_panicking() {
+        // `length` passed to `new` is only a capacity hint (see the
+        // struct-level doc comment) -- pyjanitor's equi-join caller passes
+        // the match *count*, not the right dataframe's row count, so a
+        // key well past the hint is an expected, common case, not a bug
+        // in the caller.
+        let mut slots: DenseSlots<i64> = DenseSlots::new(1);
+        *slots.touch(10, 0).unwrap() += 7;
+        let (indexers, result) = slots.to_arrays(|v| *v);
+        assert_eq!(indexers.to_vec(), vec![10]);
+        assert_eq!(result.to_vec(), vec![7]);
+    }
+
+    #[test]
+    fn a_negative_key_is_rejected_not_wrapped_into_a_huge_index() {
+        // `-1 as usize` is `usize::MAX`, not a small out-of-range index --
+        // resizing to fit that would abort the process, not just panic.
+        // Negative keys must be rejected up front instead.
+        let mut slots: DenseSlots<i64> = DenseSlots::new(4);
+        assert!(slots.touch(-1, 0).is_none());
+        let (indexers, result) = slots.to_arrays(|v| *v);
+        assert!(indexers.to_vec().is_empty());
+        assert!(result.to_vec().is_empty());
+    }
+
+    #[test]
+    fn growth_does_not_disturb_already_touched_low_keys() {
+        let mut slots: DenseSlots<i64> = DenseSlots::new(2);
+        *slots.touch(0, 0).unwrap() += 1;
+        *slots.touch(1, 0).unwrap() += 2;
+        *slots.touch(9, 0).unwrap() += 3;
+        let (indexers, result) = slots.to_arrays(|v| *v);
+        assert_eq!(indexers.to_vec(), vec![0, 1, 9]);
+        assert_eq!(result.to_vec(), vec![1, 2, 3]);
     }
 }

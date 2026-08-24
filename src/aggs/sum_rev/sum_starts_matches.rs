@@ -56,8 +56,11 @@ macro_rules! compute_ints {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item] as usize;
-                    let total = slots.touch(pos, 0);
+                    let pos = index[item];
+                    let Some(total) = slots.touch(pos, 0) else {
+                        n += 1;
+                        continue;
+                    };
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
@@ -132,8 +135,11 @@ macro_rules! compute_floats {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item] as usize;
-                    let (total, compensation) = slots.touch(pos, (0., 0.));
+                    let pos = index[item];
+                    let Some((total, compensation)) = slots.touch(pos, (0., 0.)) else {
+                        n += 1;
+                        continue;
+                    };
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;

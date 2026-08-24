@@ -46,8 +46,10 @@ macro_rules! compute_ints {
                     let Some(indexer_) = checked_index(positions[nn], index.len()) else {
                         continue;
                     };
-                    let pos = index[indexer_] as usize;
-                    let total = slots.touch(pos, 0);
+                    let pos = index[indexer_];
+                    let Some(total) = slots.touch(pos, 0) else {
+                        continue;
+                    };
                     if *boolean {
                         continue;
                     }
@@ -110,8 +112,10 @@ macro_rules! compute_floats {
                     let Some(indexer_) = checked_index(positions[nn], index.len()) else {
                         continue;
                     };
-                    let pos = index[indexer_] as usize;
-                    let (total, compensation) = slots.touch(pos, (0., 0.));
+                    let pos = index[indexer_];
+                    let Some((total, compensation)) = slots.touch(pos, (0., 0.)) else {
+                        continue;
+                    };
                     if *boolean {
                         continue;
                     }

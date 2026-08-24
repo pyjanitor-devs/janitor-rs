@@ -40,8 +40,10 @@ macro_rules! compute {
                     continue;
                 };
                 for item in start_..end_ {
-                    let pos = index[item] as usize;
-                    let (base, base_val) = slots.touch(pos, (-1, *current));
+                    let pos = index[item];
+                    let Some((base, base_val)) = slots.touch(pos, (-1, *current)) else {
+                        continue;
+                    };
                     if *boolean {
                         continue;
                     }

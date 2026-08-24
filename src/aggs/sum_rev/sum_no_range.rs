@@ -38,7 +38,9 @@ where
         };
         let current = to_i64(arr[left]);
         let boolean = booleans[left];
-        let total = slots.touch(*index_right as usize, 0);
+        let Some(total) = slots.touch(*index_right, 0) else {
+            continue;
+        };
         if boolean {
             continue;
         }
@@ -128,7 +130,9 @@ where
         };
         let current = to_f64(arr[left]);
         let boolean = booleans[left];
-        let (total, compensation) = slots.touch(*index_right as usize, (0., 0.));
+        let Some((total, compensation)) = slots.touch(*index_right, (0., 0.)) else {
+            continue;
+        };
         if boolean {
             continue;
         }
@@ -223,6 +227,41 @@ mod determinism_tests {
     use pyo3::Python;
 
     use super::{compute_sum_rev_no_range_f64, compute_sum_rev_no_range_int64};
+
+    // Regression test for issue #69: `length` is only a capacity hint
+    // (mirroring the old code's `HashMap::with_capacity(length)`), never a
+    // bound on `right_index` values. pyjanitor's equi-join caller passes
+    // `right_index.size` (the match COUNT) as `length`, while `right_index`
+    // holds real right-dataframe row positions that can run far past that
+    // count on a sparse join -- e.g. one match at row position 10 out of
+    // an 11-row right dataframe gives `length=1`, `right_index=[10]`. The
+    // old `DenseSlots` (pre-#69) indexed `seen[10]` into a 1-element `Vec`
+    // and panicked; this must instead return that one row, unpanicked.
+    #[test]
+    fn length_far_below_the_true_right_index_domain_does_not_panic() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let arr = PyArray1::from_vec(py, vec![7_i64]);
+            let left_index = PyArray1::from_vec(py, vec![0_i64]);
+            let right_index = PyArray1::from_vec(py, vec![10_i64]);
+            let booleans = PyArray1::from_vec(py, vec![false]);
+            let (indexers, result) = compute_sum_rev_no_range_int64(
+                py,
+                arr.readonly(),
+                left_index.readonly(),
+                right_index.readonly(),
+                booleans.readonly(),
+                1,
+            )
+            .expect("a sparse right_index beyond length must not error or panic");
+            assert_eq!(indexers.readonly().to_vec().unwrap(), vec![10]);
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![7]);
+        });
+    }
 
     // ELI5: issue #23's bug report showed the *old* HashMap-backed version
     // returning `right_index`/value pairs in a different order on every

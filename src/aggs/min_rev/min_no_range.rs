@@ -40,7 +40,9 @@ where
         };
         let current = arr[left];
         let boolean = booleans[left];
-        let (base, base_val) = slots.touch(*index_right as usize, (-1, current));
+        let Some((base, base_val)) = slots.touch(*index_right, (-1, current)) else {
+            continue;
+        };
         if boolean {
             continue;
         }
@@ -145,6 +147,35 @@ mod correctness_tests {
             .expect("valid equal-length inputs must not error");
             assert_eq!(indexers.readonly().to_vec().unwrap(), vec![0, 1]);
             assert_eq!(result.readonly().to_vec().unwrap(), vec![1, 0]);
+        });
+    }
+
+    // Regression test for issue #69 -- see the matching test in
+    // sum_rev/sum_no_range.rs for the full rationale: `length` is only a
+    // capacity hint, never a bound on `right_index` values.
+    #[test]
+    fn length_far_below_the_true_right_index_domain_does_not_panic() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let arr = PyArray1::from_vec(py, vec![7_i64]);
+            let left_index = PyArray1::from_vec(py, vec![0_i64]);
+            let right_index = PyArray1::from_vec(py, vec![10_i64]);
+            let booleans = PyArray1::from_vec(py, vec![false]);
+            let (indexers, result) = compute_min_rev_no_range_int64(
+                py,
+                arr.readonly(),
+                left_index.readonly(),
+                right_index.readonly(),
+                booleans.readonly(),
+                1,
+            )
+            .expect("a sparse right_index beyond length must not error or panic");
+            assert_eq!(indexers.readonly().to_vec().unwrap(), vec![10]);
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![0]);
         });
     }
 }

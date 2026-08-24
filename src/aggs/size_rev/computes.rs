@@ -26,8 +26,10 @@ pub fn size_rev_end_core(
             continue;
         };
         for item in start_..end_ {
-            let pos = index[item] as usize;
-            let total = slots.touch(pos, 0);
+            let pos = index[item];
+            let Some(total) = slots.touch(pos, 0) else {
+                continue;
+            };
             *total += 1;
         }
     }
@@ -60,8 +62,10 @@ pub fn compute_size_rev_start<'py>(
     for start in starts.into_iter() {
         let start_ = *start as usize;
         for item in start_..end_ {
-            let pos = index[item] as usize;
-            let total = slots.touch(pos, 0);
+            let pos = index[item];
+            let Some(total) = slots.touch(pos, 0) else {
+                continue;
+            };
             *total += 1;
         }
     }
@@ -102,8 +106,11 @@ pub fn compute_size_rev_end_matches<'py>(
                 n += 1;
                 continue;
             }
-            let pos = index[item] as usize;
-            let total = slots.touch(pos, 0);
+            let pos = index[item];
+            let Some(total) = slots.touch(pos, 0) else {
+                n += 1;
+                continue;
+            };
             *total += 1;
             n += 1;
         }
@@ -143,8 +150,11 @@ pub fn compute_size_rev_start_matches<'py>(
                 n += 1;
                 continue;
             }
-            let pos = index[item] as usize;
-            let total = slots.touch(pos, 0);
+            let pos = index[item];
+            let Some(total) = slots.touch(pos, 0) else {
+                n += 1;
+                continue;
+            };
             *total += 1;
             n += 1;
         }
@@ -190,8 +200,11 @@ pub fn compute_size_rev_start_end_matches<'py>(
                 n += 1;
                 continue;
             }
-            let pos = index[item] as usize;
-            let total = slots.touch(pos, 0);
+            let pos = index[item];
+            let Some(total) = slots.touch(pos, 0) else {
+                n += 1;
+                continue;
+            };
             *total += 1;
             n += 1;
         }
@@ -220,8 +233,10 @@ pub fn compute_size_rev_start_end<'py>(
             continue;
         };
         for item in start_..end_ {
-            let pos = index[item] as usize;
-            let total = slots.touch(pos, 0);
+            let pos = index[item];
+            let Some(total) = slots.touch(pos, 0) else {
+                continue;
+            };
             *total += 1;
         }
     }
@@ -254,8 +269,10 @@ pub fn compute_size_rev_positions<'py>(
             let Some(indexer_) = checked_index(positions[item], index.len()) else {
                 continue;
             };
-            let pos = index[indexer_] as usize;
-            let total = slots.touch(pos, 0);
+            let pos = index[indexer_];
+            let Some(total) = slots.touch(pos, 0) else {
+                continue;
+            };
             *total += 1;
         }
     }
@@ -460,6 +477,29 @@ mod correctness_tests {
             .expect("valid inputs must not error");
             assert_eq!(indexers.readonly().to_vec().unwrap(), vec![3, 6, 9]);
             assert_eq!(result.readonly().to_vec().unwrap(), vec![1, 2, 1]);
+        });
+    }
+
+    // Regression test for issue #69: `length` here is `ends.max()`
+    // (pyjanitor's caller), which bounds the *loop position* `item` in
+    // `0..end_`, not the *value* `index[item]` read out of it -- a single
+    // candidate at row position 10 (`index=[10]`) with `ends=[1]` gives
+    // `length=1` even though the touched key is 10. See the matching test
+    // in sum_rev/sum_no_range.rs for the full rationale.
+    #[test]
+    fn length_far_below_the_true_row_position_domain_does_not_panic() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let ends = PyArray1::from_vec(py, vec![1_i64]);
+            let index = PyArray1::from_vec(py, vec![10_i64]);
+            let (indexers, result) = compute_size_rev_end(py, ends.readonly(), index.readonly(), 1)
+                .expect("a sparse row position beyond length must not error or panic");
+            assert_eq!(indexers.readonly().to_vec().unwrap(), vec![10]);
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![1]);
         });
     }
 }

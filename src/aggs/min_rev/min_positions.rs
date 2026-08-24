@@ -45,8 +45,10 @@ macro_rules! compute {
                     let Some(indexer_) = checked_index(positions[nn], index.len()) else {
                         continue;
                     };
-                    let pos = index[indexer_] as usize;
-                    let (base, base_val) = slots.touch(pos, (-1, *current));
+                    let pos = index[indexer_];
+                    let Some((base, base_val)) = slots.touch(pos, (-1, *current)) else {
+                        continue;
+                    };
                     if *boolean {
                         continue;
                     }

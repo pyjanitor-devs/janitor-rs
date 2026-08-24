@@ -32,8 +32,10 @@ macro_rules! compute_ints {
                 let start_ = *start as usize;
                 let current_ = *current as i64;
                 for item in start_..end_ {
-                    let pos = index[item] as usize;
-                    let total = slots.touch(pos, 0);
+                    let pos = index[item];
+                    let Some(total) = slots.touch(pos, 0) else {
+                        continue;
+                    };
                     if *boolean {
                         continue;
                     }
@@ -83,8 +85,10 @@ macro_rules! compute_floats {
                 let start_ = *start as usize;
                 let current_ = *current as f64;
                 for item in start_..end_ {
-                    let pos = index[item] as usize;
-                    let (total, compensation) = slots.touch(pos, (0., 0.));
+                    let pos = index[item];
+                    let Some((total, compensation)) = slots.touch(pos, (0., 0.)) else {
+                        continue;
+                    };
                     if *boolean {
                         continue;
                     }
