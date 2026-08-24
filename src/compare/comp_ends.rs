@@ -3,6 +3,7 @@
 use itertools::izip;
 use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use super::op::CompareOp;
@@ -24,6 +25,25 @@ macro_rules! generic_compare {
             let ends_array = ends.as_array();
             let matches_array = matches.as_array();
             let counts = counts.as_array();
+            // `matches`/`counts` are supplied by the caller, already sized
+            // to this row layout's real (unclamped) widths -- unlike
+            // `compare_start_end_core` (comp.rs), which owns its own tape
+            // end to end, this function can't silently treat an
+            // out-of-bounds `end` as "contributes zero" without
+            // desynchronizing `n` from every row after it. Reject the
+            // whole call up front instead: a negative `end` wraps to a
+            // huge `usize` and a too-large one survives unchanged, either
+            // way walking `right_array[nn]` out of bounds once the main
+            // loop reaches it.
+            let right_len = right_array.len();
+            if let Some(bad_end) = ends_array
+                .iter()
+                .find(|e| **e < 0 || (**e as usize) > right_len)
+            {
+                return Err(PyValueError::new_err(format!(
+                    "end must be within 0..={right_len}; got {bad_end}"
+                )));
+            }
             let op = CompareOp::try_from_code(op)?;
             let mut result = Array1::<i8>::zeros(matches_array.len());
             let mut counts_array = Array1::<i64>::zeros(left_array.len());
@@ -95,4 +115,81 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compare_end_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compare_end_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    type CompareResult<'py> = PyResult<(Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64)>;
+
+    fn run(py: Python<'_>, end: i64) -> CompareResult<'_> {
+        let left = PyArray1::from_vec(py, vec![1_i64]);
+        let right = PyArray1::from_vec(py, vec![1_i64]);
+        let ends = PyArray1::from_vec(py, vec![end]);
+        let counts = PyArray1::from_vec(py, vec![1_i64]);
+        let matches = PyArray1::from_vec(py, vec![1_i8]);
+        compare_end_int64(
+            py,
+            left.readonly(),
+            right.readonly(),
+            ends.readonly(),
+            counts.readonly(),
+            matches.readonly(),
+            0, // CompareOp::Gt
+        )
+    }
+
+    #[test]
+    fn end_beyond_right_len_is_rejected_not_a_panic() {
+        // right has length 1; end=2 used to walk 0..2 and index
+        // right_array[1], out of bounds.
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let error = run(py, 2).expect_err("end beyond right.len() must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert!(
+                error.value(py).to_string().contains("0..=1"),
+                "expected the valid range in the message, got {error:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn negative_end_is_rejected_not_a_panic() {
+        // A negative end (not the crate's -1 sentinel elsewhere -- this
+        // file has no sentinel case at all) casts to a huge usize if
+        // unchecked, walking right_array/matches_array far out of bounds.
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let error = run(py, -2).expect_err("a negative end must be rejected");
+            assert!(error.is_instance_of::<PyValueError>(py));
+        });
+    }
+
+    #[test]
+    fn end_equal_to_right_len_is_accepted() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let (result, counts, total) = run(py, 1).expect("end == right.len() is valid");
+            // left=[1], right=[1], op=Gt: 1 > 1 is false.
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![0_i8]);
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![0_i64]);
+            assert_eq!(total, 0);
+        });
+    }
 }
