@@ -22,9 +22,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
-    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, repeat_index_core,
-    sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core,
-    CompareOp,
+    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, max_end_core,
+    max_start_core, max_start_end_core, min_end_core, min_start_core, min_start_end_core,
+    repeat_index_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
+    trim_index_core, CompareOp,
 };
 
 /// Counts bytes, calls, and outstanding (live) bytes allocated through the
@@ -601,6 +602,119 @@ fn bench_sum_kernels(c: &mut Criterion) {
     group.finish();
 }
 
+/// Inputs shared by both `min_*_core` and `max_*_core`: identical shape to
+/// `SumFixture`'s start/end/start_end fixtures (bounded interval width per
+/// AGENTS.md's aggregation-benchmark guidance), just reused across both
+/// families since, unlike `sum`, neither needs a per-dtype cast variant --
+/// see issue #49's "why cheap" note.
+struct MinMaxFixture {
+    arr: Array1<i64>,
+    booleans: Array1<bool>,
+    starts_for_start: Array1<i64>,
+    ends_for_end: Array1<i64>,
+    sliding_starts: Array1<i64>,
+    sliding_ends: Array1<i64>,
+}
+
+impl MinMaxFixture {
+    fn new(n: usize) -> Self {
+        let n64 = n as i64;
+        let arr = Array1::from_iter((0..n64).map(|i| i * 2));
+        let booleans = Array1::from_elem(n, false);
+
+        // Same reasoning as SumFixture: min_start/max_start scan
+        // arr[start..] (to the very end), so every row's start must sit
+        // near the end for the width to stay bounded.
+        let starts_for_start = Array1::from_elem(n, (n64 - SUM_BENCH_WIDTH).max(0));
+        // min_end/max_end scan arr[..end] (from the very start), the
+        // mirror image.
+        let ends_for_end = Array1::from_elem(n, SUM_BENCH_WIDTH.min(n64));
+        // min_start_end/max_start_end take an explicit [start, end) per
+        // row, so a sliding bounded window covering the whole array is
+        // realistic and still stays O(n * WIDTH).
+        let sliding_starts = Array1::from_iter(0..n64);
+        let sliding_ends = Array1::from_iter((0..n64).map(|i| (i + SUM_BENCH_WIDTH).min(n64)));
+
+        MinMaxFixture {
+            arr,
+            booleans,
+            starts_for_start,
+            ends_for_end,
+            sliding_starts,
+            sliding_ends,
+        }
+    }
+}
+
+/// ELI5: see `bench_sum_kernels`'s doc comment -- this is the same shape
+/// of benchmark, just for the "find the biggest/smallest" door instead of
+/// the "add these up" door (issue #49).
+fn bench_min_max_kernels(c: &mut Criterion) {
+    let mut group = c.benchmark_group("min_max_kernels");
+    for n in [100, 100_000] {
+        let f = MinMaxFixture::new(n);
+
+        group.bench_function(format!("min_start n={n}"), |b| {
+            b.iter(|| {
+                min_start_core(
+                    black_box(f.arr.view()),
+                    black_box(f.starts_for_start.view()),
+                    black_box(f.booleans.view()),
+                )
+            })
+        });
+        group.bench_function(format!("min_end n={n}"), |b| {
+            b.iter(|| {
+                min_end_core(
+                    black_box(f.arr.view()),
+                    black_box(f.ends_for_end.view()),
+                    black_box(f.booleans.view()),
+                )
+            })
+        });
+        group.bench_function(format!("min_start_end n={n}"), |b| {
+            b.iter(|| {
+                min_start_end_core(
+                    black_box(f.arr.view()),
+                    black_box(f.sliding_starts.view()),
+                    black_box(f.sliding_ends.view()),
+                    black_box(f.booleans.view()),
+                )
+            })
+        });
+
+        group.bench_function(format!("max_start n={n}"), |b| {
+            b.iter(|| {
+                max_start_core(
+                    black_box(f.arr.view()),
+                    black_box(f.starts_for_start.view()),
+                    black_box(f.booleans.view()),
+                )
+            })
+        });
+        group.bench_function(format!("max_end n={n}"), |b| {
+            b.iter(|| {
+                max_end_core(
+                    black_box(f.arr.view()),
+                    black_box(f.ends_for_end.view()),
+                    black_box(f.booleans.view()),
+                )
+            })
+        });
+        group.bench_function(format!("max_start_end n={n}"), |b| {
+            b.iter(|| {
+                max_start_end_core(
+                    black_box(f.arr.view()),
+                    black_box(f.sliding_starts.view()),
+                    black_box(f.sliding_ends.view()),
+                    black_box(f.booleans.view()),
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bin_search_lt,
@@ -608,6 +722,7 @@ criterion_group!(
     bench_bin_search_first_old_vs_new,
     bench_compare_start_end,
     bench_index_builders,
-    bench_sum_kernels
+    bench_sum_kernels,
+    bench_min_max_kernels
 );
 criterion_main!(benches);
