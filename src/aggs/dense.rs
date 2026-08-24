@@ -11,6 +11,18 @@ use numpy::ndarray::Array1;
 /// hedge. So instead we use a mailbox rack -- slot `i` for row `i` -- and
 /// read the rack back out in slot order. No hashing, no shuffling, and the
 /// same output every time for the same input. See issue #23.
+// ELI5 (`Vec`, not `Array1`, for these two fields): `Array1`/`ArrayView1`
+// are the shipping containers this crate uses to hand data to and from
+// Python/numpy -- built to match exactly what numpy expects on the other
+// side, and used right at the door (function parameters in, `(indexers,
+// result)` out). `values`/`seen` never leave this struct, though; they're
+// purely internal scratch bookkeeping nobody outside ever sees, so there's
+// no reason to carry `ndarray`'s extra shape/stride machinery for them --
+// a plain `Vec` (indexed writes, nothing fancier) is the simpler box for
+// work done entirely inside the house. Repacking into `Array1` at the end
+// (`to_arrays`, via `Array1::from_vec`) is free, not a tradeoff: `ndarray`
+// stores an owned array's data in a `Vec` internally, so that's a move,
+// not a copy.
 pub(crate) struct DenseSlots<T> {
     values: Vec<T>,
     seen: Vec<bool>,

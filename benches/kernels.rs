@@ -23,9 +23,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
-    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, repeat_index_core,
-    sum_end_core, sum_rev_no_range_i64_core, sum_start_core, sum_start_end_core,
-    sum_start_u32_core, trim_index_core, CompareOp,
+    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core,
+    max_rev_no_range_core, repeat_index_core, sum_end_core, sum_rev_no_range_i64_core,
+    sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core, CompareOp,
 };
 
 /// Counts bytes, calls, and outstanding (live) bytes allocated through the
@@ -739,6 +739,113 @@ fn bench_sum_rev_no_range_old_vs_new(c: &mut Criterion) {
     group.finish();
 }
 
+/// A bench-only copy of the reverse-max "no range" kernel as it existed
+/// before issue #23's dense-accumulator rewrite: two same-keyed
+/// `HashMap`s (one for the winning row's position, one for its value --
+/// the exact waste issue #48 flags), with entries emitted in the map's
+/// own (unspecified, effectively random) iteration order. Kept here for
+/// the same reason as `sum_rev_no_range_int_core_hashmap` above.
+fn max_rev_no_range_core_hashmap(
+    arr: ArrayView1<i64>,
+    left_index: ArrayView1<i64>,
+    right_index: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    length: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let mut mapping: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let zipped = left_index.into_iter().zip(right_index);
+    for (index_left, index_right) in zipped {
+        let Some(left) = usize::try_from(*index_left)
+            .ok()
+            .filter(|&left| left < arr.len())
+        else {
+            continue;
+        };
+        let current = arr[left];
+        let boolean = booleans[left];
+        let base = dictionary.entry(*index_right).or_insert(-1);
+        let base_val = mapping.entry(*index_right).or_insert(current);
+        if boolean {
+            continue;
+        }
+        if (*base == -1) || (current > *base_val) {
+            *base_val = current;
+            *base = left as i64;
+        }
+    }
+    let mut indexers = Vec::with_capacity(dictionary.len());
+    let mut result = Vec::with_capacity(dictionary.len());
+    for (key, val) in dictionary.iter() {
+        indexers.push(*key);
+        result.push(*val);
+    }
+    (indexers, result)
+}
+
+/// Direct old-(two `HashMap`s)-vs-new-(one `DenseSlots`) comparison for
+/// the reverse-max "no range" kernel. Same fixture shape as
+/// `bench_sum_rev_no_range_old_vs_new`; this one additionally shows the
+/// #48 merge (one map instead of two) alongside the #23 dense rewrite.
+fn bench_max_rev_no_range_old_vs_new(c: &mut Criterion) {
+    eprintln!("\nmax_rev_no_range old (2x HashMap) vs new (DenseSlots) allocation report:");
+    let mut group = c.benchmark_group("max_rev_no_range_old_vs_new");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_millis(500));
+    for n in [100, 100_000] {
+        let f = SumRevFixture::new(n);
+
+        let (bytes, calls, peak) = count_allocations(|| {
+            max_rev_no_range_core_hashmap(
+                f.arr.view(),
+                f.left_index.view(),
+                f.right_index.view(),
+                f.booleans.view(),
+                f.length,
+            )
+        });
+        eprintln!(
+            "  old (2x HashMap) n={n:>7}: {bytes:>9} bytes / {calls:>3} allocs / {peak:>9} peak"
+        );
+        group.bench_function(format!("old n={n}"), |b| {
+            b.iter(|| {
+                max_rev_no_range_core_hashmap(
+                    black_box(f.arr.view()),
+                    black_box(f.left_index.view()),
+                    black_box(f.right_index.view()),
+                    black_box(f.booleans.view()),
+                    black_box(f.length),
+                )
+            })
+        });
+
+        let (bytes, calls, peak) = count_allocations(|| {
+            max_rev_no_range_core(
+                f.arr.view(),
+                f.left_index.view(),
+                f.right_index.view(),
+                f.booleans.view(),
+                f.length,
+            )
+        });
+        eprintln!(
+            "  new (DenseSlots) n={n:>7}: {bytes:>9} bytes / {calls:>3} allocs / {peak:>9} peak"
+        );
+        group.bench_function(format!("new n={n}"), |b| {
+            b.iter(|| {
+                max_rev_no_range_core(
+                    black_box(f.arr.view()),
+                    black_box(f.left_index.view()),
+                    black_box(f.right_index.view()),
+                    black_box(f.booleans.view()),
+                    black_box(f.length),
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bin_search_lt,
@@ -747,6 +854,7 @@ criterion_group!(
     bench_compare_start_end,
     bench_index_builders,
     bench_sum_kernels,
-    bench_sum_rev_no_range_old_vs_new
+    bench_sum_rev_no_range_old_vs_new,
+    bench_max_rev_no_range_old_vs_new
 );
 criterion_main!(benches);
