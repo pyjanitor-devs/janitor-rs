@@ -32,7 +32,11 @@ pub fn sum_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     mut to_i64: F,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     validate_inputs(arr, left_index, right_index, booleans)?;
-    let mut slots = HashMap::<i64, usize>::new();
+    // ELI5: reserve the lookup table for the full join, but let output state
+    // grow only as distinct labels appear; duplicate-heavy inputs should not
+    // preallocate one result slot per matched row.
+    let capacity = right_index.len();
+    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
     let mut labels = Vec::new();
     let mut totals = Vec::new();
 
@@ -69,9 +73,10 @@ pub fn sum_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
     mut to_f64: F,
 ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
     validate_inputs(arr, left_index, right_index, booleans)?;
-    let mut slots = HashMap::<i64, usize>::new();
+    let capacity = right_index.len();
+    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
     let mut labels = Vec::new();
-    let mut values = Vec::<(f64, f64)>::new();
+    let mut values = Vec::new();
 
     for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
         let left = checked_index(*index_left, arr.len())
