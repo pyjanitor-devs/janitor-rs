@@ -28,6 +28,9 @@ pub fn min_rev_no_range_core<T: Copy + PartialOrd>(
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     validate_inputs(arr, left_index, right_index, booleans)?;
+    // ELI5: reserve the lookup table for the full join, but let output state
+    // grow only as distinct labels appear; duplicate-heavy inputs should not
+    // preallocate one result slot per matched row.
     let mut slots = HashMap::<i64, usize>::with_capacity(right_index.len());
     let mut labels = Vec::new();
     let mut positions = Vec::new();
@@ -134,7 +137,33 @@ mod tests {
     }
 
     #[test]
-    fn core_preserves_null_and_f32_float_behavior() {
+    fn core_supports_every_dtype() {
+        macro_rules! assert_min {
+            ($type:ty) => {
+                let got = min_rev_no_range_core(
+                    array![5 as $type, 2 as $type, 7 as $type].view(),
+                    array![0_i64, 1, 2, 1].view(),
+                    array![20_i64, 40, 20, 40].view(),
+                    array![false, false, false].view(),
+                );
+                assert_eq!(got, Ok((array![20, 40], array![0, 1])));
+            };
+        }
+
+        assert_min!(i64);
+        assert_min!(i32);
+        assert_min!(i16);
+        assert_min!(i8);
+        assert_min!(u64);
+        assert_min!(u32);
+        assert_min!(u16);
+        assert_min!(u8);
+        assert_min!(f64);
+        assert_min!(f32);
+    }
+
+    #[test]
+    fn core_preserves_null_and_tie_behavior() {
         let got = min_rev_no_range_core(
             array![5_i64, 2].view(),
             array![0_i64, 1, 0].view(),
@@ -144,12 +173,12 @@ mod tests {
         assert_eq!(got, Ok((array![20, 40], array![-1, 1])));
 
         let got = min_rev_no_range_core(
-            array![5.0_f32, 2.0].view(),
-            array![0_i64, 1].view(),
-            array![20_i64, 20].view(),
-            array![false, false].view(),
+            array![5_i64, 5, 4].view(),
+            array![0_i64, 1, 2].view(),
+            array![20_i64, 20, 20].view(),
+            array![false, false, false].view(),
         );
-        assert_eq!(got, Ok((array![20], array![1])));
+        assert_eq!(got, Ok((array![20], array![2])));
     }
 
     #[test]
