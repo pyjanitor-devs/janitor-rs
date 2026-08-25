@@ -28,9 +28,10 @@ pub fn max_rev_no_range_core<T: Copy + PartialOrd>(
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     validate_inputs(arr, left_index, right_index, booleans)?;
-    // ELI5: let the map grow with distinct labels, not with every input row;
-    // repeated labels should not force allocations for slots we never use.
-    let mut slots = HashMap::<i64, usize>::new();
+    // ELI5: reserve the lookup table for the full join, but let output state
+    // grow only as distinct labels appear; duplicate-heavy inputs should not
+    // preallocate one result slot per matched row.
+    let mut slots = HashMap::<i64, usize>::with_capacity(right_index.len());
     let mut labels = Vec::new();
     let mut positions = Vec::new();
     let mut values = Vec::new();
