@@ -3,26 +3,33 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{checked_range, ensure_equal_lengths};
 
-/// For every left row `i`, add `arr[i]` into every right-row position in
-/// `index[starts[i]..]` (open-ended to the end of `index` -- that's what
-/// makes this the "starts" shape). Multiple left rows commonly land on the
-/// same right position, so positions accumulate rather than overwrite.
+fn validate_starts_inputs(starts: ArrayView1<'_, i64>, right_len: usize) -> PyResult<()> {
+    if starts.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts cannot be empty",
+        ));
+    }
+    if starts.iter().any(|start| {
+        usize::try_from(*start)
+            .map(|start| start >= right_len)
+            .unwrap_or(true)
+    }) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts must satisfy 0 <= start < right_len",
+        ));
+    }
+    Ok(())
+}
+
+/// Accumulate reverse-sum `starts` rows in slots for the touched candidate
+/// suffix, then emit the original right labels from `index`.
 ///
-/// ELI5: `index` is always a permutation of `0..index.len()` (pyjanitor
-/// resets both frames to a plain positional `RangeIndex` before any
-/// matching runs, and this shape never drops right rows, only reorders
-/// them by the join column's value) -- so `pos = index[item]` is always a
-/// valid position in a `Vec` sized `index.len()`. That bound comes from
-/// `index` itself, not from the `length` pyjanitor passes in: `length` is
-/// `ends - starts.min()`, an exact *count* of how many positions end up
-/// touched, but not a bound on their *values* -- a left row whose own
-/// `start` is greater than 0 can still touch a position numerically past
-/// `length` (see the crate's regression test for a concrete case). Trusting
-/// a passed-in count as an index bound is exactly what issue #69 got
-/// burned by elsewhere; here we sidestep it by deriving the bound from the
-/// array we're actually indexing into, not from a Python-supplied number.
+/// ELI5: `item` is the compact candidate ordinal used to address the
+/// accumulator, while `index[item]` is only the original right-row label to
+/// return. The slots cover the union of all suffixes, so their count is the
+/// touched width rather than the full right domain.
 pub fn sum_rev_starts_int_core<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -35,33 +42,38 @@ where
     F: FnMut(T) -> i64,
 {
     let end_ = index.len();
-    let mut values = vec![0_i64; end_];
-    let mut seen = vec![false; end_];
+    let Some(min_start) = starts
+        .iter()
+        .copied()
+        .filter(|&start| start >= 0 && start < end_ as i64)
+        .min()
+    else {
+        return (Array1::from_vec(Vec::new()), Array1::from_vec(Vec::new()));
+    };
+    let min_start = min_start as usize;
+    let width = end_ - min_start;
+    let mut values = vec![0_i64; width];
     let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
     for (current, start, boolean) in zipped {
-        let start_ = *start as usize;
+        let Some((start_, _)) = checked_range(*start, end_ as i64, end_) else {
+            continue;
+        };
         let current_ = to_i64(*current);
-        for item in start_..end_ {
-            let pos = index[item] as usize;
-            // Touch the slot before checking the null mask: a null left
-            // value still means "this right position was matched," it
-            // just doesn't contribute to the running total -- matching
-            // pandas' `sum(skipna=True)`, which drops the value, not the
-            // group.
-            seen[pos] = true;
+        for value in values.iter_mut().skip(start_ - min_start) {
+            // Every valid suffix position is already part of the contiguous
+            // output domain; a null left value contributes zero to its slot.
             if *boolean {
                 continue;
             }
-            values[pos] += current_;
+            *value = value.wrapping_add(current_);
         }
     }
     let mut indexers = Vec::new();
     let mut result = Vec::new();
-    for pos in 0..end_ {
-        if seen[pos] {
-            indexers.push(pos as i64);
-            result.push(values[pos]);
-        }
+    for (slot, value) in values.iter().enumerate().take(width) {
+        let item = min_start + slot;
+        indexers.push(index[item]);
+        result.push(*value);
     }
     (Array1::from_vec(indexers), Array1::from_vec(result))
 }
@@ -85,6 +97,7 @@ macro_rules! compute_ints {
                 "starts",
                 starts.as_array().len(),
             )?;
+            validate_starts_inputs(starts.as_array(), index.as_array().len())?;
             ensure_equal_lengths(
                 "arr",
                 arr.as_array().len(),
@@ -117,12 +130,10 @@ compute_ints!(compute_sum_rev_start_uint32, u32);
 compute_ints!(compute_sum_rev_start_uint16, u16);
 compute_ints!(compute_sum_rev_start_uint8, u8);
 
-/// Pure-Rust reverse-sum core for the float path: same touch/accumulate
-/// structure as `sum_rev_starts_int_core`, but each position's slot
-/// carries a Neumaier-compensated `(total, compensation)` pair in a single
-/// `Vec`, instead of the old code's two independently-keyed `HashMap`s
-/// (issue #48: nothing enforced those two maps staying in sync -- a single
-/// paired slot can't desync).
+/// Pure-Rust reverse-sum core for the float path.
+///
+/// Each compact candidate slot carries a Neumaier-compensated
+/// `(total, compensation)` pair in one `Vec`, so the pair cannot desync.
 pub fn sum_rev_starts_float_core<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -135,19 +146,25 @@ where
     F: FnMut(T) -> f64,
 {
     let end_ = index.len();
-    let mut slots = vec![(0.0_f64, 0.0_f64); end_];
-    let mut seen = vec![false; end_];
+    let Some(min_start) = starts
+        .iter()
+        .filter_map(|start| checked_range(*start, end_ as i64, end_).map(|(start, _)| start))
+        .min()
+    else {
+        return (Array1::from_vec(Vec::new()), Array1::from_vec(Vec::new()));
+    };
+    let width = end_ - min_start;
+    let mut slots = vec![(0.0_f64, 0.0_f64); width];
     let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
     for (current, start, boolean) in zipped {
-        let start_ = *start as usize;
+        let Some((start_, _)) = checked_range(*start, end_ as i64, end_) else {
+            continue;
+        };
         let current_ = to_f64(*current);
-        for item in start_..end_ {
-            let pos = index[item] as usize;
-            seen[pos] = true;
+        for (total, compensation) in slots.iter_mut().skip(start_ - min_start) {
             if *boolean {
                 continue;
             }
-            let (total, compensation) = &mut slots[pos];
             let difference = current_ - *compensation;
             let increment = *total + difference;
             *compensation = (increment - *total) - difference;
@@ -165,11 +182,10 @@ where
     }
     let mut indexers = Vec::new();
     let mut result = Vec::new();
-    for pos in 0..end_ {
-        if seen[pos] {
-            indexers.push(pos as i64);
-            result.push(slots[pos].0);
-        }
+    for (slot, (total, _)) in slots.iter().enumerate().take(width) {
+        let item = min_start + slot;
+        indexers.push(index[item]);
+        result.push(*total);
     }
     (Array1::from_vec(indexers), Array1::from_vec(result))
 }
@@ -193,6 +209,7 @@ macro_rules! compute_floats {
                 "starts",
                 starts.as_array().len(),
             )?;
+            validate_starts_inputs(starts.as_array(), index.as_array().len())?;
             ensure_equal_lengths(
                 "arr",
                 arr.as_array().len(),
@@ -240,7 +257,7 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn overlapping_left_rows_accumulate_and_emit_ascending() {
+    fn overlapping_left_rows_accumulate_and_emit_candidate_order() {
         // index is a permutation of 0..3 -- the only shape `index` can
         // legitimately take for this join type.
         let arr = array![5_i64, 6];
@@ -256,8 +273,8 @@ mod tests {
         );
         // row0 (start=1) touches index[1..3] = {0, 1}; row1 (start=0)
         // touches index[0..3] = {2, 0, 1}.
-        assert_eq!(indexers, array![0, 1, 2]);
-        assert_eq!(result, array![11, 11, 6]);
+        assert_eq!(indexers, array![2, 0, 1]);
+        assert_eq!(result, array![6, 11, 11]);
     }
 
     #[test]
@@ -280,7 +297,7 @@ mod tests {
             booleans.view(),
             |value| value,
         );
-        assert_eq!(indexers, array![6, 7]);
+        assert_eq!(indexers, array![7, 6]);
         assert_eq!(result, array![10, 10]);
     }
 
