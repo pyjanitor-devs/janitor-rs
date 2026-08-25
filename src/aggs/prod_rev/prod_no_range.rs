@@ -29,9 +29,10 @@ pub fn prod_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     mut to_i64: F,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     validate_inputs(arr, left_index, right_index, booleans)?;
-    // ELI5: the map points each arbitrary label at one compact product slot;
-    // labels separately preserve the order in which output groups appeared.
-    let mut slots = HashMap::<i64, usize>::new();
+    // ELI5: reserve the lookup table for the full join, but let output state
+    // grow only as distinct labels appear; duplicate-heavy inputs should not
+    // preallocate one result slot per matched row.
+    let mut slots = HashMap::<i64, usize>::with_capacity(right_index.len());
     let mut labels = Vec::new();
     let mut products = Vec::new();
 
@@ -65,7 +66,7 @@ pub fn prod_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
     mut to_f64: F,
 ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
     validate_inputs(arr, left_index, right_index, booleans)?;
-    let mut slots = HashMap::<i64, usize>::new();
+    let mut slots = HashMap::<i64, usize>::with_capacity(right_index.len());
     let mut labels = Vec::new();
     let mut products = Vec::new();
 
