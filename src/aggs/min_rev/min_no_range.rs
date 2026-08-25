@@ -1,9 +1,66 @@
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_index, ensure_equal_lengths};
+use crate::aggs::checked_index;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+
+fn validate_inputs<T>(
+    arr: ArrayView1<'_, T>,
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+) -> Result<(), &'static str> {
+    if arr.len() != booleans.len() {
+        return Err("arr and booleans must have equal lengths");
+    }
+    if left_index.len() != right_index.len() {
+        return Err("left_index and right_index must have equal lengths");
+    }
+    Ok(())
+}
+
+pub fn min_rev_no_range_core<T: Copy + PartialOrd>(
+    arr: ArrayView1<'_, T>,
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+    validate_inputs(arr, left_index, right_index, booleans)?;
+    let mut slots = HashMap::<i64, usize>::with_capacity(right_index.len());
+    let mut labels = Vec::new();
+    let mut positions = Vec::new();
+    let mut values = Vec::new();
+
+    for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
+        let left = checked_index(*index_left, arr.len())
+            .ok_or("left_index must contain valid positions in arr")?;
+        let current = arr[left];
+        let boolean = booleans[left];
+        match slots.entry(*index_right) {
+            Entry::Occupied(entry) => {
+                let slot = *entry.get();
+                if boolean {
+                    continue;
+                }
+                if positions[slot] == -1 || current < values[slot] {
+                    positions[slot] = left as i64;
+                    values[slot] = current;
+                }
+            }
+            Entry::Vacant(entry) => {
+                let slot = labels.len();
+                labels.push(*index_right);
+                positions.push(if boolean { -1 } else { left as i64 });
+                values.push(current);
+                entry.insert(slot);
+            }
+        }
+    }
+
+    Ok((Array1::from_vec(labels), Array1::from_vec(positions)))
+}
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
@@ -18,46 +75,13 @@ macro_rules! compute {
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let arr = arr.as_array();
             let left_index = left_index.as_array();
             let right_index = right_index.as_array();
             let booleans = booleans.as_array();
-            let length = length as usize;
-            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-            let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
-            let zipped = left_index.into_iter().zip(right_index.into_iter());
-            for (index_left, index_right) in zipped {
-                // ELI5: see `max_rev/max_no_range.rs`'s identical guard for
-                // the full rationale (`index_left` needs a bound check,
-                // `right_index` doesn't).
-                let Some(left) = checked_index(*index_left, arr.len()) else {
-                    continue;
-                };
-                let current = arr[left];
-                let boolean = booleans[left];
-                let base = dictionary.entry(*index_right).or_insert(-1);
-                let base_val = mapping.entry(*index_right).or_insert(current);
-                if boolean {
-                    continue;
-                }
-                if (*base == -1) || (current < *base_val) {
-                    *base_val = current;
-                    *base = left as i64;
-                }
-            }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<i64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let _ = length;
+            let (indexers, result) = min_rev_no_range_core(arr, left_index, right_index, booleans)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -91,4 +115,65 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_min_rev_no_range_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_min_rev_no_range_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn core_returns_first_seen_labels_and_min_positions() {
+        let got = min_rev_no_range_core(
+            array![5_i64, 2, 7].view(),
+            array![0_i64, 1, 2, 1].view(),
+            array![20_i64, 40, 20, 40].view(),
+            array![false, false, false].view(),
+        );
+        assert_eq!(got, Ok((array![20, 40], array![0, 1])));
+    }
+
+    #[test]
+    fn core_preserves_null_and_f32_float_behavior() {
+        let got = min_rev_no_range_core(
+            array![5_i64, 2].view(),
+            array![0_i64, 1, 0].view(),
+            array![20_i64, 40, 40].view(),
+            array![true, false].view(),
+        );
+        assert_eq!(got, Ok((array![20, 40], array![-1, 1])));
+
+        let got = min_rev_no_range_core(
+            array![5.0_f32, 2.0].view(),
+            array![0_i64, 1].view(),
+            array![20_i64, 20].view(),
+            array![false, false].view(),
+        );
+        assert_eq!(got, Ok((array![20], array![1])));
+    }
+
+    #[test]
+    fn core_rejects_mismatches_and_invalid_positions() {
+        assert!(min_rev_no_range_core(
+            array![1_i64].view(),
+            array![0_i64].view(),
+            array![20_i64, 40].view(),
+            array![false].view(),
+        )
+        .is_err());
+        assert!(min_rev_no_range_core(
+            array![1_i64].view(),
+            array![-1_i64].view(),
+            array![20_i64].view(),
+            array![false].view(),
+        )
+        .is_err());
+        assert!(min_rev_no_range_core(
+            array![1_i64].view(),
+            array![i64::from(u32::MAX) + 1].view(),
+            array![20_i64].view(),
+            array![false].view(),
+        )
+        .is_err());
+    }
 }
