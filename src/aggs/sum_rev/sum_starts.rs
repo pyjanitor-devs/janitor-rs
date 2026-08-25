@@ -3,22 +3,26 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths};
+use crate::aggs::ensure_equal_lengths;
 
-fn validate_starts_inputs(starts: ArrayView1<'_, i64>, right_len: usize) -> PyResult<()> {
-    if starts.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "starts cannot be empty",
-        ));
+fn validate_starts_inputs(
+    arr_len: usize,
+    starts: ArrayView1<'_, i64>,
+    right_len: usize,
+    booleans_len: usize,
+) -> Result<(), &'static str> {
+    if arr_len != starts.len() || arr_len != booleans_len {
+        return Err("arr, starts, and booleans must have equal lengths");
+    }
+    if arr_len == 0 || right_len == 0 {
+        return Err("arr, starts, booleans, and index cannot be empty");
     }
     if starts.iter().any(|start| {
         usize::try_from(*start)
             .map(|start| start >= right_len)
             .unwrap_or(true)
     }) {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "starts must satisfy 0 <= start < right_len",
-        ));
+        return Err("starts must satisfy 0 <= start < right_len");
     }
     Ok(())
 }
@@ -36,30 +40,20 @@ pub fn sum_rev_starts_int_core<T, F>(
     index: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_i64: F,
-) -> (Array1<i64>, Array1<i64>)
+) -> Result<(Array1<i64>, Array1<i64>), &'static str>
 where
     T: Copy,
     F: FnMut(T) -> i64,
 {
     let end_ = index.len();
-    let Some(min_start) = starts
-        .iter()
-        .copied()
-        .filter(|&start| start >= 0 && start < end_ as i64)
-        .min()
-    else {
-        return (Array1::from_vec(Vec::new()), Array1::from_vec(Vec::new()));
-    };
-    let min_start = min_start as usize;
+    validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
+    let min_start = starts.iter().copied().min().unwrap() as usize;
     let width = end_ - min_start;
     let mut values = vec![0_i64; width];
     let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
     for (current, start, boolean) in zipped {
-        let Some((start_, _)) = checked_range(*start, end_ as i64, end_) else {
-            continue;
-        };
         let current_ = to_i64(*current);
-        for value in values.iter_mut().skip(start_ - min_start) {
+        for value in values.iter_mut().skip(*start as usize - min_start) {
             // Every valid suffix position is already part of the contiguous
             // output domain; a null left value contributes zero to its slot.
             if *boolean {
@@ -75,7 +69,7 @@ where
         indexers.push(index[item]);
         result.push(*value);
     }
-    (Array1::from_vec(indexers), Array1::from_vec(result))
+    Ok((Array1::from_vec(indexers), Array1::from_vec(result)))
 }
 
 macro_rules! compute_ints {
@@ -97,7 +91,6 @@ macro_rules! compute_ints {
                 "starts",
                 starts.as_array().len(),
             )?;
-            validate_starts_inputs(starts.as_array(), index.as_array().len())?;
             ensure_equal_lengths(
                 "arr",
                 arr.as_array().len(),
@@ -115,7 +108,8 @@ macro_rules! compute_ints {
                 index.as_array(),
                 booleans.as_array(),
                 |value| value as i64,
-            );
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -140,28 +134,20 @@ pub fn sum_rev_starts_float_core<T, F>(
     index: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_f64: F,
-) -> (Array1<i64>, Array1<f64>)
+) -> Result<(Array1<i64>, Array1<f64>), &'static str>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
     let end_ = index.len();
-    let Some(min_start) = starts
-        .iter()
-        .filter_map(|start| checked_range(*start, end_ as i64, end_).map(|(start, _)| start))
-        .min()
-    else {
-        return (Array1::from_vec(Vec::new()), Array1::from_vec(Vec::new()));
-    };
+    validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
+    let min_start = starts.iter().copied().min().unwrap() as usize;
     let width = end_ - min_start;
     let mut slots = vec![(0.0_f64, 0.0_f64); width];
     let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
     for (current, start, boolean) in zipped {
-        let Some((start_, _)) = checked_range(*start, end_ as i64, end_) else {
-            continue;
-        };
         let current_ = to_f64(*current);
-        for (total, compensation) in slots.iter_mut().skip(start_ - min_start) {
+        for (total, compensation) in slots.iter_mut().skip(*start as usize - min_start) {
             if *boolean {
                 continue;
             }
@@ -187,7 +173,7 @@ where
         indexers.push(index[item]);
         result.push(*total);
     }
-    (Array1::from_vec(indexers), Array1::from_vec(result))
+    Ok((Array1::from_vec(indexers), Array1::from_vec(result)))
 }
 
 macro_rules! compute_floats {
@@ -209,7 +195,6 @@ macro_rules! compute_floats {
                 "starts",
                 starts.as_array().len(),
             )?;
-            validate_starts_inputs(starts.as_array(), index.as_array().len())?;
             ensure_equal_lengths(
                 "arr",
                 arr.as_array().len(),
@@ -223,7 +208,8 @@ macro_rules! compute_floats {
                 index.as_array(),
                 booleans.as_array(),
                 |value| value as f64,
-            );
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -270,7 +256,8 @@ mod tests {
             index.view(),
             booleans.view(),
             |value| value,
-        );
+        )
+        .unwrap();
         // row0 (start=1) touches index[1..3] = {0, 1}; row1 (start=0)
         // touches index[0..3] = {2, 0, 1}.
         assert_eq!(indexers, array![2, 0, 1]);
@@ -296,7 +283,8 @@ mod tests {
             index.view(),
             booleans.view(),
             |value| value,
-        );
+        )
+        .unwrap();
         assert_eq!(indexers, array![7, 6]);
         assert_eq!(result, array![10, 10]);
     }
@@ -317,7 +305,8 @@ mod tests {
             index.view(),
             booleans.view(),
             |value| value,
-        );
+        )
+        .unwrap();
         assert_eq!(indexers, array![0]);
         assert_eq!(result, array![0]);
     }
@@ -337,8 +326,28 @@ mod tests {
             index.view(),
             booleans.view(),
             |value| value,
-        );
+        )
+        .unwrap();
         assert_eq!(indexers, array![0]);
         assert!((result[0] - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_invalid_start_before_allocation() {
+        let arr = array![5_i64];
+        let starts = array![-1_i64];
+        let index = array![0_i64];
+        let booleans = array![false];
+
+        let error = sum_rev_starts_int_core(
+            arr.view(),
+            starts.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "starts must satisfy 0 <= start < right_len");
     }
 }

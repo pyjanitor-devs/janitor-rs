@@ -2,25 +2,26 @@ use itertools::izip;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths};
+use crate::aggs::ensure_equal_lengths;
 
 fn validate_ends_inputs(
+    arr_len: usize,
     ends: numpy::ndarray::ArrayView1<'_, i64>,
     right_len: usize,
-) -> PyResult<()> {
-    if ends.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "ends cannot be empty",
-        ));
+    booleans_len: usize,
+) -> Result<(), &'static str> {
+    if arr_len != ends.len() || arr_len != booleans_len {
+        return Err("arr, ends, and booleans must have equal lengths");
+    }
+    if arr_len == 0 || right_len == 0 {
+        return Err("arr, ends, booleans, and index cannot be empty");
     }
     if ends.iter().any(|end| {
         usize::try_from(*end)
             .map(|end| end == 0 || end > right_len)
             .unwrap_or(true)
     }) {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "ends must satisfy 0 < end <= right_len",
-        ));
+        return Err("ends must satisfy 0 < end <= right_len");
     }
     Ok(())
 }
@@ -36,23 +37,17 @@ pub fn sum_rev_ends_int_core<T, F>(
     index: numpy::ndarray::ArrayView1<i64>,
     booleans: numpy::ndarray::ArrayView1<bool>,
     mut to_i64: F,
-) -> (numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<i64>)
+) -> Result<(numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<i64>), &'static str>
 where
     T: Copy,
     F: FnMut(T) -> i64,
 {
-    let max_end = ends
-        .iter()
-        .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
-        .max()
-        .unwrap_or(0);
+    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
+    let max_end = ends.iter().copied().max().unwrap() as usize;
     let mut values = vec![0_i64; max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
-        let Some((_, end_)) = checked_range(0, *end, index.len()) else {
-            continue;
-        };
         let current_ = to_i64(*current);
-        for value in values.iter_mut().take(end_) {
+        for value in values.iter_mut().take(*end as usize) {
             if *boolean {
                 continue;
             }
@@ -65,10 +60,10 @@ where
         indexers.push(index[item]);
         result.push(*value);
     }
-    (
+    Ok((
         numpy::ndarray::Array1::from_vec(indexers),
         numpy::ndarray::Array1::from_vec(result),
-    )
+    ))
 }
 
 pub fn sum_rev_ends_float_core<T, F>(
@@ -77,23 +72,17 @@ pub fn sum_rev_ends_float_core<T, F>(
     index: numpy::ndarray::ArrayView1<i64>,
     booleans: numpy::ndarray::ArrayView1<bool>,
     mut to_f64: F,
-) -> (numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<f64>)
+) -> Result<(numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<f64>), &'static str>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    let max_end = ends
-        .iter()
-        .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
-        .max()
-        .unwrap_or(0);
+    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
+    let max_end = ends.iter().copied().max().unwrap() as usize;
     let mut slots = vec![(0.0_f64, 0.0_f64); max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
-        let Some((_, end_)) = checked_range(0, *end, index.len()) else {
-            continue;
-        };
         let current_ = to_f64(*current);
-        for (total, compensation) in slots.iter_mut().take(end_) {
+        for (total, compensation) in slots.iter_mut().take(*end as usize) {
             if *boolean {
                 continue;
             }
@@ -112,10 +101,10 @@ where
         indexers.push(index[item]);
         result.push(*total);
     }
-    (
+    Ok((
         numpy::ndarray::Array1::from_vec(indexers),
         numpy::ndarray::Array1::from_vec(result),
-    )
+    ))
 }
 
 macro_rules! compute_ints {
@@ -137,10 +126,10 @@ macro_rules! compute_ints {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            validate_ends_inputs(ends, index.len())?;
             let _ = length;
             let (indexers, result) =
-                sum_rev_ends_int_core(arr, ends, index, booleans, |value| value as i64);
+                sum_rev_ends_int_core(arr, ends, index, booleans, |value| value as i64)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -174,10 +163,10 @@ macro_rules! compute_floats {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            validate_ends_inputs(ends, index.len())?;
             let _ = length;
             let (indexers, result) =
-                sum_rev_ends_float_core(arr, ends, index, booleans, |value| value as f64);
+                sum_rev_ends_float_core(arr, ends, index, booleans, |value| value as f64)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -223,9 +212,29 @@ mod tests {
             index.view(),
             booleans.view(),
             |value| value,
-        );
+        )
+        .unwrap();
 
         assert_eq!(indexers, array![10, 30]);
         assert_eq!(result, array![5, 5]);
+    }
+
+    #[test]
+    fn rejects_zero_end_before_allocation() {
+        let arr = array![5_i64];
+        let ends = array![0_i64];
+        let index = array![0_i64];
+        let booleans = array![false];
+
+        let error = sum_rev_ends_int_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "ends must satisfy 0 < end <= right_len");
     }
 }
