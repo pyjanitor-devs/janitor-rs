@@ -526,6 +526,31 @@ keeps the validation cost outside the hot loop.
 PyO3 boundary and return `PyResult` so mismatches become a normal Python
 `ValueError`. Do not add the comparison inside a row or candidate loop.
 
+### [2026-08-25] Deterministic reverse output need not be key-sorted
+
+**Context**: Reviewing a compact ordinal-vector alternative for issue #23's
+reverse aggregations.
+**Learning**: Issue #23 requires deterministic output with every aggregate
+correctly paired to its returned index; it does not require indices to be in
+ascending key order. Emitting in a stable structural order, such as the order
+of a deterministic candidate-index suffix, satisfies the contract without a
+sorting pass.
+**Recommendation**: Do not add `O(k log k)` key sorting merely to make reverse
+aggregation indices ascending. Prefer the cheapest stable emission order that
+preserves each `(index, aggregate)` association unless a separate public
+ordering contract explicitly requires sorted keys.
+
+### [2026-08-25] Benchmark validation passes before fusing them
+
+**Context**: Comparing iterator-based reverse-sum boundary validation with a
+manual pass that validated inputs while computing `min_start`/`max_end`.
+**Learning**: The fused manual pass was 1-7% slower across narrow and dense
+`sum_rev_starts`/`sum_rev_ends` workloads, despite doing fewer conceptual
+scans. Iterator-based validation and bound discovery were better optimized.
+**Recommendation**: Keep validation outside the aggregation loop, but retain
+the iterator form unless a representative benchmark demonstrates a benefit
+from fusing validation with `min`/`max` discovery.
+
 ### [2026-08-23] Issue #34 resolved by reusing #36's `ensure_equal_lengths`, not a bespoke guard
 
 **Context**: Issue #34's initial fix (this branch, before rebasing onto #36)
@@ -859,3 +884,32 @@ now calls `ensure_equal_lengths("starts", ..., "ends", ...)` (and, where
 present, `"starts"`/`"counts"`) at the top of all five functions, matching the
 `prod_starts_ends.rs`-style call site pattern; regression coverage lives in
 `aggs::adversarial_bounds_tests::index_builder_starts_ends_functions_reject_mismatched_lengths`.
+
+### [2026-08-25] Use formal GitHub sub-issues when requested
+
+**Context**: A cross-repository pyjanitor coordination task for issue #23 was
+initially created only as a linked standalone issue when the requested object
+was a formal GitHub sub-issue.
+**Learning**: GitHub supports attaching an existing issue as a formal
+cross-repository sub-issue through the GraphQL `addSubIssue` mutation.
+**Recommendation**: When a task is requested as a sub-issue, create or reuse
+the appropriately scoped issue and attach it to the parent with `addSubIssue`;
+do not rely only on textual cross-links or checklist comments.
+
+### [2026-08-25] Treat no-range right labels as arbitrary unless guaranteed otherwise
+
+**Context**: Planning a dense-slot replacement for the reverse `no_range` aggregation kernels.
+**Learning**: `right_index` in a `no_range` kernel may contain arbitrary labels such as `[20, 40, 20]`; it cannot be used directly as a vector index merely because an output length of `3` is known.
+**Recommendation**: Use direct slots only under an explicit positional-index contract. Otherwise retain a label-to-ordinal mapping or another label-compression step, and keep the original labels for output.
+
+### [2026-08-25] Treat no-range left indices as a strict contract
+
+**Context**: Reviewing the new `sum_rev_no_range` hybrid implementation.
+**Learning**: `left_index` is required to contain valid nonnegative positions into `arr`; `-1` sentinels and out-of-range values are not valid inputs for this shape. Per-row skipping can hide an upstream contract violation.
+**Recommendation**: Reject any invalid `left_index` entry and never silently skip it. For hot no-range kernels, perform that validation immediately before the corresponding `arr`/`booleans` access so the check remains one-pass; zero remains a valid index.
+
+### [2026-08-25] Prefer one-pass no-range index validation for hot kernels
+
+**Context**: Benchmarking the `sum_rev_no_range` hybrid implementation showed that a separate full validation pass added approximately 1–14% runtime on valid inputs.
+**Learning**: A per-row explicit negative/bounds check followed immediately by indexing preserves safety and early errors without requiring a second full scan.
+**Recommendation**: For hot no-range kernels, use one-pass validation with `index < 0 || index as usize >= arr.len()` before each access, unless the API specifically requires rejecting all invalid inputs before doing any aggregation work.
