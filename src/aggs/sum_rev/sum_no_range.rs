@@ -20,10 +20,6 @@ fn validate_inputs<T>(
     Ok(())
 }
 
-fn checked_left_index(index: i64, arr_len: usize) -> Result<usize, &'static str> {
-    checked_index(index, arr_len).ok_or("left_index must contain valid positions in arr")
-}
-
 /// Sums no-range rows with arbitrary right labels using compact label slots.
 ///
 /// ELI5: the map stores one total per arbitrary label, while the label vector
@@ -36,26 +32,33 @@ pub fn sum_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     mut to_i64: F,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     validate_inputs(arr, left_index, right_index, booleans)?;
-    let mut totals = HashMap::<i64, i64>::with_capacity(right_index.len());
+    // ELI5: reserve the lookup table for the full join, but let output state
+    // grow only as distinct labels appear; duplicate-heavy inputs should not
+    // preallocate one result slot per matched row.
+    let capacity = right_index.len();
+    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
     let mut labels = Vec::new();
+    let mut totals = Vec::new();
 
     for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
-        let left = checked_left_index(*index_left, arr.len())?;
-        let current = if booleans[left] { 0 } else { to_i64(arr[left]) };
-        match totals.entry(*index_right) {
-            Entry::Occupied(mut entry) => {
-                let total = entry.get_mut();
-                *total = total.wrapping_add(current);
-            }
+        let left = checked_index(*index_left, arr.len())
+            .ok_or("left_index must contain valid positions in arr")?;
+        let slot = match slots.entry(*index_right) {
+            Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => {
+                let slot = labels.len();
                 labels.push(*index_right);
-                entry.insert(current);
+                totals.push(0_i64);
+                entry.insert(slot);
+                slot
             }
+        };
+        if !booleans[left] {
+            totals[slot] = totals[slot].wrapping_add(to_i64(arr[left]));
         }
     }
 
-    let result = labels.iter().map(|label| totals[label]).collect();
-    Ok((Array1::from_vec(labels), Array1::from_vec(result)))
+    Ok((Array1::from_vec(labels), Array1::from_vec(totals)))
 }
 
 /// Float counterpart to `sum_rev_no_range_int_core`.
@@ -70,12 +73,14 @@ pub fn sum_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
     mut to_f64: F,
 ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
     validate_inputs(arr, left_index, right_index, booleans)?;
-    let mut slots = HashMap::<i64, usize>::with_capacity(right_index.len());
+    let capacity = right_index.len();
+    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
     let mut labels = Vec::new();
-    let mut values = Vec::<(f64, f64)>::new();
+    let mut values = Vec::new();
 
     for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
-        let left = checked_left_index(*index_left, arr.len())?;
+        let left = checked_index(*index_left, arr.len())
+            .ok_or("left_index must contain valid positions in arr")?;
         let slot = match slots.entry(*index_right) {
             Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => {
