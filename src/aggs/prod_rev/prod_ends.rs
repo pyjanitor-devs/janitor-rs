@@ -143,3 +143,63 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_prod_rev_end_f64, m)?)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn integer_core_groups_prefixes_and_preserves_identity() {
+        let got = prod_rev_ends_int_core(
+            array![2_i64, 3].view(),
+            array![2_i64, 3].view(),
+            array![20_i64, 10, 90].view(),
+            array![false, false].view(),
+            |value| value,
+        );
+        assert_eq!(got, Ok((array![20, 10, 90], array![6, 6, 3])));
+
+        let got = prod_rev_ends_int_core(
+            array![2_i64].view(),
+            array![1_i64].view(),
+            array![10_i64].view(),
+            array![true].view(),
+            |value| value,
+        );
+        assert_eq!(got, Ok((array![10], array![1])));
+    }
+
+    #[test]
+    fn integer_core_wraps_and_float_core_handles_infinity() {
+        let got = prod_rev_ends_int_core(
+            array![i64::MAX, 2].view(),
+            array![1_i64, 1].view(),
+            array![10_i64].view(),
+            array![false, false].view(),
+            |value| value,
+        );
+        assert_eq!(got, Ok((array![10], array![-2])));
+
+        let got = prod_rev_ends_float_core(
+            array![f64::INFINITY, 2.0].view(),
+            array![1_i64, 1].view(),
+            array![10_i64].view(),
+            array![false, false].view(),
+            |value| value,
+        );
+        assert!(got.unwrap().1[0].is_infinite());
+    }
+
+    #[test]
+    fn rejects_invalid_bounds() {
+        assert!(prod_rev_ends_int_core(
+            array![1_i64].view(),
+            array![0_i64].view(),
+            array![10_i64].view(),
+            array![false].view(),
+            |value| value,
+        )
+        .is_err());
+    }
+}

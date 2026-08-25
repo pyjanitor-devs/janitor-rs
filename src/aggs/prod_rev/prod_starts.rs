@@ -145,3 +145,67 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_prod_rev_start_f64, m)?)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn integer_core_groups_suffixes_and_preserves_identity() {
+        let arr = array![2_i64, 3];
+        let starts = array![0_i64, 1];
+        let index = array![20_i64, 10, 90];
+        let booleans = array![false, false];
+        let got = prod_rev_starts_int_core(
+            arr.view(),
+            starts.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        );
+        assert_eq!(got, Ok((array![20, 10, 90], array![2, 6, 6])));
+    }
+
+    #[test]
+    fn integer_core_wraps_and_null_rows_leave_identity() {
+        let got = prod_rev_starts_int_core(
+            array![i64::MAX, 2].view(),
+            array![0_i64, 0].view(),
+            array![10_i64].view(),
+            array![false, false].view(),
+            |value| value,
+        );
+        assert_eq!(got, Ok((array![10], array![-2])));
+
+        let got = prod_rev_starts_int_core(
+            array![2_i64].view(),
+            array![0_i64].view(),
+            array![10_i64].view(),
+            array![true].view(),
+            |value| value,
+        );
+        assert_eq!(got, Ok((array![10], array![1])));
+    }
+
+    #[test]
+    fn float32_core_promotes_output_and_rejects_invalid_bounds() {
+        let got = prod_rev_starts_float_core(
+            array![2.5_f32, 4.0].view(),
+            array![0_i64, 1].view(),
+            array![20_i64, 10].view(),
+            array![false, false].view(),
+            |value| value as f64,
+        );
+        assert_eq!(got, Ok((array![20, 10], array![2.5, 10.0])));
+
+        assert!(prod_rev_starts_int_core(
+            array![1_i64].view(),
+            array![-1_i64].view(),
+            array![10_i64].view(),
+            array![false].view(),
+            |value| value,
+        )
+        .is_err());
+    }
+}
