@@ -1,10 +1,119 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
 use crate::aggs::{checked_range, ensure_equal_lengths};
+
+fn validate_ends_inputs(
+    arr_len: usize,
+    ends: numpy::ndarray::ArrayView1<'_, i64>,
+    right_len: usize,
+    booleans_len: usize,
+) -> Result<(), &'static str> {
+    if arr_len != ends.len() || arr_len != booleans_len {
+        return Err("arr, ends, and booleans must have equal lengths");
+    }
+    if arr_len == 0 || right_len == 0 {
+        return Err("arr, ends, booleans, and index cannot be empty");
+    }
+    if ends.iter().any(|end| {
+        usize::try_from(*end)
+            .map(|end| end == 0 || end > right_len)
+            .unwrap_or(true)
+    }) {
+        return Err("ends must satisfy 0 < end <= right_len");
+    }
+    Ok(())
+}
+
+/// Accumulate reverse-sum `ends` rows in compact candidate-ordinal slots.
+///
+/// ELI5: `item` addresses the accumulator and `index[item]` is only the
+/// original right-row label returned at the end, so sparse labels never
+/// inflate the accumulator or become an out-of-bounds address.
+pub fn sum_rev_ends_int_core<T, F>(
+    arr: numpy::ndarray::ArrayView1<T>,
+    ends: numpy::ndarray::ArrayView1<i64>,
+    index: numpy::ndarray::ArrayView1<i64>,
+    booleans: numpy::ndarray::ArrayView1<bool>,
+    mut to_i64: F,
+) -> Result<(numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<i64>), &'static str>
+where
+    T: Copy,
+    F: FnMut(T) -> i64,
+{
+    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
+    let max_end = ends
+        .iter()
+        .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
+        .max()
+        .unwrap();
+    let mut values = vec![0_i64; max_end];
+    for (current, end, boolean) in izip!(arr, ends, booleans) {
+        let current_ = to_i64(*current);
+        for value in values.iter_mut().take(*end as usize) {
+            if *boolean {
+                continue;
+            }
+            *value = value.wrapping_add(current_);
+        }
+    }
+    let mut indexers = Vec::new();
+    let mut result = Vec::new();
+    for (item, value) in values.iter().enumerate().take(max_end) {
+        indexers.push(index[item]);
+        result.push(*value);
+    }
+    Ok((
+        numpy::ndarray::Array1::from_vec(indexers),
+        numpy::ndarray::Array1::from_vec(result),
+    ))
+}
+
+pub fn sum_rev_ends_float_core<T, F>(
+    arr: numpy::ndarray::ArrayView1<T>,
+    ends: numpy::ndarray::ArrayView1<i64>,
+    index: numpy::ndarray::ArrayView1<i64>,
+    booleans: numpy::ndarray::ArrayView1<bool>,
+    mut to_f64: F,
+) -> Result<(numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<f64>), &'static str>
+where
+    T: Copy,
+    F: FnMut(T) -> f64,
+{
+    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
+    let max_end = ends
+        .iter()
+        .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
+        .max()
+        .unwrap();
+    let mut slots = vec![(0.0_f64, 0.0_f64); max_end];
+    for (current, end, boolean) in izip!(arr, ends, booleans) {
+        let current_ = to_f64(*current);
+        for (total, compensation) in slots.iter_mut().take(*end as usize) {
+            if *boolean {
+                continue;
+            }
+            let difference = current_ - *compensation;
+            let increment = *total + difference;
+            *compensation = (increment - *total) - difference;
+            if !compensation.is_finite() {
+                *compensation = 0.;
+            }
+            *total = increment;
+        }
+    }
+    let mut indexers = Vec::new();
+    let mut result = Vec::new();
+    for (item, (total, _)) in slots.iter().enumerate().take(max_end) {
+        indexers.push(index[item]);
+        result.push(*total);
+    }
+    Ok((
+        numpy::ndarray::Array1::from_vec(indexers),
+        numpy::ndarray::Array1::from_vec(result),
+    ))
+}
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
@@ -25,34 +134,10 @@ macro_rules! compute_ints {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            let length = length as usize;
-            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-            let zipped = izip!(arr.into_iter(), ends.into_iter(), booleans.into_iter());
-            for (current, end, boolean) in zipped {
-                // ELI5 (the guard): `end` indexes into `index`, not `arr`, so
-                // the bound to check against is `index.len()`; an unguarded
-                // cast of the `-1` "no match" sentinel wraps to `usize::MAX`
-                // and walks `index` out of bounds. See issue #34.
-                let Some((_, end_)) = checked_range(0, *end, index.len()) else {
-                    continue;
-                };
-                let current_ = *current as i64;
-                for item in 0..end_ {
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(0);
-                    if *boolean {
-                        continue;
-                    }
-                    *total += current_;
-                }
-            }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<i64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let _ = length;
+            let (indexers, result) =
+                sum_rev_ends_int_core(arr, ends, index, booleans, |value| value as i64)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -86,44 +171,10 @@ macro_rules! compute_floats {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            let length = length as usize;
-            let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
-            let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
-            let zipped = izip!(arr.into_iter(), ends.into_iter(), booleans.into_iter());
-            for (current, end, boolean) in zipped {
-                let Some((_, end_)) = checked_range(0, *end, index.len()) else {
-                    continue;
-                };
-                let current_ = *current as f64;
-                for item in 0..end_ {
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(0.);
-                    let compensation = mapping.entry(pos).or_insert(0.);
-                    if *boolean {
-                        continue;
-                    }
-                    let difference = current_ - *compensation;
-                    let increment = *total + difference;
-                    // adapted from pandas' cython code
-                    // # GH#53606; GH#60303
-                    // # If val is +/- infinity compensation is NaN
-                    // # which would lead to results being NaN instead
-                    // # of +/- infinity. We cannot use util.is_nan
-                    // # because of no gil
-                    *compensation = (increment - *total) - difference;
-                    if !compensation.is_finite() {
-                        *compensation = 0.;
-                    }
-                    *total = increment;
-                }
-            }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<f64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let _ = length;
+            let (indexers, result) =
+                sum_rev_ends_float_core(arr, ends, index, booleans, |value| value as f64)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -149,4 +200,128 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_sum_rev_end_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_sum_rev_end_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn uses_compact_candidate_slots_in_prefix_order() {
+        let arr = array![5_i64, 7, 99];
+        let ends = array![2_i64, 1, 2];
+        let index = array![10_i64, 30, 20];
+        let booleans = array![false, true, true];
+
+        let (indexers, result) = sum_rev_ends_int_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+
+        assert_eq!(indexers, array![10, 30]);
+        assert_eq!(result, array![5, 5]);
+    }
+
+    #[test]
+    fn rejects_zero_end_before_allocation() {
+        let arr = array![5_i64];
+        let ends = array![0_i64];
+        let index = array![0_i64];
+        let booleans = array![false];
+
+        let error = sum_rev_ends_int_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "ends must satisfy 0 < end <= right_len");
+    }
+
+    #[test]
+    fn float_core_returns_zero_for_all_null_rows() {
+        let arr = array![1.0_f64, 2.0];
+        let ends = array![2_i64, 1];
+        let index = array![20_i64, 10];
+        let booleans = array![true, true];
+
+        let (indexers, result) = sum_rev_ends_float_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+
+        assert_eq!(indexers, array![20, 10]);
+        assert_eq!(result, array![0.0, 0.0]);
+    }
+
+    #[test]
+    fn float_core_preserves_infinity_without_compensation_nan() {
+        let arr = array![f64::INFINITY, 1.0];
+        let ends = array![1_i64, 1];
+        let index = array![20_i64];
+        let booleans = array![false, false];
+
+        let (_, result) = sum_rev_ends_float_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+
+        assert!(result[0].is_infinite() && result[0].is_sign_positive());
+    }
+
+    #[test]
+    fn float_core_overflow_adjacent_values_follow_float_sum() {
+        let arr = array![f64::MAX, f64::MAX];
+        let ends = array![1_i64, 2];
+        let index = array![20_i64, 10];
+        let booleans = array![false, false];
+
+        let (_, result) = sum_rev_ends_float_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+
+        assert_eq!(result[0], f64::INFINITY);
+        assert_eq!(result[1], f64::MAX);
+    }
+
+    #[test]
+    fn float32_core_promotes_values_to_float64_output() {
+        let arr = array![1.5_f32, 2.25];
+        let ends = array![2_i64, 1];
+        let index = array![20_i64, 10];
+        let booleans = array![false, false];
+
+        let (indexers, result) = sum_rev_ends_float_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value as f64,
+        )
+        .unwrap();
+
+        assert_eq!(indexers, array![20, 10]);
+        assert_eq!(result, array![3.75, 1.5]);
+    }
 }
