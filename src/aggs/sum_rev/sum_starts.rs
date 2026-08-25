@@ -10,21 +10,24 @@ fn validate_starts_inputs(
     starts: ArrayView1<'_, i64>,
     right_len: usize,
     booleans_len: usize,
-) -> Result<(), &'static str> {
+) -> Result<usize, &'static str> {
     if arr_len != starts.len() || arr_len != booleans_len {
         return Err("arr, starts, and booleans must have equal lengths");
     }
     if arr_len == 0 || right_len == 0 {
         return Err("arr, starts, booleans, and index cannot be empty");
     }
-    if starts.iter().any(|start| {
-        usize::try_from(*start)
-            .map(|start| start >= right_len)
-            .unwrap_or(true)
-    }) {
-        return Err("starts must satisfy 0 <= start < right_len");
+    let mut min_start = right_len;
+    for start in starts.iter().copied() {
+        let Ok(start) = usize::try_from(start) else {
+            return Err("starts must satisfy 0 <= start < right_len");
+        };
+        if start >= right_len {
+            return Err("starts must satisfy 0 <= start < right_len");
+        }
+        min_start = min_start.min(start);
     }
-    Ok(())
+    Ok(min_start)
 }
 
 /// Accumulate reverse-sum `starts` rows in slots for the touched candidate
@@ -46,8 +49,7 @@ where
     F: FnMut(T) -> i64,
 {
     let end_ = index.len();
-    validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
-    let min_start = starts.iter().copied().min().unwrap() as usize;
+    let min_start = validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
     let width = end_ - min_start;
     let mut values = vec![0_i64; width];
     let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
@@ -140,8 +142,7 @@ where
     F: FnMut(T) -> f64,
 {
     let end_ = index.len();
-    validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
-    let min_start = starts.iter().copied().min().unwrap() as usize;
+    let min_start = validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
     let width = end_ - min_start;
     let mut slots = vec![(0.0_f64, 0.0_f64); width];
     let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());

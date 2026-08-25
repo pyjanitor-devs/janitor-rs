@@ -9,21 +9,24 @@ fn validate_ends_inputs(
     ends: numpy::ndarray::ArrayView1<'_, i64>,
     right_len: usize,
     booleans_len: usize,
-) -> Result<(), &'static str> {
+) -> Result<usize, &'static str> {
     if arr_len != ends.len() || arr_len != booleans_len {
         return Err("arr, ends, and booleans must have equal lengths");
     }
     if arr_len == 0 || right_len == 0 {
         return Err("arr, ends, booleans, and index cannot be empty");
     }
-    if ends.iter().any(|end| {
-        usize::try_from(*end)
-            .map(|end| end == 0 || end > right_len)
-            .unwrap_or(true)
-    }) {
-        return Err("ends must satisfy 0 < end <= right_len");
+    let mut max_end = 0;
+    for end in ends.iter().copied() {
+        let Ok(end) = usize::try_from(end) else {
+            return Err("ends must satisfy 0 < end <= right_len");
+        };
+        if end == 0 || end > right_len {
+            return Err("ends must satisfy 0 < end <= right_len");
+        }
+        max_end = max_end.max(end);
     }
-    Ok(())
+    Ok(max_end)
 }
 
 /// Accumulate reverse-sum `ends` rows in compact candidate-ordinal slots.
@@ -42,8 +45,7 @@ where
     T: Copy,
     F: FnMut(T) -> i64,
 {
-    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
-    let max_end = ends.iter().copied().max().unwrap() as usize;
+    let max_end = validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
     let mut values = vec![0_i64; max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
         let current_ = to_i64(*current);
@@ -77,8 +79,7 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
-    let max_end = ends.iter().copied().max().unwrap() as usize;
+    let max_end = validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
     let mut slots = vec![(0.0_f64, 0.0_f64); max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
         let current_ = to_f64(*current);
