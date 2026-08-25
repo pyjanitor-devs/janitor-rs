@@ -539,28 +539,23 @@ mod adversarial_bounds_tests {
                 return;
             }
 
-            // issue #38: `arr[*index_left as usize]`/`booleans[...]` in the
-            // four `_rev/*_no_range.rs` files were indexed with no bound
+            // issue #38/#79: `arr[*index_left as usize]`/`booleans[...]` in
+            // the four `_rev/*_no_range.rs` files were indexed with no bound
             // check at all. A `left_index` entry past `arr.len()` must now
-            // skip that row instead of panicking.
+            // be rejected instead of panicking or silently disappearing.
             let arr = PyArray1::from_vec(py, vec![5_i64, 9]);
             let left_index = PyArray1::from_vec(py, vec![0_i64, 99]); // 99 is out of bounds
             let right_index = PyArray1::from_vec(py, vec![0_i64, 0]);
             let booleans = PyArray1::from_vec(py, vec![false, false]);
-            let (keys, vals) = super::max_rev::max_no_range::compute_max_rev_no_range_int64(
+            let result = super::max_rev::max_no_range::compute_max_rev_no_range_int64(
                 py,
                 arr.readonly(),
                 left_index.readonly(),
                 right_index.readonly(),
                 booleans.readonly(),
                 1,
-            )
-            .expect("an out-of-bounds left_index row must be skipped, not panic");
-            assert_eq!(keys.readonly().as_array().to_vec(), vec![0_i64]);
-            // `vals` holds the *position* (index_left) of the winning
-            // value, not the value itself -- row 0 (index_left=0) is the
-            // only surviving row, so it wins by default.
-            assert_eq!(vals.readonly().as_array().to_vec(), vec![0_i64]);
+            );
+            assert!(result.is_err(), "invalid left_index must be rejected");
 
             // Adversarial-review finding folded into #38: `comp_no_range.rs`
             // only guarded the `-1` sentinel, never the upper bound, before
