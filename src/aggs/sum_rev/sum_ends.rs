@@ -245,4 +245,83 @@ mod tests {
 
         assert_eq!(error, "ends must satisfy 0 < end <= right_len");
     }
+
+    #[test]
+    fn float_core_returns_zero_for_all_null_rows() {
+        let arr = array![1.0_f64, 2.0];
+        let ends = array![2_i64, 1];
+        let index = array![20_i64, 10];
+        let booleans = array![true, true];
+
+        let (indexers, result) = sum_rev_ends_float_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+
+        assert_eq!(indexers, array![20, 10]);
+        assert_eq!(result, array![0.0, 0.0]);
+    }
+
+    #[test]
+    fn float_core_preserves_infinity_without_compensation_nan() {
+        let arr = array![f64::INFINITY, 1.0];
+        let ends = array![1_i64, 1];
+        let index = array![20_i64];
+        let booleans = array![false, false];
+
+        let (_, result) = sum_rev_ends_float_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+
+        assert!(result[0].is_infinite() && result[0].is_sign_positive());
+    }
+
+    #[test]
+    fn float_core_overflow_adjacent_values_follow_float_sum() {
+        let arr = array![f64::MAX, f64::MAX];
+        let ends = array![1_i64, 2];
+        let index = array![20_i64, 10];
+        let booleans = array![false, false];
+
+        let (_, result) = sum_rev_ends_float_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+
+        assert_eq!(result[0], f64::INFINITY);
+        assert_eq!(result[1], f64::MAX);
+    }
+
+    #[test]
+    fn float32_core_promotes_values_to_float64_output() {
+        let arr = array![1.5_f32, 2.25];
+        let ends = array![2_i64, 1];
+        let index = array![20_i64, 10];
+        let booleans = array![false, false];
+
+        let (indexers, result) = sum_rev_ends_float_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value as f64,
+        )
+        .unwrap();
+
+        assert_eq!(indexers, array![20, 10]);
+        assert_eq!(result, array![3.75, 1.5]);
+    }
 }
