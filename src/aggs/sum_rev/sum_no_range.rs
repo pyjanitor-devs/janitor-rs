@@ -1,3 +1,4 @@
+use crate::aggs::checked_index;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
@@ -20,10 +21,7 @@ fn validate_inputs<T>(
 }
 
 fn checked_left_index(index: i64, arr_len: usize) -> Result<usize, &'static str> {
-    if index < 0 || (index as usize) >= arr_len {
-        return Err("left_index must contain valid positions in arr");
-    }
-    Ok(index as usize)
+    checked_index(index, arr_len).ok_or("left_index must contain valid positions in arr")
 }
 
 /// Sums no-range rows with arbitrary right labels using compact label slots.
@@ -257,6 +255,27 @@ mod tests {
         assert!(sum_rev_no_range_int_core(
             array![1_i64].view(),
             array![1_i64].view(),
+            array![20_i64].view(),
+            array![false].view(),
+            |value| value,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_left_positions_that_do_not_fit_usize() {
+        let oversized = i64::from(u32::MAX) + 1;
+        assert!(sum_rev_no_range_int_core(
+            array![1_i64].view(),
+            array![oversized].view(),
+            array![20_i64].view(),
+            array![false].view(),
+            |value| value,
+        )
+        .is_err());
+        assert!(sum_rev_no_range_float_core(
+            array![1.0_f64].view(),
+            array![oversized].view(),
             array![20_i64].view(),
             array![false].view(),
             |value| value,
