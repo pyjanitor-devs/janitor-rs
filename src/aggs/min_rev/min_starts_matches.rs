@@ -1,13 +1,38 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{ensure_equal_lengths, ensure_tape_width};
 
+fn expected_matches_width(starts: ArrayView1<'_, i64>, right_len: usize) -> PyResult<usize> {
+    if starts.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts cannot be empty",
+        ));
+    }
+
+    starts.iter().try_fold(0usize, |total, start| {
+        let start = usize::try_from(*start)
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("starts must be non-negative"))?;
+        if start >= right_len {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "starts must be less than index length",
+            ));
+        }
+        total
+            .checked_add(right_len - start)
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("matches tape width overflow"))
+    })
+}
+
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
+        /// `index`, `counts`, and `matches` are trusted outputs of the
+        /// conditional-join boundary and are expected to be non-negative.
+        /// `matches == 0` excludes a candidate; non-zero values are treated
+        /// as live without a second validation pass over the tape.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -17,7 +42,6 @@ macro_rules! compute {
             index: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
         // The macro will expand into the contents of this block.
         {
@@ -30,19 +54,27 @@ macro_rules! compute {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            let length = length as usize;
-            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-            let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
             let end_: usize = index.len();
+            if arr.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "arr cannot be empty",
+                ));
+            }
+            if index.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "index cannot be empty",
+                ));
+            }
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = starts
-                .iter()
-                .map(|s| end_.saturating_sub(*s as usize))
-                .sum();
+            let expected_matches_width = expected_matches_width(starts, end_)?;
             ensure_tape_width(expected_matches_width, matches.len())?;
+            let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
+            let mut labels = Vec::new();
+            let mut rows = Vec::new();
+            let mut values = Vec::new();
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -58,27 +90,31 @@ macro_rules! compute {
                         continue;
                     }
                     let pos = index[item];
-                    let base = dictionary.entry(pos).or_insert(-1);
-                    let base_val = mapping.entry(pos).or_insert(*current);
+                    let slot = if let Some(slot) = slots.get(&pos) {
+                        *slot
+                    } else {
+                        let slot = values.len();
+                        slots.insert(pos, slot);
+                        labels.push(pos);
+                        rows.push(-1_i64);
+                        values.push(*current);
+                        slot
+                    };
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
                     }
-                    if (*base == -1) || (*current < *base_val) {
-                        *base_val = *current;
-                        *base = posn as i64;
+                    if rows[slot] == -1 || *current < values[slot] {
+                        values[slot] = *current;
+                        rows[slot] = posn as i64;
                     }
                     n += 1;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<i64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+            Ok((
+                Array1::from_vec(labels).into_pyarray(py),
+                Array1::from_vec(rows).into_pyarray(py),
+            ))
         }
     };
 }
