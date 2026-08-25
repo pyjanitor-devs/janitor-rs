@@ -2,31 +2,28 @@ use itertools::izip;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{checked_range, ensure_equal_lengths};
 
 fn validate_ends_inputs(
     arr_len: usize,
     ends: numpy::ndarray::ArrayView1<'_, i64>,
     right_len: usize,
     booleans_len: usize,
-) -> Result<usize, &'static str> {
+) -> Result<(), &'static str> {
     if arr_len != ends.len() || arr_len != booleans_len {
         return Err("arr, ends, and booleans must have equal lengths");
     }
     if arr_len == 0 || right_len == 0 {
         return Err("arr, ends, booleans, and index cannot be empty");
     }
-    let mut max_end = 0;
-    for end in ends.iter().copied() {
-        let Ok(end) = usize::try_from(end) else {
-            return Err("ends must satisfy 0 < end <= right_len");
-        };
-        if end == 0 || end > right_len {
-            return Err("ends must satisfy 0 < end <= right_len");
-        }
-        max_end = max_end.max(end);
+    if ends.iter().any(|end| {
+        usize::try_from(*end)
+            .map(|end| end == 0 || end > right_len)
+            .unwrap_or(true)
+    }) {
+        return Err("ends must satisfy 0 < end <= right_len");
     }
-    Ok(max_end)
+    Ok(())
 }
 
 /// Accumulate reverse-sum `ends` rows in compact candidate-ordinal slots.
@@ -45,7 +42,12 @@ where
     T: Copy,
     F: FnMut(T) -> i64,
 {
-    let max_end = validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
+    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
+    let max_end = ends
+        .iter()
+        .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
+        .max()
+        .unwrap();
     let mut values = vec![0_i64; max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
         let current_ = to_i64(*current);
@@ -79,7 +81,12 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    let max_end = validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
+    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
+    let max_end = ends
+        .iter()
+        .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
+        .max()
+        .unwrap();
     let mut slots = vec![(0.0_f64, 0.0_f64); max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
         let current_ = to_f64(*current);
