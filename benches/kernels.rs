@@ -23,9 +23,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
     binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, repeat_index_core,
-    sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core,
-    CompareOp,
+    sum_end_core, sum_positions_int_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
+    trim_index_core, CompareOp,
 };
+use std::collections::HashMap;
 
 /// Counts bytes, calls, and outstanding (live) bytes allocated through the
 /// global allocator, so `bench_bin_search_first` can report an allocation
@@ -649,6 +650,165 @@ fn bench_sum_kernels(c: &mut Criterion) {
     group.finish();
 }
 
+/// A positions-tape fixture. Each left row owns a fixed-width slice of the
+/// tape; the tape entries point into `index`, rather than containing labels.
+/// The duplicate case makes every tape entry point at one label, while the
+/// unique case spreads entries across the whole index.
+struct SumPositionsFixture {
+    arr: Array1<i64>,
+    starts: Array1<i64>,
+    ends: Array1<i64>,
+    index: Array1<i64>,
+    positions: Array1<i64>,
+    booleans: Array1<bool>,
+}
+
+impl SumPositionsFixture {
+    fn new(n: usize, duplicate: bool) -> Self {
+        const WIDTH: usize = 8;
+        let arr = Array1::from_iter((0..n).map(|i| i as i64));
+        let starts = Array1::from_iter((0..n).map(|i| (i * WIDTH) as i64));
+        let ends = Array1::from_iter((0..n).map(|i| ((i + 1) * WIDTH) as i64));
+        let index = Array1::from_iter(0..n as i64);
+        let positions = Array1::from_iter((0..n).flat_map(|i| {
+            (0..WIDTH).map(move |offset| {
+                if duplicate {
+                    0
+                } else {
+                    ((i + offset) % n) as i64
+                }
+            })
+        }));
+        let booleans = Array1::from_elem(n, false);
+        Self {
+            arr,
+            starts,
+            ends,
+            index,
+            positions,
+            booleans,
+        }
+    }
+}
+
+/// The pre-optimization positions implementation, retained only as a
+/// benchmark control. It uses the same range and sentinel semantics as the
+/// production code, including arbitrary label order from HashMap iteration.
+fn sum_positions_int_old(
+    arr: ArrayView1<'_, i64>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    capacity: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let capacity = capacity.min(index.len()).min(positions.len());
+    let mut dictionary = HashMap::with_capacity(capacity);
+    for (((current, start), end), boolean) in arr
+        .iter()
+        .zip(starts.iter())
+        .zip(ends.iter())
+        .zip(booleans.iter())
+    {
+        let Some(start_) = usize::try_from(*start).ok() else {
+            continue;
+        };
+        let Some(end_) = usize::try_from(*end)
+            .ok()
+            .filter(|&end| end <= positions.len())
+        else {
+            continue;
+        };
+        if start_ >= end_ {
+            continue;
+        }
+        for nn in start_..end_ {
+            let Some(indexer_) = usize::try_from(positions[nn])
+                .ok()
+                .filter(|&indexer| indexer < index.len())
+            else {
+                continue;
+            };
+            let total = dictionary.entry(index[indexer_]).or_insert(0);
+            if !*boolean {
+                *total += *current;
+            }
+        }
+    }
+    dictionary.into_iter().unzip()
+}
+
+/// ELI5: compare the old approach (a label-to-total dictionary) with the new
+/// approach (a label-to-small-slot dictionary plus Vec state). The workload
+/// sizes deliberately include tiny, large, very large, and super-large cases.
+/// Duplicate labels expose over-reservation and repeated-hash costs; unique
+/// labels exercise the upper-bound case.
+fn bench_sum_positions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sum_positions_old_vs_compact");
+    for n in [32, 10_000, 100_000, 1_000_000] {
+        for duplicate in [true, false] {
+            let f = SumPositionsFixture::new(n, duplicate);
+            let kind = if duplicate { "duplicate" } else { "unique" };
+            let label = format!("n={n} {kind}");
+
+            let old = count_allocations(|| {
+                sum_positions_int_old(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                )
+            });
+            let compact = count_allocations(|| {
+                sum_positions_int_core(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                    |value| value,
+                )
+            });
+            eprintln!("sum_positions {label}: old {old:?}; compact {compact:?}");
+
+            group.bench_function(format!("old {label}"), |b| {
+                b.iter(|| {
+                    sum_positions_int_old(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
+                    )
+                })
+            });
+            group.bench_function(format!("compact {label}"), |b| {
+                b.iter(|| {
+                    sum_positions_int_core(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
+                        |value| value,
+                    )
+                })
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bin_search_lt,
@@ -656,6 +816,7 @@ criterion_group!(
     bench_bin_search_first_old_vs_new,
     bench_compare_start_end,
     bench_index_builders,
-    bench_sum_kernels
+    bench_sum_kernels,
+    bench_sum_positions
 );
 criterion_main!(benches);
