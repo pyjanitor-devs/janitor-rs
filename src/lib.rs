@@ -89,10 +89,10 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (884 dtype-specialized exports across 89
+    /// `register`, as of this PR (894 dtype-specialized exports across 90
     /// leaf modules). Bump this alongside any PR that intentionally adds
     /// or removes an export.
-    const EXPECTED_EXPORT_COUNT: usize = 884;
+    const EXPECTED_EXPORT_COUNT: usize = 894;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
@@ -102,7 +102,7 @@ mod registration_tests {
     /// module must be one of our own exports (Python/PyO3 module
     /// machinery -- `__name__`, `__all__`, etc. -- all use `__`-wrapped
     /// names), so counting just those catches a missing or duplicate
-    /// export without spelling out all 884 names here.
+    /// export without spelling out all 894 names here.
     #[test]
     fn total_registered_export_count_matches_expected() {
         Python::initialize();
