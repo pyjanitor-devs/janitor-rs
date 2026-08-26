@@ -20,7 +20,7 @@ fn expected_matches_width(starts: ArrayView1<'_, i64>, right_len: usize) -> PyRe
     starts.iter().try_fold(0usize, |total, start| {
         let start = usize::try_from(*start)
             .map_err(|_| pyo3::exceptions::PyValueError::new_err("starts must be non-negative"))?;
-        if start >= right_len {
+        if start > right_len {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "starts must be less than index length",
             ));
@@ -75,6 +75,11 @@ macro_rules! compute_ints {
             // here, before the loop below ever indexes into the tape.
             let expected_matches_width = expected_matches_width(starts, end_)?;
             ensure_tape_width(expected_matches_width, matches.len())?;
+            // ELI5: there can be at most one output slot per right-index
+            // position, so `index.len()` is a safe upper bound for the map.
+            // It may reserve more memory than needed when labels repeat, but
+            // it avoids repeated rehashing and growth for mostly-unique
+            // labels. The vectors grow with the actual number of labels.
             let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
             let mut labels = Vec::new();
             let mut totals = Vec::new();
@@ -270,7 +275,7 @@ mod tests {
     #[test]
     fn tape_width_rejects_negative_and_one_past_starts() {
         assert!(expected_matches_width(array![-1_i64].view(), 3).is_err());
-        assert!(expected_matches_width(array![3_i64].view(), 3).is_err());
+        assert_eq!(expected_matches_width(array![3_i64].view(), 3).unwrap(), 0);
     }
 
     #[test]
