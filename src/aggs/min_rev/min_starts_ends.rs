@@ -3,7 +3,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::checked_range;
+use crate::aggs::{checked_range, ensure_equal_lengths};
 use std::collections::{hash_map::Entry, HashMap};
 
 fn validate_inputs<T>(
@@ -24,16 +24,6 @@ fn validate_inputs<T>(
     }
     if arr.is_empty() || index.is_empty() {
         return Err("arr, starts, booleans, and index cannot be empty");
-    }
-    for (start, end) in starts.iter().zip(ends.iter()) {
-        let start = usize::try_from(*start).map_err(|_| "range bounds must be non-negative")?;
-        let end = usize::try_from(*end).map_err(|_| "range bounds must be non-negative")?;
-        if start > index.len() || end > index.len() {
-            return Err("range bounds must not exceed right_index length");
-        }
-        if start > end {
-            return Err("range start must not exceed range end");
-        }
     }
     Ok(())
 }
@@ -119,14 +109,16 @@ macro_rules! compute {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
-            let (indexers, result) = min_rev_start_end_core(
-                arr.as_array(),
-                starts.as_array(),
-                ends.as_array(),
-                index.as_array(),
-                booleans.as_array(),
-            )
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            let arr = arr.as_array();
+            let starts = starts.as_array();
+            let ends = ends.as_array();
+            let index = index.as_array();
+            let booleans = booleans.as_array();
+            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
+            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
+            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
+            let (indexers, result) = min_rev_start_end_core(arr, starts, ends, index, booleans)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
