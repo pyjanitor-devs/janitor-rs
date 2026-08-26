@@ -15,7 +15,6 @@
 //! isolation.
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
@@ -23,10 +22,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
-    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core,
-    max_rev_start_end_core, min_rev_start_end_core, prod_rev_start_end_int_core, repeat_index_core,
-    size_rev_start_end_core, sum_end_core, sum_rev_start_end_int_core, sum_start_core,
-    sum_start_end_core, sum_start_u32_core, trim_index_core, CompareOp,
+    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, max_positions_core,
+    repeat_index_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
+    trim_index_core, CompareOp,
 };
 use std::collections::HashMap;
 
@@ -652,485 +650,139 @@ fn bench_sum_kernels(c: &mut Criterion) {
     group.finish();
 }
 
-/// Bounded-width explicit ranges for the reverse aggregation comparison.
-/// The duplicate-label workload is intentional: it shows the memory cost of
-/// reserving from the full right index when only a few labels are touched.
-struct ReverseSumStartEndFixture {
+struct MaxPositionsFixture {
     arr: Array1<i64>,
     starts: Array1<i64>,
     ends: Array1<i64>,
     index: Array1<i64>,
+    positions: Array1<i64>,
     booleans: Array1<bool>,
 }
 
-impl ReverseSumStartEndFixture {
-    fn new(n: usize, duplicate_labels: bool) -> Self {
-        let width = 8_i64;
-        let n64 = n as i64;
+impl MaxPositionsFixture {
+    fn new(n: usize, duplicate: bool) -> Self {
+        const WIDTH: usize = 8;
+        let arr = Array1::from_iter((0..n).map(|i| i as i64));
+        let starts = Array1::from_iter((0..n).map(|i| (i * WIDTH) as i64));
+        let ends = Array1::from_iter((0..n).map(|i| ((i + 1) * WIDTH) as i64));
+        let index = Array1::from_iter(0..n as i64);
+        let positions = Array1::from_iter((0..n).flat_map(|i| {
+            (0..WIDTH).map(move |j| if duplicate { 0 } else { ((i + j) % n) as i64 })
+        }));
+        let booleans = Array1::from_elem(n, false);
         Self {
-            arr: Array1::from_iter((0..n64).map(|value| value + 1)),
-            starts: Array1::from_iter((0..n64).map(|value| value % n64)),
-            ends: Array1::from_iter((0..n64).map(|value| (value % n64 + width).min(n64))),
-            index: Array1::from_iter((0..n64).map(|value| {
-                if duplicate_labels {
-                    value % 16
-                } else {
-                    value
-                }
-            })),
-            booleans: Array1::from_elem(n, false),
+            arr,
+            starts,
+            ends,
+            index,
+            positions,
+            booleans,
         }
     }
 }
 
-/// Old HashMap implementation used as a local benchmark baseline only.
-/// ELI5: this is the old filing cabinet; the production code uses numbered
-/// drawers so it does not need a second dictionary for every aggregate.
-fn old_sum_rev_start_end(
+fn max_positions_old(
     arr: ArrayView1<'_, i64>,
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> (Array1<i64>, Array1<i64>) {
-    let mut dictionary = HashMap::with_capacity(index.len());
-    for (current, start, end, boolean) in izip!(arr, starts, ends, booleans) {
-        let start = *start as usize;
-        let end = (*end as usize).min(index.len());
+    capacity: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut dictionary: HashMap<i64, (i64, i64)> =
+        HashMap::with_capacity(capacity.min(index.len()).min(positions.len()));
+    for (row, (((current, start), end), boolean)) in arr
+        .iter()
+        .zip(starts.iter())
+        .zip(ends.iter())
+        .zip(booleans.iter())
+        .enumerate()
+    {
+        let Some(start) = usize::try_from(*start).ok() else {
+            continue;
+        };
+        let Some(end) = usize::try_from(*end).ok().filter(|&e| e <= positions.len()) else {
+            continue;
+        };
         if start >= end {
             continue;
         }
-        for item in start..end {
-            let total = dictionary.entry(index[item]).or_insert(0_i64);
-            if !*boolean {
-                *total = total.wrapping_add(*current);
-            }
-        }
-    }
-    let mut labels = Array1::zeros(dictionary.len());
-    let mut totals = Array1::zeros(dictionary.len());
-    for (slot, (label, total)) in dictionary.into_iter().enumerate() {
-        labels[slot] = label;
-        totals[slot] = total;
-    }
-    (labels, totals)
-}
-
-fn bench_sum_rev_start_end(c: &mut Criterion) {
-    let mut group = c.benchmark_group("sum_rev_start_end_old_vs_compact");
-    for n in [32, 10_000, 100_000, 1_000_000] {
-        for duplicate_labels in [false, true] {
-            let fixture = ReverseSumStartEndFixture::new(n, duplicate_labels);
-            let workload = if duplicate_labels {
-                "duplicates"
-            } else {
-                "unique"
+        for n in start..end {
+            let Some(pos) = usize::try_from(positions[n])
+                .ok()
+                .filter(|&p| p < index.len())
+            else {
+                continue;
             };
-            group.bench_function(format!("compact n={n} {workload}"), |b| {
-                b.iter(|| {
-                    sum_rev_start_end_int_core(
-                        black_box(fixture.arr.view()),
-                        black_box(fixture.starts.view()),
-                        black_box(fixture.ends.view()),
-                        black_box(fixture.index.view()),
-                        black_box(fixture.booleans.view()),
-                        |value| value,
-                    )
-                })
-            });
-            group.bench_function(format!("old n={n} {workload}"), |b| {
-                b.iter(|| {
-                    old_sum_rev_start_end(
-                        black_box(fixture.arr.view()),
-                        black_box(fixture.starts.view()),
-                        black_box(fixture.ends.view()),
-                        black_box(fixture.index.view()),
-                        black_box(fixture.booleans.view()),
-                    )
-                })
-            });
-            if n <= 100_000 {
-                let (compact_bytes, compact_calls, compact_peak) = count_allocations(|| {
-                    sum_rev_start_end_int_core(
-                        fixture.arr.view(),
-                        fixture.starts.view(),
-                        fixture.ends.view(),
-                        fixture.index.view(),
-                        fixture.booleans.view(),
-                        |value| value,
-                    )
-                });
-                let (old_bytes, old_calls, old_peak) = count_allocations(|| {
-                    old_sum_rev_start_end(
-                        fixture.arr.view(),
-                        fixture.starts.view(),
-                        fixture.ends.view(),
-                        fixture.index.view(),
-                        fixture.booleans.view(),
-                    )
-                });
-                eprintln!(
-                    "sum_rev_start_end n={n:>7} {workload:>9}: compact {compact_bytes} B/{compact_calls} allocs/{compact_peak} peak; old {old_bytes} B/{old_calls} allocs/{old_peak} peak"
-                );
+            let entry = dictionary.entry(index[pos]).or_insert((-1, *current));
+            if !*boolean && (entry.0 == -1 || *current > entry.1) {
+                *entry = (row as i64, *current);
             }
         }
     }
-    group.finish();
+    dictionary
+        .into_iter()
+        .map(|(label, (row, _))| (label, row))
+        .unzip()
 }
 
-fn old_min_rev_start_end(
-    arr: ArrayView1<'_, i64>,
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> (Array1<i64>, Array1<i64>) {
-    let mut rows = HashMap::with_capacity(index.len());
-    let mut values = HashMap::with_capacity(index.len());
-    for (row, (current, start, end, boolean)) in izip!(arr, starts, ends, booleans).enumerate() {
-        let start = *start as usize;
-        let end = (*end as usize).min(index.len());
-        if start >= end {
-            continue;
-        }
-        for item in start..end {
-            let label = index[item];
-            let best_row = rows.entry(label).or_insert(-1_i64);
-            let best_value = values.entry(label).or_insert(*current);
-            if !*boolean && (*best_row == -1 || *current < *best_value) {
-                *best_value = *current;
-                *best_row = row as i64;
-            }
-        }
-    }
-    let mut labels = Array1::zeros(rows.len());
-    let mut result = Array1::zeros(rows.len());
-    for (slot, (label, row)) in rows.into_iter().enumerate() {
-        labels[slot] = label;
-        result[slot] = row;
-    }
-    (labels, result)
-}
-
-fn bench_min_rev_start_end(c: &mut Criterion) {
-    let mut group = c.benchmark_group("min_rev_start_end_old_vs_compact");
+fn bench_max_positions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("max_positions_old_vs_compact");
     for n in [32, 10_000, 100_000, 1_000_000] {
-        for duplicate_labels in [false, true] {
-            let fixture = ReverseSumStartEndFixture::new(n, duplicate_labels);
-            let workload = if duplicate_labels {
-                "duplicates"
-            } else {
-                "unique"
-            };
-            group.bench_function(format!("compact n={n} {workload}"), |b| {
+        for duplicate in [true, false] {
+            let f = MaxPositionsFixture::new(n, duplicate);
+            let kind = if duplicate { "duplicate" } else { "unique" };
+            let label = format!("n={n} {kind}");
+            let old = count_allocations(|| {
+                max_positions_old(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                )
+            });
+            let compact = count_allocations(|| {
+                max_positions_core(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                )
+            });
+            eprintln!("max_positions {label}: old {old:?}; compact {compact:?}");
+            group.bench_function(format!("old {label}"), |b| {
                 b.iter(|| {
-                    min_rev_start_end_core(
-                        black_box(fixture.arr.view()),
-                        black_box(fixture.starts.view()),
-                        black_box(fixture.ends.view()),
-                        black_box(fixture.index.view()),
-                        black_box(fixture.booleans.view()),
+                    max_positions_old(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
                     )
                 })
             });
-            group.bench_function(format!("old n={n} {workload}"), |b| {
+            group.bench_function(format!("compact {label}"), |b| {
                 b.iter(|| {
-                    old_min_rev_start_end(
-                        black_box(fixture.arr.view()),
-                        black_box(fixture.starts.view()),
-                        black_box(fixture.ends.view()),
-                        black_box(fixture.index.view()),
-                        black_box(fixture.booleans.view()),
+                    max_positions_core(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
                     )
                 })
             });
-            if n <= 100_000 {
-                let (compact_bytes, compact_calls, compact_peak) = count_allocations(|| {
-                    min_rev_start_end_core(
-                        fixture.arr.view(),
-                        fixture.starts.view(),
-                        fixture.ends.view(),
-                        fixture.index.view(),
-                        fixture.booleans.view(),
-                    )
-                });
-                let (old_bytes, old_calls, old_peak) = count_allocations(|| {
-                    old_min_rev_start_end(
-                        fixture.arr.view(),
-                        fixture.starts.view(),
-                        fixture.ends.view(),
-                        fixture.index.view(),
-                        fixture.booleans.view(),
-                    )
-                });
-                eprintln!(
-                    "min_rev_start_end n={n:>7} {workload:>9}: compact {compact_bytes} B/{compact_calls} allocs/{compact_peak} peak; old {old_bytes} B/{old_calls} allocs/{old_peak} peak"
-                );
-            }
-        }
-    }
-    group.finish();
-}
-
-fn old_max_rev_start_end(
-    arr: ArrayView1<'_, i64>,
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> (Array1<i64>, Array1<i64>) {
-    let mut rows = HashMap::with_capacity(index.len());
-    let mut values = HashMap::with_capacity(index.len());
-    for (row, (current, start, end, boolean)) in izip!(arr, starts, ends, booleans).enumerate() {
-        let start = *start as usize;
-        let end = (*end as usize).min(index.len());
-        if start >= end {
-            continue;
-        }
-        for item in start..end {
-            let label = index[item];
-            let best_row = rows.entry(label).or_insert(-1_i64);
-            let best_value = values.entry(label).or_insert(*current);
-            if !*boolean && (*best_row == -1 || *current > *best_value) {
-                *best_value = *current;
-                *best_row = row as i64;
-            }
-        }
-    }
-    let mut labels = Array1::zeros(rows.len());
-    let mut result = Array1::zeros(rows.len());
-    for (slot, (label, row)) in rows.into_iter().enumerate() {
-        labels[slot] = label;
-        result[slot] = row;
-    }
-    (labels, result)
-}
-
-fn bench_max_rev_start_end(c: &mut Criterion) {
-    let mut group = c.benchmark_group("max_rev_start_end_old_vs_compact");
-    for n in [32, 10_000, 100_000, 1_000_000] {
-        for duplicate_labels in [false, true] {
-            let fixture = ReverseSumStartEndFixture::new(n, duplicate_labels);
-            let workload = if duplicate_labels {
-                "duplicates"
-            } else {
-                "unique"
-            };
-            group.bench_function(format!("compact n={n} {workload}"), |b| {
-                b.iter(|| {
-                    max_rev_start_end_core(
-                        black_box(fixture.arr.view()),
-                        black_box(fixture.starts.view()),
-                        black_box(fixture.ends.view()),
-                        black_box(fixture.index.view()),
-                        black_box(fixture.booleans.view()),
-                    )
-                })
-            });
-            group.bench_function(format!("old n={n} {workload}"), |b| {
-                b.iter(|| {
-                    old_max_rev_start_end(
-                        black_box(fixture.arr.view()),
-                        black_box(fixture.starts.view()),
-                        black_box(fixture.ends.view()),
-                        black_box(fixture.index.view()),
-                        black_box(fixture.booleans.view()),
-                    )
-                })
-            });
-            if n <= 100_000 {
-                let compact = count_allocations(|| {
-                    max_rev_start_end_core(
-                        fixture.arr.view(),
-                        fixture.starts.view(),
-                        fixture.ends.view(),
-                        fixture.index.view(),
-                        fixture.booleans.view(),
-                    )
-                });
-                let old = count_allocations(|| {
-                    old_max_rev_start_end(
-                        fixture.arr.view(),
-                        fixture.starts.view(),
-                        fixture.ends.view(),
-                        fixture.index.view(),
-                        fixture.booleans.view(),
-                    )
-                });
-                eprintln!(
-                    "max_rev_start_end n={n:>7} {workload:>9}: compact {:?}; old {:?}",
-                    compact, old
-                );
-            }
-        }
-    }
-    group.finish();
-}
-
-fn old_prod_rev_start_end(
-    arr: ArrayView1<'_, i64>,
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> (Array1<i64>, Array1<i64>) {
-    let mut products = HashMap::with_capacity(index.len());
-    for (current, start, end, boolean) in izip!(arr, starts, ends, booleans) {
-        let start = *start as usize;
-        let end = (*end as usize).min(index.len());
-        if start >= end {
-            continue;
-        }
-        for item in start..end {
-            let product = products.entry(index[item]).or_insert(1_i64);
-            if !*boolean {
-                *product = product.wrapping_mul(*current);
-            }
-        }
-    }
-    let mut labels = Array1::zeros(products.len());
-    let mut result = Array1::zeros(products.len());
-    for (slot, (label, product)) in products.into_iter().enumerate() {
-        labels[slot] = label;
-        result[slot] = product;
-    }
-    (labels, result)
-}
-
-fn bench_prod_rev_start_end(c: &mut Criterion) {
-    let mut group = c.benchmark_group("prod_rev_start_end_old_vs_compact");
-    for n in [32, 10_000, 100_000, 1_000_000] {
-        for duplicate_labels in [false, true] {
-            let fixture = ReverseSumStartEndFixture::new(n, duplicate_labels);
-            let workload = if duplicate_labels {
-                "duplicates"
-            } else {
-                "unique"
-            };
-            group.bench_function(format!("compact n={n} {workload}"), |b| {
-                b.iter(|| {
-                    prod_rev_start_end_int_core(
-                        black_box(fixture.arr.view()),
-                        black_box(fixture.starts.view()),
-                        black_box(fixture.ends.view()),
-                        black_box(fixture.index.view()),
-                        black_box(fixture.booleans.view()),
-                        |value| value,
-                    )
-                })
-            });
-            group.bench_function(format!("old n={n} {workload}"), |b| {
-                b.iter(|| {
-                    old_prod_rev_start_end(
-                        black_box(fixture.arr.view()),
-                        black_box(fixture.starts.view()),
-                        black_box(fixture.ends.view()),
-                        black_box(fixture.index.view()),
-                        black_box(fixture.booleans.view()),
-                    )
-                })
-            });
-            if n <= 100_000 {
-                let compact = count_allocations(|| {
-                    prod_rev_start_end_int_core(
-                        fixture.arr.view(),
-                        fixture.starts.view(),
-                        fixture.ends.view(),
-                        fixture.index.view(),
-                        fixture.booleans.view(),
-                        |value| value,
-                    )
-                });
-                let old = count_allocations(|| {
-                    old_prod_rev_start_end(
-                        fixture.arr.view(),
-                        fixture.starts.view(),
-                        fixture.ends.view(),
-                        fixture.index.view(),
-                        fixture.booleans.view(),
-                    )
-                });
-                eprintln!(
-                    "prod_rev_start_end n={n:>7} {workload:>9}: compact {compact:?}; old {old:?}"
-                );
-            }
-        }
-    }
-    group.finish();
-}
-
-fn old_size_rev_start_end(
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
-) -> (Array1<i64>, Array1<i64>) {
-    let mut counts = HashMap::with_capacity(index.len());
-    for (start, end) in izip!(starts, ends) {
-        let start = *start as usize;
-        let end = (*end as usize).min(index.len());
-        if start >= end {
-            continue;
-        }
-        for item in start..end {
-            *counts.entry(index[item]).or_insert(0_i64) += 1;
-        }
-    }
-    let mut labels = Array1::zeros(counts.len());
-    let mut result = Array1::zeros(counts.len());
-    for (slot, (label, count)) in counts.into_iter().enumerate() {
-        labels[slot] = label;
-        result[slot] = count;
-    }
-    (labels, result)
-}
-
-fn bench_size_rev_start_end(c: &mut Criterion) {
-    let mut group = c.benchmark_group("size_rev_start_end_old_vs_compact");
-    for n in [32, 10_000, 100_000, 1_000_000] {
-        for duplicate_labels in [false, true] {
-            let fixture = ReverseSumStartEndFixture::new(n, duplicate_labels);
-            let workload = if duplicate_labels {
-                "duplicates"
-            } else {
-                "unique"
-            };
-            group.bench_function(format!("compact n={n} {workload}"), |b| {
-                b.iter(|| {
-                    size_rev_start_end_core(
-                        black_box(fixture.starts.view()),
-                        black_box(fixture.ends.view()),
-                        black_box(fixture.index.view()),
-                    )
-                })
-            });
-            group.bench_function(format!("old n={n} {workload}"), |b| {
-                b.iter(|| {
-                    old_size_rev_start_end(
-                        black_box(fixture.starts.view()),
-                        black_box(fixture.ends.view()),
-                        black_box(fixture.index.view()),
-                    )
-                })
-            });
-            if n <= 100_000 {
-                let compact = count_allocations(|| {
-                    size_rev_start_end_core(
-                        fixture.starts.view(),
-                        fixture.ends.view(),
-                        fixture.index.view(),
-                    )
-                });
-                let old = count_allocations(|| {
-                    old_size_rev_start_end(
-                        fixture.starts.view(),
-                        fixture.ends.view(),
-                        fixture.index.view(),
-                    )
-                });
-                eprintln!(
-                    "size_rev_start_end n={n:>7} {workload:>9}: compact {compact:?}; old {old:?}"
-                );
-            }
         }
     }
     group.finish();
@@ -1144,10 +796,6 @@ criterion_group!(
     bench_compare_start_end,
     bench_index_builders,
     bench_sum_kernels,
-    bench_sum_rev_start_end,
-    bench_min_rev_start_end,
-    bench_max_rev_start_end,
-    bench_prod_rev_start_end,
-    bench_size_rev_start_end
+    bench_max_positions
 );
 criterion_main!(benches);
