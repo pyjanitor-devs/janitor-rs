@@ -96,6 +96,11 @@ pub fn compute_size_rev_end_matches<'py>(
     let ends = ends.as_array();
     let index = index.as_array();
     let matches = matches.as_array();
+    if matches.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "matches cannot be empty",
+        ));
+    }
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
@@ -157,6 +162,11 @@ pub fn compute_size_rev_start_matches<'py>(
     if index.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "index cannot be empty",
+        ));
+    }
+    if matches.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "matches cannot be empty",
         ));
     }
     let expected_matches_width: usize = starts
