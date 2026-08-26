@@ -102,6 +102,11 @@ pub fn compute_size_rev_end_matches<'py>(
             "ends and index cannot be empty",
         ));
     }
+    if matches.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "matches cannot be empty",
+        ));
+    }
     let expected_matches_width = ends.iter().try_fold(0usize, |total, end| {
         let end = usize::try_from(*end)
             .map_err(|_| pyo3::exceptions::PyValueError::new_err("ends must be non-negative"))?;
