@@ -40,7 +40,10 @@ pub fn select_start_end_core<T: PartialOrd + Copy>(
     let right_len = right[0].len();
 
     for (left_position, (start, end)) in izip!(starts.iter(), ends.iter()).enumerate() {
-        if *start < 0 || *end == -1 || *start >= *end || *end > right_len as i64 {
+        // `end == -1` is already covered by `start >= end` after negative
+        // starts are rejected, so keeping a separate sentinel branch would
+        // duplicate this range check.
+        if *start < 0 || *start >= *end || *end > right_len as i64 {
             continue;
         }
         let mut selected: Option<i64> = None;
@@ -217,13 +220,13 @@ mod tests {
 
     #[test]
     fn skips_invalid_ranges_and_preserves_left_positions() {
-        let left_array = array![2_i64, 2, 2];
+        let left_array = array![2_i64, 2, 2, 2];
         let right_array = array![1_i64, 2, 3];
-        let starts_array = array![-1_i64, 0, 2];
-        let ends_array = array![2_i64, 2, 4];
+        let starts_array = array![-1_i64, 0, 2, 0];
+        let ends_array = array![2_i64, 2, 4, -1];
         let left = [left_array.view()];
         let right = [right_array.view()];
-        let left_index_array = array![10_i64, 20, 30];
+        let left_index_array = array![10_i64, 20, 30, 40];
         let right_index_array = array![0_i64, 1, 2];
         let left_index = left_index_array.view();
         let right_index = right_index_array.view();
