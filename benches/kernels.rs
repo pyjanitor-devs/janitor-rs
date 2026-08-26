@@ -493,10 +493,17 @@ struct DirectSelectionFixture {
 }
 
 impl DirectSelectionFixture {
-    fn new(left_len: usize, right_len: usize) -> Self {
+    fn with_range(
+        left_len: usize,
+        right_len: usize,
+        start: usize,
+        end: usize,
+        first_left: i64,
+        second_left: i64,
+    ) -> Self {
         let left = [
-            Array1::from_elem(left_len, (right_len / 2) as i64),
-            Array1::from_elem(left_len, (right_len / 2) as i64),
+            Array1::from_elem(left_len, first_left),
+            Array1::from_elem(left_len, second_left),
         ];
         let right = [
             Array1::from_iter(0..right_len as i64),
@@ -504,9 +511,9 @@ impl DirectSelectionFixture {
         ];
         let left_index = Array1::from_iter(0..left_len as i64);
         let right_index = Array1::from_iter((0..right_len as i64).rev());
-        let starts = Array1::zeros(left_len);
-        let ends = Array1::from_elem(left_len, right_len as i64);
-        let matches = Array1::from_elem(left_len * right_len, 1_i8);
+        let starts = Array1::from_elem(left_len, start as i64);
+        let ends = Array1::from_elem(left_len, end as i64);
+        let matches = Array1::from_elem(left_len * (end - start), 1_i8);
         DirectSelectionFixture {
             left,
             right,
@@ -525,80 +532,100 @@ impl DirectSelectionFixture {
 /// the candidate range is known to be ordered by `right_index`.
 fn bench_direct_selection(c: &mut Criterion) {
     let mut group = c.benchmark_group("direct_selection");
-    for left_len in [100, 1_000, 10_000] {
-        let f = DirectSelectionFixture::new(left_len, 1_000);
-        let tape_allocations = count_allocations(|| {
-            let (first, _, _) = compare_start_end_core(
-                f.left[0].view(),
-                f.right[0].view(),
-                f.starts.view(),
-                f.ends.view(),
-                f.matches.view(),
-                CompareOp::Ge,
+    let right_len = 1_000;
+    let midpoint = (right_len / 2) as i64;
+    let scenarios = [
+        ("full_dense", 0, right_len, midpoint, midpoint),
+        // A bounded range is typical after the anchor predicate has been
+        // applied and should expose the fixed per-row range-check overhead.
+        ("narrow_dense", 496, 504, 500, 500),
+        // The first predicate survives many candidates, but the second
+        // predicate eliminates every one; this stresses the no-survivor path.
+        ("full_zero", 0, right_len, midpoint, -1),
+    ];
+    for (scenario, start, end, first_left, second_left) in scenarios {
+        for left_len in [100, 1_000, 10_000, 100_000] {
+            let f = DirectSelectionFixture::with_range(
+                left_len,
+                right_len,
+                start,
+                end,
+                first_left,
+                second_left,
             );
-            compare_start_end_core(
-                f.left[1].view(),
-                f.right[1].view(),
-                f.starts.view(),
-                f.ends.view(),
-                first.view(),
-                CompareOp::Le,
-            )
-        });
-        let direct_allocations = count_allocations(|| {
-            let left = [f.left[0].view(), f.left[1].view()];
-            let right = [f.right[0].view(), f.right[1].view()];
-            select_start_end_core(
-                &left,
-                &right,
-                f.left_index.view(),
-                f.right_index.view(),
-                f.starts.view(),
-                f.ends.view(),
-                &[CompareOp::Ge, CompareOp::Le],
-                true,
-            )
-        });
-        eprintln!(
-            "direct_selection left={left_len}: tape bytes/calls/peak={tape_allocations:?}; direct bytes/calls/peak={direct_allocations:?}"
-        );
-        group.bench_function(format!("matches_tape left={left_len}"), |b| {
-            b.iter(|| {
+            let tape_allocations = count_allocations(|| {
                 let (first, _, _) = compare_start_end_core(
-                    black_box(f.left[0].view()),
-                    black_box(f.right[0].view()),
-                    black_box(f.starts.view()),
-                    black_box(f.ends.view()),
-                    black_box(f.matches.view()),
-                    black_box(CompareOp::Ge),
+                    f.left[0].view(),
+                    f.right[0].view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.matches.view(),
+                    CompareOp::Ge,
                 );
-                let (second, _, _) = compare_start_end_core(
-                    black_box(f.left[1].view()),
-                    black_box(f.right[1].view()),
-                    black_box(f.starts.view()),
-                    black_box(f.ends.view()),
-                    black_box(first.view()),
-                    black_box(CompareOp::Le),
-                );
-                black_box(second)
-            })
-        });
-        group.bench_function(format!("direct_first left={left_len}"), |b| {
-            b.iter(|| {
+                compare_start_end_core(
+                    f.left[1].view(),
+                    f.right[1].view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    first.view(),
+                    CompareOp::Le,
+                )
+            });
+            let direct_allocations = count_allocations(|| {
                 let left = [f.left[0].view(), f.left[1].view()];
                 let right = [f.right[0].view(), f.right[1].view()];
-                black_box(select_start_end_core(
-                    black_box(&left),
-                    black_box(&right),
-                    black_box(f.left_index.view()),
-                    black_box(f.right_index.view()),
-                    black_box(f.starts.view()),
-                    black_box(f.ends.view()),
-                    black_box(&[CompareOp::Ge, CompareOp::Le]),
+                select_start_end_core(
+                    &left,
+                    &right,
+                    f.left_index.view(),
+                    f.right_index.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    &[CompareOp::Ge, CompareOp::Le],
                     true,
-                ))
-            })
-        });
+                )
+            });
+            eprintln!(
+            "direct_selection {scenario} left={left_len}: tape bytes/calls/peak={tape_allocations:?}; direct bytes/calls/peak={direct_allocations:?}"
+        );
+            group.bench_function(format!("{scenario}/matches_tape left={left_len}"), |b| {
+                b.iter(|| {
+                    let (first, _, _) = compare_start_end_core(
+                        black_box(f.left[0].view()),
+                        black_box(f.right[0].view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.matches.view()),
+                        black_box(CompareOp::Ge),
+                    );
+                    let (second, _, _) = compare_start_end_core(
+                        black_box(f.left[1].view()),
+                        black_box(f.right[1].view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(first.view()),
+                        black_box(CompareOp::Le),
+                    );
+                    black_box(second)
+                })
+            });
+            group.bench_function(format!("{scenario}/direct_first left={left_len}"), |b| {
+                b.iter(|| {
+                    let left = [f.left[0].view(), f.left[1].view()];
+                    let right = [f.right[0].view(), f.right[1].view()];
+                    black_box(select_start_end_core(
+                        black_box(&left),
+                        black_box(&right),
+                        black_box(f.left_index.view()),
+                        black_box(f.right_index.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(&[CompareOp::Ge, CompareOp::Le]),
+                        true,
+                    ))
+                })
+            });
+        }
     }
     group.finish();
 }
