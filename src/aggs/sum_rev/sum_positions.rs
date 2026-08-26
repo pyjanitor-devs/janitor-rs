@@ -11,7 +11,8 @@ use std::collections::HashMap;
 /// ELI5: the HashMap stores only a small slot number for each label. The
 /// actual labels and totals live side-by-side in Vecs, so duplicate labels do
 /// not require a separate hash entry or a second lookup when producing the
-/// result.
+/// result. Integer totals use wrapping arithmetic, so overflow has the same
+/// deterministic result in debug and release builds.
 pub fn sum_positions_int_core<T, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
