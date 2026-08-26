@@ -363,6 +363,11 @@ pub fn compute_size_rev_positions<'py>(
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let positions = positions.as_array();
+    if starts.is_empty() || index.is_empty() || positions.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts, ends, index, and positions cannot be empty",
+        ));
+    }
     let (labels, counts) = size_positions_core(
         starts,
         ends,
