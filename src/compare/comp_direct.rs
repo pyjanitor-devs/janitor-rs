@@ -22,7 +22,19 @@ pub fn select_start_end_core<T: PartialOrd + Copy>(
     ends: numpy::ndarray::ArrayView1<'_, i64>,
     ops: &[CompareOp],
     first: bool,
-) -> (Vec<i64>, Vec<i64>) {
+) -> Result<(Vec<i64>, Vec<i64>), &'static str> {
+    if left.is_empty()
+        || left.len() != right.len()
+        || left.len() != ops.len()
+        || left_index.len() != left[0].len()
+        || starts.len() != left[0].len()
+        || ends.len() != left[0].len()
+        || left.iter().any(|array| array.len() != left[0].len())
+        || right.iter().any(|array| array.len() != right[0].len())
+        || right_index.len() != right[0].len()
+    {
+        return Err("direct selection inputs have inconsistent lengths");
+    }
     let mut left_indices = Vec::new();
     let mut right_indices = Vec::new();
     let right_len = right[0].len();
@@ -58,7 +70,7 @@ pub fn select_start_end_core<T: PartialOrd + Copy>(
             right_indices.push(candidate);
         }
     }
-    (left_indices, right_indices)
+    Ok((left_indices, right_indices))
 }
 
 macro_rules! generic_direct {
@@ -115,7 +127,8 @@ macro_rules! generic_direct {
                 ends.as_array(),
                 &ops,
                 first,
-            );
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok((
                 left_indices.into_pyarray(py),
                 right_indices.into_pyarray(py),
@@ -182,7 +195,8 @@ mod tests {
             ends,
             &ops,
             true,
-        );
+        )
+        .expect("valid direct-selection inputs");
         assert_eq!(first_left, vec![10, 20]);
         assert_eq!(first_right, vec![2, 2]);
 
@@ -195,7 +209,8 @@ mod tests {
             ends,
             &ops,
             false,
-        );
+        )
+        .expect("valid direct-selection inputs");
         assert_eq!(last_left, vec![10, 20]);
         assert_eq!(last_right, vec![58, 58]);
     }
@@ -225,8 +240,51 @@ mod tests {
             ends,
             &ops,
             true,
-        );
+        )
+        .expect("valid direct-selection inputs");
         assert_eq!(left_indices, vec![20]);
         assert_eq!(right_indices, vec![1]);
+    }
+
+    #[test]
+    fn valid_range_with_no_surviving_predicate_returns_no_rows() {
+        let left_array = array![100_i64];
+        let right_array = array![1_i64, 2, 3];
+        let result = select_start_end_core(
+            &[left_array.view()],
+            &[right_array.view()],
+            array![10_i64].view(),
+            array![20_i64, 30, 40].view(),
+            array![0_i64].view(),
+            array![3_i64].view(),
+            &[CompareOp::Eq],
+            true,
+        )
+        .expect("the valid candidate range should not error");
+
+        assert_eq!(result, (vec![], vec![]));
+    }
+
+    #[test]
+    fn core_rejects_mismatched_parallel_lengths() {
+        let left_array = array![2_i64];
+        let right_array = array![2_i64];
+        let left = [left_array.view()];
+        let right = [right_array.view()];
+        let result = select_start_end_core(
+            &left,
+            &right,
+            array![10_i64].view(),
+            array![20_i64].view(),
+            array![0_i64, 0].view(),
+            array![1_i64].view(),
+            &[CompareOp::Eq],
+            true,
+        );
+
+        assert_eq!(
+            result,
+            Err("direct selection inputs have inconsistent lengths")
+        );
     }
 }
