@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
     binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, repeat_index_core,
-    sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core,
-    CompareOp,
+    select_start_end_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
+    trim_index_core, CompareOp,
 };
 
 /// Counts bytes, calls, and outstanding (live) bytes allocated through the
@@ -478,6 +478,131 @@ fn bench_compare_start_end(c: &mut Criterion) {
     group.finish();
 }
 
+/// Inputs for comparing two-predicate matches-tape evaluation with direct
+/// first/last selection. The right index labels deliberately run in reverse
+/// order so direct selection must preserve original-row ordering rather than
+/// returning the first candidate encountered in the range.
+struct DirectSelectionFixture {
+    left: [Array1<i64>; 2],
+    right: [Array1<i64>; 2],
+    left_index: Array1<i64>,
+    right_index: Array1<i64>,
+    starts: Array1<i64>,
+    ends: Array1<i64>,
+    matches: Array1<i8>,
+}
+
+impl DirectSelectionFixture {
+    fn new(left_len: usize, right_len: usize) -> Self {
+        let left = [
+            Array1::from_elem(left_len, (right_len / 2) as i64),
+            Array1::from_elem(left_len, (right_len / 2) as i64),
+        ];
+        let right = [
+            Array1::from_iter(0..right_len as i64),
+            Array1::from_iter(0..right_len as i64),
+        ];
+        let left_index = Array1::from_iter(0..left_len as i64);
+        let right_index = Array1::from_iter((0..right_len as i64).rev());
+        let starts = Array1::zeros(left_len);
+        let ends = Array1::from_elem(left_len, right_len as i64);
+        let matches = Array1::from_elem(left_len * right_len, 1_i8);
+        DirectSelectionFixture {
+            left,
+            right,
+            left_index,
+            right_index,
+            starts,
+            ends,
+            matches,
+        }
+    }
+}
+
+/// Compare the current two-pass matches tape with direct selection. The
+/// benchmark intentionally measures the full candidate scan: original-row
+/// ordering means direct selection cannot stop at the first candidate unless
+/// the candidate range is known to be ordered by `right_index`.
+fn bench_direct_selection(c: &mut Criterion) {
+    let mut group = c.benchmark_group("direct_selection");
+    for left_len in [100, 1_000, 10_000] {
+        let f = DirectSelectionFixture::new(left_len, 1_000);
+        let tape_allocations = count_allocations(|| {
+            let (first, _, _) = compare_start_end_core(
+                f.left[0].view(),
+                f.right[0].view(),
+                f.starts.view(),
+                f.ends.view(),
+                f.matches.view(),
+                CompareOp::Ge,
+            );
+            compare_start_end_core(
+                f.left[1].view(),
+                f.right[1].view(),
+                f.starts.view(),
+                f.ends.view(),
+                first.view(),
+                CompareOp::Le,
+            )
+        });
+        let direct_allocations = count_allocations(|| {
+            let left = [f.left[0].view(), f.left[1].view()];
+            let right = [f.right[0].view(), f.right[1].view()];
+            select_start_end_core(
+                &left,
+                &right,
+                f.left_index.view(),
+                f.right_index.view(),
+                f.starts.view(),
+                f.ends.view(),
+                &[CompareOp::Ge, CompareOp::Le],
+                true,
+            )
+        });
+        eprintln!(
+            "direct_selection left={left_len}: tape bytes/calls/peak={tape_allocations:?}; direct bytes/calls/peak={direct_allocations:?}"
+        );
+        group.bench_function(format!("matches_tape left={left_len}"), |b| {
+            b.iter(|| {
+                let (first, _, _) = compare_start_end_core(
+                    black_box(f.left[0].view()),
+                    black_box(f.right[0].view()),
+                    black_box(f.starts.view()),
+                    black_box(f.ends.view()),
+                    black_box(f.matches.view()),
+                    black_box(CompareOp::Ge),
+                );
+                let (second, _, _) = compare_start_end_core(
+                    black_box(f.left[1].view()),
+                    black_box(f.right[1].view()),
+                    black_box(f.starts.view()),
+                    black_box(f.ends.view()),
+                    black_box(first.view()),
+                    black_box(CompareOp::Le),
+                );
+                black_box(second)
+            })
+        });
+        group.bench_function(format!("direct_first left={left_len}"), |b| {
+            b.iter(|| {
+                let left = [f.left[0].view(), f.left[1].view()];
+                let right = [f.right[0].view(), f.right[1].view()];
+                black_box(select_start_end_core(
+                    black_box(&left),
+                    black_box(&right),
+                    black_box(f.left_index.view()),
+                    black_box(f.right_index.view()),
+                    black_box(f.starts.view()),
+                    black_box(f.ends.view()),
+                    black_box(&[CompareOp::Ge, CompareOp::Le]),
+                    true,
+                ))
+            })
+        });
+    }
+    group.finish();
+}
+
 /// Inputs for `bench_index_builders`: an `index` array and a `counts`
 /// array of matching length, one entry per row.
 struct IndexBuilderFixture {
@@ -655,6 +780,7 @@ criterion_group!(
     bench_bin_search_first,
     bench_bin_search_first_old_vs_new,
     bench_compare_start_end,
+    bench_direct_selection,
     bench_index_builders,
     bench_sum_kernels
 );
