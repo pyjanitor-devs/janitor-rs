@@ -251,7 +251,7 @@ mod tests {
     use pyo3::Python;
 
     #[test]
-    fn accepts_zero_width_start_at_index_length() {
+    fn computes_zero_width_start_at_index_length() {
         assert_eq!(expected_matches_width(array![3_i64].view(), 3).unwrap(), 0);
     }
 
