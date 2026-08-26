@@ -112,6 +112,11 @@ pub fn trim_index_core(
 /// ELI5: the tree stores the best answer for every power-of-two-sized block.
 /// A query then combines only the few blocks that cover its interval instead
 /// of rereading every element in the interval.
+///
+/// The caller contract is strict: every query must be non-empty and inside
+/// `index`; one malformed row rejects the batch. Pyjanitor filters candidate
+/// ranges before calling this kernel, so this makes malformed direct calls
+/// fail loudly rather than silently changing output alignment.
 pub fn range_extreme_core(
     index: ArrayView1<i64>,
     starts: ArrayView1<i64>,
@@ -306,6 +311,46 @@ mod range_extreme_tests {
         let output = range_extreme_core(index, array![0_i64].view(), array![3_i64].view(), true)
             .expect("strided input is valid");
         assert_eq!(output, array![3]);
+    }
+
+    #[test]
+    fn covers_single_whole_and_power_of_two_ranges() {
+        let one = array![17_i64];
+        assert_eq!(
+            range_extreme_core(one.view(), array![0_i64].view(), array![1_i64].view(), true,),
+            Ok(array![17])
+        );
+
+        let power_of_two = array![8_i64, 3, 12, 1, 9, 4, 7, 2];
+        assert_eq!(
+            range_extreme_core(
+                power_of_two.view(),
+                array![0_i64, 3].view(),
+                array![8_i64, 4].view(),
+                true,
+            ),
+            Ok(array![1, 1])
+        );
+        assert_eq!(
+            range_extreme_core(
+                power_of_two.view(),
+                array![0_i64, 3].view(),
+                array![8_i64, 4].view(),
+                false,
+            ),
+            Ok(array![12, 1])
+        );
+
+        let non_power_of_two = array![6_i64, 4, 10, 2, 8, 1];
+        assert_eq!(
+            range_extreme_core(
+                non_power_of_two.view(),
+                array![0_i64, 5].view(),
+                array![6_i64, 6].view(),
+                true,
+            ),
+            Ok(array![1, 1])
+        );
     }
 }
 
