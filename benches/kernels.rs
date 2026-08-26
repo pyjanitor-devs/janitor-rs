@@ -23,9 +23,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
     binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, repeat_index_core,
-    sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core,
-    CompareOp,
+    size_positions_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
+    trim_index_core, CompareOp,
 };
+use std::collections::HashMap;
 
 /// Counts bytes, calls, and outstanding (live) bytes allocated through the
 /// global allocator, so `bench_bin_search_first` can report an allocation
@@ -649,6 +650,57 @@ fn bench_sum_kernels(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_size_positions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("size_positions_old_vs_compact");
+    for n in [32, 10_000, 100_000, 1_000_000] {
+        for duplicate in [true, false] {
+            const WIDTH: usize = 8;
+            let starts = Array1::from_iter((0..n).map(|i| (i * WIDTH) as i64));
+            let ends = Array1::from_iter((0..n).map(|i| ((i + 1) * WIDTH) as i64));
+            let index = Array1::from_iter(0..n as i64);
+            let positions = Array1::from_iter((0..n).flat_map(|i| {
+                (0..WIDTH).map(move |j| if duplicate { 0 } else { ((i + j) % n) as i64 })
+            }));
+            let old = || {
+                let mut map = HashMap::with_capacity(index.len().min(positions.len()));
+                for (start, end) in starts.iter().zip(ends.iter()) {
+                    for item in *start as usize..*end as usize {
+                        let total = map.entry(index[positions[item] as usize]).or_insert(0_i64);
+                        *total += 1;
+                    }
+                }
+                map
+            };
+            let kind = if duplicate { "duplicate" } else { "unique" };
+            let label = format!("n={n} {kind}");
+            let old_memory = count_allocations(old);
+            let compact_memory = count_allocations(|| {
+                size_positions_core(
+                    starts.view(),
+                    ends.view(),
+                    index.view(),
+                    positions.view(),
+                    index.len(),
+                )
+            });
+            eprintln!("size_positions {label}: old {old_memory:?}; compact {compact_memory:?}");
+            group.bench_function(format!("old {label}"), |b| b.iter(&old));
+            group.bench_function(format!("compact {label}"), |b| {
+                b.iter(|| {
+                    size_positions_core(
+                        black_box(starts.view()),
+                        black_box(ends.view()),
+                        black_box(index.view()),
+                        black_box(positions.view()),
+                        index.len(),
+                    )
+                })
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bin_search_lt,
@@ -656,6 +708,7 @@ criterion_group!(
     bench_bin_search_first_old_vs_new,
     bench_compare_start_end,
     bench_index_builders,
-    bench_sum_kernels
+    bench_sum_kernels,
+    bench_size_positions
 );
 criterion_main!(benches);
