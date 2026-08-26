@@ -10,6 +10,8 @@ use std::collections::HashMap;
 ///
 /// ELI5: the HashMap gives each label a compact slot, while labels and
 /// products live in Vecs. New labels start at the multiplicative identity 1.
+/// Integer products use wrapping arithmetic, so overflow has the same
+/// deterministic result in debug and release builds.
 pub fn prod_positions_int_core<T, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
