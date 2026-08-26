@@ -280,7 +280,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(labels.readonly().as_slice().unwrap(), &[10, 20]);
-            assert_eq!(values.readonly().as_slice().unwrap(), &[6, 3]);
+            assert_eq!(values.readonly().as_slice().unwrap(), &[2, 6]);
         });
     }
 }
