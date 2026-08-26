@@ -140,7 +140,6 @@ pub fn compute_size_rev_start_matches<'py>(
     starts: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
-    length: i64,
 ) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let index = index.as_array();
@@ -150,13 +149,38 @@ pub fn compute_size_rev_start_matches<'py>(
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
+    if starts.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts cannot be empty",
+        ));
+    }
+    if index.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "index cannot be empty",
+        ));
+    }
     let expected_matches_width: usize = starts
         .iter()
-        .map(|s| end_.saturating_sub(*s as usize))
-        .sum();
+        .map(|start| {
+            let start = usize::try_from(*start).map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err("starts must be non-negative")
+            })?;
+            if start >= end_ {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "starts must be less than index length",
+                ));
+            }
+            Ok(end_ - start)
+        })
+        .try_fold(0usize, |total, width| {
+            total.checked_add(width?).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("matches tape width overflow")
+            })
+        })?;
     ensure_tape_width(expected_matches_width, matches.len())?;
-    let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
+    let mut labels = Vec::new();
+    let mut counts = Vec::new();
     let mut n: usize = 0;
     for start in starts.into_iter() {
         let start_ = *start as usize;
@@ -166,19 +190,23 @@ pub fn compute_size_rev_start_matches<'py>(
                 continue;
             }
             let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
-            *total += 1;
+            let slot = if let Some(slot) = slots.get(&pos) {
+                *slot
+            } else {
+                let slot = counts.len();
+                slots.insert(pos, slot);
+                labels.push(pos);
+                counts.push(0_i64);
+                slot
+            };
+            counts[slot] += 1;
             n += 1;
         }
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
-    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+    Ok((
+        Array1::from_vec(labels).into_pyarray(py),
+        Array1::from_vec(counts).into_pyarray(py),
+    ))
 }
 
 #[pyfunction]
