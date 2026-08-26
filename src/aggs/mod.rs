@@ -1,3 +1,21 @@
+//! Reverse aggregation input contracts.
+//!
+//! The match-based kernels consume a flat candidate tape. `matches.len()` is
+//! the tape width (the sum of each row's candidate range), while
+//! `counts_array.sum()` describes how many candidates matched and therefore
+//! normally equals `matches.sum()`, not `matches.len()`. The producer,
+//! pyjanitor, owns the invariant that match values are 0 or 1; Rust validates
+//! the tape shape but deliberately does not scan every value.
+//!
+//! An empty `matches` tape is rejected by the Rust API. Pyjanitor handles the
+//! legitimate all-zero-width batch before crossing this boundary and returns
+//! the corresponding empty result. Individual zero-width rows remain valid
+//! when other rows make the overall tape non-empty.
+//!
+//! ELI5: the tape is a roll of tickets shared by all rows. Rust checks that
+//! the roll has the expected number of tickets, but pyjanitor decides which
+//! tickets say yes (1) or no (0). A completely empty roll is not sent to Rust.
+
 use pyo3::prelude::*;
 
 pub mod min;
@@ -106,6 +124,9 @@ pub(crate) fn ensure_tape_width(expected_width: usize, matches_len: usize) -> Py
 /// starts consuming it. The exact candidate-width check is performed
 /// separately by `ensure_exact_tape_width`.
 pub(crate) fn ensure_nonempty_matches(matches_len: usize) -> PyResult<()> {
+    // Keep this check separate from the width check: an all-zero-width batch
+    // is handled by pyjanitor, while a direct Rust caller must provide a real
+    // candidate tape. This makes the boundary contract explicit and cheap.
     if matches_len == 0 {
         return Err(PyValueError::new_err("matches cannot be empty"));
     }
