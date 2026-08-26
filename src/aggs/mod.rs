@@ -62,6 +62,30 @@ pub(crate) fn checked_range(start: i64, end: i64, len: usize) -> Option<(usize, 
     (start < end).then_some((start, end))
 }
 
+/// Validate an exclusive range supplied to a reverse aggregation kernel.
+///
+/// ELI5: malformed bounds are caller errors, but an equal start and end is a
+/// real empty range. Keeping that distinction lets callers skip empty work
+/// without turning a one-past-the-end boundary into an error.
+pub(crate) fn validate_range(
+    start: i64,
+    end: i64,
+    len: usize,
+) -> Result<Option<(usize, usize)>, &'static str> {
+    let start = usize::try_from(start).map_err(|_| "range bounds must be non-negative")?;
+    let end = usize::try_from(end).map_err(|_| "range bounds must be non-negative")?;
+    if start > len || end > len {
+        return Err("range bounds must not exceed right_index length");
+    }
+    if start > end {
+        return Err("range start must not exceed range end");
+    }
+    if start == end {
+        return Ok(None);
+    }
+    Ok(Some((start, end)))
+}
+
 /// Reject a flat `matches` tape too short for the candidate positions every
 /// row's `(start, end)` range implies it must cover.
 ///
