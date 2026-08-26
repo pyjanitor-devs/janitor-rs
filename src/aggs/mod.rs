@@ -238,7 +238,6 @@ mod adversarial_bounds_tests {
                     ends.readonly(),
                     index.readonly(),
                     booleans.readonly(),
-                    2,
                 )
                 .expect_err("reverse wrapper must reject unequal lengths");
                 assert!(error.is_instance_of::<PyValueError>(py));
@@ -249,7 +248,6 @@ mod adversarial_bounds_tests {
                     starts.readonly(),
                     ends.readonly(),
                     index.readonly(),
-                    2,
                 )
                 .expect_err("reverse-size wrapper must reject unequal lengths");
                 assert!(error.is_instance_of::<PyValueError>(py));
