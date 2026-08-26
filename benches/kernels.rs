@@ -17,16 +17,16 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use numpy::ndarray::{Array1, ArrayView1};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
-    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, repeat_index_core,
-    sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core,
-    CompareOp,
+    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, max_positions_core,
+    repeat_index_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
+    trim_index_core, CompareOp,
 };
+use std::collections::HashMap;
 
 /// Counts bytes, calls, and outstanding (live) bytes allocated through the
 /// global allocator, so `bench_bin_search_first` can report an allocation
@@ -650,253 +650,138 @@ fn bench_sum_kernels(c: &mut Criterion) {
     group.finish();
 }
 
-/// A linear-width fixture for measuring the cost of checking the matches
-/// values themselves. Each row visits at most four right-hand positions, so
-/// the very-large case remains practical while still exercising the same
-/// flat-tape cursor as the real reverse starts/ends/matches kernels.
-struct StartsEndsMatchesCheckFixture {
+struct MaxPositionsFixture {
     arr: Array1<i64>,
     starts: Array1<i64>,
     ends: Array1<i64>,
     index: Array1<i64>,
-    matches: Array1<i8>,
+    positions: Array1<i64>,
+    booleans: Array1<bool>,
 }
 
-impl StartsEndsMatchesCheckFixture {
-    fn new(n: usize, duplicate_labels: bool) -> Self {
-        let arr = Array1::from_iter((0..n).map(|i| (i % 17) as i64));
-        let starts = Array1::from_iter((0..n).map(|i| (i % n.max(1)) as i64));
-        let ends = Array1::from_iter((0..n).map(|i| {
-            let start = i % n.max(1);
-            (start + 4).min(n) as i64
+impl MaxPositionsFixture {
+    fn new(n: usize, duplicate: bool) -> Self {
+        const WIDTH: usize = 8;
+        let arr = Array1::from_iter((0..n).map(|i| i as i64));
+        let starts = Array1::from_iter((0..n).map(|i| (i * WIDTH) as i64));
+        let ends = Array1::from_iter((0..n).map(|i| ((i + 1) * WIDTH) as i64));
+        let index = Array1::from_iter(0..n as i64);
+        let positions = Array1::from_iter((0..n).flat_map(|i| {
+            (0..WIDTH).map(move |j| if duplicate { 0 } else { ((i + j) % n) as i64 })
         }));
-        let index = Array1::from_iter((0..n).map(|i| {
-            if duplicate_labels {
-                (i % 64) as i64
-            } else {
-                i as i64
-            }
-        }));
-        let width: usize = (0..n)
-            .map(|i| ((i % n.max(1)) + 4).min(n) - (i % n.max(1)))
-            .sum();
-        let matches = Array1::from_elem(width, 1_i8);
+        let booleans = Array1::from_elem(n, false);
         Self {
             arr,
             starts,
             ends,
             index,
-            matches,
+            positions,
+            booleans,
         }
     }
 }
 
-fn sum_starts_ends_matches_without_negative_check(fixture: &StartsEndsMatchesCheckFixture) -> i64 {
-    let mut sums = HashMap::<i64, i64>::new();
-    let mut tape = 0;
-    for (current, (start, end)) in fixture
-        .arr
+fn max_positions_old(
+    arr: ArrayView1<'_, i64>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    capacity: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut dictionary: HashMap<i64, (i64, i64)> =
+        HashMap::with_capacity(capacity.min(index.len()).min(positions.len()));
+    for (row, (((current, start), end), boolean)) in arr
         .iter()
-        .zip(fixture.starts.iter().zip(fixture.ends.iter()))
+        .zip(starts.iter())
+        .zip(ends.iter())
+        .zip(booleans.iter())
+        .enumerate()
     {
-        for item in (*start as usize)..(*end as usize) {
-            if fixture.matches[tape] == 0 {
-                tape += 1;
+        let Some(start) = usize::try_from(*start).ok() else {
+            continue;
+        };
+        let Some(end) = usize::try_from(*end).ok().filter(|&e| e <= positions.len()) else {
+            continue;
+        };
+        if start >= end {
+            continue;
+        }
+        for n in start..end {
+            let Some(pos) = usize::try_from(positions[n])
+                .ok()
+                .filter(|&p| p < index.len())
+            else {
                 continue;
-            }
-            *sums.entry(fixture.index[item]).or_insert(0) += *current;
-            tape += 1;
-        }
-    }
-    sums.values().sum()
-}
-
-fn sum_starts_ends_matches_with_negative_check(
-    fixture: &StartsEndsMatchesCheckFixture,
-) -> Result<i64, ()> {
-    let mut sums = HashMap::<i64, i64>::new();
-    let mut tape = 0;
-    for (current, (start, end)) in fixture
-        .arr
-        .iter()
-        .zip(fixture.starts.iter().zip(fixture.ends.iter()))
-    {
-        for item in (*start as usize)..(*end as usize) {
-            let match_value = fixture.matches[tape];
-            // ELI5: zero is a valid "no"; negative is malformed input. The
-            // benchmark measures whether this extra safety check costs more
-            // than it is worth in the hot candidate loop.
-            if match_value < 0 {
-                return Err(());
-            }
-            if match_value == 0 {
-                tape += 1;
-                continue;
-            }
-            *sums.entry(fixture.index[item]).or_insert(0) += *current;
-            tape += 1;
-        }
-    }
-    Ok(sums.values().sum())
-}
-
-/// Compare the current matches check with a negative-value guard at the
-/// actual candidate-loop cost. This deliberately keeps the HashMap and input
-/// shape identical, so the result answers only the validation-overhead
-/// question rather than conflating it with the compact-state optimization.
-fn bench_matches_negative_check(c: &mut Criterion) {
-    let mut group = c.benchmark_group("starts_ends_matches_negative_check");
-    for n in [32, 1_000, 10_000, 100_000] {
-        for duplicate_labels in [false, true] {
-            let label_kind = if duplicate_labels {
-                "duplicate"
-            } else {
-                "unique"
             };
-            let fixture = StartsEndsMatchesCheckFixture::new(n, duplicate_labels);
-            group.bench_function(format!("old n={n} labels={label_kind}"), |b| {
+            let entry = dictionary.entry(index[pos]).or_insert((-1, *current));
+            if !*boolean && (entry.0 == -1 || *current > entry.1) {
+                *entry = (row as i64, *current);
+            }
+        }
+    }
+    dictionary
+        .into_iter()
+        .map(|(label, (row, _))| (label, row))
+        .unzip()
+}
+
+fn bench_max_positions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("max_positions_old_vs_compact");
+    for n in [32, 10_000, 100_000, 1_000_000] {
+        for duplicate in [true, false] {
+            let f = MaxPositionsFixture::new(n, duplicate);
+            let kind = if duplicate { "duplicate" } else { "unique" };
+            let label = format!("n={n} {kind}");
+            let old = count_allocations(|| {
+                max_positions_old(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                )
+            });
+            let compact = count_allocations(|| {
+                max_positions_core(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                )
+            });
+            eprintln!("max_positions {label}: old {old:?}; compact {compact:?}");
+            group.bench_function(format!("old {label}"), |b| {
                 b.iter(|| {
-                    black_box(sum_starts_ends_matches_without_negative_check(black_box(
-                        &fixture,
-                    )))
+                    max_positions_old(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
+                    )
                 })
             });
-            group.bench_function(format!("negative_check n={n} labels={label_kind}"), |b| {
+            group.bench_function(format!("compact {label}"), |b| {
                 b.iter(|| {
-                    black_box(sum_starts_ends_matches_with_negative_check(black_box(
-                        &fixture,
-                    )))
+                    max_positions_core(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
+                    )
                 })
-            });
-        }
-    }
-    group.finish();
-}
-
-fn scan_matches_without_negative_check(matches: ArrayView1<'_, i8>) -> i64 {
-    let mut total = 0_i64;
-    for value in matches {
-        if *value != 0 {
-            total += 1;
-        }
-    }
-    total
-}
-
-fn scan_matches_with_negative_check(matches: ArrayView1<'_, i8>) -> Result<i64, ()> {
-    let mut total = 0_i64;
-    for value in matches {
-        if *value < 0 {
-            return Err(());
-        }
-        if *value != 0 {
-            total += 1;
-        }
-    }
-    Ok(total)
-}
-
-/// Isolate the negative-check branch from HashMap work. This is the cleanest
-/// measurement of the validation cost itself; the full aggregation benchmark
-/// above remains the realistic end-to-end check.
-fn bench_matches_check_only(c: &mut Criterion) {
-    let mut group = c.benchmark_group("matches_negative_check_only");
-    for n in [32, 1_000, 10_000, 100_000] {
-        let matches = Array1::from_elem(n, 1_i8);
-        group.bench_function(format!("old n={n}"), |b| {
-            b.iter(|| scan_matches_without_negative_check(black_box(matches.view())))
-        });
-        group.bench_function(format!("negative_check n={n}"), |b| {
-            b.iter(|| scan_matches_with_negative_check(black_box(matches.view())))
-        });
-    }
-    group.finish();
-}
-
-fn range_width_without_strict_validation(fixture: &StartsEndsMatchesCheckFixture) -> usize {
-    fixture
-        .starts
-        .iter()
-        .zip(fixture.ends.iter())
-        .map(|(start, end)| (*end as usize).saturating_sub(*start as usize))
-        .sum()
-}
-
-fn range_width_with_strict_validation(
-    fixture: &StartsEndsMatchesCheckFixture,
-) -> Result<usize, ()> {
-    let right_len = fixture.index.len() as i64;
-    let mut width = 0_usize;
-    for (start, end) in fixture.starts.iter().zip(fixture.ends.iter()) {
-        if *start < 0 || *end < 0 || *start > *end || *end > right_len {
-            return Err(());
-        }
-        width = width.saturating_add((*end as usize) - (*start as usize));
-    }
-    Ok(width)
-}
-
-fn sum_with_width_pass(fixture: &StartsEndsMatchesCheckFixture) -> i64 {
-    black_box(range_width_without_strict_validation(fixture));
-    sum_starts_ends_matches_without_negative_check(fixture)
-}
-
-fn sum_with_strict_width_pass(fixture: &StartsEndsMatchesCheckFixture) -> Result<i64, ()> {
-    black_box(range_width_with_strict_validation(fixture)?);
-    Ok(sum_starts_ends_matches_without_negative_check(fixture))
-}
-
-/// Compare the complete aggregation cost with and without the necessary
-/// O(rows) range/tape-width pass. The validation pass allocates no state; the
-/// allocation report verifies that its memory cost is zero beyond the shared
-/// aggregation allocations.
-fn bench_range_validation_cost(c: &mut Criterion) {
-    eprintln!("\nstarts_ends_matches range validation allocation report (bytes / allocs / peak):");
-    for n in [32, 1_000, 10_000, 100_000] {
-        for duplicate_labels in [false, true] {
-            let label_kind = if duplicate_labels {
-                "duplicate"
-            } else {
-                "unique"
-            };
-            let fixture = StartsEndsMatchesCheckFixture::new(n, duplicate_labels);
-            let (bytes, calls, peak) =
-                count_allocations(|| sum_starts_ends_matches_without_negative_check(&fixture));
-            eprintln!(
-                "  baseline n={n:>6} labels={label_kind:<9}: {bytes:>9} bytes / {calls:>3} allocs / {peak:>9} peak"
-            );
-            let (bytes, calls, peak) = count_allocations(|| sum_with_width_pass(&fixture));
-            eprintln!(
-                "  width    n={n:>6} labels={label_kind:<9}: {bytes:>9} bytes / {calls:>3} allocs / {peak:>9} peak"
-            );
-            let (bytes, calls, peak) = count_allocations(|| sum_with_strict_width_pass(&fixture));
-            eprintln!(
-                "  strict   n={n:>6} labels={label_kind:<9}: {bytes:>9} bytes / {calls:>3} allocs / {peak:>9} peak"
-            );
-        }
-    }
-
-    let mut group = c.benchmark_group("starts_ends_matches_range_validation");
-    for n in [32, 1_000, 10_000, 100_000] {
-        for duplicate_labels in [false, true] {
-            let label_kind = if duplicate_labels {
-                "duplicate"
-            } else {
-                "unique"
-            };
-            let fixture = StartsEndsMatchesCheckFixture::new(n, duplicate_labels);
-            group.bench_function(format!("baseline n={n} labels={label_kind}"), |b| {
-                b.iter(|| {
-                    black_box(sum_starts_ends_matches_without_negative_check(black_box(
-                        &fixture,
-                    )))
-                })
-            });
-            group.bench_function(format!("width n={n} labels={label_kind}"), |b| {
-                b.iter(|| black_box(sum_with_width_pass(black_box(&fixture))))
-            });
-            group.bench_function(format!("strict n={n} labels={label_kind}"), |b| {
-                b.iter(|| black_box(sum_with_strict_width_pass(black_box(&fixture))))
             });
         }
     }
@@ -911,8 +796,6 @@ criterion_group!(
     bench_compare_start_end,
     bench_index_builders,
     bench_sum_kernels,
-    bench_matches_negative_check,
-    bench_matches_check_only,
-    bench_range_validation_cost
+    bench_max_positions
 );
 criterion_main!(benches);
