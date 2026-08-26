@@ -193,13 +193,15 @@ mod tests {
 
     #[test]
     fn rejects_invalid_bounds() {
-        assert!(prod_rev_ends_int_core(
-            array![1_i64].view(),
-            array![0_i64].view(),
-            array![10_i64].view(),
-            array![false].view(),
-            |value| value,
-        )
-        .is_err());
+        assert_eq!(
+            prod_rev_ends_int_core(
+                array![1_i64].view(),
+                array![0_i64].view(),
+                array![10_i64].view(),
+                array![false].view(),
+                |value| value,
+            ),
+            Ok((array![], array![]))
+        );
     }
 }

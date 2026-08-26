@@ -18,12 +18,12 @@ fn size_rev_ends_core(
     }
     if ends.iter().any(|end| {
         usize::try_from(*end)
-            .map(|end| end == 0 || end > index.len())
+            .map(|end| end > index.len())
             .unwrap_or(true)
     }) {
-        return Err("ends must satisfy 0 < end <= right_len");
+        return Err("ends must satisfy 0 <= end <= right_len");
     }
-    let max_end = ends.iter().copied().max().unwrap() as usize;
+    let max_end = ends.iter().copied().max().unwrap_or(0) as usize;
     let mut result = vec![0_i64; max_end];
     for end in ends {
         for value in result.iter_mut().take(*end as usize) {
@@ -43,10 +43,10 @@ fn size_rev_starts_core(
     }
     if starts.iter().any(|start| {
         usize::try_from(*start)
-            .map(|start| start >= index.len())
+            .map(|start| start > index.len())
             .unwrap_or(true)
     }) {
-        return Err("starts must satisfy 0 <= start < right_len");
+        return Err("starts must satisfy 0 <= start <= right_len");
     }
     let min_start = starts.iter().copied().min().unwrap() as usize;
     let mut result = vec![0_i64; index.len() - min_start];
@@ -291,7 +291,10 @@ mod tests {
     #[test]
     fn rejects_empty_and_invalid_boundaries() {
         let index = array![10_i64];
-        assert!(size_rev_ends_core(array![0_i64].view(), index.view()).is_err());
+        assert_eq!(
+            size_rev_ends_core(array![0_i64].view(), index.view()),
+            Ok((array![], array![]))
+        );
         assert!(size_rev_starts_core(array![-1_i64].view(), index.view()).is_err());
         assert!(size_rev_ends_core(array![1_i64].view(), array![].view()).is_err());
     }

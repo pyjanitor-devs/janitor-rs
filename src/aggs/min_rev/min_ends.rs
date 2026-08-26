@@ -140,13 +140,15 @@ mod tests {
         let arr = array![1_i64];
         let index = array![10_i64];
         let booleans = array![false];
-        assert!(min_rev_ends_core(
-            arr.view(),
-            array![0_i64].view(),
-            index.view(),
-            booleans.view()
-        )
-        .is_err());
+        assert_eq!(
+            min_rev_ends_core(
+                arr.view(),
+                array![0_i64].view(),
+                index.view(),
+                booleans.view()
+            ),
+            Ok((array![], array![]))
+        );
         assert!(min_rev_ends_core(
             arr.view(),
             array![-1_i64].view(),

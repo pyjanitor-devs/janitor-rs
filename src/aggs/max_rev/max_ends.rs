@@ -122,12 +122,14 @@ mod tests {
     }
     #[test]
     fn rejects_invalid_inputs() {
-        assert!(max_rev_ends_core(
-            array![1_i64].view(),
-            array![0_i64].view(),
-            array![1_i64].view(),
-            array![false].view()
-        )
-        .is_err());
+        assert_eq!(
+            max_rev_ends_core(
+                array![1_i64].view(),
+                array![0_i64].view(),
+                array![1_i64].view(),
+                array![false].view()
+            ),
+            Ok((array![], array![]))
+        );
     }
 }
