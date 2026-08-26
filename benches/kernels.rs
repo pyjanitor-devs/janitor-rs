@@ -15,17 +15,18 @@
 //! isolation.
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use numpy::ndarray::{s, Array1, ArrayView1};
+use numpy::ndarray::{Array1, ArrayView1};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
-    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, range_extreme_core,
+    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, max_positions_core,
     repeat_index_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
     trim_index_core, CompareOp,
 };
+use std::collections::HashMap;
 
 /// Counts bytes, calls, and outstanding (live) bytes allocated through the
 /// global allocator, so `bench_bin_search_first` can report an allocation
@@ -649,86 +650,139 @@ fn bench_sum_kernels(c: &mut Criterion) {
     group.finish();
 }
 
-/// Baseline equivalent of the Python implementation: scan every candidate
-/// interval independently. The benchmark deliberately uses the same
-/// unsorted original labels and interval shapes as the Python baseline.
-fn range_extreme_loop(
-    index: ArrayView1<i64>,
-    starts: ArrayView1<i64>,
-    ends: ArrayView1<i64>,
-    find_min: bool,
-) -> Array1<i64> {
-    Array1::from_iter(starts.iter().zip(ends.iter()).map(|(start, end)| {
-        let values = index.slice(s![*start as usize..*end as usize]);
-        if find_min {
-            values.iter().copied().min().unwrap()
-        } else {
-            values.iter().copied().max().unwrap()
-        }
-    }))
-}
-
-/// Candidate intervals for the range-RMQ comparison. Width is fixed while
-/// `n` grows so the baseline remains an honest O(number of queries * width)
-/// workload rather than accidentally becoming quadratic.
-struct RangeExtremeFixture {
-    index: Array1<i64>,
+struct MaxPositionsFixture {
+    arr: Array1<i64>,
     starts: Array1<i64>,
     ends: Array1<i64>,
+    index: Array1<i64>,
+    positions: Array1<i64>,
+    booleans: Array1<bool>,
 }
 
-impl RangeExtremeFixture {
-    fn new(n: usize, width: usize, overlapping: bool) -> Self {
-        let index = Array1::from_iter((0..n as i64).map(|value| n as i64 - value));
-        let query_count = if overlapping { n } else { n / width };
-        let starts = if overlapping {
-            Array1::from_iter((0..query_count).map(|row| (row % (n - width + 1)) as i64))
-        } else {
-            Array1::from_iter((0..query_count).map(|row| (row * width) as i64))
-        };
-        let ends = &starts + width as i64;
+impl MaxPositionsFixture {
+    fn new(n: usize, duplicate: bool) -> Self {
+        const WIDTH: usize = 8;
+        let arr = Array1::from_iter((0..n).map(|i| i as i64));
+        let starts = Array1::from_iter((0..n).map(|i| (i * WIDTH) as i64));
+        let ends = Array1::from_iter((0..n).map(|i| ((i + 1) * WIDTH) as i64));
+        let index = Array1::from_iter(0..n as i64);
+        let positions = Array1::from_iter((0..n).flat_map(|i| {
+            (0..WIDTH).map(move |j| if duplicate { 0 } else { ((i + j) % n) as i64 })
+        }));
+        let booleans = Array1::from_elem(n, false);
         Self {
-            index,
+            arr,
             starts,
             ends,
+            index,
+            positions,
+            booleans,
         }
     }
 }
 
-fn bench_range_extreme(c: &mut Criterion) {
-    let mut group = c.benchmark_group("range_extreme");
-    group.sample_size(20);
-    for n in [1_000, 100_000, 1_000_000] {
-        for width in [8, 64, 512] {
-            if width >= n {
+fn max_positions_old(
+    arr: ArrayView1<'_, i64>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    capacity: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut dictionary: HashMap<i64, (i64, i64)> =
+        HashMap::with_capacity(capacity.min(index.len()).min(positions.len()));
+    for (row, (((current, start), end), boolean)) in arr
+        .iter()
+        .zip(starts.iter())
+        .zip(ends.iter())
+        .zip(booleans.iter())
+        .enumerate()
+    {
+        let Some(start) = usize::try_from(*start).ok() else {
+            continue;
+        };
+        let Some(end) = usize::try_from(*end).ok().filter(|&e| e <= positions.len()) else {
+            continue;
+        };
+        if start >= end {
+            continue;
+        }
+        for n in start..end {
+            let Some(pos) = usize::try_from(positions[n])
+                .ok()
+                .filter(|&p| p < index.len())
+            else {
                 continue;
+            };
+            let entry = dictionary.entry(index[pos]).or_insert((-1, *current));
+            if !*boolean && (entry.0 == -1 || *current > entry.1) {
+                *entry = (row as i64, *current);
             }
-            for overlapping in [false, true] {
-                let fixture = RangeExtremeFixture::new(n, width, overlapping);
-                let shape = if overlapping { "overlap" } else { "nonoverlap" };
-                let label = format!("loop n={n} width={width} {shape}");
-                group.bench_function(label, |b| {
-                    b.iter(|| {
-                        range_extreme_loop(
-                            black_box(fixture.index.view()),
-                            black_box(fixture.starts.view()),
-                            black_box(fixture.ends.view()),
-                            true,
-                        )
-                    })
-                });
-                let label = format!("tree n={n} width={width} {shape}");
-                group.bench_function(label, |b| {
-                    b.iter(|| {
-                        range_extreme_core(
-                            black_box(fixture.index.view()),
-                            black_box(fixture.starts.view()),
-                            black_box(fixture.ends.view()),
-                            true,
-                        )
-                    })
-                });
-            }
+        }
+    }
+    dictionary
+        .into_iter()
+        .map(|(label, (row, _))| (label, row))
+        .unzip()
+}
+
+fn bench_max_positions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("max_positions_old_vs_compact");
+    for n in [32, 10_000, 100_000, 1_000_000] {
+        for duplicate in [true, false] {
+            let f = MaxPositionsFixture::new(n, duplicate);
+            let kind = if duplicate { "duplicate" } else { "unique" };
+            let label = format!("n={n} {kind}");
+            let old = count_allocations(|| {
+                max_positions_old(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                )
+            });
+            let compact = count_allocations(|| {
+                max_positions_core(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                )
+            });
+            eprintln!("max_positions {label}: old {old:?}; compact {compact:?}");
+            group.bench_function(format!("old {label}"), |b| {
+                b.iter(|| {
+                    max_positions_old(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
+                    )
+                })
+            });
+            group.bench_function(format!("compact {label}"), |b| {
+                b.iter(|| {
+                    max_positions_core(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
+                    )
+                })
+            });
         }
     }
     group.finish();
@@ -742,6 +796,6 @@ criterion_group!(
     bench_compare_start_end,
     bench_index_builders,
     bench_sum_kernels,
-    bench_range_extreme
+    bench_max_positions
 );
 criterion_main!(benches);
