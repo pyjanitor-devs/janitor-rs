@@ -157,6 +157,11 @@ macro_rules! compute_ints {
             let positions = positions.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
+            if arr.is_empty() || index.is_empty() || positions.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "arr, starts, ends, booleans, index, and positions cannot be empty",
+                ));
+            }
             let (labels, totals) = sum_positions_int_core(
                 arr,
                 starts,
