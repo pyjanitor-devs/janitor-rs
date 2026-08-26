@@ -64,6 +64,11 @@ macro_rules! compute_ints {
                     "index cannot be empty",
                 ));
             }
+            if matches.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "matches cannot be empty",
+                ));
+            }
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
@@ -166,6 +171,11 @@ macro_rules! compute_floats {
             if index.is_empty() {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "index cannot be empty",
+                ));
+            }
+            if matches.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "matches cannot be empty",
                 ));
             }
             // ELI5: `matches[n]` advances once per candidate position, summed
