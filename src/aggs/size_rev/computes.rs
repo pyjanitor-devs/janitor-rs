@@ -165,7 +165,7 @@ pub fn compute_size_rev_start_matches<'py>(
             let start = usize::try_from(*start).map_err(|_| {
                 pyo3::exceptions::PyValueError::new_err("starts must be non-negative")
             })?;
-            if start >= end_ {
+            if start > end_ {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "starts must be less than index length",
                 ));
@@ -179,8 +179,8 @@ pub fn compute_size_rev_start_matches<'py>(
         })?;
     ensure_tape_width(expected_matches_width, matches.len())?;
     let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
-    let mut labels = Vec::new();
-    let mut counts = Vec::new();
+    let mut labels = Vec::with_capacity(end_);
+    let mut counts = Vec::with_capacity(end_);
     let mut n: usize = 0;
     for start in starts.into_iter() {
         let start_ = *start as usize;
@@ -302,6 +302,8 @@ pub fn compute_size_rev_start_end<'py>(
 mod tests {
     use super::*;
     use numpy::ndarray::array;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
 
     #[test]
     fn counts_prefixes_and_suffixes_in_compact_slots() {
@@ -322,6 +324,25 @@ mod tests {
         assert!(size_rev_ends_core(array![0_i64].view(), index.view()).is_err());
         assert!(size_rev_starts_core(array![-1_i64].view(), index.view()).is_err());
         assert!(size_rev_ends_core(array![1_i64].view(), array![].view()).is_err());
+    }
+
+    #[test]
+    fn matches_kernel_accepts_zero_width_suffix() {
+        Python::initialize();
+        Python::attach(|py| {
+            let starts = PyArray1::from_vec(py, vec![3_i64]);
+            let index = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
+            let matches = PyArray1::from_vec(py, Vec::<i8>::new());
+            let (labels, counts) = compute_size_rev_start_matches(
+                py,
+                starts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+            )
+            .expect("a start at index.len() is a zero-width suffix");
+            assert!(labels.readonly().as_slice().unwrap().is_empty());
+            assert!(counts.readonly().as_slice().unwrap().is_empty());
+        });
     }
 }
 
