@@ -165,6 +165,10 @@ mod tests {
     fn integer_kernel_preserves_label_order_and_min_rows() {
         Python::initialize();
         Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
             let arr = PyArray1::from_vec(py, vec![2_i64, 3, 4]);
             let starts = PyArray1::from_vec(py, vec![0_i64, 1, 2]);
             let counts = PyArray1::from_vec(py, vec![1_i64, 1, 0]);
