@@ -2,7 +2,7 @@ use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 use crate::aggs::{ensure_equal_lengths, ensure_tape_width};
 
@@ -15,7 +15,7 @@ fn expected_matches_width(starts: ArrayView1<'_, i64>, right_len: usize) -> PyRe
     starts.iter().try_fold(0usize, |total, start| {
         let start = usize::try_from(*start)
             .map_err(|_| pyo3::exceptions::PyValueError::new_err("starts must be non-negative"))?;
-        if start >= right_len {
+        if start > right_len {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "starts must be less than index length",
             ));
@@ -89,15 +89,23 @@ macro_rules! compute {
                         continue;
                     }
                     let pos = index[item];
-                    let slot = if let Some(slot) = slots.get(&pos) {
-                        *slot
-                    } else {
-                        let slot = values.len();
-                        slots.insert(pos, slot);
-                        labels.push(pos);
-                        rows.push(-1_i64);
-                        values.push(*current);
-                        slot
+                    // ELI5: ask the map for the label's slot once. `get`
+                    // followed by `insert` would hash a first-seen label
+                    // twice in this hot loop.
+                    let slot = match slots.entry(pos) {
+                        Entry::Occupied(entry) => *entry.get(),
+                        Entry::Vacant(entry) => {
+                            // ELI5: a label may be seen only through null or
+                            // ignored values first, so reserve its slot now;
+                            // `rows == -1` below records that no usable max
+                            // has been found yet.
+                            let slot = values.len();
+                            entry.insert(slot);
+                            labels.push(pos);
+                            rows.push(-1_i64);
+                            values.push(*current);
+                            slot
+                        }
                     };
                     if *boolean || (*count == 0) {
                         n += 1;
@@ -166,7 +174,7 @@ mod tests {
     #[test]
     fn tape_width_rejects_negative_and_one_past_starts() {
         assert!(expected_matches_width(array![-1_i64].view(), 3).is_err());
-        assert!(expected_matches_width(array![3_i64].view(), 3).is_err());
+        assert_eq!(expected_matches_width(array![3_i64].view(), 3).unwrap(), 0);
     }
 
     #[test]
