@@ -113,10 +113,13 @@ pub fn trim_index_core(
 /// A query then combines only the few blocks that cover its interval instead
 /// of rereading every element in the interval.
 ///
-/// The caller contract is strict: every query must be non-empty and inside
-/// `index`; one malformed row rejects the batch. Pyjanitor filters candidate
-/// ranges before calling this kernel, so this makes malformed direct calls
-/// fail loudly rather than silently changing output alignment.
+/// The caller contract is strict once queries are present: every query must be
+/// a non-empty, in-bounds half-open range satisfying
+/// `0 <= start < end <= index.len()`. An empty batch (`starts` and `ends` both
+/// empty) returns an empty result. Any empty or malformed query in a
+/// non-empty batch rejects the entire batch. Pyjanitor filters candidate
+/// ranges before calling this kernel, so malformed direct calls fail loudly
+/// rather than silently changing output alignment.
 pub fn range_extreme_core(
     index: ArrayView1<i64>,
     starts: ArrayView1<i64>,
