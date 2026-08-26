@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_kernel_accepts_zero_width_suffix() {
+    fn matches_kernel_rejects_empty_tape_for_zero_width_suffix() {
         Python::initialize();
         Python::attach(|py| {
             if py.import("numpy").is_err() {
@@ -347,15 +347,13 @@ mod tests {
             let starts = PyArray1::from_vec(py, vec![3_i64]);
             let index = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
             let matches = PyArray1::from_vec(py, Vec::<i8>::new());
-            let (labels, counts) = compute_size_rev_start_matches(
+            let result = compute_size_rev_start_matches(
                 py,
                 starts.readonly(),
                 index.readonly(),
                 matches.readonly(),
-            )
-            .expect("a start at index.len() is a zero-width suffix");
-            assert!(labels.readonly().as_slice().unwrap().is_empty());
-            assert!(counts.readonly().as_slice().unwrap().is_empty());
+            );
+            assert!(result.is_err(), "an empty matches tape must be rejected");
         });
     }
 }
