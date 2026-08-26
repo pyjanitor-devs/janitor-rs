@@ -540,8 +540,10 @@ fn bench_direct_selection(c: &mut Criterion) {
         // applied and should expose the fixed per-row range-check overhead.
         ("narrow_dense", 496, 504, 500, 500),
         // The first predicate survives many candidates, but the second
-        // predicate eliminates every one; this stresses the no-survivor path.
-        ("full_zero", 0, right_len, midpoint, -1),
+        // predicate eliminates every one: `right_len <= right_value` is
+        // false for every value in `0..right_len`. This stresses the
+        // no-survivor path without relying on an invalid candidate range.
+        ("full_zero", 0, right_len, midpoint, right_len as i64),
     ];
     for (scenario, start, end, first_left, second_left) in scenarios {
         for left_len in [100, 1_000, 10_000, 100_000] {
@@ -562,14 +564,19 @@ fn bench_direct_selection(c: &mut Criterion) {
                     f.matches.view(),
                     CompareOp::Ge,
                 );
-                compare_start_end_core(
+                let second = compare_start_end_core(
                     f.left[1].view(),
                     f.right[1].view(),
                     f.starts.view(),
                     f.ends.view(),
                     first.view(),
                     CompareOp::Le,
-                )
+                );
+                if scenario == "full_zero" {
+                    assert!(second.1.iter().all(|value| *value == 0));
+                    assert_eq!(second.2, 0);
+                }
+                second
             });
             let direct_allocations = count_allocations(|| {
                 let left = [f.left[0].view(), f.left[1].view()];
