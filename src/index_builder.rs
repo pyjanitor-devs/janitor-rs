@@ -107,6 +107,208 @@ pub fn trim_index_core(
     result
 }
 
+/// Answer arbitrary half-open range minimum/maximum queries over `index`.
+///
+/// ELI5: the tree stores the best answer for every power-of-two-sized block.
+/// A query then combines only the few blocks that cover its interval instead
+/// of rereading every element in the interval.
+pub fn range_extreme_core(
+    index: ArrayView1<i64>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    find_min: bool,
+) -> Result<Array1<i64>, &'static str> {
+    if starts.len() != ends.len() {
+        return Err("starts and ends must have equal lengths");
+    }
+    if starts.is_empty() {
+        return Ok(Array1::zeros(0));
+    }
+    if index.is_empty() {
+        return Err("index cannot be empty when ranges are present");
+    }
+
+    let tree_size = index.len().next_power_of_two();
+    let identity = if find_min { i64::MAX } else { i64::MIN };
+    let mut tree = vec![identity; tree_size * 2];
+    for (slot, value) in tree[tree_size..tree_size + index.len()]
+        .iter_mut()
+        .zip(index.iter())
+    {
+        *slot = *value;
+    }
+    for node in (1..tree_size).rev() {
+        tree[node] = if find_min {
+            tree[node * 2].min(tree[node * 2 + 1])
+        } else {
+            tree[node * 2].max(tree[node * 2 + 1])
+        };
+    }
+
+    let mut result = Array1::<i64>::zeros(starts.len());
+    for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        let Some((start, end)) = checked_range_or_none(*start, *end, index.len()) else {
+            return Err("ranges must be non-empty and within index");
+        };
+        if start == end {
+            return Err("ranges must be non-empty and within index");
+        }
+        let mut left = start + tree_size;
+        let mut right = end + tree_size;
+        let mut best = identity;
+        while left < right {
+            if left % 2 == 1 {
+                best = if find_min {
+                    best.min(tree[left])
+                } else {
+                    best.max(tree[left])
+                };
+                left += 1;
+            }
+            if right % 2 == 1 {
+                right -= 1;
+                best = if find_min {
+                    best.min(tree[right])
+                } else {
+                    best.max(tree[right])
+                };
+            }
+            left /= 2;
+            right /= 2;
+        }
+        result[row] = best;
+    }
+    Ok(result)
+}
+
+/// Select the smallest original right-row index in each candidate range.
+#[pyfunction]
+#[pyo3(signature = (*, index, starts, ends))]
+pub fn index_starts_and_ends_keep_first_direct<'py>(
+    py: Python<'py>,
+    index: PyReadonlyArray1<'py, i64>,
+    starts: PyReadonlyArray1<'py, i64>,
+    ends: PyReadonlyArray1<'py, i64>,
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let result = range_extreme_core(index.as_array(), starts.as_array(), ends.as_array(), true)
+        .map_err(PyValueError::new_err)?;
+    Ok(result.into_pyarray(py))
+}
+
+/// Select the largest original right-row index in each candidate range.
+#[pyfunction]
+#[pyo3(signature = (*, index, starts, ends))]
+pub fn index_starts_and_ends_keep_last_direct<'py>(
+    py: Python<'py>,
+    index: PyReadonlyArray1<'py, i64>,
+    starts: PyReadonlyArray1<'py, i64>,
+    ends: PyReadonlyArray1<'py, i64>,
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let result = range_extreme_core(index.as_array(), starts.as_array(), ends.as_array(), false)
+        .map_err(PyValueError::new_err)?;
+    Ok(result.into_pyarray(py))
+}
+
+#[cfg(test)]
+mod range_extreme_tests {
+    use super::range_extreme_core;
+    use numpy::ndarray::{array, s};
+
+    #[test]
+    fn selects_minimum_and_maximum_original_labels() {
+        let index = array![24_i64, 58, 2, 13, 91, 7];
+        let starts = array![0_i64, 1, 2];
+        let ends = array![2_i64, 5, 6];
+
+        assert_eq!(
+            range_extreme_core(index.view(), starts.view(), ends.view(), true),
+            Ok(array![24, 2, 2])
+        );
+        assert_eq!(
+            range_extreme_core(index.view(), starts.view(), ends.view(), false),
+            Ok(array![58, 91, 91])
+        );
+    }
+
+    #[test]
+    fn handles_overlapping_disjoint_and_duplicate_label_ranges() {
+        let index = array![40_i64, 40, 12, 90, 3, 70];
+        let starts = array![0_i64, 2, 4];
+        let ends = array![3_i64, 5, 6];
+
+        assert_eq!(
+            range_extreme_core(index.view(), starts.view(), ends.view(), true),
+            Ok(array![12, 3, 3])
+        );
+        assert_eq!(
+            range_extreme_core(index.view(), starts.view(), ends.view(), false),
+            Ok(array![40, 90, 70])
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_empty_and_out_of_bounds_ranges() {
+        let index = array![4_i64, 2, 9];
+        assert_eq!(
+            range_extreme_core(
+                index.view(),
+                array![0_i64].view(),
+                array![1_i64, 2].view(),
+                true
+            ),
+            Err("starts and ends must have equal lengths")
+        );
+        assert_eq!(
+            range_extreme_core(
+                index.view(),
+                array![1_i64].view(),
+                array![1_i64].view(),
+                true
+            ),
+            Err("ranges must be non-empty and within index")
+        );
+        assert_eq!(
+            range_extreme_core(
+                index.view(),
+                array![-1_i64].view(),
+                array![2_i64].view(),
+                false
+            ),
+            Err("ranges must be non-empty and within index")
+        );
+        assert_eq!(
+            range_extreme_core(
+                index.view(),
+                array![0_i64].view(),
+                array![4_i64].view(),
+                false
+            ),
+            Err("ranges must be non-empty and within index")
+        );
+    }
+
+    #[test]
+    fn empty_query_input_returns_empty_output() {
+        let output = range_extreme_core(
+            array![1_i64, 2].view(),
+            array![].view(),
+            array![].view(),
+            true,
+        )
+        .expect("empty queries are valid");
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn accepts_a_strided_index_view() {
+        let source = array![99_i64, 8, 88, 3, 77, 5];
+        let index = source.slice(s![1..;2]);
+        let output = range_extreme_core(index, array![0_i64].view(), array![3_i64].view(), true)
+            .expect("strided input is valid");
+        assert_eq!(output, array![3]);
+    }
+}
+
 /// This function replicates index[counts>0]
 #[pyfunction]
 #[pyo3(signature = (*, index, counts, length))]
@@ -884,6 +1086,11 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(index_starts_and_ends, m)?)?;
     m.add_function(wrap_pyfunction!(index_starts_and_ends_keep_first, m)?)?;
     m.add_function(wrap_pyfunction!(index_starts_and_ends_keep_last, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        index_starts_and_ends_keep_first_direct,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(index_starts_and_ends_keep_last_direct, m)?)?;
     Ok(())
 }
 

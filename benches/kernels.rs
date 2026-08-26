@@ -15,16 +15,16 @@
 //! isolation.
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use numpy::ndarray::{Array1, ArrayView1};
+use numpy::ndarray::{s, Array1, ArrayView1};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
-    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, repeat_index_core,
-    sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core,
-    CompareOp,
+    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, range_extreme_core,
+    repeat_index_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
+    trim_index_core, CompareOp,
 };
 
 /// Counts bytes, calls, and outstanding (live) bytes allocated through the
@@ -649,6 +649,91 @@ fn bench_sum_kernels(c: &mut Criterion) {
     group.finish();
 }
 
+/// Baseline equivalent of the Python implementation: scan every candidate
+/// interval independently. The benchmark deliberately uses the same
+/// unsorted original labels and interval shapes as the Python baseline.
+fn range_extreme_loop(
+    index: ArrayView1<i64>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    find_min: bool,
+) -> Array1<i64> {
+    Array1::from_iter(starts.iter().zip(ends.iter()).map(|(start, end)| {
+        let values = index.slice(s![*start as usize..*end as usize]);
+        if find_min {
+            values.iter().copied().min().unwrap()
+        } else {
+            values.iter().copied().max().unwrap()
+        }
+    }))
+}
+
+/// Candidate intervals for the range-RMQ comparison. Width is fixed while
+/// `n` grows so the baseline remains an honest O(number of queries * width)
+/// workload rather than accidentally becoming quadratic.
+struct RangeExtremeFixture {
+    index: Array1<i64>,
+    starts: Array1<i64>,
+    ends: Array1<i64>,
+}
+
+impl RangeExtremeFixture {
+    fn new(n: usize, width: usize, overlapping: bool) -> Self {
+        let index = Array1::from_iter((0..n as i64).map(|value| n as i64 - value));
+        let query_count = if overlapping { n } else { n / width };
+        let starts = if overlapping {
+            Array1::from_iter((0..query_count).map(|row| (row % (n - width + 1)) as i64))
+        } else {
+            Array1::from_iter((0..query_count).map(|row| (row * width) as i64))
+        };
+        let ends = &starts + width as i64;
+        Self {
+            index,
+            starts,
+            ends,
+        }
+    }
+}
+
+fn bench_range_extreme(c: &mut Criterion) {
+    let mut group = c.benchmark_group("range_extreme");
+    group.sample_size(20);
+    for n in [1_000, 100_000, 1_000_000] {
+        for width in [8, 64, 512] {
+            if width >= n {
+                continue;
+            }
+            for overlapping in [false, true] {
+                let fixture = RangeExtremeFixture::new(n, width, overlapping);
+                let shape = if overlapping { "overlap" } else { "nonoverlap" };
+                let label = format!("loop n={n} width={width} {shape}");
+                group.bench_function(label, |b| {
+                    b.iter(|| {
+                        range_extreme_loop(
+                            black_box(fixture.index.view()),
+                            black_box(fixture.starts.view()),
+                            black_box(fixture.ends.view()),
+                            true,
+                        )
+                    })
+                });
+                let label = format!("tree n={n} width={width} {shape}");
+                group.bench_function(label, |b| {
+                    b.iter(|| {
+                        range_extreme_core(
+                            black_box(fixture.index.view()),
+                            black_box(fixture.starts.view()),
+                            black_box(fixture.ends.view()),
+                            true,
+                        )
+                    })
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bin_search_lt,
@@ -656,6 +741,7 @@ criterion_group!(
     bench_bin_search_first_old_vs_new,
     bench_compare_start_end,
     bench_index_builders,
-    bench_sum_kernels
+    bench_sum_kernels,
+    bench_range_extreme
 );
 criterion_main!(benches);
