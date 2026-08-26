@@ -4,10 +4,15 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-use crate::aggs::{checked_range, ensure_equal_lengths, ensure_tape_width};
+use crate::aggs::{
+    checked_range, ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches,
+};
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
+        /// `matches` must be non-empty and must contain exactly one entry for
+        /// every candidate position. pyjanitor guarantees this by ensuring
+        /// `counts_array.sum() == matches.len()` before calling the kernel.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -26,6 +31,7 @@ macro_rules! compute_ints {
             let ends = ends.as_array();
             ensure_equal_lengths("arr", arr.len(), "ends", ends.len())?;
             let matches = matches.as_array();
+            ensure_nonempty_matches(matches.len())?;
             let counts = counts.as_array();
             ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let booleans = booleans.as_array();
@@ -38,7 +44,7 @@ macro_rules! compute_ints {
                 .iter()
                 .filter_map(|e| checked_range(0, *e, index.len()).map(|(_, e_)| e_))
                 .sum();
-            ensure_tape_width(expected_matches_width, matches.len())?;
+            ensure_exact_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let mut n: usize = 0;
@@ -53,9 +59,10 @@ macro_rules! compute_ints {
                 // Unlike the dual-bound `_starts_ends` shape, this single-
                 // bound producer (`src/compare/comp_ends.rs`) has no
                 // invalid-row concept of its own -- every `end` reaching
-                // here is already guaranteed `1 <= end <= index.len()`
+                // here is already guaranteed `0 <= end <= index.len()`
                 // because `bin_search_lt_first`/`bin_search_gt_first` drop
-                // zero-match rows before `ends` is ever built. This
+                // zero-width rows before `ends` is ever built. `end == 0`
+                // is valid and simply contributes no tape entries. This
                 // `checked_range` is defense in depth against that
                 // cross-module invariant breaking, not a condition the
                 // real pyjanitor call path can trigger; see issue #40 for
@@ -103,6 +110,9 @@ compute_ints!(compute_prod_rev_end_match_uint8, u8);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// `matches` must be non-empty and must contain exactly one entry for
+        /// every candidate position. pyjanitor guarantees this by ensuring
+        /// `counts_array.sum() == matches.len()` before calling the kernel.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -121,6 +131,7 @@ macro_rules! compute_floats {
             let ends = ends.as_array();
             ensure_equal_lengths("arr", arr.len(), "ends", ends.len())?;
             let matches = matches.as_array();
+            ensure_nonempty_matches(matches.len())?;
             let counts = counts.as_array();
             ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let booleans = booleans.as_array();
@@ -133,7 +144,7 @@ macro_rules! compute_floats {
                 .iter()
                 .filter_map(|e| checked_range(0, *e, index.len()).map(|(_, e_)| e_))
                 .sum();
-            ensure_tape_width(expected_matches_width, matches.len())?;
+            ensure_exact_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let mut n: usize = 0;

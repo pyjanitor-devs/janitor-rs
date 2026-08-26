@@ -4,10 +4,13 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-use crate::aggs::{ensure_equal_lengths, ensure_tape_width};
+use crate::aggs::{ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches};
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
+        /// `matches` must be non-empty and must contain exactly one entry for
+        /// every candidate position. pyjanitor guarantees this by ensuring
+        /// `counts_array.sum() == matches.len()` before calling the kernel.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -25,6 +28,7 @@ macro_rules! compute {
             let starts = starts.as_array();
             ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let matches = matches.as_array();
+            ensure_nonempty_matches(matches.len())?;
             let counts = counts.as_array();
             ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let index = index.as_array();
@@ -42,7 +46,7 @@ macro_rules! compute {
                 .iter()
                 .map(|s| end_.saturating_sub(*s as usize))
                 .sum();
-            ensure_tape_width(expected_matches_width, matches.len())?;
+            ensure_exact_tape_width(expected_matches_width, matches.len())?;
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),

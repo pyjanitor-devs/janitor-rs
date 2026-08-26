@@ -5,7 +5,8 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    checked_end, checked_index, checked_range, ensure_equal_lengths, ensure_tape_width,
+    checked_end, checked_index, checked_range, ensure_equal_lengths, ensure_exact_tape_width,
+    ensure_nonempty_matches,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
@@ -87,6 +88,8 @@ pub fn compute_size_rev_start<'py>(
 }
 
 #[pyfunction]
+/// `matches` must be non-empty and contain exactly one entry per candidate
+/// position. pyjanitor guarantees this with `counts_array.sum() == matches.len()`.
 pub fn compute_size_rev_end_matches<'py>(
     py: Python<'py>,
     ends: PyReadonlyArray1<'py, i64>,
@@ -97,6 +100,7 @@ pub fn compute_size_rev_end_matches<'py>(
     let ends = ends.as_array();
     let index = index.as_array();
     let matches = matches.as_array();
+    ensure_nonempty_matches(matches.len())?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
@@ -105,7 +109,7 @@ pub fn compute_size_rev_end_matches<'py>(
         .iter()
         .filter_map(|e| checked_end(*e, index.len()))
         .sum();
-    ensure_tape_width(expected_matches_width, matches.len())?;
+    ensure_exact_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
     let start_: usize = 0_usize;
@@ -136,6 +140,8 @@ pub fn compute_size_rev_end_matches<'py>(
 }
 
 #[pyfunction]
+/// `matches` must be non-empty and contain exactly one entry per candidate
+/// position. pyjanitor guarantees this with `counts_array.sum() == matches.len()`.
 pub fn compute_size_rev_start_matches<'py>(
     py: Python<'py>,
     starts: PyReadonlyArray1<'py, i64>,
@@ -146,6 +152,7 @@ pub fn compute_size_rev_start_matches<'py>(
     let starts = starts.as_array();
     let index = index.as_array();
     let matches = matches.as_array();
+    ensure_nonempty_matches(matches.len())?;
     let end_: usize = index.len();
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
@@ -155,7 +162,7 @@ pub fn compute_size_rev_start_matches<'py>(
         .iter()
         .map(|s| end_.saturating_sub(*s as usize))
         .sum();
-    ensure_tape_width(expected_matches_width, matches.len())?;
+    ensure_exact_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
     let mut n: usize = 0;
@@ -183,6 +190,8 @@ pub fn compute_size_rev_start_matches<'py>(
 }
 
 #[pyfunction]
+/// `matches` must be non-empty and contain exactly one entry per candidate
+/// position. pyjanitor guarantees this with `counts_array.sum() == matches.len()`.
 pub fn compute_size_rev_start_end_matches<'py>(
     py: Python<'py>,
     starts: PyReadonlyArray1<'py, i64>,
@@ -196,6 +205,7 @@ pub fn compute_size_rev_start_end_matches<'py>(
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let matches = matches.as_array();
+    ensure_nonempty_matches(matches.len())?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
@@ -205,7 +215,7 @@ pub fn compute_size_rev_start_end_matches<'py>(
         .zip(ends.iter())
         .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
         .sum();
-    ensure_tape_width(expected_matches_width, matches.len())?;
+    ensure_exact_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
     let mut n: usize = 0;
