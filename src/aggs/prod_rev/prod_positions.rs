@@ -189,6 +189,11 @@ macro_rules! compute_floats {
             let positions = positions.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
+            if arr.is_empty() || index.is_empty() || positions.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "arr, starts, ends, booleans, index, and positions cannot be empty",
+                ));
+            }
             let (labels, products) = prod_positions_float_core(
                 arr,
                 starts,
@@ -230,7 +235,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::prod_positions_int_core;
+    use super::{prod_positions_float_core, prod_positions_int_core};
     use numpy::ndarray::array;
 
     #[test]
@@ -275,5 +280,53 @@ mod tests {
         );
         assert_eq!(labels, vec![4]);
         assert_eq!(products, vec![1]);
+    }
+
+    #[test]
+    fn floating_positions_handle_duplicate_labels_and_zero_values() {
+        let arr = array![2.0_f64, 3.0, 4.0, 0.0];
+        let starts = array![0_i64, 2, 4, 6];
+        let ends = array![2_i64, 4, 6, 8];
+        let index = array![10_i64, 20, 10];
+        let positions = array![0_i64, 1, 2, 1, 0, 2, 0, 2];
+        let booleans = array![false, false, false, false];
+
+        let (labels, products) = prod_positions_float_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            index.view(),
+            positions.view(),
+            booleans.view(),
+            3,
+            |value| value,
+        );
+
+        assert_eq!(labels, vec![10, 20]);
+        assert_eq!(products, vec![0.0, 6.0]);
+    }
+
+    #[test]
+    fn floating_positions_preserve_identity_for_null_rows() {
+        let arr = array![7.0_f64];
+        let starts = array![0_i64];
+        let ends = array![1_i64];
+        let index = array![4_i64];
+        let positions = array![0_i64];
+        let booleans = array![true];
+
+        let (labels, products) = prod_positions_float_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            index.view(),
+            positions.view(),
+            booleans.view(),
+            1,
+            |value| value,
+        );
+
+        assert_eq!(labels, vec![4]);
+        assert_eq!(products, vec![1.0]);
     }
 }
