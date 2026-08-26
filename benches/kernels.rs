@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
-    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core,
-    prod_positions_int_core, repeat_index_core, sum_end_core, sum_start_core, sum_start_end_core,
-    sum_start_u32_core, trim_index_core, CompareOp,
+    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, max_positions_core,
+    repeat_index_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
+    trim_index_core, CompareOp,
 };
 use std::collections::HashMap;
 
@@ -650,7 +650,7 @@ fn bench_sum_kernels(c: &mut Criterion) {
     group.finish();
 }
 
-struct ProdPositionsFixture {
+struct MaxPositionsFixture {
     arr: Array1<i64>,
     starts: Array1<i64>,
     ends: Array1<i64>,
@@ -659,10 +659,10 @@ struct ProdPositionsFixture {
     booleans: Array1<bool>,
 }
 
-impl ProdPositionsFixture {
+impl MaxPositionsFixture {
     fn new(n: usize, duplicate: bool) -> Self {
         const WIDTH: usize = 8;
-        let arr = Array1::from_elem(n, 2_i64);
+        let arr = Array1::from_iter((0..n).map(|i| i as i64));
         let starts = Array1::from_iter((0..n).map(|i| (i * WIDTH) as i64));
         let ends = Array1::from_iter((0..n).map(|i| ((i + 1) * WIDTH) as i64));
         let index = Array1::from_iter(0..n as i64);
@@ -681,7 +681,7 @@ impl ProdPositionsFixture {
     }
 }
 
-fn prod_positions_old(
+fn max_positions_old(
     arr: ArrayView1<'_, i64>,
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
@@ -690,12 +690,14 @@ fn prod_positions_old(
     booleans: ArrayView1<'_, bool>,
     capacity: usize,
 ) -> (Vec<i64>, Vec<i64>) {
-    let mut dictionary = HashMap::with_capacity(capacity.min(index.len()).min(positions.len()));
-    for (((current, start), end), boolean) in arr
+    let mut dictionary: HashMap<i64, (i64, i64)> =
+        HashMap::with_capacity(capacity.min(index.len()).min(positions.len()));
+    for (row, (((current, start), end), boolean)) in arr
         .iter()
         .zip(starts.iter())
         .zip(ends.iter())
         .zip(booleans.iter())
+        .enumerate()
     {
         let Some(start) = usize::try_from(*start).ok() else {
             continue;
@@ -713,24 +715,27 @@ fn prod_positions_old(
             else {
                 continue;
             };
-            let total = dictionary.entry(index[pos]).or_insert(1_i64);
-            if !*boolean {
-                *total *= *current;
+            let entry = dictionary.entry(index[pos]).or_insert((-1, *current));
+            if !*boolean && (entry.0 == -1 || *current > entry.1) {
+                *entry = (row as i64, *current);
             }
         }
     }
-    dictionary.into_iter().unzip()
+    dictionary
+        .into_iter()
+        .map(|(label, (row, _))| (label, row))
+        .unzip()
 }
 
-fn bench_prod_positions(c: &mut Criterion) {
-    let mut group = c.benchmark_group("prod_positions_old_vs_compact");
+fn bench_max_positions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("max_positions_old_vs_compact");
     for n in [32, 10_000, 100_000, 1_000_000] {
         for duplicate in [true, false] {
-            let f = ProdPositionsFixture::new(n, duplicate);
+            let f = MaxPositionsFixture::new(n, duplicate);
             let kind = if duplicate { "duplicate" } else { "unique" };
             let label = format!("n={n} {kind}");
             let old = count_allocations(|| {
-                prod_positions_old(
+                max_positions_old(
                     f.arr.view(),
                     f.starts.view(),
                     f.ends.view(),
@@ -741,7 +746,7 @@ fn bench_prod_positions(c: &mut Criterion) {
                 )
             });
             let compact = count_allocations(|| {
-                prod_positions_int_core(
+                max_positions_core(
                     f.arr.view(),
                     f.starts.view(),
                     f.ends.view(),
@@ -749,13 +754,12 @@ fn bench_prod_positions(c: &mut Criterion) {
                     f.positions.view(),
                     f.booleans.view(),
                     f.index.len(),
-                    |value| value,
                 )
             });
-            eprintln!("prod_positions {label}: old {old:?}; compact {compact:?}");
+            eprintln!("max_positions {label}: old {old:?}; compact {compact:?}");
             group.bench_function(format!("old {label}"), |b| {
                 b.iter(|| {
-                    prod_positions_old(
+                    max_positions_old(
                         black_box(f.arr.view()),
                         black_box(f.starts.view()),
                         black_box(f.ends.view()),
@@ -768,7 +772,7 @@ fn bench_prod_positions(c: &mut Criterion) {
             });
             group.bench_function(format!("compact {label}"), |b| {
                 b.iter(|| {
-                    prod_positions_int_core(
+                    max_positions_core(
                         black_box(f.arr.view()),
                         black_box(f.starts.view()),
                         black_box(f.ends.view()),
@@ -776,7 +780,6 @@ fn bench_prod_positions(c: &mut Criterion) {
                         black_box(f.positions.view()),
                         black_box(f.booleans.view()),
                         f.index.len(),
-                        |value| value,
                     )
                 })
             });
@@ -793,6 +796,6 @@ criterion_group!(
     bench_compare_start_end,
     bench_index_builders,
     bench_sum_kernels,
-    bench_prod_positions
+    bench_max_positions
 );
 criterion_main!(benches);
