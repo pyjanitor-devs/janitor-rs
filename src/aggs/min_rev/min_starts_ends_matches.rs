@@ -128,3 +128,54 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_min_rev_start_end_match_f64, m)?)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::compute_min_rev_start_end_match_int64;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::exceptions::PyValueError;
+    use pyo3::Python;
+
+    #[test]
+    fn wrapper_rejects_invalid_ranges_and_accepts_zero_survivors() {
+        Python::initialize();
+        Python::attach(|py| {
+            let arr = PyArray1::from_vec(py, vec![5_i64]);
+            let starts = PyArray1::from_vec(py, vec![-1_i64]);
+            let ends = PyArray1::from_vec(py, vec![1_i64]);
+            let index = PyArray1::from_vec(py, vec![10_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64]);
+            let matches = PyArray1::from_vec(py, vec![0_i8]);
+            let booleans = PyArray1::from_vec(py, vec![false]);
+            let error = compute_min_rev_start_end_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+                1,
+            )
+            .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![0_i64]);
+            let matches = PyArray1::from_vec(py, vec![0_i8]);
+            compute_min_rev_start_end_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+                1,
+            )
+            .expect("equal bounds with a non-empty tape are valid");
+        });
+    }
+}

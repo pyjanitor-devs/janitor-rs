@@ -286,6 +286,9 @@ pub fn compute_size_rev_start_end<'py>(
 mod tests {
     use super::*;
     use numpy::ndarray::array;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::exceptions::PyValueError;
+    use pyo3::Python;
 
     #[test]
     fn counts_prefixes_and_suffixes_in_compact_slots() {
@@ -306,6 +309,39 @@ mod tests {
         assert!(size_rev_ends_core(array![0_i64].view(), index.view()).is_err());
         assert!(size_rev_starts_core(array![-1_i64].view(), index.view()).is_err());
         assert!(size_rev_ends_core(array![1_i64].view(), array![].view()).is_err());
+    }
+
+    #[test]
+    fn starts_ends_matches_wrapper_rejects_invalid_ranges_and_accepts_zero_survivors() {
+        Python::initialize();
+        Python::attach(|py| {
+            let starts = PyArray1::from_vec(py, vec![-1_i64]);
+            let ends = PyArray1::from_vec(py, vec![1_i64]);
+            let index = PyArray1::from_vec(py, vec![10_i64]);
+            let matches = PyArray1::from_vec(py, vec![0_i8]);
+            let error = compute_size_rev_start_end_matches(
+                py,
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![0_i64]);
+            compute_size_rev_start_end_matches(
+                py,
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                1,
+            )
+            .expect("equal bounds with a non-empty tape are valid");
+        });
     }
 }
 
