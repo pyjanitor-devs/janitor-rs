@@ -17,7 +17,7 @@ fn expected_matches_width(ends: ArrayView1<'_, i64>, right_len: usize) -> PyResu
             .map_err(|_| pyo3::exceptions::PyValueError::new_err("ends must be non-negative"))?;
         if end > right_len {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "ends must satisfy 0 < end <= index length",
+                "ends must satisfy 0 <= end <= index length",
             ));
         }
         total
@@ -75,11 +75,11 @@ macro_rules! compute_ints {
                 // Unlike the dual-bound `_starts_ends` shape, this single-
                 // bound producer (`src/compare/comp_ends.rs`) has no
                 // invalid-row concept of its own -- every `end` reaching
-                // here is already guaranteed `1 <= end <= index.len()`
-                // because `bin_search_lt_first`/`bin_search_gt_first` drop
-                // zero-match rows before `ends` is ever built. This
-                // `checked_range` is defense in depth against that
-                // cross-module invariant breaking, not a condition the
+                // here is guaranteed `0 <= end <= index.len()`. `end == 0`
+                // A zero-width row contributes no tape entries. An entirely
+                // empty `matches` tape is rejected before this loop. This
+                // `checked_range` remains defense in depth against malformed
+                // negative or oversized bounds reaching the kernel, not a
                 // real pyjanitor call path can trigger; see issue #40 for
                 // the full trace and issue #41 for the tape-width check
                 // above, which is what actually guards `matches[n]`.
