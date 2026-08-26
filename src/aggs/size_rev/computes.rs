@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use crate::aggs::{
     checked_end, checked_index, checked_range, ensure_equal_lengths, ensure_tape_width,
+    validate_range,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
@@ -195,24 +196,35 @@ pub fn compute_size_rev_start_end_matches<'py>(
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let matches = matches.as_array();
+    if starts.is_empty() || index.is_empty() || matches.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts, ends, index, and matches cannot be empty",
+        ));
+    }
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize = starts
-        .iter()
-        .zip(ends.iter())
-        .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
-        .sum();
+    let expected_matches_width = starts.iter().zip(ends.iter()).try_fold(
+        0_usize,
+        |width, (start, end)| -> PyResult<usize> {
+            let range = validate_range(*start, *end, index.len())
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok(width.saturating_add(range.map_or(0, |(start_, end_)| end_ - start_)))
+        },
+    )?;
     ensure_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
     let mut n: usize = 0;
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
-        let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
+        if *start == *end {
             continue;
-        };
+        }
+        // The width pass above already proved these casts are safe.
+        let start_ = *start as usize;
+        let end_ = *end as usize;
         for item in start_..end_ {
             if matches[n] == 0 {
                 n += 1;

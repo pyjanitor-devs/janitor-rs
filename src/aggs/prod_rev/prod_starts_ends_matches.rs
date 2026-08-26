@@ -3,7 +3,7 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths, ensure_tape_width};
+use crate::aggs::{ensure_equal_lengths, ensure_tape_width, validate_range};
 use std::collections::HashMap;
 
 macro_rules! compute_ints {
@@ -33,15 +33,23 @@ macro_rules! compute_ints {
             let matches = matches.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
+            if arr.is_empty() || index.is_empty() || matches.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "arr, starts, counts, booleans, index, and matches cannot be empty",
+                ));
+            }
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = starts
-                .iter()
-                .zip(ends.iter())
-                .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
-                .sum();
+            let expected_matches_width = starts.iter().zip(ends.iter()).try_fold(
+                0_usize,
+                |width, (start, end)| -> PyResult<usize> {
+                    let range = validate_range(*start, *end, index.len())
+                        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+                    Ok(width.saturating_add(range.map_or(0, |(start_, end_)| end_ - start_)))
+                },
+            )?;
             ensure_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
@@ -54,9 +62,11 @@ macro_rules! compute_ints {
             );
             let mut n: usize = 0;
             for (current, start, end, count, boolean) in zipped {
-                let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
+                if *start == *end {
                     continue;
-                };
+                }
+                let start_ = *start as usize;
+                let end_ = *end as usize;
                 let current_ = *current as i64;
                 for item in start_..end_ {
                     if (matches[n] == 0) {
@@ -121,15 +131,23 @@ macro_rules! compute_floats {
             let matches = matches.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
+            if arr.is_empty() || index.is_empty() || matches.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "arr, starts, counts, booleans, index, and matches cannot be empty",
+                ));
+            }
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = starts
-                .iter()
-                .zip(ends.iter())
-                .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
-                .sum();
+            let expected_matches_width = starts.iter().zip(ends.iter()).try_fold(
+                0_usize,
+                |width, (start, end)| -> PyResult<usize> {
+                    let range = validate_range(*start, *end, index.len())
+                        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+                    Ok(width.saturating_add(range.map_or(0, |(start_, end_)| end_ - start_)))
+                },
+            )?;
             ensure_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
@@ -142,9 +160,11 @@ macro_rules! compute_floats {
             );
             let mut n: usize = 0;
             for (current, start, end, count, boolean) in zipped {
-                let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
+                if *start == *end {
                     continue;
-                };
+                }
+                let start_ = *start as usize;
+                let end_ = *end as usize;
                 let current_ = *current as f64;
                 for item in start_..end_ {
                     if (matches[n] == 0) {

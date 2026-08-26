@@ -62,6 +62,35 @@ pub(crate) fn checked_range(start: i64, end: i64, len: usize) -> Option<(usize, 
     (start < end).then_some((start, end))
 }
 
+/// Validate a caller-supplied half-open range, retaining empty ranges.
+///
+/// ELI5: `checked_range` is intentionally a filter for loops that can simply
+/// skip a non-empty range that is unusable. Aggregation boundaries need a
+/// stricter contract: malformed bounds are caller errors, while `start ==
+/// end` is a legitimate empty range and must not be confused with corruption.
+pub(crate) fn validate_range(
+    start: i64,
+    end: i64,
+    len: usize,
+) -> Result<Option<(usize, usize)>, &'static str> {
+    let start = usize::try_from(start).map_err(|_| "range bounds must be non-negative")?;
+    let end = usize::try_from(end).map_err(|_| "range bounds must be non-negative")?;
+    if start > len || end > len {
+        return Err("range bounds must not exceed right_index length");
+    }
+    if start > end {
+        return Err("range start must not exceed range end");
+    }
+    if start == end {
+        return Ok(None);
+    }
+    // The checks above establish exactly the preconditions that
+    // `checked_range` needs, so this conversion cannot fail. Keeping the
+    // helper here documents that non-empty ranges use the same half-open
+    // semantics as every other aggregation loop.
+    Ok(checked_range(start as i64, end as i64, len))
+}
+
 /// Reject a flat `matches` tape too short for the candidate positions every
 /// row's `(start, end)` range implies it must cover.
 ///
@@ -149,6 +178,7 @@ mod adversarial_bounds_tests {
     use super::min::min_starts_ends::min_start_end_core;
     use super::min::min_starts_ends_matches::min_start_end_match_core;
     use super::min::min_starts_matches::min_start_match_core;
+    use super::validate_range;
 
     #[test]
     fn equal_length_validation_accepts_empty_and_non_empty_pairs() {
@@ -193,6 +223,20 @@ mod adversarial_bounds_tests {
                 "matches must have length at least 5 to cover every candidate position; got 4"
             );
         });
+    }
+
+    #[test]
+    fn strict_range_validation_accepts_empty_boundary_ranges() {
+        assert_eq!(validate_range(0, 0, 3), Ok(None));
+        assert_eq!(validate_range(3, 3, 3), Ok(None));
+        assert_eq!(validate_range(0, 3, 3), Ok(Some((0, 3))));
+    }
+
+    #[test]
+    fn strict_range_validation_rejects_malformed_bounds() {
+        for (start, end) in [(-1, 0), (0, -1), (4, 4), (0, 4), (2, 1)] {
+            assert!(validate_range(start, end, 3).is_err());
+        }
     }
 
     #[test]
