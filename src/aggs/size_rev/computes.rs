@@ -315,6 +315,10 @@ mod tests {
     fn matches_kernel_accepts_zero_width_prefix() {
         Python::initialize();
         Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
             let ends = PyArray1::from_vec(py, vec![0_i64]);
             let index = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
             let matches = PyArray1::from_vec(py, Vec::<i8>::new());
