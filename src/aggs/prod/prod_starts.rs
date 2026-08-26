@@ -250,6 +250,27 @@ mod tests {
     }
 
     #[test]
+    fn zero_and_negative_values_follow_product_semantics() {
+        let booleans = array![false, false];
+        assert_eq!(
+            prod_start_core(
+                array![0_i64, 3].view(),
+                array![0_i64].view(),
+                booleans.view()
+            ),
+            array![0]
+        );
+        assert_eq!(
+            prod_start_core(
+                array![-2_i64, 3].view(),
+                array![0_i64].view(),
+                booleans.view()
+            ),
+            array![-6]
+        );
+    }
+
+    #[test]
     fn float_variant_multiplies_from_start_to_end() {
         let arr = array![2.0_f64, 3.0, 4.0];
         let starts = array![1_i64];

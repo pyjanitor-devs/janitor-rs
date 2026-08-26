@@ -302,6 +302,29 @@ mod tests {
     }
 
     #[test]
+    fn zero_and_negative_values_follow_product_semantics() {
+        let booleans = array![false, false];
+        assert_eq!(
+            prod_start_end_core(
+                array![0_i64, 3].view(),
+                array![0_i64].view(),
+                array![2_i64].view(),
+                booleans.view(),
+            ),
+            array![0]
+        );
+        assert_eq!(
+            prod_start_end_core(
+                array![-2_i64, 3].view(),
+                array![0_i64].view(),
+                array![2_i64].view(),
+                booleans.view(),
+            ),
+            array![-6]
+        );
+    }
+
+    #[test]
     fn casts_only_values_in_requested_interval() {
         let arr = array![2_i32, 3, 4, 5];
         let starts = array![2_i64];

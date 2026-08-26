@@ -250,6 +250,27 @@ mod tests {
     }
 
     #[test]
+    fn zero_and_negative_values_follow_product_semantics() {
+        let booleans = array![false, false];
+        assert_eq!(
+            prod_end_core(
+                array![0_i64, 3].view(),
+                array![2_i64].view(),
+                booleans.view()
+            ),
+            array![0]
+        );
+        assert_eq!(
+            prod_end_core(
+                array![-2_i64, 3].view(),
+                array![2_i64].view(),
+                booleans.view()
+            ),
+            array![-6]
+        );
+    }
+
+    #[test]
     fn float_sentinel_end_is_identity_not_a_panic() {
         let arr = array![2.0_f64, 3.0];
         let ends = array![-1_i64];
