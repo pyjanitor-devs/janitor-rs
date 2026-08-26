@@ -52,12 +52,15 @@ where
                     let slot = labels.len();
                     entry.insert(slot);
                     labels.push(label);
-                    totals.push(0);
+                    totals.push(0_i64);
                     slot
                 }
             };
             if !*boolean {
-                totals[slot] += current_;
+                // ELI5: once a label's bucket is found, add in the same
+                // wraparound style as the forward kernel. This keeps a very
+                // large integer from panicking only in debug/test builds.
+                totals[slot] = totals[slot].wrapping_add(current_);
             }
         }
     }
@@ -331,5 +334,29 @@ mod tests {
 
         assert_eq!(labels, vec![5]);
         assert!((totals[0] - 0.6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn integer_positions_wrap_on_overflow() {
+        let arr = array![i64::MAX, 1];
+        let starts = array![0_i64, 1];
+        let ends = array![1_i64, 2];
+        let index = array![5_i64];
+        let positions = array![0_i64, 0];
+        let booleans = array![false, false];
+
+        let (labels, totals) = sum_positions_int_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            index.view(),
+            positions.view(),
+            booleans.view(),
+            1,
+            |value| value,
+        );
+
+        assert_eq!(labels, vec![5]);
+        assert_eq!(totals, vec![i64::MIN]);
     }
 }
