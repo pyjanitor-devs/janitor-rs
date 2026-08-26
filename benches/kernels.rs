@@ -22,10 +22,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
-    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, repeat_index_core,
-    select_start_end_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
+    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, max_positions_core,
+    repeat_index_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
     trim_index_core, CompareOp,
 };
+use std::collections::HashMap;
 
 /// Counts bytes, calls, and outstanding (live) bytes allocated through the
 /// global allocator, so `bench_bin_search_first` can report an allocation
@@ -478,165 +479,6 @@ fn bench_compare_start_end(c: &mut Criterion) {
     group.finish();
 }
 
-/// Inputs for comparing two-predicate matches-tape evaluation with direct
-/// first/last selection. The right index labels deliberately run in reverse
-/// order so direct selection must preserve original-row ordering rather than
-/// returning the first candidate encountered in the range.
-struct DirectSelectionFixture {
-    left: [Array1<i64>; 2],
-    right: [Array1<i64>; 2],
-    left_index: Array1<i64>,
-    right_index: Array1<i64>,
-    starts: Array1<i64>,
-    ends: Array1<i64>,
-    matches: Array1<i8>,
-}
-
-impl DirectSelectionFixture {
-    fn with_range(
-        left_len: usize,
-        right_len: usize,
-        start: usize,
-        end: usize,
-        first_left: i64,
-        second_left: i64,
-    ) -> Self {
-        let left = [
-            Array1::from_elem(left_len, first_left),
-            Array1::from_elem(left_len, second_left),
-        ];
-        let right = [
-            Array1::from_iter(0..right_len as i64),
-            Array1::from_iter(0..right_len as i64),
-        ];
-        let left_index = Array1::from_iter(0..left_len as i64);
-        let right_index = Array1::from_iter((0..right_len as i64).rev());
-        let starts = Array1::from_elem(left_len, start as i64);
-        let ends = Array1::from_elem(left_len, end as i64);
-        let matches = Array1::from_elem(left_len * (end - start), 1_i8);
-        DirectSelectionFixture {
-            left,
-            right,
-            left_index,
-            right_index,
-            starts,
-            ends,
-            matches,
-        }
-    }
-}
-
-/// Compare the current two-pass matches tape with direct selection. The
-/// benchmark intentionally measures the full candidate scan: original-row
-/// ordering means direct selection cannot stop at the first candidate unless
-/// the candidate range is known to be ordered by `right_index`.
-fn bench_direct_selection(c: &mut Criterion) {
-    let mut group = c.benchmark_group("direct_selection");
-    let right_len = 1_000;
-    let midpoint = (right_len / 2) as i64;
-    let scenarios = [
-        ("full_dense", 0, right_len, midpoint, midpoint),
-        // A bounded range is typical after the anchor predicate has been
-        // applied and should expose the fixed per-row range-check overhead.
-        ("narrow_dense", 496, 504, 500, 500),
-        // The first predicate survives many candidates, but the second
-        // predicate eliminates every one: `right_len <= right_value` is
-        // false for every value in `0..right_len`. This stresses the
-        // no-survivor path without relying on an invalid candidate range.
-        ("full_zero", 0, right_len, midpoint, right_len as i64),
-    ];
-    for (scenario, start, end, first_left, second_left) in scenarios {
-        for left_len in [100, 1_000, 10_000, 100_000] {
-            let f = DirectSelectionFixture::with_range(
-                left_len,
-                right_len,
-                start,
-                end,
-                first_left,
-                second_left,
-            );
-            let tape_allocations = count_allocations(|| {
-                let (first, _, _) = compare_start_end_core(
-                    f.left[0].view(),
-                    f.right[0].view(),
-                    f.starts.view(),
-                    f.ends.view(),
-                    f.matches.view(),
-                    CompareOp::Ge,
-                );
-                let second = compare_start_end_core(
-                    f.left[1].view(),
-                    f.right[1].view(),
-                    f.starts.view(),
-                    f.ends.view(),
-                    first.view(),
-                    CompareOp::Le,
-                );
-                if scenario == "full_zero" {
-                    assert!(second.1.iter().all(|value| *value == 0));
-                    assert_eq!(second.2, 0);
-                }
-                second
-            });
-            let direct_allocations = count_allocations(|| {
-                let left = [f.left[0].view(), f.left[1].view()];
-                let right = [f.right[0].view(), f.right[1].view()];
-                select_start_end_core(
-                    &left,
-                    &right,
-                    f.left_index.view(),
-                    f.right_index.view(),
-                    f.starts.view(),
-                    f.ends.view(),
-                    &[CompareOp::Ge, CompareOp::Le],
-                    true,
-                )
-            });
-            eprintln!(
-            "direct_selection {scenario} left={left_len}: tape bytes/calls/peak={tape_allocations:?}; direct bytes/calls/peak={direct_allocations:?}"
-        );
-            group.bench_function(format!("{scenario}/matches_tape left={left_len}"), |b| {
-                b.iter(|| {
-                    let (first, _, _) = compare_start_end_core(
-                        black_box(f.left[0].view()),
-                        black_box(f.right[0].view()),
-                        black_box(f.starts.view()),
-                        black_box(f.ends.view()),
-                        black_box(f.matches.view()),
-                        black_box(CompareOp::Ge),
-                    );
-                    let (second, _, _) = compare_start_end_core(
-                        black_box(f.left[1].view()),
-                        black_box(f.right[1].view()),
-                        black_box(f.starts.view()),
-                        black_box(f.ends.view()),
-                        black_box(first.view()),
-                        black_box(CompareOp::Le),
-                    );
-                    black_box(second)
-                })
-            });
-            group.bench_function(format!("{scenario}/direct_first left={left_len}"), |b| {
-                b.iter(|| {
-                    let left = [f.left[0].view(), f.left[1].view()];
-                    let right = [f.right[0].view(), f.right[1].view()];
-                    black_box(select_start_end_core(
-                        black_box(&left),
-                        black_box(&right),
-                        black_box(f.left_index.view()),
-                        black_box(f.right_index.view()),
-                        black_box(f.starts.view()),
-                        black_box(f.ends.view()),
-                        black_box(&[CompareOp::Ge, CompareOp::Le]),
-                        true,
-                    ))
-                })
-            });
-        }
-    }
-    group.finish();
-}
-
 /// Inputs for `bench_index_builders`: an `index` array and a `counts`
 /// array of matching length, one entry per row.
 struct IndexBuilderFixture {
@@ -808,14 +650,152 @@ fn bench_sum_kernels(c: &mut Criterion) {
     group.finish();
 }
 
+struct MaxPositionsFixture {
+    arr: Array1<i64>,
+    starts: Array1<i64>,
+    ends: Array1<i64>,
+    index: Array1<i64>,
+    positions: Array1<i64>,
+    booleans: Array1<bool>,
+}
+
+impl MaxPositionsFixture {
+    fn new(n: usize, duplicate: bool) -> Self {
+        const WIDTH: usize = 8;
+        let arr = Array1::from_iter((0..n).map(|i| i as i64));
+        let starts = Array1::from_iter((0..n).map(|i| (i * WIDTH) as i64));
+        let ends = Array1::from_iter((0..n).map(|i| ((i + 1) * WIDTH) as i64));
+        let index = Array1::from_iter(0..n as i64);
+        let positions = Array1::from_iter((0..n).flat_map(|i| {
+            (0..WIDTH).map(move |j| if duplicate { 0 } else { ((i + j) % n) as i64 })
+        }));
+        let booleans = Array1::from_elem(n, false);
+        Self {
+            arr,
+            starts,
+            ends,
+            index,
+            positions,
+            booleans,
+        }
+    }
+}
+
+fn max_positions_old(
+    arr: ArrayView1<'_, i64>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    capacity: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut dictionary: HashMap<i64, (i64, i64)> =
+        HashMap::with_capacity(capacity.min(index.len()).min(positions.len()));
+    for (row, (((current, start), end), boolean)) in arr
+        .iter()
+        .zip(starts.iter())
+        .zip(ends.iter())
+        .zip(booleans.iter())
+        .enumerate()
+    {
+        let Some(start) = usize::try_from(*start).ok() else {
+            continue;
+        };
+        let Some(end) = usize::try_from(*end).ok().filter(|&e| e <= positions.len()) else {
+            continue;
+        };
+        if start >= end {
+            continue;
+        }
+        for n in start..end {
+            let Some(pos) = usize::try_from(positions[n])
+                .ok()
+                .filter(|&p| p < index.len())
+            else {
+                continue;
+            };
+            let entry = dictionary.entry(index[pos]).or_insert((-1, *current));
+            if !*boolean && (entry.0 == -1 || *current > entry.1) {
+                *entry = (row as i64, *current);
+            }
+        }
+    }
+    dictionary
+        .into_iter()
+        .map(|(label, (row, _))| (label, row))
+        .unzip()
+}
+
+fn bench_max_positions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("max_positions_old_vs_compact");
+    for n in [32, 10_000, 100_000, 1_000_000] {
+        for duplicate in [true, false] {
+            let f = MaxPositionsFixture::new(n, duplicate);
+            let kind = if duplicate { "duplicate" } else { "unique" };
+            let label = format!("n={n} {kind}");
+            let old = count_allocations(|| {
+                max_positions_old(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                )
+            });
+            let compact = count_allocations(|| {
+                max_positions_core(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                )
+            });
+            eprintln!("max_positions {label}: old {old:?}; compact {compact:?}");
+            group.bench_function(format!("old {label}"), |b| {
+                b.iter(|| {
+                    max_positions_old(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
+                    )
+                })
+            });
+            group.bench_function(format!("compact {label}"), |b| {
+                b.iter(|| {
+                    max_positions_core(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
+                    )
+                })
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bin_search_lt,
     bench_bin_search_first,
     bench_bin_search_first_old_vs_new,
     bench_compare_start_end,
-    bench_direct_selection,
     bench_index_builders,
-    bench_sum_kernels
+    bench_sum_kernels,
+    bench_max_positions
 );
 criterion_main!(benches);
