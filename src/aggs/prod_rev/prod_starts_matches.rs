@@ -107,7 +107,10 @@ macro_rules! compute_ints {
                         n += 1;
                         continue;
                     }
-                    totals[slot] *= current_;
+                    // ELI5: NumPy integer products wrap at the dtype boundary;
+                    // `wrapping_mul` preserves that behavior in debug builds
+                    // instead of panicking when the product overflows.
+                    totals[slot] = totals[slot].wrapping_mul(current_);
                     n += 1;
                 }
             }
@@ -281,6 +284,34 @@ mod tests {
             .unwrap();
             assert_eq!(labels.readonly().as_slice().unwrap(), &[10, 20]);
             assert_eq!(values.readonly().as_slice().unwrap(), &[2, 6]);
+        });
+    }
+
+    #[test]
+    fn integer_kernel_wraps_product_overflow() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let arr = PyArray1::from_vec(py, vec![i64::MAX, 2]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let counts = PyArray1::from_vec(py, vec![1_i64, 1]);
+            let index = PyArray1::from_vec(py, vec![10_i64, 10]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 0, 1]);
+            let booleans = PyArray1::from_vec(py, vec![false, false]);
+            let (_, values) = compute_prod_rev_start_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .unwrap();
+            assert_eq!(values.readonly().as_slice().unwrap(), &[-2]);
         });
     }
 }
