@@ -49,12 +49,15 @@ where
                     let slot = labels.len();
                     entry.insert(slot);
                     labels.push(label);
-                    products.push(1);
+                    products.push(1_i64);
                     slot
                 }
             };
             if !*boolean {
-                products[slot] *= current_;
+                // ELI5: use the same defined wraparound arithmetic as the
+                // forward kernel, so debug and release builds agree when an
+                // integer product exceeds its type's range.
+                products[slot] = products[slot].wrapping_mul(current_);
             }
         }
     }
@@ -328,5 +331,29 @@ mod tests {
 
         assert_eq!(labels, vec![4]);
         assert_eq!(products, vec![1.0]);
+    }
+
+    #[test]
+    fn integer_positions_wrap_on_overflow() {
+        let arr = array![i64::MAX, 2];
+        let starts = array![0_i64, 1];
+        let ends = array![1_i64, 2];
+        let index = array![5_i64];
+        let positions = array![0_i64, 0];
+        let booleans = array![false, false];
+
+        let (labels, products) = prod_positions_int_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            index.view(),
+            positions.view(),
+            booleans.view(),
+            1,
+            |value| value,
+        );
+
+        assert_eq!(labels, vec![5]);
+        assert_eq!(products, vec![-2]);
     }
 }
