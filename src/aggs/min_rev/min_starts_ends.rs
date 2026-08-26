@@ -25,6 +25,16 @@ fn validate_inputs<T>(
     if arr.is_empty() || index.is_empty() {
         return Err("arr, starts, booleans, and index cannot be empty");
     }
+    for (start, end) in starts.iter().zip(ends.iter()) {
+        let start = usize::try_from(*start).map_err(|_| "range bounds must be non-negative")?;
+        let end = usize::try_from(*end).map_err(|_| "range bounds must be non-negative")?;
+        if start > index.len() || end > index.len() {
+            return Err("range bounds must not exceed right_index length");
+        }
+        if start > end {
+            return Err("range start must not exceed range end");
+        }
+    }
     Ok(())
 }
 
