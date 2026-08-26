@@ -15,7 +15,7 @@ fn expected_matches_width(starts: ArrayView1<'_, i64>, right_len: usize) -> PyRe
     starts.iter().try_fold(0usize, |total, start| {
         let start = usize::try_from(*start)
             .map_err(|_| pyo3::exceptions::PyValueError::new_err("starts must be non-negative"))?;
-        if start >= right_len {
+        if start > right_len {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "starts must be less than index length",
             ));
@@ -231,4 +231,42 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_prod_rev_start_match_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_prod_rev_start_match_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_prod_rev_start_match_int64, expected_matches_width};
+    use numpy::ndarray::array;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    #[test]
+    fn accepts_zero_width_start_at_index_length() {
+        assert_eq!(expected_matches_width(array![3_i64].view(), 3).unwrap(), 0);
+    }
+
+    #[test]
+    fn integer_kernel_handles_duplicate_labels() {
+        Python::initialize();
+        Python::attach(|py| {
+            let arr = PyArray1::from_vec(py, vec![2_i64, 3]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let counts = PyArray1::from_vec(py, vec![1_i64, 1]);
+            let index = PyArray1::from_vec(py, vec![10_i64, 20]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1, 1]);
+            let booleans = PyArray1::from_vec(py, vec![false, false]);
+            let (labels, values) = compute_prod_rev_start_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .unwrap();
+            assert_eq!(labels.readonly().as_slice().unwrap(), &[10, 20]);
+            assert_eq!(values.readonly().as_slice().unwrap(), &[6, 3]);
+        });
+    }
 }
