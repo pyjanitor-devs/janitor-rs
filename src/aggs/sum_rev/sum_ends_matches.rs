@@ -53,6 +53,11 @@ macro_rules! compute_ints {
             ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
+            if arr.is_empty() || index.is_empty() || matches.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "arr, ends, counts, booleans, index, and matches cannot be empty",
+                ));
+            }
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
@@ -152,6 +157,11 @@ macro_rules! compute_floats {
             ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
+            if arr.is_empty() || index.is_empty() || matches.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "arr, ends, counts, booleans, index, and matches cannot be empty",
+                ));
+            }
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
