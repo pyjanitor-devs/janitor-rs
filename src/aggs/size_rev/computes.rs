@@ -112,7 +112,7 @@ pub fn compute_size_rev_end_matches<'py>(
             .map_err(|_| pyo3::exceptions::PyValueError::new_err("ends must be non-negative"))?;
         if end > index.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "ends must satisfy 0 < end <= index length",
+                "ends must satisfy 0 <= end <= index length",
             ));
         }
         total
