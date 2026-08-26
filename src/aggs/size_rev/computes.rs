@@ -246,6 +246,7 @@ pub fn compute_size_rev_start_end<'py>(
     let starts = starts.as_array();
     let ends = ends.as_array();
     let index = index.as_array();
+    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let (indexers, result) = size_rev_start_end_core(starts, ends, index)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
@@ -266,16 +267,6 @@ pub fn size_rev_start_end_core(
     }
     if starts.is_empty() || index.is_empty() {
         return Err("starts, ends, and index cannot be empty");
-    }
-    for (start, end) in starts.iter().zip(ends.iter()) {
-        let start = usize::try_from(*start).map_err(|_| "range bounds must be non-negative")?;
-        let end = usize::try_from(*end).map_err(|_| "range bounds must be non-negative")?;
-        if start > index.len() || end > index.len() {
-            return Err("range bounds must not exceed right_index length");
-        }
-        if start > end {
-            return Err("range start must not exceed range end");
-        }
     }
     let hint = starts
         .iter()
@@ -351,13 +342,15 @@ mod tests {
     }
 
     #[test]
-    fn explicit_ranges_reject_invalid_and_accept_zero_width_rows() {
-        assert!(size_rev_start_end_core(
-            array![2_i64, -1, 1].view(),
-            array![2_i64, 1, 4].view(),
-            array![10_i64, 20].view(),
-        )
-        .is_err());
+    fn explicit_ranges_skip_invalid_and_accept_zero_width_rows() {
+        assert_eq!(
+            size_rev_start_end_core(
+                array![2_i64, -1, 0, 1].view(),
+                array![2_i64, 1, 1, 4].view(),
+                array![10_i64, 20].view(),
+            ),
+            Ok((array![10], array![1]))
+        );
         assert_eq!(
             size_rev_start_end_core(
                 array![2_i64].view(),
