@@ -4,10 +4,17 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-use crate::aggs::{ensure_equal_lengths, ensure_tape_width};
+use crate::aggs::{ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches};
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
+        /// `matches` must be non-empty and must contain exactly one entry for
+        /// every candidate position. pyjanitor supplies the per-row counts
+        /// and binary mask from the same comparison stage. pyjanitor is
+        /// responsible for ensuring each mask value is 0 or 1; Rust does not
+        /// scan the tape to enforce that value-level contract. Normally
+        /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
+        /// full candidate-tape width.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -25,6 +32,7 @@ macro_rules! compute_ints {
             let starts = starts.as_array();
             ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let matches = matches.as_array();
+            ensure_nonempty_matches(matches.len())?;
             let counts = counts.as_array();
             ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let index = index.as_array();
@@ -39,7 +47,7 @@ macro_rules! compute_ints {
                 .iter()
                 .map(|s| end_.saturating_sub(*s as usize))
                 .sum();
-            ensure_tape_width(expected_matches_width, matches.len())?;
+            ensure_exact_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let zipped = izip!(
@@ -90,6 +98,13 @@ compute_ints!(compute_sum_rev_start_match_uint8, u8);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// `matches` must be non-empty and must contain exactly one entry for
+        /// every candidate position. pyjanitor supplies the per-row counts
+        /// and binary mask from the same comparison stage. pyjanitor is
+        /// responsible for ensuring each mask value is 0 or 1; Rust does not
+        /// scan the tape to enforce that value-level contract. Normally
+        /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
+        /// full candidate-tape width.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -107,6 +122,7 @@ macro_rules! compute_floats {
             let starts = starts.as_array();
             ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let matches = matches.as_array();
+            ensure_nonempty_matches(matches.len())?;
             let counts = counts.as_array();
             ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let index = index.as_array();
@@ -121,7 +137,7 @@ macro_rules! compute_floats {
                 .iter()
                 .map(|s| end_.saturating_sub(*s as usize))
                 .sum();
-            ensure_tape_width(expected_matches_width, matches.len())?;
+            ensure_exact_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
