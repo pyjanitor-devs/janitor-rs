@@ -16,7 +16,7 @@ fn expected_matches_width(starts: ArrayView1<'_, i64>, right_len: usize) -> PyRe
     starts.iter().try_fold(0usize, |total, start| {
         let start = usize::try_from(*start)
             .map_err(|_| pyo3::exceptions::PyValueError::new_err("starts must be non-negative"))?;
-        if start >= right_len {
+        if start > right_len {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "starts must be less than index length",
             ));
@@ -147,4 +147,42 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_min_rev_start_match_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_min_rev_start_match_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_min_rev_start_match_int64, expected_matches_width};
+    use numpy::ndarray::array;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    #[test]
+    fn accepts_zero_width_start_at_index_length() {
+        assert_eq!(expected_matches_width(array![3_i64].view(), 3).unwrap(), 0);
+    }
+
+    #[test]
+    fn integer_kernel_preserves_label_order_and_min_rows() {
+        Python::initialize();
+        Python::attach(|py| {
+            let arr = PyArray1::from_vec(py, vec![2_i64, 3, 4]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 1, 2]);
+            let counts = PyArray1::from_vec(py, vec![1_i64, 1, 0]);
+            let index = PyArray1::from_vec(py, vec![10_i64, 20, 10]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 0, 1, 1, 0, 1]);
+            let booleans = PyArray1::from_vec(py, vec![false, false, false]);
+            let (labels, rows) = compute_min_rev_start_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .unwrap();
+            assert_eq!(labels.readonly().as_slice().unwrap(), &[10, 20]);
+            assert_eq!(rows.readonly().as_slice().unwrap(), &[0, 1]);
+        });
+    }
 }
