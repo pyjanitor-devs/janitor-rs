@@ -161,7 +161,7 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn accepts_zero_width_prefix_and_rejects_invalid_ends() {
+    fn computes_zero_width_prefix_and_rejects_invalid_ends() {
         assert_eq!(
             expected_matches_width(array![0_i64, 3].view(), 3).unwrap(),
             3
