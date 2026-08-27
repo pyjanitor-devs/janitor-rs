@@ -630,7 +630,6 @@ mod adversarial_bounds_tests {
                 left_index.readonly(),
                 right_index.readonly(),
                 booleans.readonly(),
-                1,
             );
             assert!(result.is_err(), "invalid left_index must be rejected");
 

@@ -79,7 +79,10 @@ macro_rules! compute_ints {
                         n += 1;
                         continue;
                     }
-                    *total *= current_;
+                    // ELI5: integer products are allowed to wrap like NumPy
+                    // integers; wrapping_mul keeps debug and release builds
+                    // on the same path instead of panicking on overflow.
+                    *total = total.wrapping_mul(current_);
                     n += 1;
                 }
             }
