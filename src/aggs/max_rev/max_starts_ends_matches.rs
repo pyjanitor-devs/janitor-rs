@@ -178,4 +178,34 @@ mod tests {
             .expect("equal bounds with a non-empty tape are valid");
         });
     }
+
+    #[test]
+    fn wrapper_rejects_empty_matches_tape() {
+        Python::initialize();
+        Python::attach(|py| {
+            let arr = PyArray1::from_vec(py, vec![5_i64]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![0_i64]);
+            let index = PyArray1::from_vec(py, vec![10_i64]);
+            let counts = PyArray1::from_vec(py, vec![0_i64]);
+            let matches = PyArray1::from_vec(py, Vec::<i8>::new());
+            let booleans = PyArray1::from_vec(py, vec![false]);
+
+            let error = compute_max_rev_start_end_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+                1,
+            )
+            .unwrap_err();
+
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert!(error.to_string().contains("matches cannot be empty"));
+        });
+    }
 }
