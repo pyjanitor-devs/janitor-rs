@@ -2,26 +2,22 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::{ensure_equal_lengths, ensure_nonempty, ensure_valid_ends};
+
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(), &'static str> {
-    if arr.len() != ends.len() || arr.len() != booleans.len() {
-        return Err("arr, ends, and booleans must have equal lengths");
-    }
-    if arr.is_empty() || index.is_empty() {
-        return Err("arr, ends, booleans, and index cannot be empty");
-    }
-    if ends.iter().any(|end| {
-        usize::try_from(*end)
-            .map(|end| end > index.len())
-            .unwrap_or(true)
-    }) {
-        return Err("ends must satisfy 0 <= end <= right_len");
-    }
-    Ok(())
+    ensure_equal_lengths("arr", arr.len(), "ends", ends.len())
+        .map_err(|_| "arr and ends must have equal lengths")?;
+    ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())
+        .map_err(|_| "arr and booleans must have equal lengths")?;
+    ensure_nonempty("arr", arr.len())?;
+    ensure_nonempty("index", index.len())?;
+    ensure_nonempty("ends", ends.len())?;
+    ensure_valid_ends("ends", ends.iter().copied(), index.len())
 }
 
 /// Groups reverse-minimum ends by compact candidate ordinal.

@@ -2,26 +2,22 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::{ensure_equal_lengths, ensure_nonempty, ensure_valid_indices};
+
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(), &'static str> {
-    if arr.len() != starts.len() || arr.len() != booleans.len() {
-        return Err("arr, starts, and booleans must have equal lengths");
-    }
-    if arr.is_empty() || index.is_empty() {
-        return Err("arr, starts, booleans, and index cannot be empty");
-    }
-    if starts.iter().any(|start| {
-        usize::try_from(*start)
-            .map(|start| start > index.len())
-            .unwrap_or(true)
-    }) {
-        return Err("starts must satisfy 0 <= start <= right_len");
-    }
-    Ok(())
+    ensure_equal_lengths("arr", arr.len(), "starts", starts.len())
+        .map_err(|_| "arr and starts must have equal lengths")?;
+    ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())
+        .map_err(|_| "arr and booleans must have equal lengths")?;
+    ensure_nonempty("arr", arr.len())?;
+    ensure_nonempty("index", index.len())?;
+    ensure_nonempty("starts", starts.len())?;
+    ensure_valid_indices("starts", starts.iter().copied(), index.len())
 }
 
 /// Groups reverse-maximum starts by compact candidate ordinal.
