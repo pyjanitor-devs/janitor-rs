@@ -22,9 +22,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
-    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, min_positions_core,
-    repeat_index_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
-    trim_index_core, CompareOp,
+    binary_search_lt_core, binary_search_lt_first_core, compare_end_allocating_core,
+    compare_end_in_place_core, compare_ne_end_allocating_core, compare_ne_end_in_place_core,
+    compare_ne_start_allocating_core, compare_ne_start_end_allocating_core,
+    compare_ne_start_end_in_place_core, compare_ne_start_in_place_core,
+    compare_start_allocating_core, compare_start_end_core, compare_start_end_in_place_core,
+    compare_start_in_place_core, min_positions_core, repeat_index_core, sum_end_core, sum_start_core,
+    sum_start_end_core, sum_start_u32_core, trim_index_core, CompareOp,
 };
 use std::collections::HashMap;
 
@@ -479,6 +483,373 @@ fn bench_compare_start_end(c: &mut Criterion) {
     group.finish();
 }
 
+/// A realistic flat-tape fixture: every left row examines the complete right
+/// side, so the tape contains `left_len * right_len` candidate slots.
+struct PairedCompareFixture {
+    right: Array1<i64>,
+    left: Array1<i64>,
+    starts: Array1<i64>,
+    ends: Array1<i64>,
+    matches: Array1<i8>,
+}
+
+impl PairedCompareFixture {
+    fn new(left_len: usize, right_len: usize, survivor_stride: Option<usize>) -> Self {
+        let tape_width = left_len * right_len;
+        PairedCompareFixture {
+            right: Array1::from_iter(0..right_len as i64),
+            left: Array1::from_iter((0..left_len as i64).map(|i| i * 2)),
+            starts: Array1::zeros(left_len),
+            ends: Array1::from_elem(left_len, right_len as i64),
+            matches: Array1::from_iter((0..tape_width).map(|position| {
+                if survivor_stride.is_some_and(|stride| position % stride == 0) {
+                    0
+                } else {
+                    1
+                }
+            })),
+        }
+    }
+}
+
+/// Paired comparison of one additional predicate. Both kernels receive the
+/// same live mask and calculate the same counts; the allocating version
+/// creates a replacement full-width tape, while the in-place version reuses
+/// the supplied tape. `iter_batched` keeps mask setup outside the measured
+/// closure so the comparison is about the kernel, not fixture preparation.
+fn bench_compare_start_end_allocating_vs_in_place(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compare_start_end_allocating_vs_in_place");
+    for (left_len, right_len) in [(500, 5_000), (1_000, 10_000)] {
+        for (mask_name, survivor_stride) in [("dense", None), ("25pct_dead", Some(4))] {
+            let f = PairedCompareFixture::new(left_len, right_len, survivor_stride);
+            let label = format!("candidates={}/mask={mask_name}", f.matches.len());
+
+            group.bench_function(format!("{label}/allocating"), |b| {
+                b.iter(|| {
+                    compare_start_end_core(
+                        black_box(f.left.view()),
+                        black_box(f.right.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.matches.view()),
+                        black_box(CompareOp::Gt),
+                    )
+                })
+            });
+
+            group.bench_function(format!("{label}/in_place"), |b| {
+                b.iter_batched(
+                    || f.matches.clone(),
+                    |mut matches| {
+                        compare_start_end_in_place_core(
+                            black_box(f.left.view()),
+                            black_box(f.right.view()),
+                            black_box(f.starts.view()),
+                            black_box(f.ends.view()),
+                            black_box(matches.view_mut()),
+                            black_box(CompareOp::Gt),
+                        )
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            });
+
+            let mut reusable_mask = f.matches.clone();
+            let (alloc_bytes, alloc_calls, alloc_peak) = count_allocations(|| {
+                compare_start_end_core(
+                    f.left.view(),
+                    f.right.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.matches.view(),
+                    CompareOp::Gt,
+                )
+            });
+            let (in_place_bytes, in_place_calls, in_place_peak) = count_allocations(|| {
+                compare_start_end_in_place_core(
+                    f.left.view(),
+                    f.right.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    reusable_mask.view_mut(),
+                    CompareOp::Gt,
+                )
+            });
+            eprintln!(
+                "\n{label}: allocating {alloc_bytes} bytes/{alloc_calls} allocs/{alloc_peak} peak; in-place {in_place_bytes} bytes/{in_place_calls} allocs/{in_place_peak} peak"
+            );
+        }
+    }
+    group.finish();
+}
+
+fn bench_compare_side_shapes_allocating_vs_in_place(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compare_side_shapes_allocating_vs_in_place");
+    for (left_len, right_len) in [(500, 5_000), (1_000, 10_000)] {
+        for (mask_name, survivor_stride) in [("dense", None), ("25pct_dead", Some(4))] {
+            let f = PairedCompareFixture::new(left_len, right_len, survivor_stride);
+            let counts = Array1::from_elem(left_len, right_len as i64);
+            let label = format!("candidates={}/mask={mask_name}", f.matches.len());
+
+            group.bench_function(format!("{label}/starts_only/allocating"), |b| {
+                b.iter(|| {
+                    compare_start_allocating_core(
+                        black_box(f.left.view()),
+                        black_box(f.right.view()),
+                        black_box(f.starts.view()),
+                        black_box(counts.view()),
+                        black_box(f.matches.view()),
+                        black_box(CompareOp::Gt),
+                    )
+                })
+            });
+            group.bench_function(format!("{label}/starts_only/in_place"), |b| {
+                b.iter_batched(
+                    || f.matches.clone(),
+                    |mut matches| {
+                        compare_start_in_place_core(
+                            black_box(f.left.view()),
+                            black_box(f.right.view()),
+                            black_box(f.starts.view()),
+                            black_box(counts.view()),
+                            black_box(matches.view_mut()),
+                            black_box(CompareOp::Gt),
+                        )
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            });
+
+            group.bench_function(format!("{label}/ends_only/allocating"), |b| {
+                b.iter(|| {
+                    compare_end_allocating_core(
+                        black_box(f.left.view()),
+                        black_box(f.right.view()),
+                        black_box(f.ends.view()),
+                        black_box(counts.view()),
+                        black_box(f.matches.view()),
+                        black_box(CompareOp::Gt),
+                    )
+                })
+            });
+            group.bench_function(format!("{label}/ends_only/in_place"), |b| {
+                b.iter_batched(
+                    || f.matches.clone(),
+                    |mut matches| {
+                        compare_end_in_place_core(
+                            black_box(f.left.view()),
+                            black_box(f.right.view()),
+                            black_box(f.ends.view()),
+                            black_box(counts.view()),
+                            black_box(matches.view_mut()),
+                            black_box(CompareOp::Gt),
+                        )
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            });
+
+            let (start_alloc_bytes, start_alloc_calls, _) = count_allocations(|| {
+                compare_start_allocating_core(
+                    f.left.view(),
+                    f.right.view(),
+                    f.starts.view(),
+                    counts.view(),
+                    f.matches.view(),
+                    CompareOp::Gt,
+                )
+            });
+            let mut start_mask = f.matches.clone();
+            let (start_in_place_bytes, start_in_place_calls, _) = count_allocations(|| {
+                compare_start_in_place_core(
+                    f.left.view(),
+                    f.right.view(),
+                    f.starts.view(),
+                    counts.view(),
+                    start_mask.view_mut(),
+                    CompareOp::Gt,
+                )
+            });
+            let (end_alloc_bytes, end_alloc_calls, _) = count_allocations(|| {
+                compare_end_allocating_core(
+                    f.left.view(),
+                    f.right.view(),
+                    f.ends.view(),
+                    counts.view(),
+                    f.matches.view(),
+                    CompareOp::Gt,
+                )
+            });
+            let mut end_mask = f.matches.clone();
+            let (end_in_place_bytes, end_in_place_calls, _) = count_allocations(|| {
+                compare_end_in_place_core(
+                    f.left.view(),
+                    f.right.view(),
+                    f.ends.view(),
+                    counts.view(),
+                    end_mask.view_mut(),
+                    CompareOp::Gt,
+                )
+            });
+            eprintln!(
+                "\n{label}: starts allocating {start_alloc_bytes} bytes/{start_alloc_calls} allocs; starts in-place {start_in_place_bytes} bytes/{start_in_place_calls} allocs; ends allocating {end_alloc_bytes} bytes/{end_alloc_calls} allocs; ends in-place {end_in_place_bytes} bytes/{end_in_place_calls} allocs"
+            );
+        }
+    }
+    group.finish();
+}
+
+fn bench_compare_nullable_shapes_allocating_vs_in_place(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compare_nullable_shapes_allocating_vs_in_place");
+    for (left_len, right_len) in [(500, 5_000), (1_000, 10_000)] {
+        for (mask_name, survivor_stride) in [("dense", None), ("25pct_dead", Some(4))] {
+            let f = PairedCompareFixture::new(left_len, right_len, survivor_stride);
+            let counts = Array1::from_elem(left_len, right_len as i64);
+            let left_booleans = Array1::from_elem(left_len, false);
+            let right_booleans =
+                Array1::from_iter((0..right_len).map(|position| position % 17 == 0));
+            let label = format!("candidates={}/mask={mask_name}", f.matches.len());
+
+            group.bench_function(format!("{label}/starts_only/allocating"), |b| {
+                b.iter(|| {
+                    compare_ne_start_allocating_core(
+                        black_box(f.left.view()),
+                        black_box(f.right.view()),
+                        black_box(f.starts.view()),
+                        black_box(counts.view()),
+                        black_box(left_booleans.view()),
+                        black_box(right_booleans.view()),
+                        black_box(f.matches.view()),
+                        true,
+                        black_box(CompareOp::Ne),
+                    )
+                })
+            });
+            group.bench_function(format!("{label}/starts_only/in_place"), |b| {
+                b.iter_batched(
+                    || f.matches.clone(),
+                    |mut matches| {
+                        compare_ne_start_in_place_core(
+                            black_box(f.left.view()),
+                            black_box(f.right.view()),
+                            black_box(f.starts.view()),
+                            black_box(counts.view()),
+                            black_box(left_booleans.view()),
+                            black_box(right_booleans.view()),
+                            black_box(matches.view_mut()),
+                            true,
+                            black_box(CompareOp::Ne),
+                        )
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            });
+
+            group.bench_function(format!("{label}/ends_only/allocating"), |b| {
+                b.iter(|| {
+                    compare_ne_end_allocating_core(
+                        black_box(f.left.view()),
+                        black_box(f.right.view()),
+                        black_box(f.ends.view()),
+                        black_box(counts.view()),
+                        black_box(left_booleans.view()),
+                        black_box(right_booleans.view()),
+                        black_box(f.matches.view()),
+                        true,
+                        black_box(CompareOp::Ne),
+                    )
+                })
+            });
+            group.bench_function(format!("{label}/ends_only/in_place"), |b| {
+                b.iter_batched(
+                    || f.matches.clone(),
+                    |mut matches| {
+                        compare_ne_end_in_place_core(
+                            black_box(f.left.view()),
+                            black_box(f.right.view()),
+                            black_box(f.ends.view()),
+                            black_box(counts.view()),
+                            black_box(left_booleans.view()),
+                            black_box(right_booleans.view()),
+                            black_box(matches.view_mut()),
+                            true,
+                            black_box(CompareOp::Ne),
+                        )
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            });
+
+            group.bench_function(format!("{label}/starts_ends/allocating"), |b| {
+                b.iter(|| {
+                    compare_ne_start_end_allocating_core(
+                        black_box(f.left.view()),
+                        black_box(f.right.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(left_booleans.view()),
+                        black_box(right_booleans.view()),
+                        black_box(f.matches.view()),
+                        true,
+                        black_box(CompareOp::Ne),
+                    )
+                })
+            });
+            group.bench_function(format!("{label}/starts_ends/in_place"), |b| {
+                b.iter_batched(
+                    || f.matches.clone(),
+                    |mut matches| {
+                        compare_ne_start_end_in_place_core(
+                            black_box(f.left.view()),
+                            black_box(f.right.view()),
+                            black_box(f.starts.view()),
+                            black_box(f.ends.view()),
+                            black_box(left_booleans.view()),
+                            black_box(right_booleans.view()),
+                            black_box(matches.view_mut()),
+                            true,
+                            black_box(CompareOp::Ne),
+                        )
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            });
+
+            let (alloc_bytes, alloc_calls, _) = count_allocations(|| {
+                compare_ne_start_end_allocating_core(
+                    f.left.view(),
+                    f.right.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    left_booleans.view(),
+                    right_booleans.view(),
+                    f.matches.view(),
+                    true,
+                    CompareOp::Ne,
+                )
+            });
+            let mut mask = f.matches.clone();
+            let (in_place_bytes, in_place_calls, _) = count_allocations(|| {
+                compare_ne_start_end_in_place_core(
+                    f.left.view(),
+                    f.right.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    left_booleans.view(),
+                    right_booleans.view(),
+                    mask.view_mut(),
+                    true,
+                    CompareOp::Ne,
+                )
+            });
+            eprintln!(
+                "\n{label}: nullable starts+ends allocating {alloc_bytes} bytes/{alloc_calls} allocs; in-place {in_place_bytes} bytes/{in_place_calls} allocs"
+            );
+        }
+    }
+    group.finish();
+}
+
 /// Inputs for `bench_index_builders`: an `index` array and a `counts`
 /// array of matching length, one entry per row.
 struct IndexBuilderFixture {
@@ -803,6 +1174,9 @@ criterion_group!(
     bench_bin_search_first,
     bench_bin_search_first_old_vs_new,
     bench_compare_start_end,
+    bench_compare_start_end_allocating_vs_in_place,
+    bench_compare_side_shapes_allocating_vs_in_place,
+    bench_compare_nullable_shapes_allocating_vs_in_place,
     bench_index_builders,
     bench_sum_kernels,
     bench_min_positions

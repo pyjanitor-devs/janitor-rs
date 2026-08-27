@@ -100,7 +100,7 @@ mod wrapper_op_validation_tests {
                     right.readonly(),
                     starts.readonly(),
                     ends.readonly(),
-                    matches.readonly(),
+                    matches.clone(),
                     9,
                 ),
             );
@@ -138,7 +138,7 @@ mod wrapper_op_validation_tests {
                     ends.readonly(),
                     left_booleans.readonly(),
                     right_booleans.readonly(),
-                    matches.readonly(),
+                    matches.clone(),
                     false,
                     9,
                 ),

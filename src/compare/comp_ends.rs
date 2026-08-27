@@ -1,12 +1,88 @@
 /// compare rows where only ends exist (usually a >/>= join)
 /// and matches already exist
 use itertools::izip;
-use numpy::ndarray::Array1;
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use numpy::ndarray::{Array1, ArrayView1, ArrayViewMut1};
+use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use super::op::CompareOp;
+
+pub fn compare_end_in_place_core<T: PartialOrd + Copy>(
+    left: ArrayView1<T>,
+    right: ArrayView1<T>,
+    ends: ArrayView1<i64>,
+    counts: ArrayView1<i64>,
+    mut matches: ArrayViewMut1<'_, i8>,
+    op: CompareOp,
+) -> (Array1<i64>, i64) {
+    let mut counts_array = Array1::<i64>::zeros(left.len());
+    let mut total = 0;
+    let mut n = 0;
+    for (position, (left_val, end, count)) in
+        izip!(left.into_iter(), ends.into_iter(), counts.into_iter()).enumerate()
+    {
+        let end_ = *end as usize;
+        if *count == 0 {
+            n += end_;
+            continue;
+        }
+        let mut counter = 0;
+        for nn in 0..end_ {
+            if matches[n] == 0 {
+                n += 1;
+                continue;
+            }
+            let compare = op.apply(left_val, &right[nn]);
+            matches[n] = compare as i8;
+            counter += compare as i64;
+            total += compare as i64;
+            n += 1;
+        }
+        counts_array[position] = counter;
+    }
+    for value in matches.iter_mut().skip(n) {
+        *value = 0;
+    }
+    (counts_array, total)
+}
+
+pub fn compare_end_allocating_core<T: PartialOrd + Copy>(
+    left: ArrayView1<T>,
+    right: ArrayView1<T>,
+    ends: ArrayView1<i64>,
+    counts: ArrayView1<i64>,
+    matches: ArrayView1<i8>,
+    op: CompareOp,
+) -> (Array1<i8>, Array1<i64>, i64) {
+    let mut result = Array1::<i8>::zeros(matches.len());
+    let mut counts_array = Array1::<i64>::zeros(left.len());
+    let mut total = 0;
+    let mut n = 0;
+    for (position, (left_val, end, count)) in
+        izip!(left.into_iter(), ends.into_iter(), counts.into_iter()).enumerate()
+    {
+        let end_ = *end as usize;
+        if *count == 0 {
+            n += end_;
+            continue;
+        }
+        let mut counter = 0;
+        for nn in 0..end_ {
+            if matches[n] == 0 {
+                n += 1;
+                continue;
+            }
+            let compare = op.apply(left_val, &right[nn]);
+            result[n] = compare as i8;
+            counter += compare as i64;
+            total += compare as i64;
+            n += 1;
+        }
+        counts_array[position] = counter;
+    }
+    (result, counts_array, total)
+}
 
 macro_rules! generic_compare {
     ($fname:ident, $type:ty) => {
@@ -17,13 +93,15 @@ macro_rules! generic_compare {
             right: PyReadonlyArray1<'py, $type>,
             ends: PyReadonlyArray1<'py, i64>,
             counts: PyReadonlyArray1<'py, i64>,
-            matches: PyReadonlyArray1<'py, i8>,
+            matches: Bound<'py, PyArray1<i8>>,
             op: i8,
         ) -> PyResult<(Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64)> {
             let left_array = left.as_array();
             let right_array = right.as_array();
             let ends_array = ends.as_array();
-            let matches_array = matches.as_array();
+            let mut matches_array = matches
+                .try_readwrite()
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
             let counts = counts.as_array();
             // `matches`/`counts` are supplied by the caller, already sized
             // to this row layout's real (unclamped) widths -- unlike
@@ -51,44 +129,16 @@ macro_rules! generic_compare {
                 )));
             }
             let op = CompareOp::try_from_code(op)?;
-            let mut result = Array1::<i8>::zeros(matches_array.len());
-            let mut counts_array = Array1::<i64>::zeros(left_array.len());
-            let mut total: i64 = 0;
-            let start = 0;
-            let mut n = 0;
-            let zipped = izip!(
-                left_array.into_iter(),
-                ends_array.into_iter(),
-                counts.into_iter()
+            let (counts_array, total) = compare_end_in_place_core(
+                left_array,
+                right_array,
+                ends_array,
+                counts,
+                matches_array.as_array_mut(),
+                op,
             );
-            for (position, (left_val, end, count)) in zipped.enumerate() {
-                let end_ = *end as usize;
-                if *count == 0 {
-                    let size = end_ - start;
-                    n += size;
-                    continue;
-                }
-                let mut counter: i64 = 0;
-                for nn in start..end_ {
-                    if matches_array[n] == 0 {
-                        n += 1;
-                        continue;
-                    }
-                    let right_val = right_array[nn];
-                    let compare = op.apply(left_val, &right_val);
-                    counter += compare as i64;
-                    total += compare as i64;
-                    result[n] = compare as i8;
-                    n += 1;
-                }
 
-                counts_array[position] = counter;
-            }
-            Ok((
-                result.into_pyarray(py),
-                counts_array.into_pyarray(py),
-                total,
-            ))
+            Ok((matches, counts_array.into_pyarray(py), total))
         }
     };
 }
@@ -143,7 +193,7 @@ mod tests {
             right.readonly(),
             ends.readonly(),
             counts.readonly(),
-            matches.readonly(),
+            matches.clone(),
             0, // CompareOp::Gt
         )
     }

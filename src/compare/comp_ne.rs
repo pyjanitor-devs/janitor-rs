@@ -1,12 +1,123 @@
 /// compare rows where starts and ends exist - for !=
 /// and matches exist
 use itertools::izip;
-use numpy::ndarray::Array1;
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use numpy::ndarray::{Array1, ArrayView1, ArrayViewMut1};
+use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use super::op::CompareOp;
+
+pub fn compare_ne_start_end_in_place_core<T: PartialOrd + Copy>(
+    left: ArrayView1<T>,
+    right: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    left_booleans: ArrayView1<bool>,
+    right_booleans: ArrayView1<bool>,
+    mut matches: ArrayViewMut1<'_, i8>,
+    is_extension_array: bool,
+    op: CompareOp,
+) -> (Array1<i64>, i64) {
+    let mut counts_array = Array1::<i64>::zeros(left.len());
+    let mut total = 0;
+    let mut n = 0;
+    for (position, (left_val, left_bool, start, end)) in izip!(
+        left.into_iter(),
+        left_booleans.into_iter(),
+        starts.into_iter(),
+        ends.into_iter()
+    )
+    .enumerate()
+    {
+        let start_ = *start as usize;
+        let end_ = *end as usize;
+        let mut counter = 0;
+        for nn in start_..end_ {
+            if matches[n] == 0 {
+                n += 1;
+                continue;
+            }
+            let right_bool = right_booleans[nn];
+            if (*left_bool || right_bool) && is_extension_array {
+                matches[n] = 0;
+                n += 1;
+                continue;
+            }
+            if (*left_bool || right_bool) && !is_extension_array {
+                matches[n] = 1;
+                n += 1;
+                counter += 1;
+                total += 1;
+                continue;
+            }
+            let compare = op.apply(left_val, &right[nn]);
+            matches[n] = compare as i8;
+            counter += compare as i64;
+            total += compare as i64;
+            n += 1;
+        }
+        counts_array[position] = counter;
+    }
+    for value in matches.iter_mut().skip(n) {
+        *value = 0;
+    }
+    (counts_array, total)
+}
+
+pub fn compare_ne_start_end_allocating_core<T: PartialOrd + Copy>(
+    left: ArrayView1<T>,
+    right: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    left_booleans: ArrayView1<bool>,
+    right_booleans: ArrayView1<bool>,
+    matches: ArrayView1<i8>,
+    is_extension_array: bool,
+    op: CompareOp,
+) -> (Array1<i8>, Array1<i64>, i64) {
+    let mut result = Array1::<i8>::zeros(matches.len());
+    let mut counts_array = Array1::<i64>::zeros(left.len());
+    let mut total = 0;
+    let mut n = 0;
+    for (position, (left_val, left_bool, start, end)) in izip!(
+        left.into_iter(),
+        left_booleans.into_iter(),
+        starts.into_iter(),
+        ends.into_iter()
+    )
+    .enumerate()
+    {
+        let start_ = *start as usize;
+        let end_ = *end as usize;
+        let mut counter = 0;
+        for nn in start_..end_ {
+            if matches[n] == 0 {
+                n += 1;
+                continue;
+            }
+            let right_bool = right_booleans[nn];
+            if (*left_bool || right_bool) && is_extension_array {
+                n += 1;
+                continue;
+            }
+            if (*left_bool || right_bool) && !is_extension_array {
+                result[n] = 1;
+                n += 1;
+                counter += 1;
+                total += 1;
+                continue;
+            }
+            let compare = op.apply(left_val, &right[nn]);
+            result[n] = compare as i8;
+            counter += compare as i64;
+            total += compare as i64;
+            n += 1;
+        }
+        counts_array[position] = counter;
+    }
+    (result, counts_array, total)
+}
 
 macro_rules! generic_compare {
     ($fname:ident, $type:ty) => {
@@ -19,7 +130,7 @@ macro_rules! generic_compare {
             ends: PyReadonlyArray1<'py, i64>,
             left_booleans: PyReadonlyArray1<'py, bool>,
             right_booleans: PyReadonlyArray1<'py, bool>,
-            matches: PyReadonlyArray1<'py, i8>,
+            matches: Bound<'py, PyArray1<i8>>,
             is_extension_array: bool,
             op: i8,
         ) -> PyResult<(Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64)> {
@@ -29,7 +140,9 @@ macro_rules! generic_compare {
             let ends_array = ends.as_array();
             let left_booleans_array = left_booleans.as_array();
             let right_booleans_array = right_booleans.as_array();
-            let matches_array = matches.as_array();
+            let mut matches_array = matches
+                .try_readwrite()
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
             // Same reasoning as `comp_ends.rs`/`comp_starts.rs`: `matches`
             // is externally sized by the caller, so an invalid row can't
             // be silently skipped without desynchronizing `n` from every
@@ -54,55 +167,18 @@ macro_rules! generic_compare {
                 )));
             }
             let op = CompareOp::try_from_code(op)?;
-            let mut result = Array1::<i8>::zeros(matches_array.len());
-            let mut counts_array = Array1::<i64>::zeros(left_array.len());
-            let mut total: i64 = 0;
-            let mut n: usize = 0;
-            let zipped = izip!(
-                left_array.into_iter(),
-                left_booleans_array.into_iter(),
-                starts_array.into_iter(),
-                ends_array.into_iter(),
+            let (counts_array, total) = compare_ne_start_end_in_place_core(
+                left_array,
+                right_array,
+                starts_array,
+                ends_array,
+                left_booleans_array,
+                right_booleans_array,
+                matches_array.as_array_mut(),
+                is_extension_array,
+                op,
             );
-            for (position, (left_val, left_bool, start, end)) in zipped.enumerate() {
-                let start_ = *start as usize;
-                let end_ = *end as usize;
-                let mut counter: i64 = 0;
-                for nn in start_..end_ {
-                    if matches_array[n] == 0 {
-                        n += 1;
-                        continue;
-                    }
-                    let right_bool_ = right_booleans_array[nn];
-                    // pd.NA != pd.NA returns pd.NA, which defaults to False
-                    // pd.NA != anything returns pd.NA, which defaults to False
-                    // whereas np.nan != np.nan returns True
-                    // np.nan != anything returns True
-                    if (*left_bool || right_bool_) && is_extension_array {
-                        n += 1;
-                        continue;
-                    }
-                    if (*left_bool || right_bool_) && !is_extension_array {
-                        result[n] = 1;
-                        n += 1;
-                        counter += 1;
-                        total += 1;
-                        continue;
-                    }
-                    let right_val = right_array[nn];
-                    let compare = op.apply(left_val, &right_val);
-                    counter += compare as i64;
-                    total += compare as i64;
-                    result[n] = compare as i8;
-                    n += 1;
-                }
-                counts_array[position] = counter;
-            }
-            Ok((
-                result.into_pyarray(py),
-                counts_array.into_pyarray(py),
-                total,
-            ))
+            Ok((matches, counts_array.into_pyarray(py), total))
         }
     };
 }
@@ -161,7 +237,7 @@ mod tests {
             ends.readonly(),
             left_booleans.readonly(),
             right_booleans.readonly(),
-            matches.readonly(),
+            matches.clone(),
             false,
             5, // CompareOp::Ne
         )
