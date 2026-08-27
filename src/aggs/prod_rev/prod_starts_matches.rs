@@ -41,11 +41,9 @@ macro_rules! compute_ints {
             index: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
         // The macro will expand into the contents of this block.
         {
-            let _ = length;
             let arr = arr.as_array();
             let starts = starts.as_array();
             ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
@@ -148,11 +146,9 @@ macro_rules! compute_floats {
             index: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>
         // The macro will expand into the contents of this block.
         {
-            let _ = length;
             let arr = arr.as_array();
             let starts = starts.as_array();
             ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
@@ -284,7 +280,6 @@ mod tests {
                 index.readonly(),
                 matches.readonly(),
                 booleans.readonly(),
-                2,
             )
             .is_err());
         });
@@ -312,7 +307,6 @@ mod tests {
                 index.readonly(),
                 matches.readonly(),
                 booleans.readonly(),
-                2,
             )
             .unwrap();
             assert_eq!(labels.readonly().as_slice().unwrap(), &[10, 20]);
@@ -342,7 +336,6 @@ mod tests {
                 index.readonly(),
                 matches.readonly(),
                 booleans.readonly(),
-                2,
             )
             .unwrap();
             assert_eq!(values.readonly().as_slice().unwrap(), &[-2]);
