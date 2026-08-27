@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 pub mod comp;
+pub mod comp_direct;
 pub mod comp_ends;
 pub mod comp_first;
 pub mod comp_first_ends;
@@ -26,6 +27,7 @@ pub mod op;
 /// the front door needing to know every team by name.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     comp::register(m)?;
+    comp_direct::register(m)?;
     comp_ends::register(m)?;
     comp_first::register(m)?;
     comp_first_ends::register(m)?;

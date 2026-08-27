@@ -13,7 +13,9 @@ mod left_le_right;
 /// hundreds of Python wrappers.
 #[doc(hidden)]
 pub mod bench_support {
+    pub use crate::aggs::max_rev::max_positions::max_positions_core;
     pub use crate::aggs::min_rev::min_positions::min_positions_core;
+    pub use crate::aggs::size_rev::computes::size_positions_core;
     pub use crate::aggs::sum::sum_ends::sum_end_core;
     pub use crate::aggs::sum::sum_starts::{sum_start_core, sum_start_u32_core};
     pub use crate::aggs::sum::sum_starts_ends::sum_start_end_core;
@@ -23,6 +25,7 @@ pub mod bench_support {
     pub use crate::bin_search::bin_search_lt::binary_search_lt_core;
     pub use crate::bin_search::bin_search_lt_first::binary_search_lt_first_core;
     pub use crate::compare::comp::compare_start_end_core;
+    pub use crate::compare::comp_direct::select_start_end_core;
     pub use crate::compare::op::CompareOp;
     pub use crate::index_builder::{repeat_index_core, trim_index_core};
 }
@@ -90,10 +93,10 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (884 dtype-specialized exports across 89
+    /// `register`, as of this PR (894 dtype-specialized exports across 90
     /// leaf modules). Bump this alongside any PR that intentionally adds
     /// or removes an export.
-    const EXPECTED_EXPORT_COUNT: usize = 886;
+    const EXPECTED_EXPORT_COUNT: usize = 896;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
@@ -103,7 +106,7 @@ mod registration_tests {
     /// module must be one of our own exports (Python/PyO3 module
     /// machinery -- `__name__`, `__all__`, etc. -- all use `__`-wrapped
     /// names), so counting just those catches a missing or duplicate
-    /// export without spelling out all 884 names here.
+    /// export without spelling out all 894 names here.
     #[test]
     fn total_registered_export_count_matches_expected() {
         Python::initialize();
