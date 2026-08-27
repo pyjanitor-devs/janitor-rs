@@ -64,6 +64,45 @@ pub fn sum_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     Ok((Array1::from_vec(labels), Array1::from_vec(totals)))
 }
 
+/// `u64`-native counterpart to `sum_rev_no_range_int_core`.
+///
+/// ELI5: `uint64` values `>= 2**63` don't fit in `i64`; funneling them
+/// through the shared `i64` accumulator wraps them to a negative number.
+/// This keeps the accumulator and the returned totals in `u64` end-to-end
+/// so large unsigned sums come back correct instead of sign-flipped.
+pub fn sum_rev_no_range_u64_core(
+    arr: ArrayView1<'_, u64>,
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+) -> Result<(Array1<i64>, Array1<u64>), &'static str> {
+    validate_inputs(arr, left_index, right_index, booleans)?;
+    let capacity = right_index.len();
+    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
+    let mut labels = Vec::new();
+    let mut totals = Vec::new();
+
+    for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
+        let left = checked_index(*index_left, arr.len())
+            .ok_or("left_index must contain valid positions in arr")?;
+        let slot = match slots.entry(*index_right) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let slot = labels.len();
+                labels.push(*index_right);
+                totals.push(0_u64);
+                entry.insert(slot);
+                slot
+            }
+        };
+        if !booleans[left] {
+            totals[slot] = totals[slot].wrapping_add(arr[left]);
+        }
+    }
+
+    Ok((Array1::from_vec(labels), Array1::from_vec(totals)))
+}
+
 /// Float counterpart to `sum_rev_no_range_int_core`.
 ///
 /// ELI5: one compact slot owns both the running total and its compensation,
@@ -158,11 +197,33 @@ macro_rules! compute_floats {
     };
 }
 
+/// `uint64` export: returns `u64` totals so values `>= 2**63` survive
+/// the round trip to Python instead of wrapping to a negative `i64`.
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+pub fn compute_sum_rev_no_range_uint64<'py>(
+    py: Python<'py>,
+    arr: PyReadonlyArray1<'py, u64>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    booleans: PyReadonlyArray1<'py, bool>,
+    length: i64,
+) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<u64>>)> {
+    let _ = length;
+    let (indexers, result) = sum_rev_no_range_u64_core(
+        arr.as_array(),
+        left_index.as_array(),
+        right_index.as_array(),
+        booleans.as_array(),
+    )
+    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+}
+
 compute_ints!(compute_sum_rev_no_range_int64, i64);
 compute_ints!(compute_sum_rev_no_range_int32, i32);
 compute_ints!(compute_sum_rev_no_range_int16, i16);
 compute_ints!(compute_sum_rev_no_range_int8, i8);
-compute_ints!(compute_sum_rev_no_range_uint64, u64);
 compute_ints!(compute_sum_rev_no_range_uint32, u32);
 compute_ints!(compute_sum_rev_no_range_uint16, u16);
 compute_ints!(compute_sum_rev_no_range_uint8, u8);
@@ -198,6 +259,18 @@ mod tests {
             |value| value,
         );
         assert_eq!(got, Ok((array![20, 40], array![12, 4])));
+    }
+
+    #[test]
+    fn u64_core_preserves_values_at_and_above_i64_max() {
+        let value = (i64::MAX as u64) + 5;
+        let got = sum_rev_no_range_u64_core(
+            array![value].view(),
+            array![0_i64].view(),
+            array![20_i64].view(),
+            array![false].view(),
+        );
+        assert_eq!(got, Ok((array![20], array![value])));
     }
 
     #[test]
