@@ -254,14 +254,15 @@ pub fn compute_size_rev_start_end<'py>(
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
-    length: i64,
 ) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
-    let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    // There can be at most one output slot per right-side row. This local
+    // bound replaces the old caller-supplied capacity hint and cannot change
+    // the result when labels are duplicated.
+    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
         let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
