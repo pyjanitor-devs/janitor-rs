@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels};
+use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels, WrapMul};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -15,23 +15,27 @@ fn validate_inputs<T>(
     Ok(())
 }
 
-pub fn prod_rev_starts_int_core<T: Copy, F: FnMut(T) -> i64>(
+/// `A` is the accumulator type: every integer dtype instantiates this with
+/// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
+/// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
+/// `WrapMul`).
+pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-    mut to_i64: F,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+    mut convert: F,
+) -> Result<(Array1<i64>, Array1<A>), &'static str> {
     validate_inputs(arr, starts, booleans)?;
     let (min_start, width) = starts_domain(starts, index.len())?;
-    let mut values = vec![1_i64; width];
+    let mut values = vec![A::ONE; width];
     for ((current, start), boolean) in arr.iter().zip(starts.iter()).zip(booleans.iter()) {
         if *boolean {
             continue;
         }
-        let current = to_i64(*current);
+        let current = convert(*current);
         for value in values.iter_mut().skip(*start as usize - min_start) {
-            *value = value.wrapping_mul(current);
+            *value = value.wrap_mul(current);
         }
     }
     Ok((starts_labels(min_start, index), Array1::from_vec(values)))
@@ -60,7 +64,7 @@ pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
 }
 
 macro_rules! compute_ints {
-    ($fname:ident, $type:ty) => {
+    ($fname:ident, $type:ty, $acc:ty) => {
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -69,7 +73,7 @@ macro_rules! compute_ints {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
             length: i64,
-        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)> {
             let _ = length;
             into_starts_ends_result(
                 py,
@@ -78,7 +82,7 @@ macro_rules! compute_ints {
                     starts.as_array(),
                     index.as_array(),
                     booleans.as_array(),
-                    |value| value as i64,
+                    |value| value as $acc,
                 ),
             )
         }
@@ -110,14 +114,16 @@ macro_rules! compute_floats {
     };
 }
 
-compute_ints!(compute_prod_rev_start_int64, i64);
-compute_ints!(compute_prod_rev_start_int32, i32);
-compute_ints!(compute_prod_rev_start_int16, i16);
-compute_ints!(compute_prod_rev_start_int8, i8);
-compute_ints!(compute_prod_rev_start_uint64, u64);
-compute_ints!(compute_prod_rev_start_uint32, u32);
-compute_ints!(compute_prod_rev_start_uint16, u16);
-compute_ints!(compute_prod_rev_start_uint8, u8);
+// `uint64` is the one dtype whose accumulator is `u64` instead of `i64` --
+// see `WrapMul`'s doc comment. Every other dtype fits inside `i64` losslessly.
+compute_ints!(compute_prod_rev_start_int64, i64, i64);
+compute_ints!(compute_prod_rev_start_int32, i32, i64);
+compute_ints!(compute_prod_rev_start_int16, i16, i64);
+compute_ints!(compute_prod_rev_start_int8, i8, i64);
+compute_ints!(compute_prod_rev_start_uint64, u64, u64);
+compute_ints!(compute_prod_rev_start_uint32, u32, i64);
+compute_ints!(compute_prod_rev_start_uint16, u16, i64);
+compute_ints!(compute_prod_rev_start_uint8, u8, i64);
 compute_floats!(compute_prod_rev_start_f64, f64);
 compute_floats!(compute_prod_rev_start_f32, f32);
 
@@ -175,6 +181,19 @@ mod tests {
             |value| value,
         );
         assert_eq!(got, Ok((array![10], array![1])));
+    }
+
+    #[test]
+    fn u64_accumulator_preserves_values_at_and_above_i64_max() {
+        let value = (i64::MAX as u64) + 5;
+        let got = prod_rev_starts_int_core(
+            array![value].view(),
+            array![0_i64].view(),
+            array![20_i64].view(),
+            array![false].view(),
+            |v: u64| v,
+        );
+        assert_eq!(got, Ok((array![20], array![value])));
     }
 
     #[test]

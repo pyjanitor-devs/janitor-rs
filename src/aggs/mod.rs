@@ -144,6 +144,60 @@ pub(crate) fn into_starts_ends_result<'py, U: Element>(
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
+/// A wrapping-add accumulator identity, generic over `i64` (every integer
+/// dtype except `uint64`) and `u64` (`uint64` itself).
+///
+/// ELI5: `sum`'s reverse kernels share one accumulation loop across every
+/// integer dtype, funneling values through an `i64` accumulator -- harmless
+/// for every dtype except `uint64`, where a value `>= 2**63` doesn't fit in
+/// `i64` and the cast silently sign-flips it (issue #90). Parameterizing
+/// the accumulator type over this trait lets the *same* loop run with an
+/// `i64` accumulator for every dtype but `uint64`, and a `u64` accumulator
+/// for `uint64` -- one core function instead of a second hand-copied one
+/// per shape, so the `uint64` path can't quietly fall out of sync with its
+/// sibling the way it did between issue #90's fix and every other shape.
+pub(crate) trait WrapAdd: Copy {
+    const ZERO: Self;
+    fn wrap_add(self, other: Self) -> Self;
+}
+
+impl WrapAdd for i64 {
+    const ZERO: Self = 0;
+    fn wrap_add(self, other: Self) -> Self {
+        self.wrapping_add(other)
+    }
+}
+
+impl WrapAdd for u64 {
+    const ZERO: Self = 0;
+    fn wrap_add(self, other: Self) -> Self {
+        self.wrapping_add(other)
+    }
+}
+
+/// A wrapping-multiply accumulator identity, generic over `i64` and `u64`.
+///
+/// ELI5: `prod`'s counterpart to `WrapAdd` -- same reasoning, multiplication
+/// instead of addition, identity `1` instead of `0`.
+pub(crate) trait WrapMul: Copy {
+    const ONE: Self;
+    fn wrap_mul(self, other: Self) -> Self;
+}
+
+impl WrapMul for i64 {
+    const ONE: Self = 1;
+    fn wrap_mul(self, other: Self) -> Self {
+        self.wrapping_mul(other)
+    }
+}
+
+impl WrapMul for u64 {
+    const ONE: Self = 1;
+    fn wrap_mul(self, other: Self) -> Self {
+        self.wrapping_mul(other)
+    }
+}
+
 /// Convert a signed position only when it names a real element.
 ///
 /// ELI5: negative sentinels and positions past the end never become huge

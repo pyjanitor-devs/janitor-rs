@@ -2,7 +2,9 @@ use itertools::izip;
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ends_domain, ends_labels, ensure_equal_lengths, into_starts_ends_result};
+use crate::aggs::{
+    ends_domain, ends_labels, ensure_equal_lengths, into_starts_ends_result, WrapAdd,
+};
 
 fn validate_ends_inputs(
     arr_len: usize,
@@ -20,27 +22,32 @@ fn validate_ends_inputs(
 /// ELI5: `item` addresses the accumulator and `index[item]` is only the
 /// original right-row label returned at the end, so sparse labels never
 /// inflate the accumulator or become an out-of-bounds address.
-pub fn sum_rev_ends_int_core<T, F>(
+/// `A` is the accumulator type: every integer dtype instantiates this with
+/// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
+/// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
+/// `WrapAdd`).
+pub fn sum_rev_ends_int_core<T, A, F>(
     arr: numpy::ndarray::ArrayView1<T>,
     ends: numpy::ndarray::ArrayView1<i64>,
     index: numpy::ndarray::ArrayView1<i64>,
     booleans: numpy::ndarray::ArrayView1<bool>,
-    mut to_i64: F,
-) -> Result<(numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<i64>), &'static str>
+    mut convert: F,
+) -> Result<(numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<A>), &'static str>
 where
     T: Copy,
-    F: FnMut(T) -> i64,
+    A: WrapAdd,
+    F: FnMut(T) -> A,
 {
     validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
-    let mut values = vec![0_i64; max_end];
+    let mut values = vec![A::ZERO; max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
-        let current_ = to_i64(*current);
+        let current_ = convert(*current);
         for value in values.iter_mut().take(*end as usize) {
             if *boolean {
                 continue;
             }
-            *value = value.wrapping_add(current_);
+            *value = value.wrap_add(current_);
         }
     }
     Ok((
@@ -83,7 +90,7 @@ where
 }
 
 macro_rules! compute_ints {
-    ($fname:ident, $type:ty) => {
+    ($fname:ident, $type:ty, $acc:ty) => {
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -92,7 +99,7 @@ macro_rules! compute_ints {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
             length: i64,
-        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)>
         // The macro will expand into the contents of this block.
         {
             let arr = arr.as_array();
@@ -104,20 +111,22 @@ macro_rules! compute_ints {
             let _ = length;
             into_starts_ends_result(
                 py,
-                sum_rev_ends_int_core(arr, ends, index, booleans, |value| value as i64),
+                sum_rev_ends_int_core(arr, ends, index, booleans, |value| value as $acc),
             )
         }
     };
 }
 
-compute_ints!(compute_sum_rev_end_int64, i64);
-compute_ints!(compute_sum_rev_end_int32, i32);
-compute_ints!(compute_sum_rev_end_int16, i16);
-compute_ints!(compute_sum_rev_end_int8, i8);
-compute_ints!(compute_sum_rev_end_uint64, u64);
-compute_ints!(compute_sum_rev_end_uint32, u32);
-compute_ints!(compute_sum_rev_end_uint16, u16);
-compute_ints!(compute_sum_rev_end_uint8, u8);
+// `uint64` is the one dtype whose accumulator is `u64` instead of `i64` --
+// see `WrapAdd`'s doc comment. Every other dtype fits inside `i64` losslessly.
+compute_ints!(compute_sum_rev_end_int64, i64, i64);
+compute_ints!(compute_sum_rev_end_int32, i32, i64);
+compute_ints!(compute_sum_rev_end_int16, i16, i64);
+compute_ints!(compute_sum_rev_end_int8, i8, i64);
+compute_ints!(compute_sum_rev_end_uint64, u64, u64);
+compute_ints!(compute_sum_rev_end_uint32, u32, i64);
+compute_ints!(compute_sum_rev_end_uint16, u16, i64);
+compute_ints!(compute_sum_rev_end_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
@@ -192,6 +201,21 @@ mod tests {
 
         assert_eq!(indexers, array![10, 30]);
         assert_eq!(result, array![5, 5]);
+    }
+
+    #[test]
+    fn u64_accumulator_preserves_values_at_and_above_i64_max() {
+        let value = (i64::MAX as u64) + 5;
+        let (indexers, result) = sum_rev_ends_int_core(
+            array![value].view(),
+            array![1_i64].view(),
+            array![20_i64].view(),
+            array![false].view(),
+            |v: u64| v,
+        )
+        .unwrap();
+        assert_eq!(indexers, array![20]);
+        assert_eq!(result, array![value]);
     }
 
     #[test]
