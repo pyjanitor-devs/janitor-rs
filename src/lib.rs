@@ -102,7 +102,7 @@ mod registration_tests {
     /// `register`, as of this PR (884 dtype-specialized exports across 89
     /// leaf modules). Bump this alongside any PR that intentionally adds
     /// or removes an export.
-    const EXPECTED_EXPORT_COUNT: usize = 884;
+    const EXPECTED_EXPORT_COUNT: usize = 886;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
