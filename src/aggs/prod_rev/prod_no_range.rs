@@ -104,7 +104,6 @@ macro_rules! compute_ints {
             left_index: PyReadonlyArray1<'py, i64>,
             right_index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
         // The macro will expand into the contents of this block.
         {
@@ -112,7 +111,6 @@ macro_rules! compute_ints {
             let left_index = left_index.as_array();
             let right_index = right_index.as_array();
             let booleans = booleans.as_array();
-            let _ = length;
             let (indexers, result) =
                 prod_rev_no_range_int_core(arr, left_index, right_index, booleans, |value| {
                     value as i64
@@ -141,7 +139,6 @@ macro_rules! compute_floats {
             left_index: PyReadonlyArray1<'py, i64>,
             right_index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>
         // The macro will expand into the contents of this block.
         {
@@ -149,7 +146,6 @@ macro_rules! compute_floats {
             let left_index = left_index.as_array();
             let right_index = right_index.as_array();
             let booleans = booleans.as_array();
-            let _ = length;
             let (indexers, result) =
                 prod_rev_no_range_float_core(arr, left_index, right_index, booleans, |value| {
                     value as f64

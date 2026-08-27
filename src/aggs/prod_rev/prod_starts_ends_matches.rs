@@ -79,7 +79,10 @@ macro_rules! compute_ints {
                         n += 1;
                         continue;
                     }
-                    *total *= current_;
+                    // ELI5: integer products are allowed to wrap like NumPy
+                    // integers; wrapping_mul keeps debug and release builds
+                    // on the same path instead of panicking on overflow.
+                    *total = total.wrapping_mul(current_);
                     n += 1;
                 }
             }
@@ -220,4 +223,44 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_prod_rev_start_end_match_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_prod_rev_start_end_match_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_prod_rev_start_end_match_int64;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    #[test]
+    fn integer_kernel_wraps_product_overflow() {
+        Python::initialize();
+        Python::attach(|py| {
+            let arr = PyArray1::from_vec(py, vec![i64::MAX, 2]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 0]);
+            let ends = PyArray1::from_vec(py, vec![1_i64, 1]);
+            let index = PyArray1::from_vec(py, vec![42_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64, 1]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1]);
+            let booleans = PyArray1::from_vec(py, vec![false, false]);
+
+            let (labels, values) = compute_prod_rev_start_end_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+                1,
+            )
+            .expect("valid integer product input");
+
+            assert_eq!(labels.readonly().as_slice().unwrap(), &[42]);
+            assert_eq!(
+                values.readonly().as_slice().unwrap(),
+                &[i64::MAX.wrapping_mul(2)]
+            );
+        });
+    }
 }

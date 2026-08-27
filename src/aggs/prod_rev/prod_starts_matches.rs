@@ -4,7 +4,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-use crate::aggs::{ensure_equal_lengths, ensure_tape_width};
+use crate::aggs::{ensure_equal_lengths, ensure_exact_tape_width};
 
 fn expected_matches_width(starts: ArrayView1<'_, i64>, right_len: usize) -> PyResult<usize> {
     if starts.is_empty() {
@@ -74,7 +74,7 @@ macro_rules! compute_ints {
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
             let expected_matches_width = expected_matches_width(starts, end_)?;
-            ensure_tape_width(expected_matches_width, matches.len())?;
+            ensure_exact_tape_width(expected_matches_width, matches.len())?;
             let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
             let mut labels = Vec::new();
             let mut totals = Vec::new();
@@ -186,7 +186,7 @@ macro_rules! compute_floats {
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
             let expected_matches_width = expected_matches_width(starts, end_)?;
-            ensure_tape_width(expected_matches_width, matches.len())?;
+            ensure_exact_tape_width(expected_matches_width, matches.len())?;
             let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
             let mut labels = Vec::new();
             let mut totals = Vec::new();
@@ -256,6 +256,33 @@ mod tests {
     #[test]
     fn computes_zero_width_start_at_index_length() {
         assert_eq!(expected_matches_width(array![3_i64].view(), 3).unwrap(), 0);
+    }
+
+    #[test]
+    fn rejects_extra_tape_entries() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let arr = PyArray1::from_vec(py, vec![2_i64]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64]);
+            let index = PyArray1::from_vec(py, vec![10_i64, 20]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1, 0]);
+            let booleans = PyArray1::from_vec(py, vec![false]);
+            assert!(compute_prod_rev_start_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .is_err());
+        });
     }
 
     #[test]

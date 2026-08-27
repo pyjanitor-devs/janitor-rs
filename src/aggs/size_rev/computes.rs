@@ -100,6 +100,11 @@ pub fn compute_size_rev_end_matches<'py>(
     let ends = ends.as_array();
     let index = index.as_array();
     let matches = matches.as_array();
+    if ends.is_empty() || index.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "ends and index cannot be empty",
+        ));
+    }
     ensure_nonempty_matches(matches.len())?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
@@ -153,6 +158,11 @@ pub fn compute_size_rev_start_matches<'py>(
     let starts = starts.as_array();
     let index = index.as_array();
     let matches = matches.as_array();
+    if starts.is_empty() || index.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts and index cannot be empty",
+        ));
+    }
     ensure_nonempty_matches(matches.len())?;
     let end_: usize = index.len();
     // ELI5: `matches[n]` advances once per candidate position, summed
@@ -207,6 +217,11 @@ pub fn compute_size_rev_start_end_matches<'py>(
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let matches = matches.as_array();
+    if starts.is_empty() || index.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts, ends, and index cannot be empty",
+        ));
+    }
     ensure_nonempty_matches(matches.len())?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
@@ -254,14 +269,20 @@ pub fn compute_size_rev_start_end<'py>(
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
-    length: i64,
 ) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
-    let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    if starts.is_empty() || index.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts, ends, and index cannot be empty",
+        ));
+    }
+    // There can be at most one output slot per right-side row. This local
+    // bound replaces the old caller-supplied capacity hint and cannot change
+    // the result when labels are duplicated.
+    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
         let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
@@ -327,6 +348,11 @@ pub fn compute_size_rev_positions<'py>(
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let positions = positions.as_array();
+    if starts.is_empty() || index.is_empty() || positions.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts, ends, index, and positions cannot be empty",
+        ));
+    }
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
     let zipped = starts.into_iter().zip(ends);
