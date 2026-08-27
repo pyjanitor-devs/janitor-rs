@@ -11,30 +11,82 @@ use crate::aggs::{
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
 
-fn size_rev_ends_core(
+/// Count how many reverse-end rows cover each compact prefix position.
+///
+/// ELI5: each `end` says “this row covers everything before here.” Instead of
+/// walking that whole prefix for every row, the implementation activates rows
+/// once during a right-to-left sweep and carries the running count.
+pub fn size_rev_ends_core(
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    let max_end = ends_domain(ends, index.len())?;
-    let mut result = vec![0_i64; max_end];
+    if ends.is_empty() || index.is_empty() {
+        return Err("ends and index cannot be empty");
+    }
+    if ends.iter().any(|end| {
+        usize::try_from(*end)
+            .map(|end| end > index.len())
+            .unwrap_or(true)
+    }) {
+        return Err("ends must satisfy 0 <= end <= right_len");
+    }
+    let max_end = ends.iter().copied().max().unwrap_or(0) as usize;
+    // ELI5: a prefix row is active to the left of its end. Count how many
+    // rows end at each boundary, then sweep from right to left and carry the
+    // active-row count across the output. `end == 0` is an empty prefix and
+    // naturally has no activation bucket visited by the output loop. Counts
+    // are enough here, so memory depends on the compact output width—not the
+    // number of rows in the batch.
+    let mut events = vec![0_i64; max_end + 1];
     for end in ends {
-        for value in result.iter_mut().take(*end as usize) {
-            *value += 1;
-        }
+        events[*end as usize] += 1;
+    }
+
+    let mut running = 0_i64;
+    let mut result = vec![0_i64; max_end];
+    for position in (0..max_end).rev() {
+        running += events[position + 1];
+        result[position] = running;
     }
     Ok((ends_labels(max_end, index), Array1::from_vec(result)))
 }
 
-fn size_rev_starts_core(
+/// Count how many reverse-start rows cover each compact suffix position.
+///
+/// ELI5: each `start` says “this row covers everything from here onward.” The
+/// implementation groups starts by boundary and sweeps those boundaries once,
+/// so wide suffixes do not cause repeated work.
+pub fn size_rev_starts_core(
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    let (min_start, width) = starts_domain(starts, index.len())?;
-    let mut result = vec![0_i64; width];
+    if starts.is_empty() || index.is_empty() {
+        return Err("starts and index cannot be empty");
+    }
+    if starts.iter().any(|start| {
+        usize::try_from(*start)
+            .map(|start| start > index.len())
+            .unwrap_or(true)
+    }) {
+        return Err("starts must satisfy 0 <= start <= right_len");
+    }
+    let min_start = starts.iter().copied().min().unwrap() as usize;
+    let width = index.len() - min_start;
+    // ELI5: a suffix row is active from its start onward. Count rows at each
+    // start boundary, then sweep those boundaries once while carrying the
+    // active-row count. The terminal bucket represents `start ==
+    // index.len()` and is intentionally not emitted. Counts are enough, so
+    // the temporary memory is proportional to the compact output width.
+    let mut events = vec![0_i64; width + 1];
     for start in starts {
-        for value in result.iter_mut().skip(*start as usize - min_start) {
-            *value += 1;
-        }
+        events[*start as usize - min_start] += 1;
+    }
+
+    let mut running = 0_i64;
+    let mut result = Vec::with_capacity(width);
+    for event in events.iter().take(width) {
+        running += event;
+        result.push(running);
     }
     Ok((starts_labels(min_start, index), Array1::from_vec(result)))
 }
@@ -299,6 +351,19 @@ mod tests {
         );
         assert!(size_rev_starts_core(array![-1_i64].view(), index.view()).is_err());
         assert!(size_rev_ends_core(array![1_i64].view(), array![].view()).is_err());
+    }
+
+    #[test]
+    fn skips_zero_width_rows_without_affecting_other_rows() {
+        let index = array![10_i64, 20, 30];
+        assert_eq!(
+            size_rev_starts_core(array![1_i64, 3].view(), index.view()),
+            Ok((array![20, 30], array![1, 1]))
+        );
+        assert_eq!(
+            size_rev_ends_core(array![0_i64, 2].view(), index.view()),
+            Ok((array![10, 20], array![1, 1]))
+        );
     }
 }
 
