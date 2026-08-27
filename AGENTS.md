@@ -916,11 +916,11 @@ do not rely only on textual cross-links or checklist comments.
 
 ### [2026-08-26] Include performance evidence in optimization PRs and issues
 
-**Context**: Reverse-aggregation optimization work is being coordinated across
-pull requests and issue #23.
+**Context**: Performance changes are coordinated across reverse-aggregation
+pull requests and tracking issue #23.
 **Learning**: Benchmark results are part of the performance change's review
 record, not merely local investigation notes.
 **Recommendation**: Every performance PR and its tracking issue must include a
 properly formatted comparison with the old implementation, covering runtime
-and memory for the agreed tiny, large, very-large, and super-large cases and
-duplicate/unique label distributions. State benchmark limitations explicitly.
+and memory for tiny, large, very-large, and super-large cases with duplicate
+and unique label distributions. State benchmark limitations explicitly.
