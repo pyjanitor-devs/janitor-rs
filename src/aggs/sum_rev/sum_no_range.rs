@@ -17,6 +17,9 @@ fn validate_inputs<T>(
     if left_index.len() != right_index.len() {
         return Err("left_index and right_index must have equal lengths");
     }
+    if arr.is_empty() || left_index.is_empty() || right_index.is_empty() {
+        return Err("arr, left_index, and right_index cannot be empty");
+    }
     Ok(())
 }
 

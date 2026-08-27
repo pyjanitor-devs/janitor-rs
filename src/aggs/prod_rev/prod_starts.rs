@@ -16,10 +16,10 @@ fn validate_inputs<T>(
     }
     if starts.iter().any(|start| {
         usize::try_from(*start)
-            .map(|start| start >= index.len())
+            .map(|start| start > index.len())
             .unwrap_or(true)
     }) {
-        return Err("starts must satisfy 0 <= start < right_len");
+        return Err("starts must satisfy 0 <= start <= right_len");
     }
     Ok(())
 }
