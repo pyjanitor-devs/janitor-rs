@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
-    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, repeat_index_core,
-    size_positions_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
+    binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, min_positions_core,
+    repeat_index_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
     trim_index_core, CompareOp,
 };
 use std::collections::HashMap;
@@ -650,49 +650,145 @@ fn bench_sum_kernels(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_size_positions(c: &mut Criterion) {
-    let mut group = c.benchmark_group("size_positions_old_vs_compact");
+struct MinPositionsFixture {
+    arr: Array1<i64>,
+    starts: Array1<i64>,
+    ends: Array1<i64>,
+    index: Array1<i64>,
+    positions: Array1<i64>,
+    booleans: Array1<bool>,
+}
+
+impl MinPositionsFixture {
+    fn new(n: usize, duplicate: bool) -> Self {
+        const WIDTH: usize = 8;
+        let arr = Array1::from_iter((0..n).map(|i| (n - i) as i64));
+        let starts = Array1::from_iter((0..n).map(|i| (i * WIDTH) as i64));
+        let ends = Array1::from_iter((0..n).map(|i| ((i + 1) * WIDTH) as i64));
+        let index = Array1::from_iter(0..n as i64);
+        let positions = Array1::from_iter((0..n).flat_map(|i| {
+            (0..WIDTH).map(move |offset| {
+                if duplicate {
+                    0
+                } else {
+                    ((i + offset) % n) as i64
+                }
+            })
+        }));
+        let booleans = Array1::from_elem(n, false);
+        Self {
+            arr,
+            starts,
+            ends,
+            index,
+            positions,
+            booleans,
+        }
+    }
+}
+
+fn min_positions_old(
+    arr: ArrayView1<'_, i64>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    capacity: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut dictionary: HashMap<i64, (i64, i64)> =
+        HashMap::with_capacity(capacity.min(index.len()).min(positions.len()));
+    for (posn, (((current, start), end), boolean)) in arr
+        .iter()
+        .zip(starts.iter())
+        .zip(ends.iter())
+        .zip(booleans.iter())
+        .enumerate()
+    {
+        let Some(start_) = usize::try_from(*start).ok() else {
+            continue;
+        };
+        let Some(end_) = usize::try_from(*end)
+            .ok()
+            .filter(|&end| end <= positions.len())
+        else {
+            continue;
+        };
+        if start_ >= end_ {
+            continue;
+        }
+        for nn in start_..end_ {
+            let Some(indexer_) = usize::try_from(positions[nn])
+                .ok()
+                .filter(|&i| i < index.len())
+            else {
+                continue;
+            };
+            let entry = dictionary.entry(index[indexer_]).or_insert((-1, *current));
+            if !*boolean && (entry.0 == -1 || *current < entry.1) {
+                *entry = (posn as i64, *current);
+            }
+        }
+    }
+    dictionary
+        .into_iter()
+        .map(|(label, (row, _))| (label, row))
+        .unzip()
+}
+
+fn bench_min_positions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("min_positions_old_vs_compact");
     for n in [32, 10_000, 100_000, 1_000_000] {
         for duplicate in [true, false] {
-            const WIDTH: usize = 8;
-            let starts = Array1::from_iter((0..n).map(|i| (i * WIDTH) as i64));
-            let ends = Array1::from_iter((0..n).map(|i| ((i + 1) * WIDTH) as i64));
-            let index = Array1::from_iter(0..n as i64);
-            let positions = Array1::from_iter((0..n).flat_map(|i| {
-                (0..WIDTH).map(move |j| if duplicate { 0 } else { ((i + j) % n) as i64 })
-            }));
-            let old = || {
-                let mut map = HashMap::with_capacity(index.len().min(positions.len()));
-                for (start, end) in starts.iter().zip(ends.iter()) {
-                    for item in *start as usize..*end as usize {
-                        let total = map.entry(index[positions[item] as usize]).or_insert(0_i64);
-                        *total += 1;
-                    }
-                }
-                map
-            };
+            let f = MinPositionsFixture::new(n, duplicate);
             let kind = if duplicate { "duplicate" } else { "unique" };
             let label = format!("n={n} {kind}");
-            let old_memory = count_allocations(old);
-            let compact_memory = count_allocations(|| {
-                size_positions_core(
-                    starts.view(),
-                    ends.view(),
-                    index.view(),
-                    positions.view(),
-                    index.len(),
+            let old = count_allocations(|| {
+                min_positions_old(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
                 )
             });
-            eprintln!("size_positions {label}: old {old_memory:?}; compact {compact_memory:?}");
-            group.bench_function(format!("old {label}"), |b| b.iter(&old));
+            let compact = count_allocations(|| {
+                min_positions_core(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                )
+            });
+            eprintln!("min_positions {label}: old {old:?}; compact {compact:?}");
+            group.bench_function(format!("old {label}"), |b| {
+                b.iter(|| {
+                    min_positions_old(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
+                    )
+                })
+            });
             group.bench_function(format!("compact {label}"), |b| {
                 b.iter(|| {
-                    size_positions_core(
-                        black_box(starts.view()),
-                        black_box(ends.view()),
-                        black_box(index.view()),
-                        black_box(positions.view()),
-                        index.len(),
+                    min_positions_core(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
                     )
                 })
             });
@@ -709,6 +805,6 @@ criterion_group!(
     bench_compare_start_end,
     bench_index_builders,
     bench_sum_kernels,
-    bench_size_positions
+    bench_min_positions
 );
 criterion_main!(benches);

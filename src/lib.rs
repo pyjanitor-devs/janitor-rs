@@ -13,7 +13,7 @@ mod left_le_right;
 /// hundreds of Python wrappers.
 #[doc(hidden)]
 pub mod bench_support {
-    pub use crate::aggs::size_rev::computes::size_positions_core;
+    pub use crate::aggs::min_rev::min_positions::min_positions_core;
     pub use crate::aggs::sum::sum_ends::sum_end_core;
     pub use crate::aggs::sum::sum_starts::{sum_start_core, sum_start_u32_core};
     pub use crate::aggs::sum::sum_starts_ends::sum_start_end_core;
@@ -24,7 +24,6 @@ pub mod bench_support {
     pub use crate::bin_search::bin_search_lt_first::binary_search_lt_first_core;
     pub use crate::compare::comp::compare_start_end_core;
     pub use crate::compare::op::CompareOp;
-    pub use crate::index_builder::range_extreme_core;
     pub use crate::index_builder::{repeat_index_core, trim_index_core};
 }
 
@@ -91,7 +90,7 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (886 dtype-specialized exports across 89
+    /// `register`, as of this PR (884 dtype-specialized exports across 89
     /// leaf modules). Bump this alongside any PR that intentionally adds
     /// or removes an export.
     const EXPECTED_EXPORT_COUNT: usize = 886;
