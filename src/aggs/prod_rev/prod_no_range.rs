@@ -61,6 +61,46 @@ pub fn prod_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     Ok((Array1::from_vec(labels), Array1::from_vec(products)))
 }
 
+/// `u64`-native counterpart to `prod_rev_no_range_int_core`.
+///
+/// ELI5: `uint64` values `>= 2**63` don't fit in `i64`; funneling them
+/// through the shared `i64` accumulator wraps them to a negative number.
+/// This keeps the accumulator and the returned products in `u64`
+/// end-to-end so large unsigned products come back correct instead of
+/// sign-flipped.
+pub fn prod_rev_no_range_u64_core(
+    arr: ArrayView1<'_, u64>,
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+) -> Result<(Array1<i64>, Array1<u64>), &'static str> {
+    validate_inputs(arr, left_index, right_index, booleans)?;
+    let mut slots = HashMap::<i64, usize>::with_capacity(right_index.len());
+    let mut labels = Vec::new();
+    let mut products = Vec::new();
+
+    for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
+        let left = checked_index(*index_left, arr.len())
+            .ok_or("left_index must contain valid positions in arr")?;
+        let slot = match slots.entry(*index_right) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let slot = labels.len();
+                labels.push(*index_right);
+                products.push(1_u64);
+                entry.insert(slot);
+                slot
+            }
+        };
+        if booleans[left] {
+            continue;
+        }
+        products[slot] = products[slot].wrapping_mul(arr[left]);
+    }
+
+    Ok((Array1::from_vec(labels), Array1::from_vec(products)))
+}
+
 pub fn prod_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
     arr: ArrayView1<'_, T>,
     left_index: ArrayView1<'_, i64>,
@@ -123,11 +163,32 @@ macro_rules! compute_ints {
     };
 }
 
+/// `uint64` export: returns `u64` products so values `>= 2**63` survive
+/// the round trip to Python instead of wrapping to a negative `i64`.
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+pub fn compute_prod_rev_no_range_uint64<'py>(
+    py: Python<'py>,
+    arr: PyReadonlyArray1<'py, u64>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    booleans: PyReadonlyArray1<'py, bool>,
+    length: i64,
+) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<u64>>)> {
+    let arr = arr.as_array();
+    let left_index = left_index.as_array();
+    let right_index = right_index.as_array();
+    let booleans = booleans.as_array();
+    let _ = length;
+    let (indexers, result) = prod_rev_no_range_u64_core(arr, left_index, right_index, booleans)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+}
+
 compute_ints!(compute_prod_rev_no_range_int64, i64);
 compute_ints!(compute_prod_rev_no_range_int32, i32);
 compute_ints!(compute_prod_rev_no_range_int16, i16);
 compute_ints!(compute_prod_rev_no_range_int8, i8);
-compute_ints!(compute_prod_rev_no_range_uint64, u64);
 compute_ints!(compute_prod_rev_no_range_uint32, u32);
 compute_ints!(compute_prod_rev_no_range_uint16, u16);
 compute_ints!(compute_prod_rev_no_range_uint8, u8);
@@ -197,6 +258,18 @@ mod tests {
             |value| value,
         );
         assert_eq!(got, Ok((array![20, 40], array![35, 4])));
+    }
+
+    #[test]
+    fn u64_core_preserves_values_at_and_above_i64_max() {
+        let value = (i64::MAX as u64) + 5;
+        let got = prod_rev_no_range_u64_core(
+            array![value].view(),
+            array![0_i64].view(),
+            array![20_i64].view(),
+            array![false].view(),
+        );
+        assert_eq!(got, Ok((array![20], array![value])));
     }
 
     #[test]
