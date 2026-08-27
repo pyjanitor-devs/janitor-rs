@@ -40,20 +40,37 @@ where
     A: WrapAdd,
     F: FnMut(T) -> A,
 {
-    validate_starts_inputs(arr.len(), starts.len(), booleans.len())?;
-    let (min_start, width) = starts_domain(starts, index.len())?;
-    let mut values = vec![A::ZERO; width];
-    let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
-    for (current, start, boolean) in zipped {
-        let current_ = convert(*current);
-        for value in values.iter_mut().skip(*start as usize - min_start) {
-            // Every valid suffix position is already part of the contiguous
-            // output domain; a null left value contributes zero to its slot.
-            if *boolean {
-                continue;
+    let end_ = index.len();
+    validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
+    let min_start = starts.iter().copied().min().unwrap() as usize;
+    let width = end_ - min_start;
+    // ELI5: a suffix starts once and then stays active. Instead of adding a
+    // row's value to every later output slot, put the row in the bucket where
+    // it starts and add it to one running total exactly once.
+    //
+    // `head`/`next` are flat linked buckets. They avoid the many small heap
+    // allocations that `Vec<Vec<usize>>` would require. The final bucket is
+    // reserved for start == end_, a valid zero-width suffix which is never
+    // emitted and therefore never activated.
+    let mut head = vec![usize::MAX; width + 1];
+    let mut next = vec![usize::MAX; arr.len()];
+    for (row, start) in starts.iter().enumerate().rev() {
+        let bucket = *start as usize - min_start;
+        next[row] = head[bucket];
+        head[bucket] = row;
+    }
+
+    let mut running = 0_i64;
+    let mut values = Vec::with_capacity(width);
+    for first_row in head.iter().take(width) {
+        let mut row = *first_row;
+        while row != usize::MAX {
+            if !booleans[row] {
+                running = running.wrapping_add(to_i64(arr[row]));
             }
-            *value = value.wrap_add(current_);
+            row = next[row];
         }
+        values.push(running);
     }
     Ok((starts_labels(min_start, index), Array1::from_vec(values)))
 }
@@ -122,8 +139,14 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    validate_starts_inputs(arr.len(), starts.len(), booleans.len())?;
-    let (min_start, width) = starts_domain(starts, index.len())?;
+    let end_ = index.len();
+    validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
+    let min_start = starts.iter().copied().min().unwrap() as usize;
+    let width = end_ - min_start;
+    // Keep the existing per-position Neumaier accumulation for floats. A
+    // single running sweep would change the original row order at positions
+    // where rows become active at different boundaries. Compensation improves
+    // stability but does not make floating-point addition associative.
     let mut slots = vec![(0.0_f64, 0.0_f64); width];
     let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
     for (current, start, boolean) in zipped {
@@ -135,12 +158,9 @@ where
             let difference = current_ - *compensation;
             let increment = *total + difference;
             *compensation = (increment - *total) - difference;
-            // adapted from pandas' cython code
-            // # GH#53606; GH#60303
-            // # If val is +/- infinity compensation is NaN
-            // # which would lead to results being NaN instead
-            // # of +/- infinity. We cannot use util.is_nan
-            // # because of no gil
+            // Adapted from pandas' cython code (GH#53606/GH#60303): if an
+            // infinity makes the compensation NaN, discard only the
+            // compensation so the actual infinity remains the result.
             if !compensation.is_finite() {
                 *compensation = 0.;
             }

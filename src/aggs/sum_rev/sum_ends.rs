@@ -38,17 +38,33 @@ where
     A: WrapAdd,
     F: FnMut(T) -> A,
 {
-    validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
-    let max_end = ends_domain(ends, index.len())?;
-    let mut values = vec![A::ZERO; max_end];
-    for (current, end, boolean) in izip!(arr, ends, booleans) {
-        let current_ = convert(*current);
-        for value in values.iter_mut().take(*end as usize) {
-            if *boolean {
-                continue;
+    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
+    let max_end = ends
+        .iter()
+        .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
+        .max()
+        .unwrap_or(0);
+    // ELI5: an end-bound row covers a prefix. Sweep from right to left so a
+    // row becomes active once, at position `end - 1`, and remains active for
+    // every position to its left. `end == 0` naturally has no activation.
+    let mut head = vec![usize::MAX; max_end + 1];
+    let mut next = vec![usize::MAX; arr.len()];
+    for (row, end) in ends.iter().enumerate().rev() {
+        next[row] = head[*end as usize];
+        head[*end as usize] = row;
+    }
+
+    let mut running = 0_i64;
+    let mut values = vec![0_i64; max_end];
+    for position in (0..max_end).rev() {
+        let mut row = head[position + 1];
+        while row != usize::MAX {
+            if !booleans[row] {
+                running = running.wrapping_add(to_i64(arr[row]));
             }
-            *value = value.wrap_add(current_);
+            row = next[row];
         }
+        values[position] = running;
     }
     Ok((
         ends_labels(max_end, index),
@@ -67,8 +83,14 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
-    let max_end = ends_domain(ends, index.len())?;
+    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
+    let max_end = ends
+        .iter()
+        .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
+        .max()
+        .unwrap();
+    // Keep the existing per-position Neumaier accumulation for floats for
+    // the same row-order reason as the starts path.
     let mut slots = vec![(0.0_f64, 0.0_f64); max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
         let current_ = to_f64(*current);
