@@ -2,7 +2,7 @@ use itertools::izip;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths};
+use crate::aggs::{checked_range, ensure_equal_lengths, validate_range};
 
 fn validate_ends_inputs(
     arr_len: usize,
@@ -16,12 +16,11 @@ fn validate_ends_inputs(
     if arr_len == 0 || right_len == 0 {
         return Err("arr, ends, booleans, and index cannot be empty");
     }
-    if ends.iter().any(|end| {
-        usize::try_from(*end)
-            .map(|end| end == 0 || end > right_len)
-            .unwrap_or(true)
-    }) {
-        return Err("ends must satisfy 0 < end <= right_len");
+    if ends
+        .iter()
+        .any(|end| validate_range(0, *end, right_len).is_err())
+    {
+        return Err("ends must satisfy 0 <= end <= right_len");
     }
     Ok(())
 }
@@ -47,7 +46,7 @@ where
         .iter()
         .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
         .max()
-        .unwrap();
+        .unwrap_or(0);
     let mut values = vec![0_i64; max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
         let current_ = to_i64(*current);
@@ -228,22 +227,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_end_before_allocation() {
+    fn accepts_zero_end_as_an_empty_prefix() {
         let arr = array![5_i64];
         let ends = array![0_i64];
         let index = array![0_i64];
         let booleans = array![false];
 
-        let error = sum_rev_ends_int_core(
+        let result = sum_rev_ends_int_core(
             arr.view(),
             ends.view(),
             index.view(),
             booleans.view(),
             |value| value,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error, "ends must satisfy 0 < end <= right_len");
+        assert!(result.0.is_empty());
+        assert!(result.1.is_empty());
     }
 
     #[test]

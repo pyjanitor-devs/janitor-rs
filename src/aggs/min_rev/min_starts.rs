@@ -16,10 +16,10 @@ fn validate_inputs<T>(
     }
     if starts.iter().any(|start| {
         usize::try_from(*start)
-            .map(|start| start >= index.len())
+            .map(|start| start > index.len())
             .unwrap_or(true)
     }) {
-        return Err("starts must satisfy 0 <= start < right_len");
+        return Err("starts must satisfy 0 <= start <= right_len");
     }
     Ok(())
 }
@@ -144,13 +144,15 @@ mod tests {
         let arr = array![1_i64];
         let index = array![10_i64];
         let booleans = array![false];
-        assert!(min_rev_starts_core(
-            arr.view(),
-            array![1_i64].view(),
-            index.view(),
-            booleans.view()
-        )
-        .is_err());
+        assert_eq!(
+            min_rev_starts_core(
+                arr.view(),
+                array![1_i64].view(),
+                index.view(),
+                booleans.view()
+            ),
+            Ok((array![], array![]))
+        );
         assert!(min_rev_starts_core(
             arr.view(),
             array![-1_i64].view(),
