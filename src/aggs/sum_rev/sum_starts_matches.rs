@@ -1,13 +1,42 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{ensure_equal_lengths, ensure_tape_width};
 
+/// Validate signed starts and calculate the width required by the flat tape.
+///
+/// ELI5: every row consumes the suffix from its start to the end of the right
+/// candidate index. Check the signed value before converting it to `usize`.
+fn expected_matches_width(starts: ArrayView1<'_, i64>, right_len: usize) -> PyResult<usize> {
+    if starts.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts cannot be empty",
+        ));
+    }
+
+    starts.iter().try_fold(0usize, |total, start| {
+        let start = usize::try_from(*start)
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("starts must be non-negative"))?;
+        if start > right_len {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "starts must be less than index length",
+            ));
+        }
+        total
+            .checked_add(right_len - start)
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("matches tape width overflow"))
+    })
+}
+
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
+        /// `index` labels, `counts`, and `matches` are trusted outputs of the
+        /// conditional-join boundary and are expected to be non-negative.
+        /// `matches == 0` excludes a candidate; non-zero values are treated as
+        /// live without a second validation pass over the tape.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -17,7 +46,6 @@ macro_rules! compute_ints {
             index: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
         // The macro will expand into the contents of this block.
         {
@@ -31,17 +59,35 @@ macro_rules! compute_ints {
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let end_: usize = index.len();
+            if arr.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "arr cannot be empty",
+                ));
+            }
+            if index.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "index cannot be empty",
+                ));
+            }
+            if matches.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "matches cannot be empty",
+                ));
+            }
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = starts
-                .iter()
-                .map(|s| end_.saturating_sub(*s as usize))
-                .sum();
+            let expected_matches_width = expected_matches_width(starts, end_)?;
             ensure_tape_width(expected_matches_width, matches.len())?;
-            let length = length as usize;
-            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+            // ELI5: there can be at most one output slot per right-index
+            // position, so `index.len()` is a safe upper bound for the map.
+            // It may reserve more memory than needed when labels repeat, but
+            // it avoids repeated rehashing and growth for mostly-unique
+            // labels. The vectors grow with the actual number of labels.
+            let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
+            let mut labels = Vec::new();
+            let mut totals = Vec::new();
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -58,23 +104,27 @@ macro_rules! compute_ints {
                         continue;
                     }
                     let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(0);
+                    let slot = if let Some(slot) = slots.get(&pos) {
+                        *slot
+                    } else {
+                        let slot = totals.len();
+                        slots.insert(pos, slot);
+                        labels.push(pos);
+                        totals.push(0_i64);
+                        slot
+                    };
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
                     }
-                    *total += current_;
+                    totals[slot] = totals[slot].wrapping_add(current_);
                     n += 1;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<i64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+            Ok((
+                Array1::from_vec(labels).into_pyarray(py),
+                Array1::from_vec(totals).into_pyarray(py),
+            ))
         }
     };
 }
@@ -90,6 +140,10 @@ compute_ints!(compute_sum_rev_start_match_uint8, u8);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// `index` labels, `counts`, and `matches` are trusted outputs of the
+        /// conditional-join boundary and are expected to be non-negative.
+        /// `matches == 0` excludes a candidate; non-zero values are treated as
+        /// live without a second validation pass over the tape.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -99,7 +153,6 @@ macro_rules! compute_floats {
             index: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>
         // The macro will expand into the contents of this block.
         {
@@ -113,18 +166,30 @@ macro_rules! compute_floats {
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let end_: usize = index.len();
+            if arr.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "arr cannot be empty",
+                ));
+            }
+            if index.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "index cannot be empty",
+                ));
+            }
+            if matches.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "matches cannot be empty",
+                ));
+            }
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = starts
-                .iter()
-                .map(|s| end_.saturating_sub(*s as usize))
-                .sum();
+            let expected_matches_width = expected_matches_width(starts, end_)?;
             ensure_tape_width(expected_matches_width, matches.len())?;
-            let length = length as usize;
-            let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
-            let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
+            let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
+            let mut labels = Vec::new();
+            let mut states = Vec::new();
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -141,12 +206,20 @@ macro_rules! compute_floats {
                         continue;
                     }
                     let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(0.);
-                    let compensation = mapping.entry(pos).or_insert(0.);
+                    let slot = if let Some(slot) = slots.get(&pos) {
+                        *slot
+                    } else {
+                        let slot = states.len();
+                        slots.insert(pos, slot);
+                        labels.push(pos);
+                        states.push((0.0_f64, 0.0_f64));
+                        slot
+                    };
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
                     }
+                    let (total, compensation) = &mut states[slot];
                     let difference = current_ - *compensation;
                     let increment = *total + difference;
                     *compensation = (increment - *total) - difference;
@@ -163,14 +236,11 @@ macro_rules! compute_floats {
                     n += 1;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<f64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+            let totals = states.into_iter().map(|(total, _)| total).collect();
+            Ok((
+                Array1::from_vec(labels).into_pyarray(py),
+                Array1::from_vec(totals).into_pyarray(py),
+            ))
         }
     };
 }
@@ -195,4 +265,62 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_sum_rev_start_match_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_sum_rev_start_match_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_sum_rev_start_match_int64, expected_matches_width};
+    use numpy::ndarray::array;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    #[test]
+    fn tape_width_accepts_valid_starts() {
+        assert_eq!(
+            expected_matches_width(array![0_i64, 1].view(), 3).unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn tape_width_rejects_negative_and_one_past_starts() {
+        assert!(expected_matches_width(array![-1_i64].view(), 3).is_err());
+        assert_eq!(expected_matches_width(array![3_i64].view(), 3).unwrap(), 0);
+    }
+
+    #[test]
+    fn tape_width_rejects_empty_starts() {
+        assert!(expected_matches_width(array![].view(), 3).is_err());
+    }
+
+    #[test]
+    fn integer_kernel_keeps_first_seen_labels_and_skips_null_values() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let arr = PyArray1::from_vec(py, vec![2_i64, 3, 4]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 1, 2]);
+            let counts = PyArray1::from_vec(py, vec![1_i64, 1, 0]);
+            let index = PyArray1::from_vec(py, vec![10_i64, 20, 10]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 0, 1, 1, 0, 1]);
+            let booleans = PyArray1::from_vec(py, vec![false, false, false]);
+
+            let (labels, values) = compute_sum_rev_start_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .expect("valid starts+matches input");
+
+            assert_eq!(labels.readonly().as_slice().unwrap(), &[10, 20]);
+            assert_eq!(values.readonly().as_slice().unwrap(), &[4, 3]);
+        });
+    }
 }
