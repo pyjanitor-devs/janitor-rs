@@ -122,6 +122,43 @@ to NumPy) is the worked example to follow:
    #1673 for the format), so a reviewer can see the kernel-level and
    end-to-end pictures without having to reproduce either locally.
 
+### Conditional-join survivor masks
+
+Comparison kernels that receive an existing `matches` tape update it in
+place. The first predicate still creates the tape; each later predicate
+clears entries that fail and returns updated counts. This preserves the
+flat `int8` representation and removes one full-width result allocation per
+additional predicate.
+
+The paired `compare_start_end_allocating_vs_in_place` benchmark in
+`benches/kernels.rs` measures the two cores on identical inputs. In one local
+run, in-place filtering was approximately 17% faster for dense masks at both
+2.5M candidates (1.88 ms versus 2.27 ms) and 10M candidates (7.53 ms versus
+9.16 ms). With 25% of mask entries already dead, it was approximately 21%
+faster at 2.5M candidates (1.60 ms versus 2.02 ms) and 20% faster at 10M
+candidates (6.38 ms versus 7.97 ms). It also reduced the per-call allocation
+from 2.5 MB/10 MB to 4 KB/8 KB, with one allocation instead of two.
+
+The same paired run for starts-only and ends-only was consistent: dense
+2.5M-candidate runs improved from 2.27 ms to 1.88 ms and from 2.47 ms to
+1.95 ms respectively; 25%-dead runs improved from 2.02 ms to 1.60 ms and
+from 2.04 ms to 1.62 ms. These side-only shapes had the same allocation
+reduction.
+
+The nullable `!=` cores showed the same direction at 2.5M candidates. Dense
+starts-only improved from 4.18 ms to 3.08 ms, ends-only from 3.67 ms to 3.08
+ms, and starts+ends from 2.83 ms to 2.51 ms. With 25% dead entries, the
+corresponding improvements were 3.48 ms to 2.51 ms, 3.02 ms to 2.51 ms, and
+2.31 ms to 2.05 ms. Each nullable shape reduced the mask allocation from
+2.5 MB/2 allocations to 4 KB/1 allocation.
+
+Mutation is limited to masks owned by pyjanitor's internal join pipeline.
+The Python caller must provide a writable, one-dimensional `int8` NumPy array
+with the expected flat-tape width. Read-only arrays are
+rejected by these mutable entry points; caller-owned buffers should not be
+passed to them. The logical tape position still advances over dead entries,
+so row ranges and their cumulative widths remain aligned.
+
 ## Linting
 
 ```sh

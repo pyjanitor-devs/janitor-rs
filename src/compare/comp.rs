@@ -1,6 +1,6 @@
 use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::ensure_tape_width;
@@ -104,6 +104,52 @@ pub fn compare_start_end_core<T: PartialOrd + Copy>(
     (result, counts_array, total)
 }
 
+/// Apply one additional predicate directly to an existing survivor mask.
+///
+/// ELI5: the ordinary core writes the answer onto a fresh tape. This variant
+/// reuses the caller's tape and crosses out candidates that fail, so chained
+/// predicates do not need a second full-width tape for every pass.
+pub fn compare_start_end_in_place_core<T: PartialOrd + Copy>(
+    left: ArrayView1<T>,
+    right: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    mut matches: numpy::ndarray::ArrayViewMut1<'_, i8>,
+    op: CompareOp,
+) -> (Array1<i64>, i64) {
+    let mut counts_array = Array1::<i64>::zeros(left.len());
+    let mut total: i64 = 0;
+    let mut n: usize = 0;
+    let right_len = right.len();
+    let zipped = izip!(left.into_iter(), starts.into_iter(), ends.into_iter());
+    for (position, (left_val, start, end)) in zipped.enumerate() {
+        if *start < 0 || *end == -1 || *start >= *end || *end > right_len as i64 {
+            continue;
+        }
+        let start_ = *start as usize;
+        let end_ = *end as usize;
+        let mut counter: i64 = 0;
+        for nn in start_..end_ {
+            if matches[n] == 0 {
+                n += 1;
+                continue;
+            }
+            let compare = op.apply(left_val, &right[nn]);
+            matches[n] = compare as i8;
+            counter += compare as i64;
+            total += compare as i64;
+            n += 1;
+        }
+        counts_array[position] = counter;
+    }
+    // ELI5: a fresh result tape used to start as all zeros. Clear any
+    // unused tail here so reusing the input tape preserves that behavior.
+    for value in matches.iter_mut().skip(n) {
+        *value = 0;
+    }
+    (counts_array, total)
+}
+
 macro_rules! generic_compare {
     ($fname:ident, $type:ty) => {
         #[pyfunction]
@@ -113,7 +159,7 @@ macro_rules! generic_compare {
             right: PyReadonlyArray1<'py, $type>,
             starts: PyReadonlyArray1<'py, i64>,
             ends: PyReadonlyArray1<'py, i64>,
-            matches: PyReadonlyArray1<'py, i8>,
+            matches: Bound<'py, PyArray1<i8>>,
             op: i8,
         ) -> PyResult<(Bound<'py, PyArray1<i8>>, Bound<'py, PyArray1<i64>>, i64)> {
             let starts_view = starts.as_array();
@@ -135,21 +181,20 @@ macro_rules! generic_compare {
                 .filter(|(s, e)| **s >= 0 && **e != -1 && **s < **e && **e <= right_len as i64)
                 .map(|(s, e)| (*e as usize) - (*s as usize))
                 .sum();
-            ensure_tape_width(expected_matches_width, matches.as_array().len())?;
+            ensure_tape_width(expected_matches_width, matches.len()?)?;
             let op = CompareOp::try_from_code(op)?;
-            let (result, counts_array, total) = compare_start_end_core(
+            let (counts_array, total) = compare_start_end_in_place_core(
                 left.as_array(),
                 right.as_array(),
                 starts_view,
                 ends_view,
-                matches.as_array(),
+                matches
+                    .try_readwrite()
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?
+                    .as_array_mut(),
                 op,
             );
-            Ok((
-                result.into_pyarray(py),
-                counts_array.into_pyarray(py),
-                total,
-            ))
+            Ok((matches, counts_array.into_pyarray(py), total))
         }
     };
 }
@@ -380,6 +425,93 @@ mod tests {
     }
 
     #[test]
+    fn in_place_filter_preserves_tape_alignment_and_clears_failures() {
+        let left = array![1_i64, 10];
+        let right = array![0_i64, 2, 9, 11];
+        let starts = array![0_i64, 2];
+        let ends = array![2_i64, 4];
+        let mut matches = array![1_i8, 0, 1, 1];
+        let (counts, total) = compare_start_end_in_place_core(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            matches.view_mut(),
+            GT,
+        );
+        // row 0: only the already-live 1>0 candidate survives; row 1:
+        // 10>9 survives and 10>11 is cleared.
+        assert_eq!(matches, array![1_i8, 0, 1, 0]);
+        assert_eq!(counts, array![1, 1]);
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn python_wrapper_mutates_the_supplied_mask() {
+        use numpy::{PyArray1, PyArrayMethods};
+        use pyo3::Python;
+
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let left = PyArray1::from_vec(py, vec![1_i64]);
+            let right = PyArray1::from_vec(py, vec![0_i64, 2]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![2_i64]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1]);
+            let (result, counts, total) = compare_start_end_int64(
+                py,
+                left.readonly(),
+                right.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                matches.clone(),
+                0, // CompareOp::Gt
+            )
+            .expect("valid writable mask should be accepted");
+            assert_eq!(result.as_ptr(), matches.as_ptr());
+            assert_eq!(result.readonly().to_vec().unwrap(), vec![1_i8, 0]);
+            assert_eq!(matches.readonly().to_vec().unwrap(), vec![1_i8, 0]);
+            assert_eq!(counts.readonly().to_vec().unwrap(), vec![1_i64]);
+            assert_eq!(total, 1);
+        });
+    }
+
+    #[test]
+    fn python_wrapper_rejects_a_read_only_mask_without_panicking() {
+        use numpy::PyArray1;
+        use pyo3::Python;
+
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let left = PyArray1::from_vec(py, vec![1_i64]);
+            let right = PyArray1::from_vec(py, vec![0_i64]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![1_i64]);
+            let matches = PyArray1::from_vec(py, vec![1_i8]);
+            matches.call_method1("setflags", (false,)).unwrap();
+
+            let result = compare_start_end_int64(
+                py,
+                left.readonly(),
+                right.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                matches,
+                0, // CompareOp::Gt
+            );
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
     fn non_sentinel_negative_start_does_not_underflow_the_width_precheck() {
         use numpy::{PyArray1, PyArrayMethods};
         use pyo3::exceptions::PyValueError;
@@ -408,7 +540,7 @@ mod tests {
                 right.readonly(),
                 starts.readonly(),
                 ends.readonly(),
-                matches.readonly(),
+                matches.clone(),
                 // `compare_start_end_int64` is the `#[pyfunction]` wrapper,
                 // which still takes `CompareOp::try_from_code`'s raw i8
                 // code (not the `GT`/`LT`/... `CompareOp` aliases this
@@ -543,7 +675,7 @@ mod tests {
                 right.readonly(),
                 starts.readonly(),
                 ends.readonly(),
-                matches.readonly(),
+                matches.clone(),
                 0, // CompareOp::Gt, see the sibling test above for why
             );
             // As with the negative-start case: accepted (row now correctly
@@ -585,7 +717,7 @@ mod tests {
                 right.readonly(),
                 starts.readonly(),
                 ends.readonly(),
-                matches.readonly(),
+                matches.clone(),
                 0, // CompareOp::Gt
             );
             if let Err(error) = result {

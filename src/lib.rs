@@ -24,7 +24,20 @@ pub mod bench_support {
     pub use crate::bin_search::bin_search_le_first::binary_search_le_first_core;
     pub use crate::bin_search::bin_search_lt::binary_search_lt_core;
     pub use crate::bin_search::bin_search_lt_first::binary_search_lt_first_core;
-    pub use crate::compare::comp::compare_start_end_core;
+    pub use crate::compare::comp::{compare_start_end_core, compare_start_end_in_place_core};
+    pub use crate::compare::comp_ends::{compare_end_allocating_core, compare_end_in_place_core};
+    pub use crate::compare::comp_ne::{
+        compare_ne_start_end_allocating_core, compare_ne_start_end_in_place_core,
+    };
+    pub use crate::compare::comp_ne_ends::{
+        compare_ne_end_allocating_core, compare_ne_end_in_place_core,
+    };
+    pub use crate::compare::comp_ne_starts::{
+        compare_ne_start_allocating_core, compare_ne_start_in_place_core,
+    };
+    pub use crate::compare::comp_starts::{
+        compare_start_allocating_core, compare_start_in_place_core,
+    };
     pub use crate::compare::comp_direct::select_start_end_core;
     pub use crate::compare::op::CompareOp;
     pub use crate::index_builder::{repeat_index_core, trim_index_core};
