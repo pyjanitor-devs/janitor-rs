@@ -27,8 +27,8 @@ use janitor_rs::bench_support::{
     compare_ne_start_allocating_core, compare_ne_start_end_allocating_core,
     compare_ne_start_end_in_place_core, compare_ne_start_in_place_core,
     compare_start_allocating_core, compare_start_end_core, compare_start_end_in_place_core,
-    compare_start_in_place_core, min_positions_core, repeat_index_core, sum_end_core, sum_start_core,
-    sum_start_end_core, sum_start_u32_core, trim_index_core, CompareOp,
+    compare_start_in_place_core, min_positions_core, repeat_index_core, sum_end_core,
+    sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core, CompareOp,
 };
 use std::collections::HashMap;
 
