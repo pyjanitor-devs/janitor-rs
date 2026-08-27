@@ -42,3 +42,7 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 [[bench]]
 name = "kernels"
 harness = false
+
+[[bench]]
+name = "no_range_aggs"
+harness = false

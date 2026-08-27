@@ -4,7 +4,9 @@ use pyo3::prelude::*;
 
 /// For every `left[i]`, find the first position in all of `right` whose
 /// value is greater than or equal to `left[i]` (`right` is assumed sorted
-/// ascending). Rows with no such position are dropped entirely rather
+/// ascending, which in particular means NaN-free -- see the
+/// contiguous-fast-path note below for what that rules out and why it
+/// matters). Rows with no such position are dropped entirely rather
 /// than represented with a sentinel; only the surviving `(search index,
 /// left_index[i])` pairs are returned, in row order.
 ///
@@ -21,22 +23,33 @@ pub fn binary_search_le_first_core<T: PartialOrd + Copy>(
     left_index: ArrayView1<i64>,
 ) -> (Vec<i64>, Vec<i64>) {
     let len_right = right.len();
+    let right_slice = right.as_slice();
     let mut search_indices = Vec::new();
     let mut index_left = Vec::new();
     for (pos, left_value) in left.into_iter().enumerate() {
-        let mut min_idx = 0;
-        let mut max_idx = len_right;
-        while min_idx < max_idx {
-            // to avoid overflow
-            // adapted from numba's implementation
-            let mid_idx = min_idx + ((max_idx - min_idx) >> 1);
-            let current_value = right[mid_idx];
-            if current_value < *left_value {
-                min_idx = mid_idx + 1;
-            } else {
-                max_idx = mid_idx;
+        let min_idx = if let Some(slice) = right_slice {
+            // Only guaranteed to match the fallback below for a
+            // genuinely sorted, NaN-free `right` (this function's
+            // documented precondition) -- see bin_search_lt.rs's core
+            // for why `partition_point`'s branchless search can probe
+            // differently than a manual loop when that's violated.
+            slice.partition_point(|v| *v < *left_value)
+        } else {
+            let mut min_idx = 0;
+            let mut max_idx = len_right;
+            while min_idx < max_idx {
+                // to avoid overflow
+                // adapted from numba's implementation
+                let mid_idx = min_idx + ((max_idx - min_idx) >> 1);
+                let current_value = right[mid_idx];
+                if current_value < *left_value {
+                    min_idx = mid_idx + 1;
+                } else {
+                    max_idx = mid_idx;
+                }
             }
-        }
+            min_idx
+        };
         if min_idx == len_right {
             continue;
         }
@@ -48,6 +61,14 @@ pub fn binary_search_le_first_core<T: PartialOrd + Copy>(
 
 macro_rules! bin_search {
     ($fname:ident, $type:ty) => {
+        /// For every `left[i]`, the first position in all of `right`
+        /// whose value is greater than or equal to `left[i]`. `right` is
+        /// assumed sorted ascending, which in particular means NaN-free:
+        /// for a `right` that contains NaN, this function will not
+        /// panic, but its result is not guaranteed to be the same for a
+        /// contiguous `right` array as for a non-contiguous (e.g. sliced
+        /// with a step) one. See `binary_search_le_first_core`'s doc
+        /// comment (in the Rust source) for why.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -103,7 +124,68 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use numpy::ndarray::array;
+    use numpy::ndarray::{array, s};
+
+    #[test]
+    fn contiguous_and_strided_paths_agree() {
+        let right_dense = array![1_i64, 3, 5, 5, 5, 9];
+        assert!(right_dense.view().as_slice().is_some());
+        let right_padded = array![1_i64, -1, 3, -1, 5, -1, 5, -1, 5, -1, 9, -1];
+        let right_strided = right_padded.slice(s![..;2]);
+        assert!(right_strided.as_slice().is_none());
+
+        let left = array![0_i64, 5, 100];
+        let left_index = array![10_i64, 20, 30];
+        let fast = binary_search_le_first_core(left.view(), right_dense.view(), left_index.view());
+        let fallback = binary_search_le_first_core(left.view(), right_strided, left_index.view());
+        assert_eq!(fast, fallback);
+    }
+
+    #[test]
+    fn nan_in_right_does_not_panic_but_parity_is_not_guaranteed() {
+        // See bin_search_lt.rs's core for the full explanation: a `right`
+        // containing NaN violates "sorted ascending," and the fast path's
+        // branchless partition_point can then probe different elements
+        // than the manual fallback loop even with an identical predicate,
+        // landing on a genuinely different (but still in-bounds) answer.
+        // Deliberately not asserting fast == fallback -- that's exactly
+        // the parity this out-of-contract input isn't guaranteed to have.
+        let right_dense = array![-1.0_f64, f64::NAN, 0.0, 1.0, 2.0, 3.0, 4.0];
+        assert!(right_dense.view().as_slice().is_some());
+        let right_padded = array![
+            -1.0_f64,
+            -99.0,
+            f64::NAN,
+            -99.0,
+            0.0,
+            -99.0,
+            1.0,
+            -99.0,
+            2.0,
+            -99.0,
+            3.0,
+            -99.0,
+            4.0,
+            -99.0
+        ];
+        let right_strided = right_padded.slice(s![..;2]);
+        assert!(right_strided.as_slice().is_none());
+
+        let left = array![0.0_f64];
+        let left_index = array![0_i64];
+        let (fast_indices, _) =
+            binary_search_le_first_core(left.view(), right_dense.view(), left_index.view());
+        let (fallback_indices, _) =
+            binary_search_le_first_core(left.view(), right_strided, left_index.view());
+        for indices in [&fast_indices, &fallback_indices] {
+            for &idx in indices {
+                assert!(
+                    (0..7).contains(&idx),
+                    "expected an index in 0..7, got {idx}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn empty_input_returns_nothing() {

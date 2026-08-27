@@ -23,10 +23,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
     binary_search_lt_core, binary_search_lt_first_core, compare_start_end_core, max_end_core,
-    max_start_core, max_start_end_core, min_end_core, min_start_core, min_start_end_core,
-    repeat_index_core, sum_end_core, sum_start_core, sum_start_end_core, sum_start_u32_core,
-    trim_index_core, CompareOp,
+    max_positions_core, max_start_core, max_start_end_core, min_end_core, min_start_core,
+    min_start_end_core, repeat_index_core, sum_end_core, sum_start_core, sum_start_end_core,
+    sum_start_u32_core, trim_index_core, CompareOp,
 };
+use std::collections::HashMap;
 
 /// Counts bytes, calls, and outstanding (live) bytes allocated through the
 /// global allocator, so `bench_bin_search_first` can report an allocation
@@ -115,19 +116,67 @@ impl BinarySearchFixture {
     }
 }
 
+/// Same logical content as `BinarySearchFixture`, but `right` is stored at
+/// double width with a junk value interleaved after each real one, so a
+/// stride-2 view over it is non-contiguous (`.as_slice()` returns `None`)
+/// while still reading the identical `0, 2, 4, ...` sequence
+/// `BinarySearchFixture` does -- letting `bench_bin_search_lt` compare the
+/// `slice::partition_point` fast path against the `ArrayView1` manual-loop
+/// fallback on otherwise-identical data.
+struct StridedBinarySearchFixture {
+    right_padded: Array1<i64>,
+    left: Array1<i64>,
+    starts: Array1<i64>,
+    ends: Array1<i64>,
+}
+
+impl StridedBinarySearchFixture {
+    fn new(n: usize) -> Self {
+        let right_padded = Array1::from_iter((0..n as i64).flat_map(|i| [i * 2, -1]));
+        let left = Array1::from_iter((0..n as i64).map(|i| i * 2 + 1));
+        let starts = Array1::from_iter(0..n as i64);
+        let ends = Array1::from_elem(n, n as i64);
+        StridedBinarySearchFixture {
+            right_padded,
+            left,
+            starts,
+            ends,
+        }
+    }
+
+    fn right_view(&self) -> ArrayView1<'_, i64> {
+        self.right_padded.slice(numpy::ndarray::s![..;2])
+    }
+}
+
 /// ELI5: for every value in `left`, find where it would slot into the
-/// sorted `right` array -- the building block behind a `<` join.
+/// sorted `right` array -- the building block behind a `<` join. Run
+/// against both a contiguous `right` (the fast path) and a strided one
+/// (the fallback loop), so a regression in either isn't hidden by only
+/// ever benchmarking the other.
 fn bench_bin_search_lt(c: &mut Criterion) {
     let mut group = c.benchmark_group("bin_search_lt");
     for n in [100, 100_000] {
         let f = BinarySearchFixture::new(n);
-        group.bench_function(format!("n={n}"), |b| {
+        group.bench_function(format!("n={n} (contiguous)"), |b| {
             b.iter(|| {
                 binary_search_lt_core(
                     black_box(f.left.view()),
                     black_box(f.right.view()),
                     black_box(f.starts.view()),
                     black_box(f.ends.view()),
+                )
+            })
+        });
+
+        let sf = StridedBinarySearchFixture::new(n);
+        group.bench_function(format!("n={n} (strided)"), |b| {
+            b.iter(|| {
+                binary_search_lt_core(
+                    black_box(sf.left.view()),
+                    black_box(sf.right_view()),
+                    black_box(sf.starts.view()),
+                    black_box(sf.ends.view()),
                 )
             })
         });
@@ -602,16 +651,197 @@ fn bench_sum_kernels(c: &mut Criterion) {
     group.finish();
 }
 
-/// Inputs shared by both `min_*_core` and `max_*_core`: identical shape to
-/// `SumFixture`'s start/end/start_end fixtures (bounded interval width per
-/// AGENTS.md's aggregation-benchmark guidance), just reused across both
-/// families since, unlike `sum`, neither needs a per-dtype cast variant --
-/// see issue #49's "why cheap" note.
+struct MaxPositionsFixture {
+    arr: Array1<i64>,
+    starts: Array1<i64>,
+    ends: Array1<i64>,
+    index: Array1<i64>,
+    positions: Array1<i64>,
+    booleans: Array1<bool>,
+}
+
+impl MaxPositionsFixture {
+    fn new(n: usize, duplicate: bool) -> Self {
+        const WIDTH: usize = 8;
+        let arr = Array1::from_iter((0..n).map(|i| i as i64));
+        let starts = Array1::from_iter((0..n).map(|i| (i * WIDTH) as i64));
+        let ends = Array1::from_iter((0..n).map(|i| ((i + 1) * WIDTH) as i64));
+        let index = Array1::from_iter(0..n as i64);
+        let positions = Array1::from_iter((0..n).flat_map(|i| {
+            (0..WIDTH).map(move |j| if duplicate { 0 } else { ((i + j) % n) as i64 })
+        }));
+        let booleans = Array1::from_elem(n, false);
+        Self {
+            arr,
+            starts,
+            ends,
+            index,
+            positions,
+            booleans,
+        }
+    }
+}
+
+fn max_positions_old(
+    arr: ArrayView1<'_, i64>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    capacity: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut dictionary: HashMap<i64, (i64, i64)> =
+        HashMap::with_capacity(capacity.min(index.len()).min(positions.len()));
+    for (row, (((current, start), end), boolean)) in arr
+        .iter()
+        .zip(starts.iter())
+        .zip(ends.iter())
+        .zip(booleans.iter())
+        .enumerate()
+    {
+        let Some(start) = usize::try_from(*start).ok() else {
+            continue;
+        };
+        let Some(end) = usize::try_from(*end).ok().filter(|&e| e <= positions.len()) else {
+            continue;
+        };
+        if start >= end {
+            continue;
+        }
+        for n in start..end {
+            let Some(pos) = usize::try_from(positions[n])
+                .ok()
+                .filter(|&p| p < index.len())
+            else {
+                continue;
+            };
+            let entry = dictionary.entry(index[pos]).or_insert((-1, *current));
+            if !*boolean && (entry.0 == -1 || *current > entry.1) {
+                *entry = (row as i64, *current);
+            }
+        }
+    }
+    dictionary
+        .into_iter()
+        .map(|(label, (row, _))| (label, row))
+        .unzip()
+}
+
+fn assert_max_positions_parity(old: &(Vec<i64>, Vec<i64>), compact: &(Vec<i64>, Vec<i64>)) {
+    assert_eq!(
+        old.0.len(),
+        old.1.len(),
+        "old implementation returned mismatched labels and rows"
+    );
+    assert_eq!(
+        compact.0.len(),
+        compact.1.len(),
+        "compact implementation returned mismatched labels and rows"
+    );
+    let mut old_pairs: Vec<_> = old.0.iter().copied().zip(old.1.iter().copied()).collect();
+    let mut compact_pairs: Vec<_> = compact
+        .0
+        .iter()
+        .copied()
+        .zip(compact.1.iter().copied())
+        .collect();
+    old_pairs.sort_unstable();
+    compact_pairs.sort_unstable();
+    assert_eq!(
+        old_pairs, compact_pairs,
+        "compact max_positions output differs from the old implementation"
+    );
+}
+
+fn bench_max_positions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("max_positions_old_vs_compact");
+    for n in [32, 10_000, 100_000, 1_000_000] {
+        for duplicate in [true, false] {
+            let f = MaxPositionsFixture::new(n, duplicate);
+            let kind = if duplicate { "duplicate" } else { "unique" };
+            let label = format!("n={n} {kind}");
+            let old_result = max_positions_old(
+                f.arr.view(),
+                f.starts.view(),
+                f.ends.view(),
+                f.index.view(),
+                f.positions.view(),
+                f.booleans.view(),
+                f.index.len(),
+            );
+            let compact_result = max_positions_core(
+                f.arr.view(),
+                f.starts.view(),
+                f.ends.view(),
+                f.index.view(),
+                f.positions.view(),
+                f.booleans.view(),
+                f.index.len(),
+            );
+            assert_max_positions_parity(&old_result, &compact_result);
+            let old = count_allocations(|| {
+                max_positions_old(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                )
+            });
+            let compact = count_allocations(|| {
+                max_positions_core(
+                    f.arr.view(),
+                    f.starts.view(),
+                    f.ends.view(),
+                    f.index.view(),
+                    f.positions.view(),
+                    f.booleans.view(),
+                    f.index.len(),
+                )
+            });
+            eprintln!("max_positions {label}: old {old:?}; compact {compact:?}");
+            group.bench_function(format!("old {label}"), |b| {
+                b.iter(|| {
+                    max_positions_old(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
+                    )
+                })
+            });
+            group.bench_function(format!("compact {label}"), |b| {
+                b.iter(|| {
+                    max_positions_core(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.index.view()),
+                        black_box(f.positions.view()),
+                        black_box(f.booleans.view()),
+                        f.index.len(),
+                    )
+                })
+            });
+        }
+    }
+    group.finish();
+}
+
+/// Inputs shared by the min/max start, end, and explicit-range benchmarks.
+/// ELI5: these are small, bounded windows so the benchmark measures the
+/// aggregation kernels rather than an accidentally quadratic fixture.
 struct MinMaxFixture {
     arr: Array1<i64>,
     booleans: Array1<bool>,
-    starts_for_start: Array1<i64>,
-    ends_for_end: Array1<i64>,
+    starts: Array1<i64>,
+    ends: Array1<i64>,
     sliding_starts: Array1<i64>,
     sliding_ends: Array1<i64>,
 }
@@ -619,98 +849,67 @@ struct MinMaxFixture {
 impl MinMaxFixture {
     fn new(n: usize) -> Self {
         let n64 = n as i64;
-        let arr = Array1::from_iter((0..n64).map(|i| i * 2));
-        let booleans = Array1::from_elem(n, false);
-
-        // Same reasoning as SumFixture: min_start/max_start scan
-        // arr[start..] (to the very end), so every row's start must sit
-        // near the end for the width to stay bounded.
-        let starts_for_start = Array1::from_elem(n, (n64 - SUM_BENCH_WIDTH).max(0));
-        // min_end/max_end scan arr[..end] (from the very start), the
-        // mirror image.
-        let ends_for_end = Array1::from_elem(n, SUM_BENCH_WIDTH.min(n64));
-        // min_start_end/max_start_end take an explicit [start, end) per
-        // row, so a sliding bounded window covering the whole array is
-        // realistic and still stays O(n * WIDTH).
-        let sliding_starts = Array1::from_iter(0..n64);
-        let sliding_ends = Array1::from_iter((0..n64).map(|i| (i + SUM_BENCH_WIDTH).min(n64)));
-
+        let width = 32_i64;
         MinMaxFixture {
-            arr,
-            booleans,
-            starts_for_start,
-            ends_for_end,
-            sliding_starts,
-            sliding_ends,
+            arr: Array1::from_iter((0..n64).map(|i| i * 2)),
+            booleans: Array1::from_elem(n, false),
+            starts: Array1::from_elem(n, (n64 - width).max(0)),
+            ends: Array1::from_elem(n, width.min(n64)),
+            sliding_starts: Array1::from_iter(0..n64),
+            sliding_ends: Array1::from_iter((0..n64).map(|i| (i + width).min(n64))),
         }
     }
 }
 
-/// ELI5: see `bench_sum_kernels`'s doc comment -- this is the same shape
-/// of benchmark, just for the "find the biggest/smallest" door instead of
-/// the "add these up" door (issue #49).
 fn bench_min_max_kernels(c: &mut Criterion) {
     let mut group = c.benchmark_group("min_max_kernels");
     for n in [100, 100_000] {
         let f = MinMaxFixture::new(n);
-
-        group.bench_function(format!("min_start n={n}"), |b| {
-            b.iter(|| {
-                min_start_core(
-                    black_box(f.arr.view()),
-                    black_box(f.starts_for_start.view()),
-                    black_box(f.booleans.view()),
-                )
-            })
-        });
-        group.bench_function(format!("min_end n={n}"), |b| {
-            b.iter(|| {
-                min_end_core(
-                    black_box(f.arr.view()),
-                    black_box(f.ends_for_end.view()),
-                    black_box(f.booleans.view()),
-                )
-            })
-        });
-        group.bench_function(format!("min_start_end n={n}"), |b| {
-            b.iter(|| {
-                min_start_end_core(
-                    black_box(f.arr.view()),
-                    black_box(f.sliding_starts.view()),
-                    black_box(f.sliding_ends.view()),
-                    black_box(f.booleans.view()),
-                )
-            })
-        });
-
-        group.bench_function(format!("max_start n={n}"), |b| {
-            b.iter(|| {
-                max_start_core(
-                    black_box(f.arr.view()),
-                    black_box(f.starts_for_start.view()),
-                    black_box(f.booleans.view()),
-                )
-            })
-        });
-        group.bench_function(format!("max_end n={n}"), |b| {
-            b.iter(|| {
-                max_end_core(
-                    black_box(f.arr.view()),
-                    black_box(f.ends_for_end.view()),
-                    black_box(f.booleans.view()),
-                )
-            })
-        });
-        group.bench_function(format!("max_start_end n={n}"), |b| {
-            b.iter(|| {
-                max_start_end_core(
-                    black_box(f.arr.view()),
-                    black_box(f.sliding_starts.view()),
-                    black_box(f.sliding_ends.view()),
-                    black_box(f.booleans.view()),
-                )
-            })
-        });
+        for (name, kernel) in [
+            ("min_start", 0),
+            ("min_end", 1),
+            ("min_start_end", 2),
+            ("max_start", 3),
+            ("max_end", 4),
+            ("max_start_end", 5),
+        ] {
+            group.bench_function(format!("{name} n={n}"), |b| {
+                b.iter(|| match kernel {
+                    0 => min_start_core(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.booleans.view()),
+                    ),
+                    1 => min_end_core(
+                        black_box(f.arr.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.booleans.view()),
+                    ),
+                    2 => min_start_end_core(
+                        black_box(f.arr.view()),
+                        black_box(f.sliding_starts.view()),
+                        black_box(f.sliding_ends.view()),
+                        black_box(f.booleans.view()),
+                    ),
+                    3 => max_start_core(
+                        black_box(f.arr.view()),
+                        black_box(f.starts.view()),
+                        black_box(f.booleans.view()),
+                    ),
+                    4 => max_end_core(
+                        black_box(f.arr.view()),
+                        black_box(f.ends.view()),
+                        black_box(f.booleans.view()),
+                    ),
+                    _ => max_start_end_core(
+                        black_box(f.arr.view()),
+                        black_box(f.sliding_starts.view()),
+                        black_box(f.sliding_ends.view()),
+                        black_box(f.booleans.view()),
+                    ),
+                })
+            });
+        }
     }
     group.finish();
 }
@@ -723,6 +922,7 @@ criterion_group!(
     bench_compare_start_end,
     bench_index_builders,
     bench_sum_kernels,
-    bench_min_max_kernels
+    bench_min_max_kernels,
+    bench_max_positions
 );
 criterion_main!(benches);
