@@ -15,6 +15,26 @@ fn validate_inputs<T>(
     Ok(())
 }
 
+/// Choose the sweep only when it has enough work to repay its row metadata.
+///
+/// The old loop performs approximately `rows * width` winner checks. The
+/// sweep performs approximately `rows + width` event/output work, but also
+/// allocates a flat bucket head array and one link per row. The `8x` margin is
+/// deliberately conservative: it avoids paying that metadata and setup cost
+/// when the ranges are narrow, while still selecting the sweep for the wide
+/// inputs where the nested loop repeats the same work many times. The value
+/// was selected from the tiny/large/very-large/narrow benchmark matrix rather
+/// than from an input-size assumption. Saturating arithmetic keeps this
+/// estimate safe even for dimensions near `usize::MAX`.
+///
+/// ELI5: use the shortcut only when there are enough repeated chores for the
+/// shortcut to be worth setting up; for a tiny job, just do the chores.
+fn should_sweep(rows: usize, width: usize) -> bool {
+    let repeated_work = rows.saturating_mul(width);
+    let sweep_work = rows.saturating_add(width);
+    repeated_work > sweep_work.saturating_mul(8)
+}
+
 /// Groups reverse-maximum starts by compact candidate ordinal.
 /// ELI5: all suffixes share a contiguous union, so one slot per ordinal replaces the HashMaps.
 pub fn max_rev_starts_core<T: PartialOrd + Copy>(
@@ -23,28 +43,65 @@ pub fn max_rev_starts_core<T: PartialOrd + Copy>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, starts, booleans)?;
-    let (min_start, width) = starts_domain(starts, index.len())?;
-    let mut values = vec![arr[0]; width];
-    let mut positions = vec![-1_i64; width];
-    for (row, ((current, start), boolean)) in arr
-        .iter()
-        .zip(starts.iter())
-        .zip(booleans.iter())
-        .enumerate()
-    {
-        for (position, value) in positions
-            .iter_mut()
-            .zip(values.iter_mut())
-            .skip(*start as usize - min_start)
+    validate_inputs(arr, starts, index, booleans)?;
+    let min_start = starts.iter().copied().min().unwrap() as usize;
+    let width = index.len() - min_start;
+
+    if !should_sweep(arr.len(), width) {
+        let mut values = vec![arr[0]; width];
+        let mut positions = vec![-1_i64; width];
+        for (row, ((current, start), boolean)) in arr
+            .iter()
+            .zip(starts.iter())
+            .zip(booleans.iter())
+            .enumerate()
         {
-            if *boolean {
-                continue;
+            for (position, value) in positions
+                .iter_mut()
+                .zip(values.iter_mut())
+                .skip(*start as usize - min_start)
+            {
+                if *boolean {
+                    continue;
+                }
+                if *position == -1 || *current > *value {
+                    *position = row as i64;
+                    *value = *current;
+                }
             }
-            if *position == -1 || *current > *value {
-                *position = row as i64;
-                *value = *current;
+        }
+        let indexers = (min_start..index.len()).map(|item| index[item]).collect();
+        return Ok((indexers, Array1::from_vec(positions)));
+    }
+
+    // ELI5: a suffix row becomes eligible once the sweep reaches its start.
+    // Put each row in that boundary's bucket, then update the current winner
+    // once when the row becomes eligible. This avoids comparing the same row
+    // against every later output slot. The linked buckets preserve input-row
+    // order, so equal values keep the old first-row tie behavior.
+    let mut head = vec![usize::MAX; width + 1];
+    let mut next = vec![usize::MAX; arr.len()];
+    for (row, start) in starts.iter().enumerate().rev() {
+        let bucket = *start as usize - min_start;
+        next[row] = head[bucket];
+        head[bucket] = row;
+    }
+
+    let mut positions = vec![-1_i64; width];
+    let mut current_winner: Option<(T, i64)> = None;
+    for (bucket, _) in head.iter().enumerate().take(width) {
+        let mut row = head[bucket];
+        while row != usize::MAX {
+            let current = arr[row];
+            if !booleans[row]
+                && (current_winner.is_none() || current > current_winner.as_ref().unwrap().0)
+            {
+                current_winner = Some((current, row as i64));
             }
+            row = next[row];
+        }
+        if let Some((_, row)) = current_winner {
+            positions[bucket] = row;
         }
     }
     Ok((starts_labels(min_start, index), Array1::from_vec(positions)))
@@ -121,5 +178,20 @@ mod tests {
             array![false].view()
         )
         .is_err());
+    }
+
+    #[test]
+    fn sweep_preserves_first_tie_and_skips_null_rows() {
+        let mut arr = Array1::from_elem(100, 7_i64);
+        arr[0] = 5;
+        let mut starts = Array1::zeros(100);
+        starts[99] = 500;
+        let index = Array1::from_iter(0_i64..1000);
+        let mut booleans = Array1::from_elem(100, false);
+        booleans[99] = true;
+        let got = max_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
+        let (labels, positions) = got.unwrap();
+        assert_eq!(labels, index);
+        assert!(positions.iter().all(|position| *position == 1));
     }
 }

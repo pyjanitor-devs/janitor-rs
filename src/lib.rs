@@ -13,7 +13,9 @@ mod left_le_right;
 /// hundreds of Python wrappers.
 #[doc(hidden)]
 pub mod bench_support {
+    pub use crate::aggs::max_rev::max_ends::max_rev_ends_core;
     pub use crate::aggs::max_rev::max_positions::max_positions_core;
+    pub use crate::aggs::max_rev::max_starts::max_rev_starts_core;
     pub use crate::aggs::min_rev::min_ends::min_rev_ends_core;
     pub use crate::aggs::min_rev::min_positions::min_positions_core;
     pub use crate::aggs::min_rev::min_starts::min_rev_starts_core;
