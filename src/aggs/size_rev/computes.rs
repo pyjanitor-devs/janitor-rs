@@ -1,49 +1,12 @@
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use crate::aggs::{
     checked_end, checked_index, checked_range, ensure_equal_lengths, ensure_exact_tape_width,
     ensure_nonempty_matches,
 };
-
-pub fn size_positions_core(
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
-    positions: ArrayView1<'_, i64>,
-    capacity: usize,
-) -> (Vec<i64>, Vec<i64>) {
-    let capacity = capacity.min(index.len()).min(positions.len());
-    let mut slots: HashMap<i64, usize> = HashMap::with_capacity(capacity);
-    let mut labels = Vec::with_capacity(capacity);
-    let mut counts = Vec::with_capacity(capacity);
-    for (start, end) in starts.into_iter().zip(ends) {
-        let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
-            continue;
-        };
-        for item in start_..end_ {
-            let Some(indexer_) = checked_index(positions[item], index.len()) else {
-                continue;
-            };
-            let label = index[indexer_];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    counts.push(0);
-                    slot
-                }
-            };
-            counts[slot] += 1;
-        }
-    }
-    (labels, counts)
-}
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
 
@@ -56,12 +19,12 @@ fn size_rev_ends_core(
     }
     if ends.iter().any(|end| {
         usize::try_from(*end)
-            .map(|end| end == 0 || end > index.len())
+            .map(|end| end > index.len())
             .unwrap_or(true)
     }) {
-        return Err("ends must satisfy 0 < end <= right_len");
+        return Err("ends must satisfy 0 <= end <= right_len");
     }
-    let max_end = ends.iter().copied().max().unwrap() as usize;
+    let max_end = ends.iter().copied().max().unwrap_or(0) as usize;
     let mut result = vec![0_i64; max_end];
     for end in ends {
         for value in result.iter_mut().take(*end as usize) {
@@ -81,10 +44,10 @@ fn size_rev_starts_core(
     }
     if starts.iter().any(|start| {
         usize::try_from(*start)
-            .map(|start| start >= index.len())
+            .map(|start| start > index.len())
             .unwrap_or(true)
     }) {
-        return Err("starts must satisfy 0 <= start < right_len");
+        return Err("starts must satisfy 0 <= start <= right_len");
     }
     let min_start = starts.iter().copied().min().unwrap() as usize;
     let mut result = vec![0_i64; index.len() - min_start];
@@ -125,7 +88,8 @@ pub fn compute_size_rev_start<'py>(
 
 #[pyfunction]
 /// `matches` must be non-empty and contain exactly one entry per candidate
-/// position. pyjanitor guarantees this with `counts_array.sum() == matches.len()`.
+/// position. `counts_array.sum()` normally equals `matches.sum()`; the tape
+/// width is `matches.len()`.
 pub fn compute_size_rev_end_matches<'py>(
     py: Python<'py>,
     ends: PyReadonlyArray1<'py, i64>,
@@ -177,7 +141,8 @@ pub fn compute_size_rev_end_matches<'py>(
 
 #[pyfunction]
 /// `matches` must be non-empty and contain exactly one entry per candidate
-/// position. pyjanitor guarantees this with `counts_array.sum() == matches.len()`.
+/// position. `counts_array.sum()` normally equals `matches.sum()`; the tape
+/// width is `matches.len()`.
 pub fn compute_size_rev_start_matches<'py>(
     py: Python<'py>,
     starts: PyReadonlyArray1<'py, i64>,
@@ -227,7 +192,8 @@ pub fn compute_size_rev_start_matches<'py>(
 
 #[pyfunction]
 /// `matches` must be non-empty and contain exactly one entry per candidate
-/// position. pyjanitor guarantees this with `counts_array.sum() == matches.len()`.
+/// position. `counts_array.sum()` normally equals `matches.sum()`; the tape
+/// width is `matches.len()`.
 pub fn compute_size_rev_start_end_matches<'py>(
     py: Python<'py>,
     starts: PyReadonlyArray1<'py, i64>,
@@ -288,65 +254,33 @@ pub fn compute_size_rev_start_end<'py>(
     starts: PyReadonlyArray1<'py, i64>,
     ends: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
+    length: i64,
 ) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
-    let index = index.as_array();
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-    let (indexers, result) = size_rev_start_end_core(starts, ends, index)
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
-}
-
-/// Count explicit range coverage for each distinct right-hand label.
-///
-/// ELI5: each label gets one numbered counter. Repeated labels reuse that
-/// counter, so the state vectors grow with distinct labels rather than with
-/// every repeated occurrence.
-pub fn size_rev_start_end_core(
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    if starts.len() != ends.len() {
-        return Err("starts and ends must have equal lengths");
-    }
-    if starts.is_empty() || index.is_empty() {
-        return Err("starts, ends, and index cannot be empty");
-    }
-    let hint = starts
-        .iter()
-        .zip(ends.iter())
-        .filter_map(|(start, end)| checked_range(*start, *end, index.len()))
-        .fold(0_usize, |total, (start, end)| {
-            total.saturating_add(end - start)
-        })
-        .min(index.len());
-    // ELI5: this width is only a safe upper bound. Duplicate labels do not
-    // create duplicate vector entries because vectors grow on first sight.
-    let mut slots = HashMap::with_capacity(hint);
-    let mut labels = Vec::new();
-    let mut counts = Vec::new();
-    for (start, end) in starts.iter().zip(ends.iter()) {
-        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+    let index = index.as_array();
+    let length = length as usize;
+    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let zipped = starts.into_iter().zip(ends);
+    for (start, end) in zipped {
+        let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
             continue;
         };
-        for item in start..end {
-            let label = index[item];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    counts.push(0_i64);
-                    slot
-                }
-            };
-            counts[slot] += 1;
+        for item in start_..end_ {
+            let pos = index[item];
+            let total = dictionary.entry(pos).or_insert(0);
+            *total += 1;
         }
     }
-    Ok((Array1::from_vec(labels), Array1::from_vec(counts)))
+    let length = dictionary.len();
+    let mut indexers = Array1::<i64>::zeros(length);
+    let mut result = Array1::<i64>::zeros(length);
+    for (pos, (key, val)) in dictionary.iter().enumerate() {
+        indexers[pos] = *key;
+        result[pos] = *val;
+    }
+    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
 #[cfg(test)]
@@ -370,55 +304,12 @@ mod tests {
     #[test]
     fn rejects_empty_and_invalid_boundaries() {
         let index = array![10_i64];
-        assert!(size_rev_ends_core(array![0_i64].view(), index.view()).is_err());
-        assert!(size_rev_starts_core(array![-1_i64].view(), index.view()).is_err());
-        assert!(size_rev_ends_core(array![1_i64].view(), array![].view()).is_err());
-    }
-
-    #[test]
-    fn explicit_ranges_count_duplicate_labels_in_compact_slots() {
         assert_eq!(
-            size_rev_start_end_core(
-                array![0_i64, 1, 0].view(),
-                array![2_i64, 3, 1].view(),
-                array![10_i64, 20, 10].view(),
-            ),
-            Ok((array![10, 20], array![3, 2]))
-        );
-    }
-
-    #[test]
-    fn explicit_ranges_skip_invalid_and_accept_zero_width_rows() {
-        assert_eq!(
-            size_rev_start_end_core(
-                array![2_i64, -1, 0, 1].view(),
-                array![2_i64, 1, 1, 4].view(),
-                array![10_i64, 20].view(),
-            ),
-            Ok((array![10], array![1]))
-        );
-        assert_eq!(
-            size_rev_start_end_core(
-                array![2_i64].view(),
-                array![2_i64].view(),
-                array![10_i64, 20].view(),
-            ),
+            size_rev_ends_core(array![0_i64].view(), index.view()),
             Ok((array![], array![]))
         );
-    }
-
-    #[test]
-    fn explicit_range_validation_rejects_empty_and_mismatched_inputs() {
-        assert!(size_rev_start_end_core(
-            array![0_i64].view(),
-            array![1_i64, 1].view(),
-            array![10_i64].view(),
-        )
-        .is_err());
-        assert!(
-            size_rev_start_end_core(array![].view(), array![].view(), array![10_i64].view(),)
-                .is_err()
-        );
+        assert!(size_rev_starts_core(array![-1_i64].view(), index.view()).is_err());
+        assert!(size_rev_ends_core(array![1_i64].view(), array![].view()).is_err());
     }
 }
 

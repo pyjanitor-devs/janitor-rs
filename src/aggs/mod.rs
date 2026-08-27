@@ -1,3 +1,21 @@
+//! Reverse aggregation input contracts.
+//!
+//! The match-based kernels consume a flat candidate tape. `matches.len()` is
+//! the tape width (the sum of each row's candidate range), while
+//! `counts_array.sum()` describes how many candidates matched and therefore
+//! normally equals `matches.sum()`, not `matches.len()`. The producer,
+//! pyjanitor, owns the invariant that match values are 0 or 1; Rust validates
+//! the tape shape but deliberately does not scan every value.
+//!
+//! An empty `matches` tape is rejected by the Rust API. Pyjanitor handles the
+//! legitimate all-zero-width batch before crossing this boundary and returns
+//! the corresponding empty result. Individual zero-width rows remain valid
+//! when other rows make the overall tape non-empty.
+//!
+//! ELI5: the tape is a roll of tickets shared by all rows. Rust checks that
+//! the roll has the expected number of tickets, but pyjanitor decides which
+//! tickets say yes (1) or no (0). A completely empty roll is not sent to Rust.
+
 use pyo3::prelude::*;
 
 pub mod min;
@@ -62,6 +80,30 @@ pub(crate) fn checked_range(start: i64, end: i64, len: usize) -> Option<(usize, 
     (start < end).then_some((start, end))
 }
 
+/// Validate an exclusive range supplied to a reverse aggregation kernel.
+///
+/// ELI5: malformed bounds are caller errors, but an equal start and end is a
+/// real empty range. Keeping that distinction lets callers skip empty work
+/// without turning a one-past-the-end boundary into an error.
+pub(crate) fn validate_range(
+    start: i64,
+    end: i64,
+    len: usize,
+) -> Result<Option<(usize, usize)>, &'static str> {
+    let start = usize::try_from(start).map_err(|_| "range bounds must be non-negative")?;
+    let end = usize::try_from(end).map_err(|_| "range bounds must be non-negative")?;
+    if start > len || end > len {
+        return Err("range bounds must not exceed right_index length");
+    }
+    if start > end {
+        return Err("range start must not exceed range end");
+    }
+    if start == end {
+        return Ok(None);
+    }
+    Ok(Some((start, end)))
+}
+
 /// Reject a flat `matches` tape too short for the candidate positions every
 /// row's `(start, end)` range implies it must cover.
 ///
@@ -82,6 +124,9 @@ pub(crate) fn ensure_tape_width(expected_width: usize, matches_len: usize) -> Py
 /// starts consuming it. The exact candidate-width check is performed
 /// separately by `ensure_exact_tape_width`.
 pub(crate) fn ensure_nonempty_matches(matches_len: usize) -> PyResult<()> {
+    // Keep this check separate from the width check: an all-zero-width batch
+    // is handled by pyjanitor, while a direct Rust caller must provide a real
+    // candidate tape. This makes the boundary contract explicit and cheap.
     if matches_len == 0 {
         return Err(PyValueError::new_err("matches cannot be empty"));
     }
@@ -90,10 +135,12 @@ pub(crate) fn ensure_nonempty_matches(matches_len: usize) -> PyResult<()> {
 
 /// Reject a flat `matches` tape whose length differs from the candidate width.
 ///
-/// ELI5: `counts_array.sum()` in pyjanitor is the number of candidate
-/// positions represented by the tape. Every candidate needs exactly one
-/// `matches` entry, so both a short tape and a tape with trailing entries are
-/// invalid.
+/// ELI5: `matches.len()` is the number of candidate positions represented by
+/// the tape. `counts_array.sum()` is the number of candidates that survived
+/// the comparison, so it generally equals `matches.sum()`, not
+/// `matches.len()`. The producer (pyjanitor) is responsible for ensuring that
+/// every `matches` value is either 0 or 1; this helper intentionally does not
+/// scan the tape to enforce that value-level contract.
 pub(crate) fn ensure_exact_tape_width(expected_width: usize, matches_len: usize) -> PyResult<()> {
     if expected_width == matches_len {
         return Ok(());
@@ -279,6 +326,7 @@ mod adversarial_bounds_tests {
                     starts.readonly(),
                     ends.readonly(),
                     index.readonly(),
+                    2,
                 )
                 .expect_err("reverse-size wrapper must reject unequal lengths");
                 assert!(error.is_instance_of::<PyValueError>(py));

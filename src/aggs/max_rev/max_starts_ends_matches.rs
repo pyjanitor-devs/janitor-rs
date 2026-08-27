@@ -11,8 +11,12 @@ use std::collections::HashMap;
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
         /// `matches` must be non-empty and must contain exactly one entry for
-        /// every candidate position. pyjanitor guarantees this by ensuring
-        /// `counts_array.sum() == matches.len()` before calling the kernel.
+        /// every candidate position. pyjanitor supplies the per-row counts
+        /// and binary mask from the same comparison stage. pyjanitor is
+        /// responsible for ensuring each mask value is 0 or 1; Rust does not
+        /// scan the tape to enforce that value-level contract. Normally
+        /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
+        /// full candidate-tape width.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -123,4 +127,42 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_max_rev_start_end_match_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_max_rev_start_end_match_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_max_rev_start_end_match_int64;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::exceptions::PyValueError;
+    use pyo3::Python;
+
+    #[test]
+    fn wrapper_rejects_empty_matches_tape_for_zero_width_range() {
+        Python::initialize();
+        Python::attach(|py| {
+            let arr = PyArray1::from_vec(py, vec![5_i64]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![0_i64]);
+            let index = PyArray1::from_vec(py, vec![10_i64]);
+            let counts = PyArray1::from_vec(py, vec![0_i64]);
+            let matches = PyArray1::from_vec(py, Vec::<i8>::new());
+            let booleans = PyArray1::from_vec(py, vec![false]);
+
+            let error = compute_max_rev_start_end_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+                1,
+            )
+            .unwrap_err();
+
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert!(error.to_string().contains("matches cannot be empty"));
+        });
+    }
 }

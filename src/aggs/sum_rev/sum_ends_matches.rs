@@ -11,8 +11,12 @@ use crate::aggs::{
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
         /// `matches` must be non-empty and must contain exactly one entry for
-        /// every candidate position. pyjanitor guarantees this by ensuring
-        /// `counts_array.sum() == matches.len()` before calling the kernel.
+        /// every candidate position. pyjanitor supplies the per-row counts
+        /// and binary mask from the same comparison stage. pyjanitor is
+        /// responsible for ensuring each mask value is 0 or 1; Rust does not
+        /// scan the tape to enforce that value-level contract. Normally
+        /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
+        /// full candidate-tape width.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -111,8 +115,12 @@ compute_ints!(compute_sum_rev_end_match_uint8, u8);
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
         /// `matches` must be non-empty and must contain exactly one entry for
-        /// every candidate position. pyjanitor guarantees this by ensuring
-        /// `counts_array.sum() == matches.len()` before calling the kernel.
+        /// every candidate position. pyjanitor supplies the per-row counts
+        /// and binary mask from the same comparison stage. pyjanitor is
+        /// responsible for ensuring each mask value is 0 or 1; Rust does not
+        /// scan the tape to enforce that value-level contract. Normally
+        /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
+        /// full candidate-tape width.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
