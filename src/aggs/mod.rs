@@ -16,6 +16,8 @@
 //! the roll has the expected number of tickets, but pyjanitor decides which
 //! tickets say yes (1) or no (0). A completely empty roll is not sent to Rust.
 
+use numpy::ndarray::{Array1, ArrayView1};
+use numpy::{Element, IntoPyArray, PyArray1};
 use pyo3::prelude::*;
 
 pub mod min;
@@ -51,6 +53,97 @@ pub(crate) fn ensure_equal_lengths(
     )))
 }
 
+// Shared domain contract for the plain reverse `*_rev_starts` and
+// `*_rev_ends` aggregation shapes (min/max/prod/sum/size).
+//
+// ELI5: every row's suffix `[start, right_len)` or prefix `[0, end)`
+// touches a contiguous slice of the right side. The union of all those
+// slices is one compact domain -- `min_start..right_len` for starts,
+// `0..max_end` for ends -- so one accumulator slot per ordinal in that
+// domain replaces per-row HashMaps. `starts_domain`/`ends_domain` validate
+// the boundary array and derive that domain; `starts_labels`/`ends_labels`
+// turn a domain back into the original right-side labels the caller
+// expects in the output. Aggregate-specific accumulation (winning
+// positions for min/max, running products for prod, counts for size)
+// stays with each site -- only the domain and its labels are shared here.
+// Validating equal lengths against `arr`/`booleans` also stays with each
+// site: `size` doesn't have those arrays, so it isn't a shared concern.
+
+/// Validate a non-empty `starts` boundary array against `right_len` and
+/// derive the compact accumulator domain it implies.
+///
+/// Returns `(min_start, width)` where `width = right_len - min_start` is
+/// the exact number of accumulator slots the compact scheme needs.
+pub(crate) fn starts_domain(
+    starts: ArrayView1<'_, i64>,
+    right_len: usize,
+) -> Result<(usize, usize), &'static str> {
+    if starts.is_empty() || right_len == 0 {
+        return Err("starts and index cannot be empty");
+    }
+    if starts.iter().any(|start| {
+        usize::try_from(*start)
+            .map(|start| start > right_len)
+            .unwrap_or(true)
+    }) {
+        return Err("starts must satisfy 0 <= start <= right_len");
+    }
+    let min_start = starts.iter().copied().min().unwrap() as usize;
+    Ok((min_start, right_len - min_start))
+}
+
+/// Validate a non-empty `ends` boundary array against `right_len` and
+/// derive the compact accumulator domain it implies.
+///
+/// Returns `max_end`, the exact number of accumulator slots the compact
+/// scheme needs.
+pub(crate) fn ends_domain(
+    ends: ArrayView1<'_, i64>,
+    right_len: usize,
+) -> Result<usize, &'static str> {
+    if ends.is_empty() || right_len == 0 {
+        return Err("ends and index cannot be empty");
+    }
+    if ends.iter().any(|end| {
+        usize::try_from(*end)
+            .map(|end| end > right_len)
+            .unwrap_or(true)
+    }) {
+        return Err("ends must satisfy 0 <= end <= right_len");
+    }
+    Ok(ends.iter().copied().max().unwrap() as usize)
+}
+
+/// Materialize output labels for a `starts_domain` result.
+pub(crate) fn starts_labels(min_start: usize, index: ArrayView1<'_, i64>) -> Array1<i64> {
+    (min_start..index.len()).map(|item| index[item]).collect()
+}
+
+/// Materialize output labels for an `ends_domain` result.
+pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<i64> {
+    (0..max_end).map(|item| index[item]).collect()
+}
+
+/// Shared return shape for every `*_rev_starts`/`*_rev_ends` `#[pyfunction]`
+/// wrapper: a pair of numpy arrays, generic over the value array's element
+/// type `U` so it fits min/max/size (`i64`) and prod/sum's int (`i64`) and
+/// float (`f64`) variants alike.
+pub(crate) type StartsEndsResult<'py, U> =
+    PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<U>>)>;
+
+/// Convert a plain reverse aggregation core's `Result` into the `PyResult`
+/// pair every `*_rev_starts`/`*_rev_ends` `#[pyfunction]` wrapper returns.
+///
+/// ELI5: every wrapper in this family maps a core error to a `ValueError`
+/// and then converts both output arrays to numpy the same way.
+pub(crate) fn into_starts_ends_result<'py, U: Element>(
+    py: Python<'py>,
+    core_result: Result<(Array1<i64>, Array1<U>), &'static str>,
+) -> StartsEndsResult<'py, U> {
+    let (indexers, result) = core_result.map_err(PyValueError::new_err)?;
+    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+}
+
 /// Convert a signed position only when it names a real element.
 ///
 /// ELI5: negative sentinels and positions past the end never become huge
@@ -78,30 +171,6 @@ pub(crate) fn checked_range(start: i64, end: i64, len: usize) -> Option<(usize, 
     let start = usize::try_from(start).ok()?;
     let end = checked_end(end, len)?;
     (start < end).then_some((start, end))
-}
-
-/// Validate an exclusive range supplied to a reverse aggregation kernel.
-///
-/// ELI5: malformed bounds are caller errors, but an equal start and end is a
-/// real empty range. Keeping that distinction lets callers skip empty work
-/// without turning a one-past-the-end boundary into an error.
-pub(crate) fn validate_range(
-    start: i64,
-    end: i64,
-    len: usize,
-) -> Result<Option<(usize, usize)>, &'static str> {
-    let start = usize::try_from(start).map_err(|_| "range bounds must be non-negative")?;
-    let end = usize::try_from(end).map_err(|_| "range bounds must be non-negative")?;
-    if start > len || end > len {
-        return Err("range bounds must not exceed right_index length");
-    }
-    if start > end {
-        return Err("range start must not exceed range end");
-    }
-    if start == end {
-        return Ok(None);
-    }
-    Ok(Some((start, end)))
 }
 
 /// Reject a flat `matches` tape too short for the candidate positions every

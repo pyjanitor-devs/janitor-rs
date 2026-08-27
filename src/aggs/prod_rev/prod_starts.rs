@@ -1,25 +1,16 @@
 use numpy::ndarray::{Array1, ArrayView1};
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+
+use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(), &'static str> {
     if arr.len() != starts.len() || arr.len() != booleans.len() {
         return Err("arr, starts, and booleans must have equal lengths");
-    }
-    if arr.is_empty() || index.is_empty() {
-        return Err("arr, starts, booleans, and index cannot be empty");
-    }
-    if starts.iter().any(|start| {
-        usize::try_from(*start)
-            .map(|start| start > index.len())
-            .unwrap_or(true)
-    }) {
-        return Err("starts must satisfy 0 <= start <= right_len");
     }
     Ok(())
 }
@@ -31,9 +22,8 @@ pub fn prod_rev_starts_int_core<T: Copy, F: FnMut(T) -> i64>(
     booleans: ArrayView1<'_, bool>,
     mut to_i64: F,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, starts, index, booleans)?;
-    let min_start = starts.iter().copied().min().unwrap() as usize;
-    let width = index.len() - min_start;
+    validate_inputs(arr, starts, booleans)?;
+    let (min_start, width) = starts_domain(starts, index.len())?;
     let mut values = vec![1_i64; width];
     for ((current, start), boolean) in arr.iter().zip(starts.iter()).zip(booleans.iter()) {
         if *boolean {
@@ -44,8 +34,7 @@ pub fn prod_rev_starts_int_core<T: Copy, F: FnMut(T) -> i64>(
             *value = value.wrapping_mul(current);
         }
     }
-    let indexers = (min_start..index.len()).map(|item| index[item]).collect();
-    Ok((indexers, Array1::from_vec(values)))
+    Ok((starts_labels(min_start, index), Array1::from_vec(values)))
 }
 
 pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
@@ -55,9 +44,8 @@ pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
     booleans: ArrayView1<'_, bool>,
     mut to_f64: F,
 ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
-    validate_inputs(arr, starts, index, booleans)?;
-    let min_start = starts.iter().copied().min().unwrap() as usize;
-    let width = index.len() - min_start;
+    validate_inputs(arr, starts, booleans)?;
+    let (min_start, width) = starts_domain(starts, index.len())?;
     let mut values = vec![1_f64; width];
     for ((current, start), boolean) in arr.iter().zip(starts.iter()).zip(booleans.iter()) {
         if *boolean {
@@ -68,8 +56,7 @@ pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
             *value *= current;
         }
     }
-    let indexers = (min_start..index.len()).map(|item| index[item]).collect();
-    Ok((indexers, Array1::from_vec(values)))
+    Ok((starts_labels(min_start, index), Array1::from_vec(values)))
 }
 
 macro_rules! compute_ints {
@@ -84,15 +71,16 @@ macro_rules! compute_ints {
             length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
             let _ = length;
-            let (indexers, result) = prod_rev_starts_int_core(
-                arr.as_array(),
-                starts.as_array(),
-                index.as_array(),
-                booleans.as_array(),
-                |value| value as i64,
+            into_starts_ends_result(
+                py,
+                prod_rev_starts_int_core(
+                    arr.as_array(),
+                    starts.as_array(),
+                    index.as_array(),
+                    booleans.as_array(),
+                    |value| value as i64,
+                ),
             )
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
 }
@@ -108,15 +96,16 @@ macro_rules! compute_floats {
             length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)> {
             let _ = length;
-            let (indexers, result) = prod_rev_starts_float_core(
-                arr.as_array(),
-                starts.as_array(),
-                index.as_array(),
-                booleans.as_array(),
-                |value| value as f64,
+            into_starts_ends_result(
+                py,
+                prod_rev_starts_float_core(
+                    arr.as_array(),
+                    starts.as_array(),
+                    index.as_array(),
+                    booleans.as_array(),
+                    |value| value as f64,
+                ),
             )
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
 }

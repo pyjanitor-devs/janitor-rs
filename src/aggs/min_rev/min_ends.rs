@@ -1,25 +1,16 @@
 use numpy::ndarray::{Array1, ArrayView1};
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+
+use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
     ends: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(), &'static str> {
     if arr.len() != ends.len() || arr.len() != booleans.len() {
         return Err("arr, ends, and booleans must have equal lengths");
-    }
-    if arr.is_empty() || index.is_empty() {
-        return Err("arr, ends, booleans, and index cannot be empty");
-    }
-    if ends.iter().any(|end| {
-        usize::try_from(*end)
-            .map(|end| end > index.len())
-            .unwrap_or(true)
-    }) {
-        return Err("ends must satisfy 0 <= end <= right_len");
     }
     Ok(())
 }
@@ -34,8 +25,8 @@ pub fn min_rev_ends_core<T: PartialOrd + Copy>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, ends, index, booleans)?;
-    let max_end = ends.iter().copied().max().unwrap() as usize;
+    validate_inputs(arr, ends, booleans)?;
+    let max_end = ends_domain(ends, index.len())?;
     let mut values = vec![arr[0]; max_end];
     let mut positions = vec![-1_i64; max_end];
 
@@ -57,8 +48,7 @@ pub fn min_rev_ends_core<T: PartialOrd + Copy>(
         }
     }
 
-    let indexers = (0..max_end).map(|item| index[item]).collect();
-    Ok((indexers, Array1::from_vec(positions)))
+    Ok((ends_labels(max_end, index), Array1::from_vec(positions)))
 }
 
 macro_rules! compute {
@@ -73,14 +63,15 @@ macro_rules! compute {
             length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
             let _ = length;
-            let (indexers, result) = min_rev_ends_core(
-                arr.as_array(),
-                ends.as_array(),
-                index.as_array(),
-                booleans.as_array(),
+            into_starts_ends_result(
+                py,
+                min_rev_ends_core(
+                    arr.as_array(),
+                    ends.as_array(),
+                    index.as_array(),
+                    booleans.as_array(),
+                ),
             )
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
 }

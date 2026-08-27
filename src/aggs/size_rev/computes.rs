@@ -4,8 +4,9 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    checked_end, checked_index, checked_range, ensure_equal_lengths, ensure_exact_tape_width,
-    ensure_nonempty_matches,
+    checked_end, checked_index, checked_range, ends_domain, ends_labels, ensure_equal_lengths,
+    ensure_exact_tape_width, ensure_nonempty_matches, into_starts_ends_result, starts_domain,
+    starts_labels,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
@@ -14,50 +15,28 @@ fn size_rev_ends_core(
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    if ends.is_empty() || index.is_empty() {
-        return Err("ends and index cannot be empty");
-    }
-    if ends.iter().any(|end| {
-        usize::try_from(*end)
-            .map(|end| end > index.len())
-            .unwrap_or(true)
-    }) {
-        return Err("ends must satisfy 0 <= end <= right_len");
-    }
-    let max_end = ends.iter().copied().max().unwrap_or(0) as usize;
+    let max_end = ends_domain(ends, index.len())?;
     let mut result = vec![0_i64; max_end];
     for end in ends {
         for value in result.iter_mut().take(*end as usize) {
             *value += 1;
         }
     }
-    let indexers = (0..max_end).map(|item| index[item]).collect();
-    Ok((indexers, Array1::from_vec(result)))
+    Ok((ends_labels(max_end, index), Array1::from_vec(result)))
 }
 
 fn size_rev_starts_core(
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    if starts.is_empty() || index.is_empty() {
-        return Err("starts and index cannot be empty");
-    }
-    if starts.iter().any(|start| {
-        usize::try_from(*start)
-            .map(|start| start > index.len())
-            .unwrap_or(true)
-    }) {
-        return Err("starts must satisfy 0 <= start <= right_len");
-    }
-    let min_start = starts.iter().copied().min().unwrap() as usize;
-    let mut result = vec![0_i64; index.len() - min_start];
+    let (min_start, width) = starts_domain(starts, index.len())?;
+    let mut result = vec![0_i64; width];
     for start in starts {
         for value in result.iter_mut().skip(*start as usize - min_start) {
             *value += 1;
         }
     }
-    let indexers = (min_start..index.len()).map(|item| index[item]).collect();
-    Ok((indexers, Array1::from_vec(result)))
+    Ok((starts_labels(min_start, index), Array1::from_vec(result)))
 }
 
 #[pyfunction]
@@ -68,9 +47,7 @@ pub fn compute_size_rev_end<'py>(
     length: i64,
 ) -> SizeRevResult<'py> {
     let _ = length;
-    let (indexers, result) = size_rev_ends_core(ends.as_array(), index.as_array())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+    into_starts_ends_result(py, size_rev_ends_core(ends.as_array(), index.as_array()))
 }
 
 #[pyfunction]
@@ -81,9 +58,10 @@ pub fn compute_size_rev_start<'py>(
     length: i64,
 ) -> SizeRevResult<'py> {
     let _ = length;
-    let (indexers, result) = size_rev_starts_core(starts.as_array(), index.as_array())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+    into_starts_ends_result(
+        py,
+        size_rev_starts_core(starts.as_array(), index.as_array()),
+    )
 }
 
 #[pyfunction]

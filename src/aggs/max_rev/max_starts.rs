@@ -1,25 +1,16 @@
 use numpy::ndarray::{Array1, ArrayView1};
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+
+use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(), &'static str> {
     if arr.len() != starts.len() || arr.len() != booleans.len() {
         return Err("arr, starts, and booleans must have equal lengths");
-    }
-    if arr.is_empty() || index.is_empty() {
-        return Err("arr, starts, booleans, and index cannot be empty");
-    }
-    if starts.iter().any(|start| {
-        usize::try_from(*start)
-            .map(|start| start > index.len())
-            .unwrap_or(true)
-    }) {
-        return Err("starts must satisfy 0 <= start <= right_len");
     }
     Ok(())
 }
@@ -32,9 +23,8 @@ pub fn max_rev_starts_core<T: PartialOrd + Copy>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, starts, index, booleans)?;
-    let min_start = starts.iter().copied().min().unwrap() as usize;
-    let width = index.len() - min_start;
+    validate_inputs(arr, starts, booleans)?;
+    let (min_start, width) = starts_domain(starts, index.len())?;
     let mut values = vec![arr[0]; width];
     let mut positions = vec![-1_i64; width];
     for (row, ((current, start), boolean)) in arr
@@ -57,8 +47,7 @@ pub fn max_rev_starts_core<T: PartialOrd + Copy>(
             }
         }
     }
-    let indexers = (min_start..index.len()).map(|item| index[item]).collect();
-    Ok((indexers, Array1::from_vec(positions)))
+    Ok((starts_labels(min_start, index), Array1::from_vec(positions)))
 }
 
 macro_rules! compute {
@@ -73,14 +62,15 @@ macro_rules! compute {
             length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
             let _ = length;
-            let (indexers, result) = max_rev_starts_core(
-                arr.as_array(),
-                starts.as_array(),
-                index.as_array(),
-                booleans.as_array(),
+            into_starts_ends_result(
+                py,
+                max_rev_starts_core(
+                    arr.as_array(),
+                    starts.as_array(),
+                    index.as_array(),
+                    booleans.as_array(),
+                ),
             )
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
 }
