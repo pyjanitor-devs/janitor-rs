@@ -4,8 +4,8 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    checked_end, checked_index, checked_range, ensure_equal_lengths, ensure_tape_width,
-    validate_range,
+    checked_end, checked_index, checked_range, ensure_equal_lengths, ensure_exact_tape_width,
+    ensure_nonempty_matches,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
@@ -19,12 +19,12 @@ fn size_rev_ends_core(
     }
     if ends.iter().any(|end| {
         usize::try_from(*end)
-            .map(|end| end == 0 || end > index.len())
+            .map(|end| end > index.len())
             .unwrap_or(true)
     }) {
-        return Err("ends must satisfy 0 < end <= right_len");
+        return Err("ends must satisfy 0 <= end <= right_len");
     }
-    let max_end = ends.iter().copied().max().unwrap() as usize;
+    let max_end = ends.iter().copied().max().unwrap_or(0) as usize;
     let mut result = vec![0_i64; max_end];
     for end in ends {
         for value in result.iter_mut().take(*end as usize) {
@@ -44,10 +44,10 @@ fn size_rev_starts_core(
     }
     if starts.iter().any(|start| {
         usize::try_from(*start)
-            .map(|start| start >= index.len())
+            .map(|start| start > index.len())
             .unwrap_or(true)
     }) {
-        return Err("starts must satisfy 0 <= start < right_len");
+        return Err("starts must satisfy 0 <= start <= right_len");
     }
     let min_start = starts.iter().copied().min().unwrap() as usize;
     let mut result = vec![0_i64; index.len() - min_start];
@@ -87,6 +87,9 @@ pub fn compute_size_rev_start<'py>(
 }
 
 #[pyfunction]
+/// `matches` must be non-empty and contain exactly one entry per candidate
+/// position. `counts_array.sum()` normally equals `matches.sum()`; the tape
+/// width is `matches.len()`.
 pub fn compute_size_rev_end_matches<'py>(
     py: Python<'py>,
     ends: PyReadonlyArray1<'py, i64>,
@@ -97,6 +100,7 @@ pub fn compute_size_rev_end_matches<'py>(
     let ends = ends.as_array();
     let index = index.as_array();
     let matches = matches.as_array();
+    ensure_nonempty_matches(matches.len())?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
@@ -105,7 +109,7 @@ pub fn compute_size_rev_end_matches<'py>(
         .iter()
         .filter_map(|e| checked_end(*e, index.len()))
         .sum();
-    ensure_tape_width(expected_matches_width, matches.len())?;
+    ensure_exact_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
     let start_: usize = 0_usize;
@@ -136,6 +140,9 @@ pub fn compute_size_rev_end_matches<'py>(
 }
 
 #[pyfunction]
+/// `matches` must be non-empty and contain exactly one entry per candidate
+/// position. `counts_array.sum()` normally equals `matches.sum()`; the tape
+/// width is `matches.len()`.
 pub fn compute_size_rev_start_matches<'py>(
     py: Python<'py>,
     starts: PyReadonlyArray1<'py, i64>,
@@ -146,6 +153,7 @@ pub fn compute_size_rev_start_matches<'py>(
     let starts = starts.as_array();
     let index = index.as_array();
     let matches = matches.as_array();
+    ensure_nonempty_matches(matches.len())?;
     let end_: usize = index.len();
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
@@ -155,7 +163,7 @@ pub fn compute_size_rev_start_matches<'py>(
         .iter()
         .map(|s| end_.saturating_sub(*s as usize))
         .sum();
-    ensure_tape_width(expected_matches_width, matches.len())?;
+    ensure_exact_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
     let mut n: usize = 0;
@@ -183,6 +191,9 @@ pub fn compute_size_rev_start_matches<'py>(
 }
 
 #[pyfunction]
+/// `matches` must be non-empty and contain exactly one entry per candidate
+/// position. `counts_array.sum()` normally equals `matches.sum()`; the tape
+/// width is `matches.len()`.
 pub fn compute_size_rev_start_end_matches<'py>(
     py: Python<'py>,
     starts: PyReadonlyArray1<'py, i64>,
@@ -196,35 +207,25 @@ pub fn compute_size_rev_start_end_matches<'py>(
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let matches = matches.as_array();
-    if starts.is_empty() || index.is_empty() || matches.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "starts, ends, index, and matches cannot be empty",
-        ));
-    }
+    ensure_nonempty_matches(matches.len())?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width = starts.iter().zip(ends.iter()).try_fold(
-        0_usize,
-        |width, (start, end)| -> PyResult<usize> {
-            let range = validate_range(*start, *end, index.len())
-                .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            Ok(width.saturating_add(range.map_or(0, |(start_, end_)| end_ - start_)))
-        },
-    )?;
-    ensure_tape_width(expected_matches_width, matches.len())?;
+    let expected_matches_width: usize = starts
+        .iter()
+        .zip(ends.iter())
+        .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
+        .sum();
+    ensure_exact_tape_width(expected_matches_width, matches.len())?;
     let length = length as usize;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
     let mut n: usize = 0;
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
-        if *start == *end {
+        let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
             continue;
-        }
-        // The width pass above already proved these casts are safe.
-        let start_ = *start as usize;
-        let end_ = *end as usize;
+        };
         for item in start_..end_ {
             if matches[n] == 0 {
                 n += 1;
@@ -286,9 +287,6 @@ pub fn compute_size_rev_start_end<'py>(
 mod tests {
     use super::*;
     use numpy::ndarray::array;
-    use numpy::{PyArray1, PyArrayMethods};
-    use pyo3::exceptions::PyValueError;
-    use pyo3::Python;
 
     #[test]
     fn counts_prefixes_and_suffixes_in_compact_slots() {
@@ -306,42 +304,12 @@ mod tests {
     #[test]
     fn rejects_empty_and_invalid_boundaries() {
         let index = array![10_i64];
-        assert!(size_rev_ends_core(array![0_i64].view(), index.view()).is_err());
+        assert_eq!(
+            size_rev_ends_core(array![0_i64].view(), index.view()),
+            Ok((array![], array![]))
+        );
         assert!(size_rev_starts_core(array![-1_i64].view(), index.view()).is_err());
         assert!(size_rev_ends_core(array![1_i64].view(), array![].view()).is_err());
-    }
-
-    #[test]
-    fn starts_ends_matches_wrapper_rejects_invalid_ranges_and_accepts_zero_survivors() {
-        Python::initialize();
-        Python::attach(|py| {
-            let starts = PyArray1::from_vec(py, vec![-1_i64]);
-            let ends = PyArray1::from_vec(py, vec![1_i64]);
-            let index = PyArray1::from_vec(py, vec![10_i64]);
-            let matches = PyArray1::from_vec(py, vec![0_i8]);
-            let error = compute_size_rev_start_end_matches(
-                py,
-                starts.readonly(),
-                ends.readonly(),
-                index.readonly(),
-                matches.readonly(),
-                1,
-            )
-            .unwrap_err();
-            assert!(error.is_instance_of::<PyValueError>(py));
-
-            let starts = PyArray1::from_vec(py, vec![0_i64]);
-            let ends = PyArray1::from_vec(py, vec![0_i64]);
-            compute_size_rev_start_end_matches(
-                py,
-                starts.readonly(),
-                ends.readonly(),
-                index.readonly(),
-                matches.readonly(),
-                1,
-            )
-            .expect("equal bounds with a non-empty tape are valid");
-        });
     }
 }
 

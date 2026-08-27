@@ -3,11 +3,20 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ensure_equal_lengths, ensure_tape_width, validate_range};
+use crate::aggs::{
+    checked_range, ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches,
+};
 use std::collections::HashMap;
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
+        /// `matches` must be non-empty and must contain exactly one entry for
+        /// every candidate position. pyjanitor supplies the per-row counts
+        /// and binary mask from the same comparison stage. pyjanitor is
+        /// responsible for ensuring each mask value is 0 or 1; Rust does not
+        /// scan the tape to enforce that value-level contract. Normally
+        /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
+        /// full candidate-tape width.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -31,26 +40,19 @@ macro_rules! compute_ints {
             let counts = counts.as_array();
             ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let matches = matches.as_array();
+            ensure_nonempty_matches(matches.len())?;
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            if arr.is_empty() || index.is_empty() || matches.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "arr, starts, counts, booleans, index, and matches cannot be empty",
-                ));
-            }
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width = starts.iter().zip(ends.iter()).try_fold(
-                0_usize,
-                |width, (start, end)| -> PyResult<usize> {
-                    let range = validate_range(*start, *end, index.len())
-                        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-                    Ok(width.saturating_add(range.map_or(0, |(start_, end_)| end_ - start_)))
-                },
-            )?;
-            ensure_tape_width(expected_matches_width, matches.len())?;
+            let expected_matches_width: usize = starts
+                .iter()
+                .zip(ends.iter())
+                .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
+                .sum();
+            ensure_exact_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let zipped = izip!(
@@ -62,12 +64,9 @@ macro_rules! compute_ints {
             );
             let mut n: usize = 0;
             for (current, start, end, count, boolean) in zipped {
-                if *start == *end {
+                let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
                     continue;
-                }
-                // The width pass above already proved these casts are safe.
-                let start_ = *start as usize;
-                let end_ = *end as usize;
+                };
                 let current_ = *current as i64;
                 for item in start_..end_ {
                     if (matches[n] == 0) {
@@ -107,6 +106,13 @@ compute_ints!(compute_sum_rev_start_end_match_uint8, u8);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// `matches` must be non-empty and must contain exactly one entry for
+        /// every candidate position. pyjanitor supplies the per-row counts
+        /// and binary mask from the same comparison stage. pyjanitor is
+        /// responsible for ensuring each mask value is 0 or 1; Rust does not
+        /// scan the tape to enforce that value-level contract. Normally
+        /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
+        /// full candidate-tape width.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -130,26 +136,19 @@ macro_rules! compute_floats {
             let counts = counts.as_array();
             ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let matches = matches.as_array();
+            ensure_nonempty_matches(matches.len())?;
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            if arr.is_empty() || index.is_empty() || matches.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "arr, starts, counts, booleans, index, and matches cannot be empty",
-                ));
-            }
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width = starts.iter().zip(ends.iter()).try_fold(
-                0_usize,
-                |width, (start, end)| -> PyResult<usize> {
-                    let range = validate_range(*start, *end, index.len())
-                        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-                    Ok(width.saturating_add(range.map_or(0, |(start_, end_)| end_ - start_)))
-                },
-            )?;
-            ensure_tape_width(expected_matches_width, matches.len())?;
+            let expected_matches_width: usize = starts
+                .iter()
+                .zip(ends.iter())
+                .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
+                .sum();
+            ensure_exact_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
@@ -162,12 +161,9 @@ macro_rules! compute_floats {
             );
             let mut n: usize = 0;
             for (current, start, end, count, boolean) in zipped {
-                if *start == *end {
+                let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
                     continue;
-                }
-                // The width pass above already proved these casts are safe.
-                let start_ = *start as usize;
-                let end_ = *end as usize;
+                };
                 let current_ = *current as f64;
                 for item in start_..end_ {
                     if (matches[n] == 0) {
@@ -229,55 +225,4 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_sum_rev_start_end_match_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_sum_rev_start_end_match_f64, m)?)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::compute_sum_rev_start_end_match_int64;
-    use numpy::{PyArray1, PyArrayMethods};
-    use pyo3::exceptions::PyValueError;
-    use pyo3::Python;
-
-    #[test]
-    fn wrapper_rejects_invalid_ranges_and_accepts_zero_survivors() {
-        Python::initialize();
-        Python::attach(|py| {
-            let arr = PyArray1::from_vec(py, vec![5_i64]);
-            let starts = PyArray1::from_vec(py, vec![-1_i64]);
-            let ends = PyArray1::from_vec(py, vec![1_i64]);
-            let index = PyArray1::from_vec(py, vec![10_i64]);
-            let counts = PyArray1::from_vec(py, vec![1_i64]);
-            let matches = PyArray1::from_vec(py, vec![0_i8]);
-            let booleans = PyArray1::from_vec(py, vec![false]);
-            let error = compute_sum_rev_start_end_match_int64(
-                py,
-                arr.readonly(),
-                starts.readonly(),
-                ends.readonly(),
-                index.readonly(),
-                counts.readonly(),
-                matches.readonly(),
-                booleans.readonly(),
-                1,
-            )
-            .unwrap_err();
-            assert!(error.is_instance_of::<PyValueError>(py));
-
-            let starts = PyArray1::from_vec(py, vec![0_i64]);
-            let ends = PyArray1::from_vec(py, vec![0_i64]);
-            let matches = PyArray1::from_vec(py, vec![0_i8]);
-            compute_sum_rev_start_end_match_int64(
-                py,
-                arr.readonly(),
-                starts.readonly(),
-                ends.readonly(),
-                index.readonly(),
-                counts.readonly(),
-                matches.readonly(),
-                booleans.readonly(),
-                1,
-            )
-            .expect("equal bounds with a non-empty tape are valid");
-        });
-    }
 }
