@@ -3,6 +3,42 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
+pub fn size_positions_core(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    capacity: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let capacity = capacity.min(index.len()).min(positions.len());
+    let mut slots: HashMap<i64, usize> = HashMap::with_capacity(capacity);
+    let mut labels = Vec::with_capacity(capacity);
+    let mut counts = Vec::with_capacity(capacity);
+    for (start, end) in starts.into_iter().zip(ends) {
+        let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+            continue;
+        };
+        for item in start_..end_ {
+            let Some(indexer_) = checked_index(positions[item], index.len()) else {
+                continue;
+            };
+            let label = index[indexer_];
+            let slot = match slots.entry(label) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let slot = labels.len();
+                    entry.insert(slot);
+                    labels.push(label);
+                    counts.push(0);
+                    slot
+                }
+            };
+            counts[slot] += 1;
+        }
+    }
+    (labels, counts)
+}
+
 use crate::aggs::{
     checked_end, checked_index, checked_range, ensure_equal_lengths, ensure_tape_width,
 };
@@ -295,6 +331,23 @@ mod tests {
         assert!(size_rev_starts_core(array![-1_i64].view(), index.view()).is_err());
         assert!(size_rev_ends_core(array![1_i64].view(), array![].view()).is_err());
     }
+
+    #[test]
+    fn positions_count_duplicate_labels_and_skip_invalid_entries() {
+        let starts = array![0_i64, 2];
+        let ends = array![2_i64, 4];
+        let index = array![10_i64, 20, 10];
+        let positions = array![0_i64, 1, 2, -1];
+        let (labels, counts) = size_positions_core(
+            starts.view(),
+            ends.view(),
+            index.view(),
+            positions.view(),
+            3,
+        );
+        assert_eq!(labels, vec![10, 20]);
+        assert_eq!(counts, vec![2, 1]);
+    }
 }
 
 #[pyfunction]
@@ -304,36 +357,26 @@ pub fn compute_size_rev_positions<'py>(
     ends: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
     positions: PyReadonlyArray1<'py, i64>,
-    length: i64,
 ) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let positions = positions.as_array();
-    let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-    let zipped = starts.into_iter().zip(ends);
-    for (start, end) in zipped {
-        let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
-            continue;
-        };
-        for item in start_..end_ {
-            let Some(indexer_) = checked_index(positions[item], index.len()) else {
-                continue;
-            };
-            let pos = index[indexer_];
-            let total = dictionary.entry(pos).or_insert(0);
-            *total += 1;
-        }
+    if starts.is_empty() || index.is_empty() || positions.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts, ends, index, and positions cannot be empty",
+        ));
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let (labels, counts) = size_positions_core(
+        starts,
+        ends,
+        index,
+        positions,
+        index.len().min(positions.len()),
+    );
+    let indexers = Array1::from_vec(labels);
+    let result = Array1::from_vec(counts);
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 

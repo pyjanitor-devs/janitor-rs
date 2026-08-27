@@ -913,3 +913,14 @@ do not rely only on textual cross-links or checklist comments.
 **Context**: Benchmarking the `sum_rev_no_range` hybrid implementation showed that a separate full validation pass added approximately 1–14% runtime on valid inputs.
 **Learning**: A per-row explicit negative/bounds check followed immediately by indexing preserves safety and early errors without requiring a second full scan.
 **Recommendation**: For hot no-range kernels, use one-pass validation with `index < 0 || index as usize >= arr.len()` before each access, unless the API specifically requires rejecting all invalid inputs before doing any aggregation work.
+
+### [2026-08-26] Include performance evidence in optimization PRs and issues
+
+**Context**: Performance changes are coordinated across reverse-aggregation
+pull requests and tracking issue #23.
+**Learning**: Benchmark results are part of the performance change's review
+record, not merely local investigation notes.
+**Recommendation**: Every performance PR and its tracking issue must include a
+properly formatted comparison with the old implementation, covering runtime
+and memory for tiny, large, very-large, and super-large cases with duplicate
+and unique label distributions. State benchmark limitations explicitly.
