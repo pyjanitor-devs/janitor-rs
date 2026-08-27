@@ -207,9 +207,7 @@ pub fn compute_sum_rev_no_range_uint64<'py>(
     left_index: PyReadonlyArray1<'py, i64>,
     right_index: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
-    length: i64,
 ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<u64>>)> {
-    let _ = length;
     let (indexers, result) = sum_rev_no_range_u64_core(
         arr.as_array(),
         left_index.as_array(),
