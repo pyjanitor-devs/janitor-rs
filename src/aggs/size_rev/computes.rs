@@ -9,6 +9,42 @@ use crate::aggs::{
     ensure_nonempty_matches,
 };
 
+pub fn size_positions_core(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    capacity: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    let capacity = capacity.min(index.len()).min(positions.len());
+    let mut slots: HashMap<i64, usize> = HashMap::with_capacity(capacity);
+    let mut labels = Vec::with_capacity(capacity);
+    let mut counts = Vec::with_capacity(capacity);
+    for (start, end) in starts.into_iter().zip(ends) {
+        let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+            continue;
+        };
+        for item in start_..end_ {
+            let Some(indexer_) = checked_index(positions[item], index.len()) else {
+                continue;
+            };
+            let label = index[indexer_];
+            let slot = match slots.entry(label) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
+                    let slot = labels.len();
+                    entry.insert(slot);
+                    labels.push(label);
+                    counts.push(0);
+                    slot
+                }
+            };
+            counts[slot] += 1;
+        }
+    }
+    (labels, counts)
+}
+
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
 
 fn size_rev_ends_core(
