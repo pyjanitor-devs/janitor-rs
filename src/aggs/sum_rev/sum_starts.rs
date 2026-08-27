@@ -3,7 +3,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{ensure_equal_lengths, validate_range};
 
 fn validate_starts_inputs(
     arr_len: usize,
@@ -17,12 +17,11 @@ fn validate_starts_inputs(
     if arr_len == 0 || right_len == 0 {
         return Err("arr, starts, booleans, and index cannot be empty");
     }
-    if starts.iter().any(|start| {
-        usize::try_from(*start)
-            .map(|start| start >= right_len)
-            .unwrap_or(true)
-    }) {
-        return Err("starts must satisfy 0 <= start < right_len");
+    if starts
+        .iter()
+        .any(|start| validate_range(*start, right_len as i64, right_len).is_err())
+    {
+        return Err("starts must satisfy 0 <= start <= right_len");
     }
     Ok(())
 }
@@ -348,6 +347,6 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, "starts must satisfy 0 <= start < right_len");
+        assert_eq!(error, "starts must satisfy 0 <= start <= right_len");
     }
 }

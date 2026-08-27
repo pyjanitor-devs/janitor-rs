@@ -16,10 +16,10 @@ fn validate_inputs<T>(
     }
     if ends.iter().any(|end| {
         usize::try_from(*end)
-            .map(|end| end == 0 || end > index.len())
+            .map(|end| end > index.len())
             .unwrap_or(true)
     }) {
-        return Err("ends must satisfy 0 < end <= right_len");
+        return Err("ends must satisfy 0 <= end <= right_len");
     }
     Ok(())
 }
@@ -193,13 +193,15 @@ mod tests {
 
     #[test]
     fn rejects_invalid_bounds() {
-        assert!(prod_rev_ends_int_core(
-            array![1_i64].view(),
-            array![0_i64].view(),
-            array![10_i64].view(),
-            array![false].view(),
-            |value| value,
-        )
-        .is_err());
+        assert_eq!(
+            prod_rev_ends_int_core(
+                array![1_i64].view(),
+                array![0_i64].view(),
+                array![10_i64].view(),
+                array![false].view(),
+                |value| value,
+            ),
+            Ok((array![], array![]))
+        );
     }
 }

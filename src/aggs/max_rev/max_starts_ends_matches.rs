@@ -3,11 +3,20 @@ use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths, ensure_tape_width};
+use crate::aggs::{
+    checked_range, ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches,
+};
 use std::collections::HashMap;
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
+        /// `matches` must be non-empty and must contain exactly one entry for
+        /// every candidate position. pyjanitor supplies the per-row counts
+        /// and binary mask from the same comparison stage. pyjanitor is
+        /// responsible for ensuring each mask value is 0 or 1; Rust does not
+        /// scan the tape to enforce that value-level contract. Normally
+        /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
+        /// full candidate-tape width.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -31,6 +40,7 @@ macro_rules! compute {
             let counts = counts.as_array();
             ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let matches = matches.as_array();
+            ensure_nonempty_matches(matches.len())?;
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             // ELI5: `matches[n]` advances once per candidate position, summed
@@ -42,7 +52,7 @@ macro_rules! compute {
                 .zip(ends.iter())
                 .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
                 .sum();
-            ensure_tape_width(expected_matches_width, matches.len())?;
+            ensure_exact_tape_width(expected_matches_width, matches.len())?;
             let length = length as usize;
             let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
             let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
@@ -117,4 +127,42 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_max_rev_start_end_match_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_max_rev_start_end_match_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_max_rev_start_end_match_int64;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::exceptions::PyValueError;
+    use pyo3::Python;
+
+    #[test]
+    fn wrapper_rejects_empty_matches_tape_for_zero_width_range() {
+        Python::initialize();
+        Python::attach(|py| {
+            let arr = PyArray1::from_vec(py, vec![5_i64]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![0_i64]);
+            let index = PyArray1::from_vec(py, vec![10_i64]);
+            let counts = PyArray1::from_vec(py, vec![0_i64]);
+            let matches = PyArray1::from_vec(py, Vec::<i8>::new());
+            let booleans = PyArray1::from_vec(py, vec![false]);
+
+            let error = compute_max_rev_start_end_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+                1,
+            )
+            .unwrap_err();
+
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert!(error.to_string().contains("matches cannot be empty"));
+        });
+    }
 }
