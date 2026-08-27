@@ -727,6 +727,32 @@ fn max_positions_old(
         .unzip()
 }
 
+fn assert_max_positions_parity(old: &(Vec<i64>, Vec<i64>), compact: &(Vec<i64>, Vec<i64>)) {
+    assert_eq!(
+        old.0.len(),
+        old.1.len(),
+        "old implementation returned mismatched labels and rows"
+    );
+    assert_eq!(
+        compact.0.len(),
+        compact.1.len(),
+        "compact implementation returned mismatched labels and rows"
+    );
+    let mut old_pairs: Vec<_> = old.0.iter().copied().zip(old.1.iter().copied()).collect();
+    let mut compact_pairs: Vec<_> = compact
+        .0
+        .iter()
+        .copied()
+        .zip(compact.1.iter().copied())
+        .collect();
+    old_pairs.sort_unstable();
+    compact_pairs.sort_unstable();
+    assert_eq!(
+        old_pairs, compact_pairs,
+        "compact max_positions output differs from the old implementation"
+    );
+}
+
 fn bench_max_positions(c: &mut Criterion) {
     let mut group = c.benchmark_group("max_positions_old_vs_compact");
     for n in [32, 10_000, 100_000, 1_000_000] {
@@ -734,6 +760,25 @@ fn bench_max_positions(c: &mut Criterion) {
             let f = MaxPositionsFixture::new(n, duplicate);
             let kind = if duplicate { "duplicate" } else { "unique" };
             let label = format!("n={n} {kind}");
+            let old_result = max_positions_old(
+                f.arr.view(),
+                f.starts.view(),
+                f.ends.view(),
+                f.index.view(),
+                f.positions.view(),
+                f.booleans.view(),
+                f.index.len(),
+            );
+            let compact_result = max_positions_core(
+                f.arr.view(),
+                f.starts.view(),
+                f.ends.view(),
+                f.index.view(),
+                f.positions.view(),
+                f.booleans.view(),
+                f.index.len(),
+            );
+            assert_max_positions_parity(&old_result, &compact_result);
             let old = count_allocations(|| {
                 max_positions_old(
                     f.arr.view(),
