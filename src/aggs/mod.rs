@@ -125,14 +125,20 @@ pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<
 }
 
 /// Choose the boundary sweep only when its one-time setup should repay the
-/// repeated work in the direct nested loop.
+/// repeated work in the direct nested loop without an excessive memory cost.
 ///
 /// ELI5: build the shortcut only when there are enough repeated chores to
-/// make the setup worthwhile.
+/// make the setup worthwhile, and do not trade a tiny job for a huge bucket
+/// of row links.
 pub(crate) fn should_sweep(rows: usize, width: usize) -> bool {
     let repeated_work = rows.saturating_mul(width);
     let sweep_work = rows.saturating_add(width);
-    repeated_work > sweep_work.saturating_mul(8)
+    let direct_bytes = width.saturating_mul(2 * std::mem::size_of::<i64>());
+    let sweep_metadata = rows
+        .saturating_add(width.saturating_add(1))
+        .saturating_mul(std::mem::size_of::<usize>());
+    let memory_budget = direct_bytes.saturating_mul(8);
+    repeated_work > sweep_work.saturating_mul(8) && sweep_metadata <= memory_budget
 }
 
 /// Run a boundary sweep that returns the winning row for each output slot.
@@ -376,6 +382,45 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     sum::register(m)?;
     sum_rev::register(m)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use numpy::ndarray::array;
+
+    use super::{should_sweep, sweep_min};
+
+    #[test]
+    fn sweep_gate_accounts_for_row_link_memory() {
+        assert!(!should_sweep(1_000_000, 9));
+        assert!(should_sweep(1_000, 10_000));
+    }
+
+    #[test]
+    fn sweep_min_handles_ties_nulls_and_both_directions() {
+        let arr = array![7_i64, 7, 7];
+        let booleans = array![true, false, false];
+
+        let forward = sweep_min(
+            arr.view(),
+            booleans.view(),
+            3,
+            |row| [0, 2, 1][row],
+            |position| position,
+            0..3,
+        );
+        assert_eq!(forward, array![-1, 2, 1]);
+
+        let reverse = sweep_min(
+            arr.view(),
+            booleans.view(),
+            3,
+            |row| [3, 1, 2][row],
+            |position| position + 1,
+            (0..3).rev(),
+        );
+        assert_eq!(reverse, array![1, 2, -1]);
+    }
 }
 
 #[cfg(test)]
