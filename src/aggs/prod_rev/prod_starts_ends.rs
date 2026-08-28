@@ -4,7 +4,6 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{checked_range, ensure_equal_lengths, WrapMul};
-use std::collections::{hash_map::Entry, HashMap};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -28,32 +27,23 @@ fn validate_inputs<T>(
     Ok(())
 }
 
-fn capacity_hint(
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    right_len: usize,
-) -> usize {
-    // ELI5: the total number of covered positions is a safe ceiling for the
-    // number of distinct labels, so it limits rehashing without trusting a
-    // Python-side size or reserving beyond the right index.
-    starts
-        .iter()
-        .zip(ends.iter())
-        .filter_map(|(start, end)| checked_range(*start, *end, right_len))
-        .fold(0_usize, |total, (start, end)| {
-            total.saturating_add(end - start)
-        })
-        .min(right_len)
-}
-
-/// Multiply values into one compact state slot for each distinct label.
+/// Multiply values into one state slot per right-row ordinal.
 ///
-/// ELI5: every label has one numbered drawer containing its product. A null
-/// row leaves the drawer at the multiplicative identity, `1`, just as the
-/// old implementation did. `A` is the accumulator type: every integer dtype
-/// instantiates this with `A = i64`, except `uint64`, which instantiates it
-/// with `A = u64` so values `>= 2**63` don't get sign-flipped by a forced
-/// `i64` cast (see `WrapMul`).
+/// `index` contains unique right-row identities supplied by pyjanitor. The
+/// identities may be reordered by sorting or contain gaps; `item`, the
+/// position in `index`, is the state slot, while `index[item]` is the output
+/// label. `starts` and `ends` index this compact array and describe half-open
+/// ranges `[start, end)`. Invalid or zero-width ranges are skipped by
+/// `checked_range`, and empty input arrays are rejected.
+///
+/// A null row leaves a touched slot at the multiplicative identity, `1`.
+/// Integer accumulators use `wrapping_mul` through `WrapMul`, matching the
+/// project's overflow contract. `A` is `i64` for ordinary integer dtypes and
+/// `u64` for `uint64`, preserving values at and above `2**63`.
+///
+/// ELI5: every right-row position gets a numbered drawer containing its
+/// product. The printed row identity may be 42, 7, or 100; the drawer number
+/// is its position on the shelf, not the printed identity.
 pub fn prod_rev_start_end_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -68,30 +58,25 @@ where
     F: FnMut(T) -> A,
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
-    let mut slots = HashMap::with_capacity(capacity_hint(starts, ends, index.len()));
-    let mut labels = Vec::new();
-    let mut products = Vec::new();
+    let mut seen = vec![false; index.len()];
+    let mut touched = Vec::new();
+    let mut products = vec![A::ONE; index.len()];
     for (current, start, end, boolean) in izip!(arr, starts, ends, booleans) {
         let Some((start, end)) = checked_range(*start, *end, index.len()) else {
             continue;
         };
         for item in start..end {
-            let label = index[item];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    products.push(A::ONE);
-                    slot
-                }
-            };
+            if !seen[item] {
+                seen[item] = true;
+                touched.push(item);
+            }
             if !*boolean {
-                products[slot] = products[slot].wrap_mul(convert(*current));
+                products[item] = products[item].wrap_mul(convert(*current));
             }
         }
     }
+    let labels = touched.iter().map(|&item| index[item]).collect();
+    let products = touched.iter().map(|&item| products[item]).collect();
     Ok((Array1::from_vec(labels), Array1::from_vec(products)))
 }
 
@@ -108,30 +93,25 @@ where
     F: FnMut(T) -> f64,
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
-    let mut slots = HashMap::with_capacity(capacity_hint(starts, ends, index.len()));
-    let mut labels = Vec::new();
-    let mut products = Vec::new();
+    let mut seen = vec![false; index.len()];
+    let mut touched = Vec::new();
+    let mut products = vec![1.0_f64; index.len()];
     for (current, start, end, boolean) in izip!(arr, starts, ends, booleans) {
         let Some((start, end)) = checked_range(*start, *end, index.len()) else {
             continue;
         };
         for item in start..end {
-            let label = index[item];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    products.push(1.0_f64);
-                    slot
-                }
-            };
+            if !seen[item] {
+                seen[item] = true;
+                touched.push(item);
+            }
             if !*boolean {
-                products[slot] *= to_f64(*current);
+                products[item] *= to_f64(*current);
             }
         }
     }
+    let labels = touched.iter().map(|&item| index[item]).collect();
+    let products = touched.iter().map(|&item| products[item]).collect();
     Ok((Array1::from_vec(labels), Array1::from_vec(products)))
 }
 
@@ -239,16 +219,16 @@ mod tests {
     }
 
     #[test]
-    fn compact_slots_multiply_duplicate_labels() {
+    fn dense_slots_multiply_unique_gapped_labels() {
         let got = prod_rev_start_end_int_core(
             array![2_i64, 3, 4].view(),
             array![0_i64, 1, 0].view(),
             array![2_i64, 3, 1].view(),
-            array![10_i64, 20, 10].view(),
+            array![42_i64, 7, 100].view(),
             array![false, false, false].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![10, 20], array![24, 6])));
+        assert_eq!(got, Ok((array![42, 7, 100], array![8, 6, 3])));
     }
 
     #[test]
