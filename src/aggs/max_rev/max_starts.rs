@@ -2,7 +2,9 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{into_starts_ends_result, should_sweep, starts_domain, starts_labels};
+use crate::aggs::{
+    into_starts_ends_result, should_sweep, starts_domain, starts_labels, sweep_winner,
+};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -17,7 +19,7 @@ fn validate_inputs<T>(
 
 /// Groups reverse-maximum starts by compact candidate ordinal.
 /// ELI5: all suffixes share a contiguous union, so one slot per ordinal replaces the HashMaps.
-pub fn max_rev_starts_core<T: PartialOrd + PartialEq + Copy>(
+pub fn max_rev_starts_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
@@ -53,40 +55,16 @@ pub fn max_rev_starts_core<T: PartialOrd + PartialEq + Copy>(
         return Ok((indexers, Array1::from_vec(positions)));
     }
 
-    // ELI5: a suffix row becomes eligible once the sweep reaches its start.
-    // Put each row in that boundary's bucket, then update the current winner
-    // once when the row becomes eligible. This avoids comparing the same row
-    // against every later output slot. The linked buckets preserve input-row
-    // order, so equal values keep the old first-row tie behavior.
-    let mut head = vec![usize::MAX; width + 1];
-    let mut next = vec![usize::MAX; arr.len()];
-    for (row, start) in starts.iter().enumerate().rev() {
-        let bucket = *start as usize - min_start;
-        next[row] = head[bucket];
-        head[bucket] = row;
-    }
-
-    let mut positions = vec![-1_i64; width];
-    let mut current_winner: Option<(T, i64)> = None;
-    for (bucket, _) in head.iter().enumerate().take(width) {
-        let mut row = head[bucket];
-        while row != usize::MAX {
-            let current = arr[row];
-            if !booleans[row]
-                && (current_winner.is_none()
-                    || current > current_winner.as_ref().unwrap().0
-                    || (current == current_winner.as_ref().unwrap().0
-                        && (row as i64) < current_winner.as_ref().unwrap().1))
-            {
-                current_winner = Some((current, row as i64));
-            }
-            row = next[row];
-        }
-        if let Some((_, row)) = current_winner {
-            positions[bucket] = row;
-        }
-    }
-    Ok((starts_labels(min_start, index), Array1::from_vec(positions)))
+    let positions = sweep_winner(
+        arr,
+        booleans,
+        width,
+        |row| starts[row] as usize - min_start,
+        |position| position,
+        0..width,
+        |current, winner| current > winner,
+    );
+    Ok((starts_labels(min_start, index), positions))
 }
 
 macro_rules! compute {
@@ -193,5 +171,36 @@ mod tests {
         let expected =
             Array1::from_iter((0..20).map(|position| if position == 19 { 2 } else { 18 }));
         assert_eq!(got, Ok((Array1::from_iter(0..20_i64), expected)));
+    }
+
+    #[test]
+    fn sweep_matches_direct_reference_with_null_and_nonuniform_starts() {
+        let arr = Array1::from_iter((0..20).map(|row| (row % 7) as i64));
+        let starts = Array1::from_iter((0..20).map(|row| (row * 3 % 21) as i64));
+        let index = Array1::from_iter(0..20_i64);
+        let mut booleans = Array1::from_elem(20, false);
+        booleans[4] = true;
+        booleans[17] = true;
+
+        let min_start = starts.iter().copied().min().unwrap() as usize;
+        let width = index.len() - min_start;
+        let mut values = vec![arr[0]; width];
+        let mut expected = vec![-1_i64; width];
+        for row in 0..arr.len() {
+            if booleans[row] {
+                continue;
+            }
+            for position in (starts[row] as usize - min_start)..width {
+                if expected[position] == -1 || arr[row] > values[position] {
+                    expected[position] = row as i64;
+                    values[position] = arr[row];
+                }
+            }
+        }
+
+        let (labels, positions) =
+            max_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view()).unwrap();
+        assert_eq!(labels, index);
+        assert_eq!(positions, Array1::from_vec(expected));
     }
 }

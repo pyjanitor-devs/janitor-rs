@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, should_sweep};
+use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, should_sweep, sweep_winner};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -17,7 +17,7 @@ fn validate_inputs<T>(
 
 /// Groups reverse-maximum ends by compact candidate ordinal.
 /// ELI5: every prefix starts at zero, so the largest end is the exact slot count.
-pub fn max_rev_ends_core<T: PartialOrd + PartialEq + Copy>(
+pub fn max_rev_ends_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
@@ -50,39 +50,16 @@ pub fn max_rev_ends_core<T: PartialOrd + PartialEq + Copy>(
         return Ok((indexers, Array1::from_vec(positions)));
     }
 
-    // ELI5: a prefix row is eligible while the sweep is left of its end.
-    // Bucket each row by its end, then activate it once at `end - 1` while
-    // sweeping right-to-left. The linked buckets preserve input-row order,
-    // retaining the old first-row tie behavior. `end == 0` has no activation
-    // bucket in the emitted domain and therefore remains an empty prefix.
-    let mut head = vec![usize::MAX; max_end + 1];
-    let mut next = vec![usize::MAX; arr.len()];
-    for (row, end) in ends.iter().enumerate().rev() {
-        next[row] = head[*end as usize];
-        head[*end as usize] = row;
-    }
-
-    let mut positions = vec![-1_i64; max_end];
-    let mut current_winner: Option<(T, i64)> = None;
-    for position in (0..max_end).rev() {
-        let mut row = head[position + 1];
-        while row != usize::MAX {
-            let current = arr[row];
-            if !booleans[row]
-                && (current_winner.is_none()
-                    || current > current_winner.as_ref().unwrap().0
-                    || (current == current_winner.as_ref().unwrap().0
-                        && (row as i64) < current_winner.as_ref().unwrap().1))
-            {
-                current_winner = Some((current, row as i64));
-            }
-            row = next[row];
-        }
-        if let Some((_, row)) = current_winner {
-            positions[position] = row;
-        }
-    }
-    Ok((ends_labels(max_end, index), Array1::from_vec(positions)))
+    let positions = sweep_winner(
+        arr,
+        booleans,
+        max_end,
+        |row| ends[row] as usize,
+        |position| position + 1,
+        (0..max_end).rev(),
+        |current, winner| current > winner,
+    );
+    Ok((ends_labels(max_end, index), positions))
 }
 
 macro_rules! compute {
@@ -214,5 +191,35 @@ mod tests {
         booleans[18] = false;
         let got = max_rev_ends_core(arr.view(), ends.view(), index.view(), booleans.view());
         assert_eq!(got, Ok((index, Array1::from_elem(20, 2_i64))));
+    }
+
+    #[test]
+    fn sweep_matches_direct_reference_with_null_and_nonuniform_ends() {
+        let arr = Array1::from_iter((0..20).map(|row| (row % 7) as i64));
+        let ends = Array1::from_iter((0..20).map(|row| (row * 3 % 21) as i64));
+        let index = Array1::from_iter(0..20_i64);
+        let mut booleans = Array1::from_elem(20, false);
+        booleans[4] = true;
+        booleans[17] = true;
+
+        let max_end = ends.iter().copied().max().unwrap() as usize;
+        let mut values = vec![arr[0]; max_end];
+        let mut expected = vec![-1_i64; max_end];
+        for row in 0..arr.len() {
+            if booleans[row] {
+                continue;
+            }
+            for position in 0..ends[row] as usize {
+                if expected[position] == -1 || arr[row] > values[position] {
+                    expected[position] = row as i64;
+                    values[position] = arr[row];
+                }
+            }
+        }
+
+        let (labels, positions) =
+            max_rev_ends_core(arr.view(), ends.view(), index.view(), booleans.view()).unwrap();
+        assert_eq!(labels, Array1::from_iter(0..max_end as i64));
+        assert_eq!(positions, Array1::from_vec(expected));
     }
 }
