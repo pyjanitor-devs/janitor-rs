@@ -19,6 +19,7 @@ fn validate_inputs<T>(
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
 /// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
 /// `WrapMul`).
+#[allow(private_bounds)]
 pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -28,15 +29,24 @@ pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
 ) -> Result<(Array1<i64>, Array1<A>), &'static str> {
     validate_inputs(arr, starts, booleans)?;
     let (min_start, width) = starts_domain(starts, index.len())?;
-    let mut values = vec![A::ONE; width];
+    // ELI5: a suffix row joins the running product when the sweep reaches its
+    // start. Combine rows that join at the same boundary into one product
+    // event, then apply each event once. Wrapping multiplication is
+    // associative, so this removes the per-row `next` metadata without
+    // changing the integer overflow contract. The terminal bucket represents
+    // `start == index.len()` and is not emitted.
+    let mut events = vec![A::ONE; width + 1];
     for ((current, start), boolean) in arr.iter().zip(starts.iter()).zip(booleans.iter()) {
-        if *boolean {
-            continue;
+        if !*boolean {
+            let bucket = *start as usize - min_start;
+            events[bucket] = events[bucket].wrap_mul(convert(*current));
         }
-        let current = convert(*current);
-        for value in values.iter_mut().skip(*start as usize - min_start) {
-            *value = value.wrap_mul(current);
-        }
+    }
+    let mut running = A::ONE;
+    let mut values = Vec::with_capacity(width);
+    for event in events.iter().take(width) {
+        running = running.wrap_mul(*event);
+        values.push(running);
     }
     Ok((starts_labels(min_start, index), Array1::from_vec(values)))
 }
@@ -50,6 +60,12 @@ pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
 ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
     validate_inputs(arr, starts, booleans)?;
     let (min_start, width) = starts_domain(starts, index.len())?;
+    // Keep floats on the direct nested loop. Unlike integer wrapping
+    // multiplication, IEEE-754 multiplication is not safely regroupable:
+    // changing the order can change rounding and the propagation of NaN or
+    // infinity. ELI5: integer products are exact on a wrapping number wheel,
+    // but decimal-like floats can give a different answer when we rearrange
+    // the multiplication, so this path preserves the old row/position order.
     let mut values = vec![1_f64; width];
     for ((current, start), boolean) in arr.iter().zip(starts.iter()).zip(booleans.iter()) {
         if *boolean {
@@ -180,16 +196,20 @@ mod tests {
     }
 
     #[test]
-    fn u64_accumulator_preserves_values_at_and_above_i64_max() {
-        let value = (i64::MAX as u64) + 5;
+    fn integer_sweep_preserves_products_and_zero_width_rows() {
+        let arr = Array1::from_elem(100, 2_i64);
+        let mut starts = Array1::from_elem(100, 0_i64);
+        starts[99] = 1000;
+        let index = Array1::from_iter(0_i64..1000);
+        let booleans = Array1::from_elem(100, false);
         let got = prod_rev_starts_int_core(
-            array![value].view(),
-            array![0_i64].view(),
-            array![20_i64].view(),
-            array![false].view(),
-            |v: u64| v,
+            arr.view(),
+            starts.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
         );
-        assert_eq!(got, Ok((array![20], array![value])));
+        assert_eq!(got.unwrap().1, Array1::from_elem(1000, 0_i64));
     }
 
     #[test]
