@@ -232,6 +232,17 @@ pub fn compute_size_rev_start_end_matches<'py>(
 }
 
 #[pyfunction]
+/// Count covered right-row positions for each distinct right-row identity.
+///
+/// `index` is supplied by pyjanitor and contains unique right-row identities.
+/// The identities may be reordered by sorting or contain gaps; `item`, the
+/// position in `index`, is the state slot, while `index[item]` is the output
+/// label. `starts` and `ends` index this compact array and describe half-open
+/// ranges `[start, end)`. Invalid or zero-width ranges are skipped by
+/// `checked_range`; empty `starts`, `ends`, or `index` inputs are rejected.
+///
+/// ELI5: each right-row position gets a drawer. Every range adds one to each
+/// covered drawer, then we print the row identity stored in `index[item]`.
 pub fn compute_size_rev_start_end<'py>(
     py: Python<'py>,
     starts: PyReadonlyArray1<'py, i64>,
@@ -247,28 +258,24 @@ pub fn compute_size_rev_start_end<'py>(
             "starts, ends, and index cannot be empty",
         ));
     }
-    // There can be at most one output slot per right-side row. This local
-    // bound replaces the old caller-supplied capacity hint and cannot change
-    // the result when labels are duplicated.
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
+    let mut seen = vec![false; index.len()];
+    let mut touched = Vec::new();
+    let mut result = vec![0_i64; index.len()];
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
         let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
             continue;
         };
         for item in start_..end_ {
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
-            *total += 1;
+            if !seen[item] {
+                seen[item] = true;
+                touched.push(item);
+            }
+            result[item] += 1;
         }
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let indexers: Vec<i64> = touched.iter().map(|&item| index[item]).collect();
+    let result: Vec<i64> = touched.iter().map(|&item| result[item]).collect();
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
