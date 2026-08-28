@@ -3,7 +3,7 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    checked_range, ends_domain, ends_labels, ensure_equal_lengths, into_starts_ends_result, WrapAdd,
+    ends_domain, ends_labels, ensure_equal_lengths, into_starts_ends_result, WrapAdd,
 };
 
 fn validate_ends_inputs(
@@ -80,11 +80,7 @@ where
     F: FnMut(T) -> f64,
 {
     validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
-    let max_end = ends
-        .iter()
-        .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
-        .max()
-        .unwrap();
+    let max_end = ends_domain(ends, index.len())?;
     // Keep the existing per-position Neumaier accumulation for floats for
     // the same row-order reason as the starts path.
     let mut slots = vec![(0.0_f64, 0.0_f64); max_end];
