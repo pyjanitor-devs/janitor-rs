@@ -300,6 +300,63 @@ mod tests {
         assert!(size_rev_starts_core(array![-1_i64].view(), index.view()).is_err());
         assert!(size_rev_ends_core(array![1_i64].view(), array![].view()).is_err());
     }
+
+    #[test]
+    fn positions_count_reordered_unique_labels_by_ordinal() {
+        let starts = array![0_i64, 1, 2];
+        let ends = array![1_i64, 2, 3];
+        let index = array![42_i64, 7, 100];
+        let positions = array![1_i64, 0, 2];
+
+        let (labels, counts) =
+            size_positions_core(starts.view(), ends.view(), index.view(), positions.view());
+
+        assert_eq!(labels, array![7, 42, 100]);
+        assert_eq!(counts, array![1, 1, 1]);
+    }
+}
+
+fn size_positions_core(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+) -> (Array1<i64>, Array1<i64>) {
+    // `positions` contains ordinal offsets into `index`; right-side row
+    // identities are expected to be unique by the pyjanitor contract. Size
+    // state can therefore use the ordinal directly instead of hashing labels.
+    // ELI5: make one counter box for each referenced right row, remember which
+    // boxes were touched, then copy only those boxes into the output.
+    // `positions` is an ordinal tape, so its largest valid entry is the only
+    // state boundary we need; the full right index may contain an unused tail.
+    // ELI5: make counters for reachable boxes, then return only used boxes.
+    let width = positions
+        .iter()
+        .filter_map(|position| checked_index(*position, index.len()))
+        .max()
+        .map_or(0, |position| position + 1);
+    let mut seen = vec![false; width];
+    let mut touched = Vec::new();
+    let mut counts = vec![0_i64; width];
+    for (start, end) in starts.into_iter().zip(ends) {
+        let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+            continue;
+        };
+        for item in start_..end_ {
+            let Some(indexer_) = checked_index(positions[item], index.len()) else {
+                continue;
+            };
+            if !seen[indexer_] {
+                seen[indexer_] = true;
+                touched.push(indexer_);
+            }
+            counts[indexer_] += 1;
+        }
+    }
+    (
+        Array1::from_iter(touched.iter().map(|&position| index[position])),
+        Array1::from_iter(touched.iter().map(|&position| counts[position])),
+    )
 }
 
 #[pyfunction]
@@ -320,28 +377,7 @@ pub fn compute_size_rev_positions<'py>(
             "starts, ends, index, and positions cannot be empty",
         ));
     }
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
-    let zipped = starts.into_iter().zip(ends);
-    for (start, end) in zipped {
-        let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
-            continue;
-        };
-        for item in start_..end_ {
-            let Some(indexer_) = checked_index(positions[item], index.len()) else {
-                continue;
-            };
-            let pos = index[indexer_];
-            let total = dictionary.entry(pos).or_insert(0);
-            *total += 1;
-        }
-    }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let (indexers, result) = size_positions_core(starts, ends, index, positions);
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 

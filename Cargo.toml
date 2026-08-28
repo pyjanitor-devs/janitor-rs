@@ -46,3 +46,7 @@ harness = false
 [[bench]]
 name = "no_range_aggs"
 harness = false
+
+[[bench]]
+name = "rev_positions_size"
+harness = false
