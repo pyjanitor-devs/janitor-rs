@@ -2,7 +2,6 @@ use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
 use crate::aggs::{ensure_equal_lengths, ensure_exact_tape_width};
 
@@ -32,6 +31,10 @@ macro_rules! compute_ints {
         /// conditional-join boundary and are expected to be non-negative.
         /// `matches == 0` excludes a candidate; non-zero values are treated
         /// as live without a second validation pass over the tape.
+        ///
+        /// `index` must contain unique right-row identities. It may be
+        /// reordered or contain gaps; the suffix ordinal `item` selects dense
+        /// state, and `index[item]` is the output label.
         ///
         /// The accumulator type `$acc` is `i64` for every dtype except
         /// `uint64`, which uses `u64` so values `>= 2**63` don't get
@@ -79,9 +82,14 @@ macro_rules! compute_ints {
             // here, before the loop below ever indexes into the tape.
             let expected_matches_width = expected_matches_width(starts, end_)?;
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
-            let mut labels = Vec::new();
-            let mut totals: Vec<$acc> = Vec::new();
+            let min_start = starts.iter().map(|s| *s as usize).min().unwrap();
+            // ELI5: if every suffix starts at 900 in a 1,000-row right frame,
+            // only 100 ordinal slots can be reached. Allocate that suffix
+            // domain, not one slot per label in the whole frame.
+            let width = end_ - min_start;
+            let mut seen = vec![false; width];
+            let mut touched = Vec::new();
+            let mut totals = vec![1 as $acc; width];
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -97,16 +105,11 @@ macro_rules! compute_ints {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    let slot = if let Some(slot) = slots.get(&pos) {
-                        *slot
-                    } else {
-                        let slot = totals.len();
-                        slots.insert(pos, slot);
-                        labels.push(pos);
-                        totals.push(1);
-                        slot
-                    };
+                    let slot = item - min_start;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        touched.push(slot);
+                    }
                     if (*boolean) || (*count == 0) {
                         n += 1;
                         continue;
@@ -118,9 +121,14 @@ macro_rules! compute_ints {
                     n += 1;
                 }
             }
+            let labels: Vec<i64> = touched
+                .iter()
+                .map(|&slot| index[slot + min_start])
+                .collect();
+            let compact_totals: Vec<$acc> = touched.iter().map(|&slot| totals[slot]).collect();
             Ok((
                 Array1::from_vec(labels).into_pyarray(py),
-                Array1::from_vec(totals).into_pyarray(py),
+                Array1::from_vec(compact_totals).into_pyarray(py),
             ))
         }
     };
@@ -143,6 +151,10 @@ macro_rules! compute_floats {
         /// conditional-join boundary and are expected to be non-negative.
         /// `matches == 0` excludes a candidate; non-zero values are treated
         /// as live without a second validation pass over the tape.
+        ///
+        /// `index` contains unique right-row identities. They may be reordered
+        /// or contain gaps; the suffix ordinal `item` selects dense state, and
+        /// `index[item]` is the output label.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -193,9 +205,13 @@ macro_rules! compute_floats {
             // here, before the loop below ever indexes into the tape.
             let expected_matches_width = expected_matches_width(starts, end_)?;
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
-            let mut labels = Vec::new();
-            let mut totals = Vec::new();
+            let min_start = starts.iter().map(|s| *s as usize).min().unwrap();
+            // See the integer path above: prefix-independent suffixes let us
+            // allocate only the reachable ordinal domain.
+            let width = end_ - min_start;
+            let mut seen = vec![false; width];
+            let mut touched = Vec::new();
+            let mut totals = vec![1.0_f64; width];
             for (current, start, count, boolean) in zipped {
                 let start_ = *start as usize;
                 let current_ = *current as f64;
@@ -204,16 +220,11 @@ macro_rules! compute_floats {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    let slot = if let Some(slot) = slots.get(&pos) {
-                        *slot
-                    } else {
-                        let slot = totals.len();
-                        slots.insert(pos, slot);
-                        labels.push(pos);
-                        totals.push(1.0_f64);
-                        slot
-                    };
+                    let slot = item - min_start;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        touched.push(slot);
+                    }
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
@@ -222,9 +233,14 @@ macro_rules! compute_floats {
                     n += 1;
                 }
             }
+            let labels: Vec<i64> = touched
+                .iter()
+                .map(|&slot| index[slot + min_start])
+                .collect();
+            let compact_totals: Vec<f64> = touched.iter().map(|&slot| totals[slot]).collect();
             Ok((
                 Array1::from_vec(labels).into_pyarray(py),
-                Array1::from_vec(totals).into_pyarray(py),
+                Array1::from_vec(compact_totals).into_pyarray(py),
             ))
         }
     };
@@ -325,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn integer_kernel_handles_duplicate_labels() {
+    fn integer_kernel_handles_multiple_labels() {
         Python::initialize();
         Python::attach(|py| {
             if py.import("numpy").is_err() {
@@ -362,10 +378,10 @@ mod tests {
                 return;
             }
             let arr = PyArray1::from_vec(py, vec![i64::MAX, 2]);
-            let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 0]);
             let counts = PyArray1::from_vec(py, vec![1_i64, 1]);
-            let index = PyArray1::from_vec(py, vec![10_i64, 10]);
-            let matches = PyArray1::from_vec(py, vec![1_i8, 0, 1]);
+            let index = PyArray1::from_vec(py, vec![10_i64]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 1]);
             let booleans = PyArray1::from_vec(py, vec![false, false]);
             let (_, values) = compute_prod_rev_start_match_int64(
                 py,
@@ -378,6 +394,35 @@ mod tests {
             )
             .unwrap();
             assert_eq!(values.readonly().as_slice().unwrap(), &[-2]);
+        });
+    }
+
+    #[test]
+    fn dense_suffix_slots_preserve_permuted_gapped_labels() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let arr = PyArray1::from_vec(py, vec![2_i64, 3]);
+            let starts = PyArray1::from_vec(py, vec![1_i64, 0]);
+            let counts = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let index = PyArray1::from_vec(py, vec![42_i64, 7, 100]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 0, 1, 1, 1]);
+            let booleans = PyArray1::from_vec(py, vec![false, false]);
+            let (labels, values) = compute_prod_rev_start_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .unwrap();
+            assert_eq!(labels.readonly().as_slice().unwrap(), &[7, 42, 100]);
+            assert_eq!(values.readonly().as_slice().unwrap(), &[6, 3, 3]);
         });
     }
 }
