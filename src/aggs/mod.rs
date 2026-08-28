@@ -149,8 +149,7 @@ pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool
     // avoids building metadata for tiny jobs, while the memory multiplier
     // limits the extra row-link/bucket storage relative to the direct path.
     let memory_budget = direct_bytes.saturating_mul(SWEEP_MEMORY_MULTIPLIER);
-    repeated_work > sweep_work.saturating_mul(SWEEP_WORK_RATIO)
-        && sweep_metadata <= memory_budget
+    repeated_work > sweep_work.saturating_mul(SWEEP_WORK_RATIO) && sweep_metadata <= memory_budget
 }
 
 /// Reduce boundary events into one value per compact output position.
