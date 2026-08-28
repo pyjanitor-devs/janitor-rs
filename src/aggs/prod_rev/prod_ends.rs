@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, WrapMul};
+use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, sweep_reduce, WrapMul};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -34,20 +34,20 @@ pub fn prod_rev_ends_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     // right-to-left and apply each event once. Wrapping multiplication is
     // associative, so no per-row `next` metadata is needed; `end == 0` has
     // no emitted slot and therefore contributes nothing.
-    let mut events = vec![A::ONE; max_end + 1];
-    for ((current, end), boolean) in arr.iter().zip(ends.iter()).zip(booleans.iter()) {
-        if !*boolean {
-            let bucket = *end as usize;
-            events[bucket] = events[bucket].wrap_mul(convert(*current));
-        }
-    }
-    let mut running = A::ONE;
-    let mut values = vec![A::ONE; max_end];
-    for position in (0..max_end).rev() {
-        running = running.wrap_mul(events[position + 1]);
-        values[position] = running;
-    }
-    Ok((ends_labels(max_end, index), Array1::from_vec(values)))
+    let events = arr
+        .iter()
+        .zip(ends.iter())
+        .zip(booleans.iter())
+        .filter(|((_, end), boolean)| !**boolean && **end > 0)
+        .map(|((current, end), _)| (*end as usize - 1, convert(*current)));
+    let values = sweep_reduce(
+        max_end,
+        A::ONE,
+        events,
+        (0..max_end).rev(),
+        |left, right| left.wrap_mul(right),
+    );
+    Ok((ends_labels(max_end, index), values))
 }
 
 pub fn prod_rev_ends_float_core<T: Copy, F: FnMut(T) -> f64>(

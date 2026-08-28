@@ -124,6 +124,9 @@ pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<
     (0..max_end).map(|item| index[item]).collect()
 }
 
+const SWEEP_WORK_RATIO: usize = 8;
+const SWEEP_MEMORY_MULTIPLIER: usize = 8;
+
 /// Choose the boundary sweep only when its one-time setup should repay the
 /// repeated work in the direct nested loop without an excessive memory cost.
 ///
@@ -142,8 +145,45 @@ pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool
     let sweep_metadata = rows
         .saturating_add(width.saturating_add(1))
         .saturating_mul(std::mem::size_of::<usize>());
-    let memory_budget = direct_bytes.saturating_mul(8);
-    repeated_work > sweep_work.saturating_mul(8) && sweep_metadata <= memory_budget
+    // These are policy knobs, not correctness conditions: the work ratio
+    // avoids building metadata for tiny jobs, while the memory multiplier
+    // limits the extra row-link/bucket storage relative to the direct path.
+    let memory_budget = direct_bytes.saturating_mul(SWEEP_MEMORY_MULTIPLIER);
+    repeated_work > sweep_work.saturating_mul(SWEEP_WORK_RATIO)
+        && sweep_metadata <= memory_budget
+}
+
+/// Reduce boundary events into one value per compact output position.
+///
+/// ELI5: each row drops its contribution into the bucket where it becomes
+/// active. We combine values sharing a bucket, then walk the buckets in the
+/// caller's direction while carrying a running result. Starts and ends use
+/// different bucket numbering, so callers provide those mappings; allocation
+/// and sweep mechanics live here once.
+pub(crate) fn sweep_reduce<T, Events, OutputPositions, Combine>(
+    width: usize,
+    identity: T,
+    events: Events,
+    output_positions: OutputPositions,
+    combine: Combine,
+) -> Array1<T>
+where
+    T: Copy,
+    Events: IntoIterator<Item = (usize, T)>,
+    OutputPositions: IntoIterator<Item = usize>,
+    Combine: Fn(T, T) -> T,
+{
+    let mut result = vec![identity; width];
+    for (bucket, value) in events {
+        result[bucket] = combine(result[bucket], value);
+    }
+
+    let mut running = identity;
+    for position in output_positions {
+        running = combine(running, result[position]);
+        result[position] = running;
+    }
+    Array1::from_vec(result)
 }
 
 /// Run a boundary sweep that returns the winning row for each output slot.
@@ -214,7 +254,7 @@ where
 mod sweep_tests {
     use numpy::ndarray::array;
 
-    use super::{should_sweep, sweep_winner};
+    use super::{should_sweep, sweep_reduce, sweep_winner};
 
     #[test]
     fn sweep_gate_accounts_for_row_link_memory_and_dtype() {
@@ -249,6 +289,19 @@ mod sweep_tests {
             |current, winner| current > winner,
         );
         assert_eq!(reverse, array![1, 2, -1]);
+    }
+
+    #[test]
+    fn sweep_reduce_supports_forward_and_reverse_event_orders() {
+        let forward = sweep_reduce(3, 0_i64, [(0, 2), (1, 3), (0, 4)], 0..3, |left, right| {
+            left + right
+        });
+        assert_eq!(forward, array![6, 9, 9]);
+
+        let reverse = sweep_reduce(3, 1_i64, [(0, 2), (2, 3)], (0..3).rev(), |left, right| {
+            left * right
+        });
+        assert_eq!(reverse, array![6, 3, 3]);
     }
 }
 

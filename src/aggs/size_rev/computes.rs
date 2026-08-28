@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::aggs::{
     checked_end, checked_index, checked_range, ends_domain, ends_labels, ensure_equal_lengths,
     ensure_exact_tape_width, ensure_nonempty_matches, into_starts_ends_result, starts_domain,
-    starts_labels,
+    starts_labels, sweep_reduce,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
@@ -31,20 +31,14 @@ pub fn size_rev_ends_core(
     // the right-to-left sweep overwrite the event after reading it, so the
     // output and event counts share one allocation. `end == 0` is an empty
     // prefix and has no event to record.
-    let mut events = vec![0_i64; max_end];
-    for end in ends {
-        let end = *end as usize;
-        if end > 0 {
-            events[end - 1] += 1;
-        }
-    }
-
-    let mut running = 0_i64;
-    for event in events.iter_mut().rev() {
-        running += *event;
-        *event = running;
-    }
-    Ok((ends_labels(max_end, index), Array1::from_vec(events)))
+    let events = ends
+        .iter()
+        .filter(|end| **end > 0)
+        .map(|end| (*end as usize - 1, 1_i64));
+    let result = sweep_reduce(max_end, 0_i64, events, (0..max_end).rev(), |left, right| {
+        left + right
+    });
+    Ok((ends_labels(max_end, index), result))
 }
 
 /// Count how many reverse-start rows cover each compact suffix position.
@@ -57,23 +51,15 @@ pub fn size_rev_starts_core(
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     let (min_start, width) = starts_domain(starts, index.len())?;
-    // ELI5: a suffix row is active from its start onward. Count rows at each
-    // start boundary, then sweep those boundaries once while carrying the
-    // active-row count. The terminal bucket represents `start ==
-    // index.len()` and is intentionally not emitted. Counts are enough, so
-    // the temporary memory is proportional to the compact output width.
-    let mut events = vec![0_i64; width + 1];
-    for start in starts {
-        events[*start as usize - min_start] += 1;
-    }
-
-    let mut running = 0_i64;
-    for event in events.iter_mut().take(width) {
-        running += *event;
-        *event = running;
-    }
-    events.truncate(width);
-    Ok((starts_labels(min_start, index), Array1::from_vec(events)))
+    // ELI5: a suffix row is active from its start onward. The shared reducer
+    // counts rows at each start boundary, then carries the active-row count
+    // forward. The valid `start == index.len()` bucket has no emitted slot and
+    // is naturally outside the compact output domain.
+    let events = starts
+        .iter()
+        .map(|start| (*start as usize - min_start, 1_i64));
+    let result = sweep_reduce(width, 0_i64, events, 0..width, |left, right| left + right);
+    Ok((starts_labels(min_start, index), result))
 }
 
 #[pyfunction]

@@ -4,7 +4,8 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    ensure_equal_lengths, into_starts_ends_result, starts_domain, starts_labels, WrapAdd,
+    ensure_equal_lengths, into_starts_ends_result, starts_domain, starts_labels, sweep_reduce,
+    WrapAdd,
 };
 
 fn validate_starts_inputs(
@@ -44,28 +45,17 @@ where
     validate_starts_inputs(arr.len(), starts.len(), booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
 
-    // ELI5: a suffix starts once and then stays active. Instead of adding a
-    // row's value to every later output slot, put the row's value into the
-    // bucket where it starts and add each bucket to one running total exactly
-    // once. Integer wrapping addition is associative, so grouping values at a
-    // boundary preserves the result while using memory proportional only to
-    // the compact output width. The final bucket is reserved for start ==
-    // end_, a valid zero-width suffix which is never emitted.
-    let mut events = vec![A::ZERO; width + 1];
-    for (current, start, boolean) in izip!(arr, starts, booleans) {
-        if !*boolean {
-            let bucket = *start as usize - min_start;
-            events[bucket] = events[bucket].wrap_add(convert(*current));
-        }
-    }
-
-    let mut running = A::ZERO;
-    for event in events.iter_mut().take(width) {
-        running = running.wrap_add(*event);
-        *event = running;
-    }
-    events.truncate(width);
-    Ok((starts_labels(min_start, index), Array1::from_vec(events)))
+    // ELI5: a suffix starts once and then stays active. The shared reducer puts
+    // each row's value into its start bucket and carries one running sum
+    // forward, so a wide suffix is not rescanned for every row. Integer
+    // wrapping addition is associative, so this regrouping preserves results.
+    let events = izip!(arr, starts, booleans)
+        .filter(|(_, _, boolean)| !**boolean)
+        .map(|(current, start, _)| (*start as usize - min_start, convert(*current)));
+    let result = sweep_reduce(width, A::ZERO, events, 0..width, |left, right| {
+        left.wrap_add(right)
+    });
+    Ok((starts_labels(min_start, index), result))
 }
 
 macro_rules! compute_ints {

@@ -3,7 +3,7 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    ends_domain, ends_labels, ensure_equal_lengths, into_starts_ends_result, WrapAdd,
+    ends_domain, ends_labels, ensure_equal_lengths, into_starts_ends_result, sweep_reduce, WrapAdd,
 };
 
 fn validate_ends_inputs(
@@ -48,26 +48,17 @@ where
     // boundary preserves results. Using `end - 1` means each event can be
     // replaced by its final value after it is read; `end == 0` is an empty
     // prefix and has no event.
-    let mut events = vec![A::ZERO; max_end];
-    for (current, end, boolean) in izip!(arr, ends, booleans) {
-        if !*boolean {
-            let end = *end as usize;
-            if end > 0 {
-                let bucket = end - 1;
-                events[bucket] = events[bucket].wrap_add(convert(*current));
-            }
-        }
-    }
-
-    let mut running = A::ZERO;
-    for event in events.iter_mut().rev() {
-        running = running.wrap_add(*event);
-        *event = running;
-    }
-    Ok((
-        ends_labels(max_end, index),
-        numpy::ndarray::Array1::from_vec(events),
-    ))
+    let events = izip!(arr, ends, booleans)
+        .filter(|(_, end, boolean)| !**boolean && **end > 0)
+        .map(|(current, end, _)| (*end as usize - 1, convert(*current)));
+    let values = sweep_reduce(
+        max_end,
+        A::ZERO,
+        events,
+        (0..max_end).rev(),
+        |left, right| left.wrap_add(right),
+    );
+    Ok((ends_labels(max_end, index), values))
 }
 
 pub fn sum_rev_ends_float_core<T, F>(

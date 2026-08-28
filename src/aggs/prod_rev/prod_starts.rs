@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels, WrapMul};
+use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels, sweep_reduce, WrapMul};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -29,26 +29,20 @@ pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
 ) -> Result<(Array1<i64>, Array1<A>), &'static str> {
     validate_inputs(arr, starts, booleans)?;
     let (min_start, width) = starts_domain(starts, index.len())?;
-    // ELI5: a suffix row joins the running product when the sweep reaches its
-    // start. Combine rows that join at the same boundary into one product
-    // event, then apply each event once. Wrapping multiplication is
-    // associative, so this removes the per-row `next` metadata without
-    // changing the integer overflow contract. The terminal bucket represents
-    // `start == index.len()` and is not emitted.
-    let mut events = vec![A::ONE; width + 1];
-    for ((current, start), boolean) in arr.iter().zip(starts.iter()).zip(booleans.iter()) {
-        if !*boolean {
-            let bucket = *start as usize - min_start;
-            events[bucket] = events[bucket].wrap_mul(convert(*current));
-        }
-    }
-    let mut running = A::ONE;
-    let mut values = Vec::with_capacity(width);
-    for event in events.iter().take(width) {
-        running = running.wrap_mul(*event);
-        values.push(running);
-    }
-    Ok((starts_labels(min_start, index), Array1::from_vec(values)))
+    // ELI5: a suffix row joins the running product at its start bucket. The
+    // shared reducer combines rows sharing a boundary, then carries one
+    // product forward. Wrapping multiplication is associative, so this
+    // removes repeated per-row work without changing integer overflow rules.
+    let events = arr
+        .iter()
+        .zip(starts.iter())
+        .zip(booleans.iter())
+        .filter(|((_, _), boolean)| !**boolean)
+        .map(|((current, start), _)| (*start as usize - min_start, convert(*current)));
+    let result = sweep_reduce(width, A::ONE, events, 0..width, |left, right| {
+        left.wrap_mul(right)
+    });
+    Ok((starts_labels(min_start, index), result))
 }
 
 pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
