@@ -1,8 +1,6 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
 use crate::aggs::{ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches};
 
@@ -15,6 +13,10 @@ macro_rules! compute_ints {
         /// scan the tape to enforce that value-level contract. Normally
         /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
         /// full candidate-tape width.
+        ///
+        /// `index` contains unique right-row identities. They may be
+        /// reordered or contain gaps; the ordinal `item` selects dense state,
+        /// and `index[item]` is the output label.
         ///
         /// The accumulator type `$acc` is `i64` for every dtype except
         /// `uint64`, which uses `u64` so values `>= 2**63` don't get
@@ -51,7 +53,13 @@ macro_rules! compute_ints {
                 .map(|s| end_.saturating_sub(*s as usize))
                 .sum();
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut dictionary: HashMap<i64, $acc> = HashMap::with_capacity(end_);
+            // ELI5: `item` is already the unique right-row drawer number.
+            // `index[item]` is only the identity printed at output; it may
+            // be permuted or contain gaps after pyjanitor sorts the right
+            // frame.
+            let mut seen = vec![false; end_];
+            let mut touched = Vec::new();
+            let mut totals = vec![0 as $acc; end_];
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -67,23 +75,20 @@ macro_rules! compute_ints {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(0);
+                    if !seen[item] {
+                        seen[item] = true;
+                        touched.push(item);
+                    }
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
                     }
-                    *total += current_;
+                    totals[item] = totals[item].wrapping_add(current_);
                     n += 1;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<$acc>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let indexers: Vec<i64> = touched.iter().map(|&item| index[item]).collect();
+            let result: Vec<$acc> = touched.iter().map(|&item| totals[item]).collect();
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -109,6 +114,10 @@ macro_rules! compute_floats {
         /// scan the tape to enforce that value-level contract. Normally
         /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
         /// full candidate-tape width.
+        ///
+        /// `index` contains unique right-row identities. They may be
+        /// reordered or contain gaps; the ordinal `item` selects dense state,
+        /// and `index[item]` is the output label.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -141,8 +150,12 @@ macro_rules! compute_floats {
                 .map(|s| end_.saturating_sub(*s as usize))
                 .sum();
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(end_);
-            let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(end_);
+            // State is keyed by the right-index ordinal, not by the numeric
+            // identity stored in `index[item]`.
+            let mut seen = vec![false; end_];
+            let mut touched = Vec::new();
+            let mut totals = vec![0.0_f64; end_];
+            let mut mapping = vec![0.0_f64; end_];
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -158,36 +171,32 @@ macro_rules! compute_floats {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(0.);
-                    let compensation = mapping.entry(pos).or_insert(0.);
+                    if !seen[item] {
+                        seen[item] = true;
+                        touched.push(item);
+                    }
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
                     }
-                    let difference = current_ - *compensation;
-                    let increment = *total + difference;
-                    *compensation = (increment - *total) - difference;
+                    let difference = current_ - mapping[item];
+                    let increment = totals[item] + difference;
+                    mapping[item] = (increment - totals[item]) - difference;
                     // adapted from pandas' cython code
                     // # GH#53606; GH#60303
                     // # If val is +/- infinity compensation is NaN
                     // # which would lead to results being NaN instead
                     // # of +/- infinity. We cannot use util.is_nan
                     // # because of no gil
-                    if !compensation.is_finite() {
-                        *compensation = 0.;
+                    if !mapping[item].is_finite() {
+                        mapping[item] = 0.;
                     }
-                    *total = increment;
+                    totals[item] = increment;
                     n += 1;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<f64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let indexers: Vec<i64> = touched.iter().map(|&item| index[item]).collect();
+            let result: Vec<f64> = touched.iter().map(|&item| totals[item]).collect();
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -217,7 +226,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_sum_rev_start_match_uint64;
+    use super::{compute_sum_rev_start_match_int64, compute_sum_rev_start_match_uint64};
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::Python;
 
@@ -248,6 +257,31 @@ mod tests {
             .unwrap();
             assert_eq!(labels.readonly().as_slice().unwrap(), &[10]);
             assert_eq!(values.readonly().as_slice().unwrap(), &[value]);
+        });
+    }
+
+    #[test]
+    fn dense_slots_preserve_permuted_gapped_labels_and_sparse_matches() {
+        Python::initialize();
+        Python::attach(|py| {
+            let arr = PyArray1::from_vec(py, vec![5_i64, 7]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let counts = PyArray1::from_vec(py, vec![1_i64, 1]);
+            let index = PyArray1::from_vec(py, vec![42_i64, 7, 100]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 0, 1, 1, 0]);
+            let booleans = PyArray1::from_vec(py, vec![false, false]);
+            let (labels, values) = compute_sum_rev_start_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .unwrap();
+            assert_eq!(labels.readonly().as_slice().unwrap(), &[42, 100, 7]);
+            assert_eq!(values.readonly().as_slice().unwrap(), &[5, 5, 7]);
         });
     }
 }
