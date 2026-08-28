@@ -124,11 +124,28 @@ pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<
     (0..max_end).map(|item| index[item]).collect()
 }
 
+// These knobs deliberately live beside the gate: they describe the policy for
+// choosing an implementation, not the correctness of either implementation.
 const SWEEP_WORK_RATIO: usize = 8;
 const SWEEP_MEMORY_MULTIPLIER: usize = 8;
 
 /// Choose the boundary sweep only when its one-time setup should repay the
 /// repeated work in the direct nested loop without an excessive memory cost.
+///
+/// The direct implementation does roughly `rows * width` work. The sweep does
+/// roughly `rows + width` work, but it also needs row-to-bucket metadata and a
+/// bucket array. We estimate the direct path's retained storage as one value
+/// and one `i64` label per output slot, then allow sweep metadata up to
+/// `SWEEP_MEMORY_MULTIPLIER` times that estimate. This is intentionally a
+/// conservative, allocation-independent estimate: it omits allocator headers,
+/// shared label storage, and small scalar state, and therefore is a dispatch
+/// guard rather than a memory guarantee.
+///
+/// `SWEEP_WORK_RATIO` prevents building metadata when the sweep would save only
+/// a small amount of repeated work. The memory multiplier prevents a very large
+/// row batch with a narrow output domain from turning the optimization into a
+/// memory spike. Both are policy knobs that can be benchmark-tuned without
+/// changing aggregation semantics.
 ///
 /// ELI5: build the shortcut only when there are enough repeated chores to
 /// make the setup worthwhile, and do not trade a tiny job for a huge bucket
@@ -159,6 +176,9 @@ pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool
 /// caller's direction while carrying a running result. Starts and ends use
 /// different bucket numbering, so callers provide those mappings; allocation
 /// and sweep mechanics live here once.
+///
+/// Callers must provide bucket values in `0..width`. Domain helpers validate
+/// the starts/ends before this low-level reducer is called.
 pub(crate) fn sweep_reduce<T, Events, OutputPositions, Combine>(
     width: usize,
     identity: T,

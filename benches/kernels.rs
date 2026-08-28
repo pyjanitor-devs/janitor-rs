@@ -21,6 +21,11 @@ use std::hint::black_box;
 mod support;
 // ELI5: every benchmark executable uses the same scorekeeper for allocations,
 // so memory numbers mean the same thing across old and optimized kernels.
+// The sweep gate uses a related estimate: direct output storage is the budget
+// baseline, while row-link and bucket metadata are charged against a fixed
+// multiplier. Keeping the accounting and policy rationale visible here makes
+// it clear that a faster benchmark is not automatically a better choice if it
+// creates an avoidable memory spike.
 use support::count_allocations;
 
 use janitor_rs::bench_support::{
