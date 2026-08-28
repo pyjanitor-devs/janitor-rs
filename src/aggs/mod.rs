@@ -124,6 +124,90 @@ pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<
     (0..max_end).map(|item| index[item]).collect()
 }
 
+/// Choose the boundary sweep only when its one-time setup should repay the
+/// repeated work in the direct nested loop without an excessive memory cost.
+///
+/// ELI5: build the shortcut only when there are enough repeated chores to
+/// make the setup worthwhile, and do not trade a tiny job for a huge bucket
+/// of row links.
+pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool {
+    let repeated_work = rows.saturating_mul(width);
+    let sweep_work = rows.saturating_add(width);
+    // The direct path keeps one value and one row position per output slot.
+    // The labels are common to both paths, so they are intentionally omitted.
+    // This is a conservative approximation: it models the direct path's
+    // value and position buffers and the sweep's row-link and bucket arrays,
+    // but excludes allocator headers and the small scalar winner state.
+    let direct_bytes = width.saturating_mul(value_size + std::mem::size_of::<i64>());
+    let sweep_metadata = rows
+        .saturating_add(width.saturating_add(1))
+        .saturating_mul(std::mem::size_of::<usize>());
+    let memory_budget = direct_bytes.saturating_mul(8);
+    repeated_work > sweep_work.saturating_mul(8) && sweep_metadata <= memory_budget
+}
+
+/// Run a boundary sweep that returns the winning row for each output slot.
+///
+/// ELI5: put every row into the bucket where it becomes eligible, then walk
+/// the output buckets in order while carrying the best row seen so far. The
+/// two small closures describe the starts/ends-specific bucket numbering;
+/// the winner and tie-breaking logic lives here exactly once.
+///
+/// `booleans` is the null mask supplied by pyjanitor. In particular, pyjanitor
+/// marks floating-point NaN values as null before calling this backend, so the
+/// kernel deliberately relies on that mask rather than implementing a second
+/// NaN policy for every supported dtype.
+pub(crate) fn sweep_min<T, RowBucket, OutputBucket, OutputPositions>(
+    arr: ArrayView1<'_, T>,
+    booleans: ArrayView1<'_, bool>,
+    width: usize,
+    row_bucket: RowBucket,
+    output_bucket: OutputBucket,
+    output_positions: OutputPositions,
+) -> Array1<i64>
+where
+    T: PartialOrd + Copy,
+    RowBucket: Fn(usize) -> usize,
+    OutputBucket: Fn(usize) -> usize,
+    OutputPositions: IntoIterator<Item = usize>,
+{
+    let mut head = vec![usize::MAX; width + 1];
+    let mut next = vec![usize::MAX; arr.len()];
+    for row in (0..arr.len()).rev() {
+        let bucket = row_bucket(row);
+        next[row] = head[bucket];
+        head[bucket] = row;
+    }
+
+    let mut positions = vec![-1_i64; width];
+    let mut current_winner: Option<(T, i64)> = None;
+    for position in output_positions {
+        let mut row = head[output_bucket(position)];
+        while row != usize::MAX {
+            if booleans[row] {
+                row = next[row];
+                continue;
+            }
+            let current = arr[row];
+            let replaces_winner = match current_winner.as_ref() {
+                None => true,
+                Some((winner_value, winner_row)) => {
+                    current < *winner_value
+                        || (current == *winner_value && (row as i64) < *winner_row)
+                }
+            };
+            if replaces_winner {
+                current_winner = Some((current, row as i64));
+            }
+            row = next[row];
+        }
+        if let Some((_, row)) = current_winner {
+            positions[position] = row;
+        }
+    }
+    Array1::from_vec(positions)
+}
+
 /// Shared return shape for every `*_rev_starts`/`*_rev_ends` `#[pyfunction]`
 /// wrapper: a pair of numpy arrays, generic over the value array's element
 /// type `U` so it fits min/max/size (`i64`) and prod/sum's int (`i64`) and
@@ -312,6 +396,46 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     sum::register(m)?;
     sum_rev::register(m)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use numpy::ndarray::array;
+
+    use super::{should_sweep, sweep_min};
+
+    #[test]
+    fn sweep_gate_accounts_for_row_link_memory() {
+        assert!(!should_sweep(1_000_000, 9, std::mem::size_of::<i64>()));
+        assert!(!should_sweep(1_000_000, 9, std::mem::size_of::<u8>()));
+        assert!(should_sweep(1_000, 10_000, std::mem::size_of::<i64>()));
+    }
+
+    #[test]
+    fn sweep_min_handles_ties_nulls_and_both_directions() {
+        let arr = array![7_i64, 7, 7];
+        let booleans = array![true, false, false];
+
+        let forward = sweep_min(
+            arr.view(),
+            booleans.view(),
+            3,
+            |row| [0, 2, 1][row],
+            |position| position,
+            0..3,
+        );
+        assert_eq!(forward, array![-1, 2, 1]);
+
+        let reverse = sweep_min(
+            arr.view(),
+            booleans.view(),
+            3,
+            |row| [3, 1, 2][row],
+            |position| position + 1,
+            (0..3).rev(),
+        );
+        assert_eq!(reverse, array![1, 2, -1]);
+    }
 }
 
 #[cfg(test)]

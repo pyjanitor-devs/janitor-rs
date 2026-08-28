@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels};
+use crate::aggs::{into_starts_ends_result, should_sweep, starts_domain, starts_labels, sweep_min};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -27,6 +27,24 @@ pub fn min_rev_starts_core<T: PartialOrd + Copy>(
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     validate_inputs(arr, starts, booleans)?;
     let (min_start, width) = starts_domain(starts, index.len())?;
+
+    if should_sweep(arr.len(), width, std::mem::size_of::<T>()) {
+        // ELI5: a suffix row becomes eligible when the sweep reaches its
+        // start. Bucket each row at that boundary, then compare it with the
+        // current champion only once. Equal values are explicitly resolved by
+        // the smallest input row index in `sweep_min`, matching the direct
+        // path regardless of bucket traversal order.
+        let positions = sweep_min(
+            arr,
+            booleans,
+            width,
+            |row| starts[row] as usize - min_start,
+            |position| position,
+            0..width,
+        );
+        return Ok((starts_labels(min_start, index), positions));
+    }
+
     let mut values = vec![arr[0]; width];
     let mut positions = vec![-1_i64; width];
 
@@ -125,6 +143,39 @@ mod tests {
         let booleans = array![true, false, true];
         let got = min_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
         assert_eq!(got, Ok((array![10, 20, 30], array![-1, 1, 1])));
+    }
+
+    #[test]
+    fn sweep_preserves_smallest_row_on_equal_minimum() {
+        let mut arr = Array1::from_elem(20, 99_i64);
+        arr[2] = 7;
+        arr[18] = 7;
+        let mut starts = Array1::from_elem(20, 20_i64);
+        starts[2] = 19;
+        starts[18] = 0;
+        let index = Array1::from_iter(0..20_i64);
+        let booleans = Array1::from_elem(20, false);
+        let got = min_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
+        let expected =
+            Array1::from_iter((0..20).map(|position| if position == 19 { 2 } else { 18 }));
+        assert_eq!(got, Ok((Array1::from_iter(0..20_i64), expected)));
+    }
+
+    #[test]
+    fn sweep_skips_null_rows() {
+        let mut arr = Array1::from_elem(20, 99_i64);
+        arr[2] = 7;
+        arr[18] = 0;
+        let mut starts = Array1::from_elem(20, 20_i64);
+        starts[2] = 19;
+        starts[18] = 0;
+        let index = Array1::from_iter(0..20_i64);
+        let mut booleans = Array1::from_elem(20, true);
+        booleans[2] = false;
+        let got = min_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
+        let expected =
+            Array1::from_iter((0..20).map(|position| if position == 19 { 2 } else { -1 }));
+        assert_eq!(got, Ok((Array1::from_iter(0..20_i64), expected)));
     }
 
     #[test]
