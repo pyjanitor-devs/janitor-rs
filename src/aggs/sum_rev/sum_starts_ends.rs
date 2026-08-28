@@ -4,7 +4,6 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{checked_range, ensure_equal_lengths, WrapAdd};
-use std::collections::{hash_map::Entry, HashMap};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -28,31 +27,18 @@ fn validate_inputs<T>(
     Ok(())
 }
 
-fn capacity_hint(
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    right_len: usize,
-) -> usize {
-    // ELI5: one interval can introduce at most one new label per position it
-    // covers. Summing those widths gives a safe, cheap ceiling for the
-    // number of distinct labels, while `min` prevents a malformed/overlapping
-    // workload from asking the map for more buckets than the index contains.
-    starts
-        .iter()
-        .zip(ends.iter())
-        .filter_map(|(start, end)| checked_range(*start, *end, right_len))
-        .fold(0_usize, |total, (start, end)| {
-            total.saturating_add(end - start)
-        })
-        .min(right_len)
-}
-
 /// Sum values into one compact state slot for each distinct right-hand label.
 ///
 /// ELI5: `starts` and `ends` describe little windows into `index`. We keep a
-/// small numbered drawer for each label we actually encounter, rather than
-/// carrying a separate dictionary for labels and totals. Duplicate labels
-/// therefore share one drawer and do not allocate duplicate aggregate state.
+/// numbered drawer for each right-hand row position, rather than asking a
+/// dictionary which drawer owns the position on every visit. `index[item]` is
+/// the output label for that drawer. The caller contract guarantees that
+/// `index` contains each right-row identity at most once; identities may be
+/// reordered or have gaps, because the drawer number is `item`, not the value
+/// stored in `index[item]`.
+///
+/// Empty `arr`/`index` inputs are rejected. Invalid or zero-width ranges are
+/// skipped by `checked_range`, and valid ranges are half-open `[start, end)`.
 /// `A` is the accumulator type: every integer dtype instantiates this with
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
 /// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
@@ -72,13 +58,12 @@ where
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
 
-    // ELI5: reserving up to the total number of positions covered avoids
-    // repeated rehashing when most labels are unique, but does not reserve
-    // the whole right index when only a few narrow ranges can be touched.
-    let hint = capacity_hint(starts, ends, index.len());
-    let mut slots = HashMap::with_capacity(hint);
-    let mut labels = Vec::new();
-    let mut totals = Vec::new();
+    // ELI5: because each right row is unique, its position in `index` is
+    // already a perfect drawer number. Gaps in the identity values do not
+    // matter: `[7, 3, 11]` still has drawers `0`, `1`, and `2`.
+    let mut seen = vec![false; index.len()];
+    let mut touched = Vec::new();
+    let mut totals = vec![A::ZERO; index.len()];
 
     for (current, start, end, boolean) in
         izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter())
@@ -87,24 +72,19 @@ where
             continue;
         };
         for item in start..end {
-            let label = index[item];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    totals.push(A::ZERO);
-                    slot
-                }
-            };
+            if !seen[item] {
+                seen[item] = true;
+                touched.push(item);
+            }
             if *boolean {
                 continue;
             }
-            totals[slot] = totals[slot].wrap_add(convert(*current));
+            totals[item] = totals[item].wrap_add(convert(*current));
         }
     }
 
+    let labels = touched.iter().map(|&item| index[item]).collect();
+    let totals = touched.iter().map(|&item| totals[item]).collect();
     Ok((Array1::from_vec(labels), Array1::from_vec(totals)))
 }
 
@@ -122,11 +102,10 @@ where
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
 
-    let hint = capacity_hint(starts, ends, index.len());
-    let mut slots = HashMap::with_capacity(hint);
-    let mut labels = Vec::new();
-    let mut totals = Vec::new();
-    let mut compensations = Vec::new();
+    let mut seen = vec![false; index.len()];
+    let mut touched = Vec::new();
+    let mut totals = vec![0.0; index.len()];
+    let mut compensations = vec![0.0; index.len()];
 
     for (current, start, end, boolean) in
         izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter())
@@ -136,34 +115,28 @@ where
         };
         let current = to_f64(*current);
         for item in start..end {
-            let label = index[item];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    totals.push(0.0);
-                    compensations.push(0.0);
-                    slot
-                }
-            };
+            if !seen[item] {
+                seen[item] = true;
+                touched.push(item);
+            }
             if *boolean {
                 continue;
             }
-            let difference = current - compensations[slot];
-            let increment = totals[slot] + difference;
-            compensations[slot] = (increment - totals[slot]) - difference;
+            let difference = current - compensations[item];
+            let increment = totals[item] + difference;
+            compensations[item] = (increment - totals[item]) - difference;
             // ELI5: compensation remembers tiny rounding crumbs. If an
             // infinity makes that crumb NaN, discard the crumb so the actual
             // infinity remains the result, matching pandas' summation rules.
-            if !compensations[slot].is_finite() {
-                compensations[slot] = 0.0;
+            if !compensations[item].is_finite() {
+                compensations[item] = 0.0;
             }
-            totals[slot] = increment;
+            totals[item] = increment;
         }
     }
 
+    let labels = touched.iter().map(|&item| index[item]).collect();
+    let totals = touched.iter().map(|&item| totals[item]).collect();
     Ok((Array1::from_vec(labels), Array1::from_vec(totals)))
 }
 
@@ -333,16 +306,16 @@ mod tests {
     }
 
     #[test]
-    fn compact_slots_sum_duplicate_labels_and_arbitrary_ranges() {
+    fn dense_slots_sum_unique_gapped_labels_and_arbitrary_ranges() {
         let got = sum_rev_start_end_int_core(
             array![1_i64, 2, 3].view(),
             array![0_i64, 1, 0].view(),
             array![2_i64, 3, 1].view(),
-            array![10_i64, 20, 10].view(),
+            array![42_i64, 7, 100].view(),
             array![false, false, false].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![10, 20], array![6, 3])));
+        assert_eq!(got, Ok((array![42, 7, 100], array![4, 3, 2])));
     }
 
     #[test]
