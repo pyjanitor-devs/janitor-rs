@@ -15,6 +15,19 @@ fn validate_inputs<T>(
     Ok(())
 }
 
+/// Choose the sweep only when it has enough repeated work to repay its
+/// per-row event metadata. The 8x margin is conservative and was selected
+/// from the tiny/large/very-large/narrow benchmark matrix; saturating
+/// arithmetic keeps the estimate safe for very large dimensions.
+///
+/// ELI5: set up the shortcut only when there are enough repeated chores to
+/// make the setup worthwhile.
+fn should_sweep(rows: usize, width: usize) -> bool {
+    let repeated_work = rows.saturating_mul(width);
+    let sweep_work = rows.saturating_add(width);
+    repeated_work > sweep_work.saturating_mul(8)
+}
+
 /// Groups reverse-minimum starts by compact candidate ordinal.
 ///
 /// ELI5: every suffix touches a contiguous tail of `index`, so one slot per
@@ -25,8 +38,43 @@ pub fn min_rev_starts_core<T: PartialOrd + Copy>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, starts, booleans)?;
-    let (min_start, width) = starts_domain(starts, index.len())?;
+    validate_inputs(arr, starts, index, booleans)?;
+    let min_start = starts.iter().copied().min().unwrap() as usize;
+    let width = index.len() - min_start;
+
+    if should_sweep(arr.len(), width) {
+        // ELI5: a suffix row becomes eligible when the sweep reaches its
+        // start. Bucket each row at that boundary, then compare it with the
+        // current champion only once. Flat linked buckets preserve input
+        // order, so equal values retain the old first-row tie behavior.
+        let mut head = vec![usize::MAX; width + 1];
+        let mut next = vec![usize::MAX; arr.len()];
+        for (row, start) in starts.iter().enumerate().rev() {
+            let bucket = *start as usize - min_start;
+            next[row] = head[bucket];
+            head[bucket] = row;
+        }
+        let mut positions = vec![-1_i64; width];
+        let mut current_winner: Option<(T, i64)> = None;
+        for (bucket, _) in head.iter().enumerate().take(width) {
+            let mut row = head[bucket];
+            while row != usize::MAX {
+                let current = arr[row];
+                if !booleans[row]
+                    && (current_winner.is_none() || current < current_winner.as_ref().unwrap().0)
+                {
+                    current_winner = Some((current, row as i64));
+                }
+                row = next[row];
+            }
+            if let Some((_, row)) = current_winner {
+                positions[bucket] = row;
+            }
+        }
+        let indexers = (min_start..index.len()).map(|item| index[item]).collect();
+        return Ok((indexers, Array1::from_vec(positions)));
+    }
+
     let mut values = vec![arr[0]; width];
     let mut positions = vec![-1_i64; width];
 

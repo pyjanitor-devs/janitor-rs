@@ -15,6 +15,19 @@ fn validate_inputs<T>(
     Ok(())
 }
 
+/// Choose the sweep only when it has enough repeated work to repay its
+/// per-row event metadata. The 8x margin is conservative and was selected
+/// from the tiny/large/very-large/narrow benchmark matrix; saturating
+/// arithmetic keeps the estimate safe for very large dimensions.
+///
+/// ELI5: set up the shortcut only when there are enough repeated chores to
+/// make the setup worthwhile.
+fn should_sweep(rows: usize, width: usize) -> bool {
+    let repeated_work = rows.saturating_mul(width);
+    let sweep_work = rows.saturating_add(width);
+    repeated_work > sweep_work.saturating_mul(8)
+}
+
 /// Groups reverse-minimum ends by compact candidate ordinal.
 ///
 /// ELI5: every prefix touches the same contiguous range beginning at zero,
@@ -25,8 +38,42 @@ pub fn min_rev_ends_core<T: PartialOrd + Copy>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, ends, booleans)?;
-    let max_end = ends_domain(ends, index.len())?;
+    validate_inputs(arr, ends, index, booleans)?;
+    let max_end = ends.iter().copied().max().unwrap() as usize;
+
+    if should_sweep(arr.len(), max_end) {
+        // ELI5: a prefix row is eligible while the sweep is left of its end.
+        // Bucket each row at its end, activate it once while sweeping from
+        // right to left, and retain the current minimum. Flat linked buckets
+        // preserve input order, so equal values retain the old first-row tie
+        // behavior.
+        let mut head = vec![usize::MAX; max_end + 1];
+        let mut next = vec![usize::MAX; arr.len()];
+        for (row, end) in ends.iter().enumerate().rev() {
+            next[row] = head[*end as usize];
+            head[*end as usize] = row;
+        }
+        let mut positions = vec![-1_i64; max_end];
+        let mut current_winner: Option<(T, i64)> = None;
+        for position in (0..max_end).rev() {
+            let mut row = head[position + 1];
+            while row != usize::MAX {
+                let current = arr[row];
+                if !booleans[row]
+                    && (current_winner.is_none() || current < current_winner.as_ref().unwrap().0)
+                {
+                    current_winner = Some((current, row as i64));
+                }
+                row = next[row];
+            }
+            if let Some((_, row)) = current_winner {
+                positions[position] = row;
+            }
+        }
+        let indexers = (0..max_end).map(|item| index[item]).collect();
+        return Ok((indexers, Array1::from_vec(positions)));
+    }
+
     let mut values = vec![arr[0]; max_end];
     let mut positions = vec![-1_i64; max_end];
 
