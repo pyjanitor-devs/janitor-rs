@@ -27,18 +27,24 @@ pub fn size_rev_ends_core(
     // naturally has no activation bucket visited by the output loop. Counts
     // are enough here, so memory depends on the compact output width—not the
     // number of rows in the batch.
-    let mut events = vec![0_i64; max_end + 1];
+    // Store each non-empty prefix at its final covered position. This lets
+    // the right-to-left sweep overwrite the event after reading it, so the
+    // output and event counts share one allocation. `end == 0` is an empty
+    // prefix and has no event to record.
+    let mut events = vec![0_i64; max_end];
     for end in ends {
-        events[*end as usize] += 1;
+        let end = *end as usize;
+        if end > 0 {
+            events[end - 1] += 1;
+        }
     }
 
     let mut running = 0_i64;
-    let mut result = vec![0_i64; max_end];
-    for position in (0..max_end).rev() {
-        running += events[position + 1];
-        result[position] = running;
+    for event in events.iter_mut().rev() {
+        running += *event;
+        *event = running;
     }
-    Ok((ends_labels(max_end, index), Array1::from_vec(result)))
+    Ok((ends_labels(max_end, index), Array1::from_vec(events)))
 }
 
 /// Count how many reverse-start rows cover each compact suffix position.
@@ -50,16 +56,6 @@ pub fn size_rev_starts_core(
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    if starts.is_empty() || index.is_empty() {
-        return Err("starts and index cannot be empty");
-    }
-    if starts.iter().any(|start| {
-        usize::try_from(*start)
-            .map(|start| start > index.len())
-            .unwrap_or(true)
-    }) {
-        return Err("starts must satisfy 0 <= start <= right_len");
-    }
     let (min_start, width) = starts_domain(starts, index.len())?;
     // ELI5: a suffix row is active from its start onward. Count rows at each
     // start boundary, then sweep those boundaries once while carrying the
