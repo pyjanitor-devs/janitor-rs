@@ -6,7 +6,6 @@ use pyo3::prelude::*;
 use crate::aggs::{
     checked_range, ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches,
 };
-use std::collections::HashMap;
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
@@ -52,8 +51,23 @@ macro_rules! compute {
                 .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
                 .sum();
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
-            let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(index.len());
+            // The fold below finds the smallest enclosing valid slice.
+            // ELI5: it stretches one ruler just enough to cover every range.
+            // Ranges point directly at right-side rows, so each row in
+            // the smallest enclosing slice gets a bucket. `seen` preserves a
+            // matched label even when its row is null or has zero count.
+            let (min_start, max_end) = starts
+                .iter()
+                .zip(ends.iter())
+                .filter_map(|(s, e)| checked_range(*s, *e, index.len()))
+                .fold((usize::MAX, 0), |(min_start, max_end), (start, end)| {
+                    (min_start.min(start), max_end.max(end))
+                });
+            let width = max_end.saturating_sub(min_start);
+            let mut seen = vec![false; width];
+            let mut touched = Vec::new();
+            let mut best_positions = vec![-1_i64; width];
+            let mut best_values: Vec<Option<$type>> = vec![None; width];
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -71,27 +85,27 @@ macro_rules! compute {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    let base = dictionary.entry(pos).or_insert(-1);
-                    let base_val = mapping.entry(pos).or_insert(*current);
+                    let slot = item - min_start;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        touched.push(slot);
+                        best_values[slot] = Some(*current);
+                    }
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
                     }
-                    if (*base == -1) || (*current > *base_val) {
-                        *base_val = *current;
-                        *base = posn as i64;
+                    if (best_positions[slot] == -1)
+                        || (*current > best_values[slot].expect("seen slot has a value"))
+                    {
+                        best_values[slot] = Some(*current);
+                        best_positions[slot] = posn as i64;
                     }
                     n += 1;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<i64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let indexers = Array1::from_iter(touched.iter().map(|&slot| index[min_start + slot]));
+            let result = Array1::from_iter(touched.iter().map(|&slot| best_positions[slot]));
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
