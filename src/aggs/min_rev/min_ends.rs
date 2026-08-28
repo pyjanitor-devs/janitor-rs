@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result};
+use crate::aggs::{ends_labels, into_starts_ends_result};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -38,7 +38,7 @@ pub fn min_rev_ends_core<T: PartialOrd + Copy>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, ends, index, booleans)?;
+    validate_inputs(arr, ends, booleans)?;
     let max_end = ends.iter().copied().max().unwrap() as usize;
 
     if should_sweep(arr.len(), max_end) {
