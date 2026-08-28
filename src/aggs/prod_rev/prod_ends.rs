@@ -28,15 +28,23 @@ pub fn prod_rev_ends_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
 ) -> Result<(Array1<i64>, Array1<A>), &'static str> {
     validate_inputs(arr, ends, booleans)?;
     let max_end = ends_domain(ends, index.len())?;
-    let mut values = vec![A::ONE; max_end];
+    // ELI5: a prefix row joins the running product just to the left of its
+    // end. Combine rows at the same end into one product event, then sweep
+    // right-to-left and apply each event once. Wrapping multiplication is
+    // associative, so no per-row `next` metadata is needed; `end == 0` has
+    // no emitted slot and therefore contributes nothing.
+    let mut events = vec![1_i64; max_end + 1];
     for ((current, end), boolean) in arr.iter().zip(ends.iter()).zip(booleans.iter()) {
-        if *boolean {
-            continue;
+        if !*boolean {
+            let bucket = *end as usize;
+            events[bucket] = events[bucket].wrapping_mul(to_i64(*current));
         }
-        let current = convert(*current);
-        for value in values.iter_mut().take(*end as usize) {
-            *value = value.wrap_mul(current);
-        }
+    }
+    let mut running = 1_i64;
+    let mut values = vec![1_i64; max_end];
+    for position in (0..max_end).rev() {
+        running = running.wrapping_mul(events[position + 1]);
+        values[position] = running;
     }
     Ok((ends_labels(max_end, index), Array1::from_vec(values)))
 }
@@ -50,6 +58,12 @@ pub fn prod_rev_ends_float_core<T: Copy, F: FnMut(T) -> f64>(
 ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
     validate_inputs(arr, ends, booleans)?;
     let max_end = ends_domain(ends, index.len())?;
+    // Keep floats on the direct nested loop. Unlike integer wrapping
+    // multiplication, IEEE-754 multiplication is not safely regroupable:
+    // changing the order can change rounding and the propagation of NaN or
+    // infinity. ELI5: integer products are exact on a wrapping number wheel,
+    // but decimal-like floats can give a different answer when we rearrange
+    // the multiplication, so this path preserves the old row/position order.
     let mut values = vec![1_f64; max_end];
     for ((current, end), boolean) in arr.iter().zip(ends.iter()).zip(booleans.iter()) {
         if *boolean {
@@ -209,5 +223,22 @@ mod tests {
             ),
             Ok((array![], array![]))
         );
+    }
+
+    #[test]
+    fn integer_sweep_preserves_products_and_zero_width_rows() {
+        let arr = Array1::from_elem(100, 2_i64);
+        let mut ends = Array1::from_elem(100, 1000_i64);
+        ends[99] = 0;
+        let index = Array1::from_iter(0_i64..1000);
+        let booleans = Array1::from_elem(100, false);
+        let got = prod_rev_ends_int_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        );
+        assert_eq!(got.unwrap().1, Array1::from_elem(1000, 0_i64));
     }
 }
