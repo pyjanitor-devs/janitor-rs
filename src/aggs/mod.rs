@@ -130,10 +130,12 @@ pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<
 /// ELI5: build the shortcut only when there are enough repeated chores to
 /// make the setup worthwhile, and do not trade a tiny job for a huge bucket
 /// of row links.
-pub(crate) fn should_sweep(rows: usize, width: usize) -> bool {
+pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool {
     let repeated_work = rows.saturating_mul(width);
     let sweep_work = rows.saturating_add(width);
-    let direct_bytes = width.saturating_mul(2 * std::mem::size_of::<i64>());
+    // The direct path keeps one value and one row position per output slot.
+    // The labels are common to both paths, so they are intentionally omitted.
+    let direct_bytes = width.saturating_mul(value_size + std::mem::size_of::<i64>());
     let sweep_metadata = rows
         .saturating_add(width.saturating_add(1))
         .saturating_mul(std::mem::size_of::<usize>());
@@ -147,6 +149,11 @@ pub(crate) fn should_sweep(rows: usize, width: usize) -> bool {
 /// the output buckets in order while carrying the best row seen so far. The
 /// two small closures describe the starts/ends-specific bucket numbering;
 /// the winner and tie-breaking logic lives here exactly once.
+///
+/// `booleans` is the null mask supplied by pyjanitor. In particular, pyjanitor
+/// marks floating-point NaN values as null before calling this backend, so the
+/// kernel deliberately relies on that mask rather than implementing a second
+/// NaN policy for every supported dtype.
 pub(crate) fn sweep_min<T, RowBucket, OutputBucket, OutputPositions>(
     arr: ArrayView1<'_, T>,
     booleans: ArrayView1<'_, bool>,
@@ -174,6 +181,10 @@ where
     for position in output_positions {
         let mut row = head[output_bucket(position)];
         while row != usize::MAX {
+            if booleans[row] {
+                row = next[row];
+                continue;
+            }
             let current = arr[row];
             let replaces_winner = match current_winner.as_ref() {
                 None => true,
@@ -182,7 +193,7 @@ where
                         || (current == *winner_value && (row as i64) < *winner_row)
                 }
             };
-            if !booleans[row] && replaces_winner {
+            if replaces_winner {
                 current_winner = Some((current, row as i64));
             }
             row = next[row];
@@ -392,8 +403,9 @@ mod sweep_tests {
 
     #[test]
     fn sweep_gate_accounts_for_row_link_memory() {
-        assert!(!should_sweep(1_000_000, 9));
-        assert!(should_sweep(1_000, 10_000));
+        assert!(!should_sweep(1_000_000, 9, std::mem::size_of::<i64>()));
+        assert!(!should_sweep(1_000_000, 9, std::mem::size_of::<u8>()));
+        assert!(should_sweep(1_000, 10_000, std::mem::size_of::<i64>()));
     }
 
     #[test]

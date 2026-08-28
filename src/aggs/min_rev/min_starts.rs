@@ -28,11 +28,12 @@ pub fn min_rev_starts_core<T: PartialOrd + Copy>(
     validate_inputs(arr, starts, booleans)?;
     let (min_start, width) = starts_domain(starts, index.len())?;
 
-    if should_sweep(arr.len(), width) {
+    if should_sweep(arr.len(), width, std::mem::size_of::<T>()) {
         // ELI5: a suffix row becomes eligible when the sweep reaches its
         // start. Bucket each row at that boundary, then compare it with the
-        // current champion only once. Flat linked buckets preserve input
-        // order, so equal values retain the old first-row tie behavior.
+        // current champion only once. Equal values are explicitly resolved by
+        // the smallest input row index in `sweep_min`, matching the direct
+        // path regardless of bucket traversal order.
         let positions = sweep_min(
             arr,
             booleans,

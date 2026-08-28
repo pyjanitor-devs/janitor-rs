@@ -28,12 +28,12 @@ pub fn min_rev_ends_core<T: PartialOrd + Copy>(
     validate_inputs(arr, ends, booleans)?;
     let max_end = ends_domain(ends, index.len())?;
 
-    if should_sweep(arr.len(), max_end) {
+    if should_sweep(arr.len(), max_end, std::mem::size_of::<T>()) {
         // ELI5: a prefix row is eligible while the sweep is left of its end.
         // Bucket each row at its end, activate it once while sweeping from
-        // right to left, and retain the current minimum. Flat linked buckets
-        // preserve input order, so equal values retain the old first-row tie
-        // behavior.
+        // right to left, and retain the current minimum. Equal values are
+        // explicitly resolved by the smallest input row index in `sweep_min`,
+        // matching the direct path regardless of bucket traversal order.
         let positions = sweep_min(
             arr,
             booleans,
