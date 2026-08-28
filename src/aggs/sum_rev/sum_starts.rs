@@ -67,7 +67,6 @@ macro_rules! compute_ints {
             starts: PyReadonlyArray1<'py, i64>,
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)>
         // The macro will expand into the contents of this block.
         {
@@ -83,11 +82,6 @@ macro_rules! compute_ints {
                 "booleans",
                 booleans.as_array().len(),
             )?;
-            // `length` (== `ends - starts.min()`) is only a row-count the
-            // caller already knows; the kernel derives its own safe bound
-            // from `index.len()` instead of trusting this number -- see
-            // the doc comment on `sum_rev_starts_int_core`.
-            let _ = length;
             into_starts_ends_result(
                 py,
                 sum_rev_starts_int_core(
@@ -166,7 +160,6 @@ macro_rules! compute_floats {
             starts: PyReadonlyArray1<'py, i64>,
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>
         // The macro will expand into the contents of this block.
         {
@@ -182,7 +175,6 @@ macro_rules! compute_floats {
                 "booleans",
                 booleans.as_array().len(),
             )?;
-            let _ = length;
             into_starts_ends_result(
                 py,
                 sum_rev_starts_float_core(
