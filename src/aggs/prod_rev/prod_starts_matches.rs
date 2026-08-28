@@ -27,11 +27,15 @@ fn expected_matches_width(starts: ArrayView1<'_, i64>, right_len: usize) -> PyRe
 }
 
 macro_rules! compute_ints {
-    ($fname:ident, $type:ty) => {
+    ($fname:ident, $type:ty, $acc:ty) => {
         /// `index`, `counts`, and `matches` are trusted outputs of the
         /// conditional-join boundary and are expected to be non-negative.
         /// `matches == 0` excludes a candidate; non-zero values are treated
         /// as live without a second validation pass over the tape.
+        ///
+        /// The accumulator type `$acc` is `i64` for every dtype except
+        /// `uint64`, which uses `u64` so values `>= 2**63` don't get
+        /// sign-flipped by a forced `i64` cast (issue #90's bug class).
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -41,7 +45,7 @@ macro_rules! compute_ints {
             index: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)>
         // The macro will expand into the contents of this block.
         {
             let arr = arr.as_array();
@@ -77,7 +81,7 @@ macro_rules! compute_ints {
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
             let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
             let mut labels = Vec::new();
-            let mut totals = Vec::new();
+            let mut totals: Vec<$acc> = Vec::new();
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -87,7 +91,7 @@ macro_rules! compute_ints {
             let mut n: usize = 0;
             for (current, start, count, boolean) in zipped {
                 let start_ = *start as usize;
-                let current_ = *current as i64;
+                let current_ = *current as $acc;
                 for item in start_..end_ {
                     if (matches[n] == 0) {
                         n += 1;
@@ -100,7 +104,7 @@ macro_rules! compute_ints {
                         let slot = totals.len();
                         slots.insert(pos, slot);
                         labels.push(pos);
-                        totals.push(1_i64);
+                        totals.push(1);
                         slot
                     };
                     if (*boolean) || (*count == 0) {
@@ -122,14 +126,16 @@ macro_rules! compute_ints {
     };
 }
 
-compute_ints!(compute_prod_rev_start_match_int64, i64);
-compute_ints!(compute_prod_rev_start_match_int32, i32);
-compute_ints!(compute_prod_rev_start_match_int16, i16);
-compute_ints!(compute_prod_rev_start_match_int8, i8);
-compute_ints!(compute_prod_rev_start_match_uint64, u64);
-compute_ints!(compute_prod_rev_start_match_uint32, u32);
-compute_ints!(compute_prod_rev_start_match_uint16, u16);
-compute_ints!(compute_prod_rev_start_match_uint8, u8);
+// `uint64` is the one dtype whose accumulator is `u64` instead of `i64` --
+// see the macro's doc comment. Every other dtype fits inside `i64` losslessly.
+compute_ints!(compute_prod_rev_start_match_int64, i64, i64);
+compute_ints!(compute_prod_rev_start_match_int32, i32, i64);
+compute_ints!(compute_prod_rev_start_match_int16, i16, i64);
+compute_ints!(compute_prod_rev_start_match_int8, i8, i64);
+compute_ints!(compute_prod_rev_start_match_uint64, u64, u64);
+compute_ints!(compute_prod_rev_start_match_uint32, u32, i64);
+compute_ints!(compute_prod_rev_start_match_uint16, u16, i64);
+compute_ints!(compute_prod_rev_start_match_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
@@ -248,10 +254,43 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_prod_rev_start_match_int64, expected_matches_width};
+    use super::{
+        compute_prod_rev_start_match_int64, compute_prod_rev_start_match_uint64,
+        expected_matches_width,
+    };
     use numpy::ndarray::array;
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::Python;
+
+    #[test]
+    fn u64_accumulator_preserves_values_at_and_above_i64_max() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+            let value = (i64::MAX as u64) + 5;
+            let arr = PyArray1::from_vec(py, vec![value]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let counts = PyArray1::from_vec(py, vec![1_i64]);
+            let index = PyArray1::from_vec(py, vec![10_i64]);
+            let matches = PyArray1::from_vec(py, vec![1_i8]);
+            let booleans = PyArray1::from_vec(py, vec![false]);
+            let (labels, values) = compute_prod_rev_start_match_uint64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .unwrap();
+            assert_eq!(labels.readonly().as_slice().unwrap(), &[10]);
+            assert_eq!(values.readonly().as_slice().unwrap(), &[value]);
+        });
+    }
 
     #[test]
     fn computes_zero_width_start_at_index_length() {

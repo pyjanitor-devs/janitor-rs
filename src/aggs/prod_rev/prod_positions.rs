@@ -3,7 +3,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_index, checked_range, ensure_equal_lengths};
+use crate::aggs::{checked_index, checked_range, ensure_equal_lengths, WrapMul};
 use std::collections::HashMap;
 
 /// Multiply values for each label reached through the positions tape.
@@ -11,8 +11,11 @@ use std::collections::HashMap;
 /// ELI5: the HashMap gives each label a compact slot, while labels and
 /// products live in Vecs. New labels start at the multiplicative identity 1.
 /// Integer products use wrapping arithmetic, so overflow has the same
-/// deterministic result in debug and release builds.
-pub fn prod_positions_int_core<T, F>(
+/// deterministic result in debug and release builds. `A` is the accumulator
+/// type: every integer dtype instantiates this with `A = i64`, except
+/// `uint64`, which instantiates it with `A = u64` so values `>= 2**63`
+/// don't get sign-flipped by a forced `i64` cast (see `WrapMul`).
+pub fn prod_positions_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
@@ -21,10 +24,11 @@ pub fn prod_positions_int_core<T, F>(
     booleans: ArrayView1<'_, bool>,
     capacity: usize,
     to_value: F,
-) -> (Vec<i64>, Vec<i64>)
+) -> (Vec<i64>, Vec<A>)
 where
     T: Copy,
-    F: Fn(T) -> i64,
+    A: WrapMul,
+    F: Fn(T) -> A,
 {
     let capacity = capacity.min(index.len()).min(positions.len());
     let mut slots: HashMap<i64, usize> = HashMap::with_capacity(capacity);
@@ -51,7 +55,7 @@ where
                     let slot = labels.len();
                     entry.insert(slot);
                     labels.push(label);
-                    products.push(1_i64);
+                    products.push(A::ONE);
                     slot
                 }
             };
@@ -59,7 +63,7 @@ where
                 // ELI5: use the same defined wraparound arithmetic as the
                 // forward kernel, so debug and release builds agree when an
                 // integer product exceeds its type's range.
-                products[slot] = products[slot].wrapping_mul(current_);
+                products[slot] = products[slot].wrap_mul(current_);
             }
         }
     }
@@ -118,7 +122,7 @@ where
 }
 
 macro_rules! compute_ints {
-    ($fname:ident, $type:ty) => {
+    ($fname:ident, $type:ty, $acc:ty) => {
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -128,7 +132,7 @@ macro_rules! compute_ints {
             index: PyReadonlyArray1<'py, i64>,
             positions: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)>
         // The macro will expand into the contents of this block.
         {
             let arr = arr.as_array();
@@ -153,7 +157,7 @@ macro_rules! compute_ints {
                 positions,
                 booleans,
                 index.len().min(positions.len()),
-                |value| value as i64,
+                |value| value as $acc,
             );
             let indexers = Array1::from_vec(labels);
             let result = Array1::from_vec(products);
@@ -162,14 +166,16 @@ macro_rules! compute_ints {
     };
 }
 
-compute_ints!(compute_prod_rev_positions_int64, i64);
-compute_ints!(compute_prod_rev_positions_int32, i32);
-compute_ints!(compute_prod_rev_positions_int16, i16);
-compute_ints!(compute_prod_rev_positions_int8, i8);
-compute_ints!(compute_prod_rev_positions_uint64, u64);
-compute_ints!(compute_prod_rev_positions_uint32, u32);
-compute_ints!(compute_prod_rev_positions_uint16, u16);
-compute_ints!(compute_prod_rev_positions_uint8, u8);
+// `uint64` is the one dtype whose accumulator is `u64` instead of `i64` --
+// see `WrapMul`'s doc comment. Every other dtype fits inside `i64` losslessly.
+compute_ints!(compute_prod_rev_positions_int64, i64, i64);
+compute_ints!(compute_prod_rev_positions_int32, i32, i64);
+compute_ints!(compute_prod_rev_positions_int16, i16, i64);
+compute_ints!(compute_prod_rev_positions_int8, i8, i64);
+compute_ints!(compute_prod_rev_positions_uint64, u64, u64);
+compute_ints!(compute_prod_rev_positions_uint32, u32, i64);
+compute_ints!(compute_prod_rev_positions_uint16, u16, i64);
+compute_ints!(compute_prod_rev_positions_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
@@ -333,6 +339,29 @@ mod tests {
 
         assert_eq!(labels, vec![4]);
         assert_eq!(products, vec![1.0]);
+    }
+
+    #[test]
+    fn u64_accumulator_preserves_values_at_and_above_i64_max() {
+        let value = (i64::MAX as u64) + 5;
+        let arr = array![value];
+        let starts = array![0_i64];
+        let ends = array![1_i64];
+        let index = array![5_i64];
+        let positions = array![0_i64];
+        let booleans = array![false];
+        let (labels, products) = prod_positions_int_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            index.view(),
+            positions.view(),
+            booleans.view(),
+            1,
+            |v: u64| v,
+        );
+        assert_eq!(labels, vec![5]);
+        assert_eq!(products, vec![value]);
     }
 
     #[test]

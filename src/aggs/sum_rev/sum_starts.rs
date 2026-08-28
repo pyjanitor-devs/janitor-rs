@@ -3,7 +3,9 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ensure_equal_lengths, into_starts_ends_result, starts_domain, starts_labels};
+use crate::aggs::{
+    ensure_equal_lengths, into_starts_ends_result, starts_domain, starts_labels, WrapAdd,
+};
 
 fn validate_starts_inputs(
     arr_len: usize,
@@ -22,38 +24,42 @@ fn validate_starts_inputs(
 /// ELI5: `item` is the compact candidate ordinal used to address the
 /// accumulator, while `index[item]` is only the original right-row label to
 /// return. The slots cover the union of all suffixes, so their count is the
-/// touched width rather than the full right domain.
-pub fn sum_rev_starts_int_core<T, F>(
+/// touched width rather than the full right domain. `A` is the accumulator
+/// type: every integer dtype instantiates this with `A = i64`, except
+/// `uint64`, which instantiates it with `A = u64` so values `>= 2**63`
+/// don't get sign-flipped by a forced `i64` cast (see `WrapAdd`).
+pub fn sum_rev_starts_int_core<T, A, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
     index: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
-    mut to_i64: F,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str>
+    mut convert: F,
+) -> Result<(Array1<i64>, Array1<A>), &'static str>
 where
     T: Copy,
-    F: FnMut(T) -> i64,
+    A: WrapAdd,
+    F: FnMut(T) -> A,
 {
     validate_starts_inputs(arr.len(), starts.len(), booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
-    let mut values = vec![0_i64; width];
+    let mut values = vec![A::ZERO; width];
     let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
     for (current, start, boolean) in zipped {
-        let current_ = to_i64(*current);
+        let current_ = convert(*current);
         for value in values.iter_mut().skip(*start as usize - min_start) {
             // Every valid suffix position is already part of the contiguous
             // output domain; a null left value contributes zero to its slot.
             if *boolean {
                 continue;
             }
-            *value = value.wrapping_add(current_);
+            *value = value.wrap_add(current_);
         }
     }
     Ok((starts_labels(min_start, index), Array1::from_vec(values)))
 }
 
 macro_rules! compute_ints {
-    ($fname:ident, $type:ty) => {
+    ($fname:ident, $type:ty, $acc:ty) => {
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -62,7 +68,7 @@ macro_rules! compute_ints {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
             length: i64,
-        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)>
         // The macro will expand into the contents of this block.
         {
             ensure_equal_lengths(
@@ -89,21 +95,23 @@ macro_rules! compute_ints {
                     starts.as_array(),
                     index.as_array(),
                     booleans.as_array(),
-                    |value| value as i64,
+                    |value| value as $acc,
                 ),
             )
         }
     };
 }
 
-compute_ints!(compute_sum_rev_start_int64, i64);
-compute_ints!(compute_sum_rev_start_int32, i32);
-compute_ints!(compute_sum_rev_start_int16, i16);
-compute_ints!(compute_sum_rev_start_int8, i8);
-compute_ints!(compute_sum_rev_start_uint64, u64);
-compute_ints!(compute_sum_rev_start_uint32, u32);
-compute_ints!(compute_sum_rev_start_uint16, u16);
-compute_ints!(compute_sum_rev_start_uint8, u8);
+// `uint64` is the one dtype whose accumulator is `u64` instead of `i64` --
+// see `WrapAdd`'s doc comment. Every other dtype fits inside `i64` losslessly.
+compute_ints!(compute_sum_rev_start_int64, i64, i64);
+compute_ints!(compute_sum_rev_start_int32, i32, i64);
+compute_ints!(compute_sum_rev_start_int16, i16, i64);
+compute_ints!(compute_sum_rev_start_int8, i8, i64);
+compute_ints!(compute_sum_rev_start_uint64, u64, u64);
+compute_ints!(compute_sum_rev_start_uint32, u32, i64);
+compute_ints!(compute_sum_rev_start_uint16, u16, i64);
+compute_ints!(compute_sum_rev_start_uint8, u8, i64);
 
 /// Pure-Rust reverse-sum core for the float path.
 ///
@@ -304,6 +312,21 @@ mod tests {
         .unwrap();
         assert_eq!(indexers, array![0]);
         assert!((result[0] - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn u64_accumulator_preserves_values_at_and_above_i64_max() {
+        let value = (i64::MAX as u64) + 5;
+        let (indexers, result) = sum_rev_starts_int_core(
+            array![value].view(),
+            array![0_i64].view(),
+            array![20_i64].view(),
+            array![false].view(),
+            |v: u64| v,
+        )
+        .unwrap();
+        assert_eq!(indexers, array![20]);
+        assert_eq!(result, array![value]);
     }
 
     #[test]

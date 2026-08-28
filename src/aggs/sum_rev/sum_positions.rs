@@ -3,7 +3,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_index, checked_range, ensure_equal_lengths};
+use crate::aggs::{checked_index, checked_range, ensure_equal_lengths, WrapAdd};
 use std::collections::HashMap;
 
 /// Accumulate integer values for the indirect ranges in `positions`.
@@ -12,8 +12,11 @@ use std::collections::HashMap;
 /// actual labels and totals live side-by-side in Vecs, so duplicate labels do
 /// not require a separate hash entry or a second lookup when producing the
 /// result. Integer totals use wrapping arithmetic, so overflow has the same
-/// deterministic result in debug and release builds.
-pub fn sum_positions_int_core<T, F>(
+/// deterministic result in debug and release builds. `A` is the accumulator
+/// type: every integer dtype instantiates this with `A = i64`, except
+/// `uint64`, which instantiates it with `A = u64` so values `>= 2**63`
+/// don't get sign-flipped by a forced `i64` cast (see `WrapAdd`).
+pub fn sum_positions_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
@@ -21,11 +24,12 @@ pub fn sum_positions_int_core<T, F>(
     positions: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     capacity: usize,
-    to_i64: F,
-) -> (Vec<i64>, Vec<i64>)
+    to_acc: F,
+) -> (Vec<i64>, Vec<A>)
 where
     T: Copy,
-    F: Fn(T) -> i64,
+    A: WrapAdd,
+    F: Fn(T) -> A,
 {
     let capacity = capacity.min(index.len()).min(positions.len());
     let mut slots: HashMap<i64, usize> = HashMap::with_capacity(capacity);
@@ -41,7 +45,7 @@ where
         let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
             continue;
         };
-        let current_ = to_i64(*current);
+        let current_ = to_acc(*current);
         for nn in start_..end_ {
             let Some(indexer_) = checked_index(positions[nn], index.len()) else {
                 continue;
@@ -53,7 +57,7 @@ where
                     let slot = labels.len();
                     entry.insert(slot);
                     labels.push(label);
-                    totals.push(0_i64);
+                    totals.push(A::ZERO);
                     slot
                 }
             };
@@ -61,7 +65,7 @@ where
                 // ELI5: once a label's bucket is found, add in the same
                 // wraparound style as the forward kernel. This keeps a very
                 // large integer from panicking only in debug/test builds.
-                totals[slot] = totals[slot].wrapping_add(current_);
+                totals[slot] = totals[slot].wrap_add(current_);
             }
         }
     }
@@ -139,7 +143,7 @@ where
 }
 
 macro_rules! compute_ints {
-    ($fname:ident, $type:ty) => {
+    ($fname:ident, $type:ty, $acc:ty) => {
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -149,7 +153,7 @@ macro_rules! compute_ints {
             index: PyReadonlyArray1<'py, i64>,
             positions: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)>
         // The macro will expand into the contents of this block.
         {
             let arr = arr.as_array();
@@ -174,7 +178,7 @@ macro_rules! compute_ints {
                 positions,
                 booleans,
                 index.len().min(positions.len()),
-                |value| value as i64,
+                |value| value as $acc,
             );
             let indexers = Array1::from_vec(labels);
             let result = Array1::from_vec(totals);
@@ -183,14 +187,16 @@ macro_rules! compute_ints {
     };
 }
 
-compute_ints!(compute_sum_rev_positions_int64, i64);
-compute_ints!(compute_sum_rev_positions_int32, i32);
-compute_ints!(compute_sum_rev_positions_int16, i16);
-compute_ints!(compute_sum_rev_positions_int8, i8);
-compute_ints!(compute_sum_rev_positions_uint64, u64);
-compute_ints!(compute_sum_rev_positions_uint32, u32);
-compute_ints!(compute_sum_rev_positions_uint16, u16);
-compute_ints!(compute_sum_rev_positions_uint8, u8);
+// `uint64` is the one dtype whose accumulator is `u64` instead of `i64` --
+// see `WrapAdd`'s doc comment. Every other dtype fits inside `i64` losslessly.
+compute_ints!(compute_sum_rev_positions_int64, i64, i64);
+compute_ints!(compute_sum_rev_positions_int32, i32, i64);
+compute_ints!(compute_sum_rev_positions_int16, i16, i64);
+compute_ints!(compute_sum_rev_positions_int8, i8, i64);
+compute_ints!(compute_sum_rev_positions_uint64, u64, u64);
+compute_ints!(compute_sum_rev_positions_uint32, u32, i64);
+compute_ints!(compute_sum_rev_positions_uint16, u16, i64);
+compute_ints!(compute_sum_rev_positions_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
@@ -335,6 +341,29 @@ mod tests {
 
         assert_eq!(labels, vec![5]);
         assert!((totals[0] - 0.6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn u64_accumulator_preserves_values_at_and_above_i64_max() {
+        let value = (i64::MAX as u64) + 5;
+        let arr = array![value];
+        let starts = array![0_i64];
+        let ends = array![1_i64];
+        let index = array![5_i64];
+        let positions = array![0_i64];
+        let booleans = array![false];
+        let (labels, totals) = sum_positions_int_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            index.view(),
+            positions.view(),
+            booleans.view(),
+            1,
+            |v: u64| v,
+        );
+        assert_eq!(labels, vec![5]);
+        assert_eq!(totals, vec![value]);
     }
 
     #[test]
