@@ -44,35 +44,34 @@ where
     validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
     let min_start = starts.iter().copied().min().unwrap() as usize;
     let width = end_ - min_start;
+
     // ELI5: a suffix starts once and then stays active. Instead of adding a
-    // row's value to every later output slot, put the row in the bucket where
-    // it starts and add it to one running total exactly once.
-    //
-    // `head`/`next` are flat linked buckets. They avoid the many small heap
-    // allocations that `Vec<Vec<usize>>` would require. The final bucket is
-    // reserved for start == end_, a valid zero-width suffix which is never
-    // emitted and therefore never activated.
-    let mut head = vec![usize::MAX; width + 1];
-    let mut next = vec![usize::MAX; arr.len()];
-    for (row, start) in starts.iter().enumerate().rev() {
-        let bucket = *start as usize - min_start;
-        next[row] = head[bucket];
-        head[bucket] = row;
+    // row's value to every later output slot, put the row's value into the
+    // bucket where it starts and add each bucket to one running total exactly
+    // once. Integer wrapping addition is associative, so grouping values at a
+    // boundary preserves the result while using memory proportional only to
+    // the compact output width. The final bucket is reserved for start ==
+    // end_, a valid zero-width suffix which is never emitted.
+    let mut events = vec![0_i64; width + 1];
+    for (current, start, boolean) in izip!(arr, starts, booleans) {
+        if !*boolean {
+            let bucket = *start as usize - min_start;
+            events[bucket] = events[bucket].wrapping_add(to_i64(*current));
+        }
     }
 
     let mut running = 0_i64;
-    let mut values = Vec::with_capacity(width);
-    for first_row in head.iter().take(width) {
-        let mut row = *first_row;
-        while row != usize::MAX {
-            if !booleans[row] {
-                running = running.wrapping_add(to_i64(arr[row]));
-            }
-            row = next[row];
-        }
-        values.push(running);
+    let mut result = Vec::with_capacity(width);
+    for event in events.iter().take(width) {
+        running = running.wrapping_add(*event);
+        result.push(running);
     }
-    Ok((starts_labels(min_start, index), Array1::from_vec(values)))
+    let mut indexers = Vec::with_capacity(width);
+    for slot in 0..width {
+        let item = min_start + slot;
+        indexers.push(index[item]);
+    }
+    Ok((Array1::from_vec(indexers), Array1::from_vec(result)))
 }
 
 macro_rules! compute_ints {

@@ -48,7 +48,14 @@ fn old_starts(
     arr: ArrayView1<'_, i64>,
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
 ) -> (Array1<i64>, Array1<i64>) {
+    assert_eq!(arr.len(), starts.len());
+    assert_eq!(arr.len(), booleans.len());
+    assert!(!arr.is_empty() && !index.is_empty());
+    assert!(starts.iter().all(|start| usize::try_from(*start)
+        .map(|start| start <= index.len())
+        .unwrap_or(false)));
     let min_start = starts.iter().copied().min().unwrap() as usize;
     let width = index.len() - min_start;
     let mut values = vec![0_i64; width];
@@ -65,7 +72,14 @@ fn old_ends(
     arr: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
 ) -> (Array1<i64>, Array1<i64>) {
+    assert_eq!(arr.len(), ends.len());
+    assert_eq!(arr.len(), booleans.len());
+    assert!(!arr.is_empty() && !index.is_empty());
+    assert!(ends.iter().all(|end| usize::try_from(*end)
+        .map(|end| end <= index.len())
+        .unwrap_or(false)));
     let max_end = ends.iter().copied().max().unwrap() as usize;
     let mut values = vec![0_i64; max_end];
     for (current, end) in arr.iter().zip(ends.iter()) {
@@ -102,7 +116,7 @@ fn bench(c: &mut Criterion) {
         };
         let booleans = Array1::from_elem(rows, false);
 
-        let old_start = old_starts(arr.view(), starts.view(), index.view());
+        let old_start = old_starts(arr.view(), starts.view(), index.view(), booleans.view());
         let new_start = sum_rev_starts_int_core(
             arr.view(),
             starts.mapv(|value| value).view(),
@@ -113,7 +127,7 @@ fn bench(c: &mut Criterion) {
         .unwrap();
         assert_eq!(old_start, new_start, "starts mismatch for {name}");
 
-        let old_end = old_ends(arr.view(), ends.view(), index.view());
+        let old_end = old_ends(arr.view(), ends.view(), index.view(), booleans.view());
         let new_end = sum_rev_ends_int_core(
             arr.view(),
             ends.view(),
@@ -124,8 +138,9 @@ fn bench(c: &mut Criterion) {
         .unwrap();
         assert_eq!(old_end, new_end, "ends mismatch for {name}");
 
-        let old_start_memory =
-            allocation_report(|| old_starts(arr.view(), starts.view(), index.view()));
+        let old_start_memory = allocation_report(|| {
+            old_starts(arr.view(), starts.view(), index.view(), booleans.view())
+        });
         let new_start_memory = allocation_report(|| {
             sum_rev_starts_int_core(
                 arr.view(),
@@ -135,7 +150,8 @@ fn bench(c: &mut Criterion) {
                 |value| value,
             )
         });
-        let old_end_memory = allocation_report(|| old_ends(arr.view(), ends.view(), index.view()));
+        let old_end_memory =
+            allocation_report(|| old_ends(arr.view(), ends.view(), index.view(), booleans.view()));
         let new_end_memory = allocation_report(|| {
             sum_rev_ends_int_core(
                 arr.view(),
@@ -163,6 +179,7 @@ fn bench(c: &mut Criterion) {
                     black_box(arr.view()),
                     black_box(starts.view()),
                     black_box(index.view()),
+                    black_box(booleans.view()),
                 )
             })
         });
@@ -183,6 +200,7 @@ fn bench(c: &mut Criterion) {
                     black_box(arr.view()),
                     black_box(ends.view()),
                     black_box(index.view()),
+                    black_box(booleans.view()),
                 )
             })
         });
