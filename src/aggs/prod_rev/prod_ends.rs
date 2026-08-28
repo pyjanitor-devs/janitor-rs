@@ -19,6 +19,7 @@ fn validate_inputs<T>(
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
 /// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
 /// `WrapMul`).
+#[allow(private_bounds)]
 pub fn prod_rev_ends_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     arr: ArrayView1<'_, T>,
     ends: ArrayView1<'_, i64>,
@@ -33,17 +34,17 @@ pub fn prod_rev_ends_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     // right-to-left and apply each event once. Wrapping multiplication is
     // associative, so no per-row `next` metadata is needed; `end == 0` has
     // no emitted slot and therefore contributes nothing.
-    let mut events = vec![1_i64; max_end + 1];
+    let mut events = vec![A::ONE; max_end + 1];
     for ((current, end), boolean) in arr.iter().zip(ends.iter()).zip(booleans.iter()) {
         if !*boolean {
             let bucket = *end as usize;
-            events[bucket] = events[bucket].wrapping_mul(to_i64(*current));
+            events[bucket] = events[bucket].wrap_mul(convert(*current));
         }
     }
-    let mut running = 1_i64;
-    let mut values = vec![1_i64; max_end];
+    let mut running = A::ONE;
+    let mut values = vec![A::ONE; max_end];
     for position in (0..max_end).rev() {
-        running = running.wrapping_mul(events[position + 1]);
+        running = running.wrap_mul(events[position + 1]);
         values[position] = running;
     }
     Ok((ends_labels(max_end, index), Array1::from_vec(values)))

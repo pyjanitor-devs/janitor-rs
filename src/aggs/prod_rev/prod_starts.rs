@@ -19,6 +19,7 @@ fn validate_inputs<T>(
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
 /// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
 /// `WrapMul`).
+#[allow(private_bounds)]
 pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -34,17 +35,17 @@ pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     // associative, so this removes the per-row `next` metadata without
     // changing the integer overflow contract. The terminal bucket represents
     // `start == index.len()` and is not emitted.
-    let mut events = vec![1_i64; width + 1];
+    let mut events = vec![A::ONE; width + 1];
     for ((current, start), boolean) in arr.iter().zip(starts.iter()).zip(booleans.iter()) {
         if !*boolean {
             let bucket = *start as usize - min_start;
-            events[bucket] = events[bucket].wrapping_mul(to_i64(*current));
+            events[bucket] = events[bucket].wrap_mul(convert(*current));
         }
     }
-    let mut running = 1_i64;
+    let mut running = A::ONE;
     let mut values = Vec::with_capacity(width);
     for event in events.iter().take(width) {
-        running = running.wrapping_mul(*event);
+        running = running.wrap_mul(*event);
         values.push(running);
     }
     Ok((starts_labels(min_start, index), Array1::from_vec(values)))
