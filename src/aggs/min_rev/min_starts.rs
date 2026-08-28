@@ -19,7 +19,7 @@ fn validate_inputs<T>(
 ///
 /// ELI5: every suffix touches a contiguous tail of `index`, so one slot per
 /// position in the union of those tails replaces both key/value HashMaps.
-pub fn min_rev_starts_core<T: PartialOrd + PartialEq + Copy>(
+pub fn min_rev_starts_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
@@ -42,16 +42,18 @@ pub fn min_rev_starts_core<T: PartialOrd + PartialEq + Copy>(
         }
         let mut positions = vec![-1_i64; width];
         let mut current_winner: Option<(T, i64)> = None;
-        for (bucket, _) in head.iter().enumerate().take(width) {
+        for bucket in 0..width {
             let mut row = head[bucket];
             while row != usize::MAX {
                 let current = arr[row];
-                if !booleans[row]
-                    && (current_winner.is_none()
-                        || current < current_winner.as_ref().unwrap().0
-                        || (current == current_winner.as_ref().unwrap().0
-                            && (row as i64) < current_winner.as_ref().unwrap().1))
-                {
+                let replaces_winner = match current_winner.as_ref() {
+                    None => true,
+                    Some((winner_value, winner_row)) => {
+                        current < *winner_value
+                            || (current == *winner_value && (row as i64) < *winner_row)
+                    }
+                };
+                if !booleans[row] && replaces_winner {
                     current_winner = Some((current, row as i64));
                 }
                 row = next[row];
@@ -176,6 +178,23 @@ mod tests {
         let got = min_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
         let expected =
             Array1::from_iter((0..20).map(|position| if position == 19 { 2 } else { 18 }));
+        assert_eq!(got, Ok((Array1::from_iter(0..20_i64), expected)));
+    }
+
+    #[test]
+    fn sweep_skips_null_rows() {
+        let mut arr = Array1::from_elem(20, 99_i64);
+        arr[2] = 7;
+        arr[18] = 0;
+        let mut starts = Array1::from_elem(20, 20_i64);
+        starts[2] = 19;
+        starts[18] = 0;
+        let index = Array1::from_iter(0..20_i64);
+        let mut booleans = Array1::from_elem(20, true);
+        booleans[2] = false;
+        let got = min_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
+        let expected =
+            Array1::from_iter((0..20).map(|position| if position == 19 { 2 } else { -1 }));
         assert_eq!(got, Ok((Array1::from_iter(0..20_i64), expected)));
     }
 
