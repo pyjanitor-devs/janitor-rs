@@ -64,6 +64,10 @@ pub fn compute_size_rev_start<'py>(
 /// `matches` must be non-empty and contain exactly one entry per candidate
 /// position. `counts_array.sum()` normally equals `matches.sum()`; the tape
 /// width is `matches.len()`.
+///
+/// `index` contains unique right-row identities. They may be reordered or
+/// contain gaps; the ordinal candidate position selects dense state, and
+/// `index[item]` is the output label.
 pub fn compute_size_rev_end_matches<'py>(
     py: Python<'py>,
     ends: PyReadonlyArray1<'py, i64>,
@@ -83,36 +87,39 @@ pub fn compute_size_rev_end_matches<'py>(
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize = ends
-        .iter()
-        .filter_map(|e| checked_end(*e, index.len()))
-        .sum();
+    let (expected_matches_width, max_end) =
+        ends.iter()
+            .fold((0_usize, 0_usize), |(width, max_end), end| {
+                checked_end(*end, index.len())
+                    .map(|end_| (width + end_, max_end.max(end_)))
+                    .unwrap_or((width, max_end))
+            });
     ensure_exact_tape_width(expected_matches_width, matches.len())?;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
-    let start_: usize = 0_usize;
+    // ELI5: a prefix ending at 8 can only touch slots 0 through 7, so state
+    // sized to `max_end` avoids reserving for an enormous right frame.
+    let mut seen = vec![false; max_end];
+    let mut touched = Vec::new();
+    let mut counts_by_item = vec![0_i64; max_end];
     let mut n: usize = 0;
     for end in ends.into_iter() {
         let Some(end_) = checked_end(*end, index.len()) else {
             continue;
         };
-        for item in start_..end_ {
+        for item in 0..end_ {
             if matches[n] == 0 {
                 n += 1;
                 continue;
             }
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
-            *total += 1;
+            if !seen[item] {
+                seen[item] = true;
+                touched.push(item);
+            }
+            counts_by_item[item] += 1;
             n += 1;
         }
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let indexers: Vec<i64> = touched.iter().map(|&item| index[item]).collect();
+    let result: Vec<i64> = touched.iter().map(|&item| counts_by_item[item]).collect();
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
@@ -276,6 +283,8 @@ pub fn compute_size_rev_start_end<'py>(
 mod tests {
     use super::*;
     use numpy::ndarray::array;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
 
     #[test]
     fn counts_prefixes_and_suffixes_in_compact_slots() {
@@ -299,6 +308,33 @@ mod tests {
         );
         assert!(size_rev_starts_core(array![-1_i64].view(), index.view()).is_err());
         assert!(size_rev_ends_core(array![1_i64].view(), array![].view()).is_err());
+    }
+
+    #[test]
+    fn dense_slots_preserve_permuted_gapped_labels_and_sparse_matches() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+
+            // ELI5: each nonzero tape entry adds one to its ordinal slot;
+            // labels are restored from `index` only when output is built.
+            let ends = PyArray1::from_vec(py, vec![3_i64, 2]);
+            let index = PyArray1::from_vec(py, vec![42_i64, 7, 100]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 0, 1, 1, 1]);
+            let (labels, counts) = compute_size_rev_end_matches(
+                py,
+                ends.readonly(),
+                index.readonly(),
+                matches.readonly(),
+            )
+            .unwrap();
+
+            assert_eq!(labels.readonly().as_slice().unwrap(), &[42, 100, 7]);
+            assert_eq!(counts.readonly().as_slice().unwrap(), &[2, 1, 1]);
+        });
     }
 }
 
