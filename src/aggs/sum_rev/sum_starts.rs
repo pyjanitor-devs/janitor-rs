@@ -28,6 +28,7 @@ fn validate_starts_inputs(
 /// type: every integer dtype instantiates this with `A = i64`, except
 /// `uint64`, which instantiates it with `A = u64` so values `>= 2**63`
 /// don't get sign-flipped by a forced `i64` cast (see `WrapAdd`).
+#[allow(private_bounds)]
 pub fn sum_rev_starts_int_core<T, A, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -42,20 +43,29 @@ where
 {
     validate_starts_inputs(arr.len(), starts.len(), booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
-    let mut values = vec![A::ZERO; width];
-    let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
-    for (current, start, boolean) in zipped {
-        let current_ = convert(*current);
-        for value in values.iter_mut().skip(*start as usize - min_start) {
-            // Every valid suffix position is already part of the contiguous
-            // output domain; a null left value contributes zero to its slot.
-            if *boolean {
-                continue;
-            }
-            *value = value.wrap_add(current_);
+
+    // ELI5: a suffix starts once and then stays active. Instead of adding a
+    // row's value to every later output slot, put the row's value into the
+    // bucket where it starts and add each bucket to one running total exactly
+    // once. Integer wrapping addition is associative, so grouping values at a
+    // boundary preserves the result while using memory proportional only to
+    // the compact output width. The final bucket is reserved for start ==
+    // end_, a valid zero-width suffix which is never emitted.
+    let mut events = vec![A::ZERO; width + 1];
+    for (current, start, boolean) in izip!(arr, starts, booleans) {
+        if !*boolean {
+            let bucket = *start as usize - min_start;
+            events[bucket] = events[bucket].wrap_add(convert(*current));
         }
     }
-    Ok((starts_labels(min_start, index), Array1::from_vec(values)))
+
+    let mut running = A::ZERO;
+    for event in events.iter_mut().take(width) {
+        running = running.wrap_add(*event);
+        *event = running;
+    }
+    events.truncate(width);
+    Ok((starts_labels(min_start, index), Array1::from_vec(events)))
 }
 
 macro_rules! compute_ints {
@@ -124,6 +134,10 @@ where
 {
     validate_starts_inputs(arr.len(), starts.len(), booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
+    // Keep the existing per-position Neumaier accumulation for floats. A
+    // single running sweep would change the original row order at positions
+    // where rows become active at different boundaries. Compensation improves
+    // stability but does not make floating-point addition associative.
     let mut slots = vec![(0.0_f64, 0.0_f64); width];
     let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
     for (current, start, boolean) in zipped {
@@ -135,12 +149,9 @@ where
             let difference = current_ - *compensation;
             let increment = *total + difference;
             *compensation = (increment - *total) - difference;
-            // adapted from pandas' cython code
-            // # GH#53606; GH#60303
-            // # If val is +/- infinity compensation is NaN
-            // # which would lead to results being NaN instead
-            // # of +/- infinity. We cannot use util.is_nan
-            // # because of no gil
+            // Adapted from pandas' cython code (GH#53606/GH#60303): if an
+            // infinity makes the compensation NaN, discard only the
+            // compensation so the actual infinity remains the result.
             if !compensation.is_finite() {
                 *compensation = 0.;
             }
@@ -319,6 +330,21 @@ mod tests {
         .unwrap();
         assert_eq!(indexers, array![20]);
         assert_eq!(result, array![value]);
+    }
+
+    #[test]
+    fn integer_accumulator_wraps_on_overflow() {
+        let (indexers, result) = sum_rev_starts_int_core(
+            array![i64::MAX, 1].view(),
+            array![0_i64, 0].view(),
+            array![0_i64].view(),
+            array![false, false].view(),
+            |value| value,
+        )
+        .unwrap();
+
+        assert_eq!(indexers, array![0]);
+        assert_eq!(result, array![i64::MIN]);
     }
 
     #[test]
