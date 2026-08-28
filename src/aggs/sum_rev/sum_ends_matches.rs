@@ -1,12 +1,9 @@
-use itertools::izip;
-use numpy::ndarray::Array1;
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
-use pyo3::prelude::*;
-use std::collections::HashMap;
-
 use crate::aggs::{
     checked_range, ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches,
 };
+use itertools::izip;
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use pyo3::prelude::*;
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
@@ -17,6 +14,10 @@ macro_rules! compute_ints {
         /// scan the tape to enforce that value-level contract. Normally
         /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
         /// full candidate-tape width.
+        ///
+        /// `index` contains unique right-row identities. They may be
+        /// reordered or contain gaps; the ordinal `item` selects dense state,
+        /// and `index[item]` is the output label.
         ///
         /// The accumulator type `$acc` is `i64` for every dtype except
         /// `uint64`, which uses `u64` so values `>= 2**63` don't get
@@ -47,12 +48,21 @@ macro_rules! compute_ints {
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = ends
-                .iter()
-                .filter_map(|e| checked_range(0, *e, index.len()).map(|(_, e_)| e_))
-                .sum();
+            let (expected_matches_width, max_end) =
+                ends.iter()
+                    .fold((0_usize, 0_usize), |(width, max_end), end| {
+                        checked_range(0, *end, index.len())
+                            .map(|(_, end_)| (width + end_, max_end.max(end_)))
+                            .unwrap_or((width, max_end))
+                    });
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut dictionary: HashMap<i64, $acc> = HashMap::with_capacity(index.len());
+            // Prefix rows can only reach ordinals below their largest `end`.
+            // ELI5: if every prefix stops at item 8, eight slots are enough;
+            // allocating one slot per right-row label would waste memory when
+            // the right frame is huge but the candidate prefixes are narrow.
+            let mut seen = vec![false; max_end];
+            let mut touched = Vec::new();
+            let mut totals = vec![0 as $acc; max_end];
             let mut n: usize = 0;
             let zipped = izip!(
                 arr.into_iter(),
@@ -83,23 +93,20 @@ macro_rules! compute_ints {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(0);
+                    if !seen[item] {
+                        seen[item] = true;
+                        touched.push(item);
+                    }
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
                     }
-                    *total += current_;
+                    totals[item] = totals[item].wrapping_add(current_);
                     n += 1;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<$acc>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let indexers: Vec<i64> = touched.iter().map(|&item| index[item]).collect();
+            let result: Vec<$acc> = touched.iter().map(|&item| totals[item]).collect();
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -125,6 +132,10 @@ macro_rules! compute_floats {
         /// scan the tape to enforce that value-level contract. Normally
         /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
         /// full candidate-tape width.
+        ///
+        /// `index` contains unique right-row identities. They may be
+        /// reordered or contain gaps; the ordinal `item` selects dense state,
+        /// and `index[item]` is the output label.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -151,13 +162,20 @@ macro_rules! compute_floats {
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = ends
-                .iter()
-                .filter_map(|e| checked_range(0, *e, index.len()).map(|(_, e_)| e_))
-                .sum();
+            let (expected_matches_width, max_end) =
+                ends.iter()
+                    .fold((0_usize, 0_usize), |(width, max_end), end| {
+                        checked_range(0, *end, index.len())
+                            .map(|(_, end_)| (width + end_, max_end.max(end_)))
+                            .unwrap_or((width, max_end))
+                    });
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(index.len());
-            let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(index.len());
+            // See the integer path above: prefix bounds make `max_end` a safe
+            // and substantially smaller dense-state capacity when applicable.
+            let mut seen = vec![false; max_end];
+            let mut touched = Vec::new();
+            let mut totals = vec![0.0_f64; max_end];
+            let mut mapping = vec![0.0_f64; max_end];
             let mut n: usize = 0;
             let zipped = izip!(
                 arr.into_iter(),
@@ -175,16 +193,17 @@ macro_rules! compute_floats {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(0.);
-                    let compensation = mapping.entry(pos).or_insert(0.);
+                    if !seen[item] {
+                        seen[item] = true;
+                        touched.push(item);
+                    }
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
                     }
-                    let difference = current_ - *compensation;
-                    let increment = *total + difference;
-                    *compensation = (increment - *total) - difference;
+                    let difference = current_ - mapping[item];
+                    let increment = totals[item] + difference;
+                    mapping[item] = (increment - totals[item]) - difference;
                     // https://github.com/pandas-dev/pandas/blob/fee326fa8338d57230f742a6d8a2ce527f3479bc/pandas/_libs/groupby.pyx#L801
                     // adapted from pandas' cython code
                     // # GH#53606; GH#60303
@@ -192,20 +211,15 @@ macro_rules! compute_floats {
                     // # which would lead to results being NaN instead
                     // # of +/- infinity. We cannot use util.is_nan
                     // # because of no gil
-                    if !compensation.is_finite() {
-                        *compensation = 0.;
+                    if !mapping[item].is_finite() {
+                        mapping[item] = 0.;
                     }
-                    *total = increment;
+                    totals[item] = increment;
                     n += 1;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<f64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let indexers: Vec<i64> = touched.iter().map(|&item| index[item]).collect();
+            let result: Vec<f64> = touched.iter().map(|&item| totals[item]).collect();
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -235,7 +249,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_sum_rev_end_match_uint64;
+    use super::{compute_sum_rev_end_match_int64, compute_sum_rev_end_match_uint64};
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::Python;
 
@@ -266,6 +280,47 @@ mod tests {
             .unwrap();
             assert_eq!(labels.readonly().as_slice().unwrap(), &[10]);
             assert_eq!(values.readonly().as_slice().unwrap(), &[value]);
+        });
+    }
+
+    #[test]
+    fn dense_slots_preserve_permuted_gapped_labels_and_sparse_matches() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+
+            // `index` contains unique row identities, but they are not
+            // positional: labels are reordered and have gaps.  The dense
+            // state must therefore be indexed by `item`, then translated
+            // back through `index[item]` only when producing output.
+            //
+            // ELI5: each `end` describes a prefix of the right table, while
+            // `matches` is one long tape containing those prefixes back to
+            // back.  The mask selects item 0 and item 2 in the first prefix,
+            // then item 0 in the second prefix.
+            let arr = PyArray1::from_vec(py, vec![5_i64, 7]);
+            let index = PyArray1::from_vec(py, vec![42_i64, 7, 100]);
+            let ends = PyArray1::from_vec(py, vec![3_i64, 2]);
+            let counts = PyArray1::from_vec(py, vec![2_i64, 1]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 0, 1, 1, 0]);
+            let booleans = PyArray1::from_vec(py, vec![false, false]);
+
+            let (labels, values) = compute_sum_rev_end_match_int64(
+                py,
+                arr.readonly(),
+                index.readonly(),
+                ends.readonly(),
+                counts.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .unwrap();
+
+            assert_eq!(labels.readonly().as_slice().unwrap(), &[42, 100]);
+            assert_eq!(values.readonly().as_slice().unwrap(), &[12, 5]);
         });
     }
 }
