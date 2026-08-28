@@ -11,32 +11,69 @@ use crate::aggs::{
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
 
-fn size_rev_ends_core(
+/// Count how many reverse-end rows cover each compact prefix position.
+///
+/// ELI5: each `end` says “this row covers everything before here.” Instead of
+/// walking that whole prefix for every row, the implementation activates rows
+/// once during a right-to-left sweep and carries the running count.
+pub fn size_rev_ends_core(
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     let max_end = ends_domain(ends, index.len())?;
-    let mut result = vec![0_i64; max_end];
+    // ELI5: a prefix row is active to the left of its end. Count how many
+    // rows end at each boundary, then sweep from right to left and carry the
+    // active-row count across the output. `end == 0` is an empty prefix and
+    // naturally has no activation bucket visited by the output loop. Counts
+    // are enough here, so memory depends on the compact output width—not the
+    // number of rows in the batch.
+    // Store each non-empty prefix at its final covered position. This lets
+    // the right-to-left sweep overwrite the event after reading it, so the
+    // output and event counts share one allocation. `end == 0` is an empty
+    // prefix and has no event to record.
+    let mut events = vec![0_i64; max_end];
     for end in ends {
-        for value in result.iter_mut().take(*end as usize) {
-            *value += 1;
+        let end = *end as usize;
+        if end > 0 {
+            events[end - 1] += 1;
         }
     }
-    Ok((ends_labels(max_end, index), Array1::from_vec(result)))
+
+    let mut running = 0_i64;
+    for event in events.iter_mut().rev() {
+        running += *event;
+        *event = running;
+    }
+    Ok((ends_labels(max_end, index), Array1::from_vec(events)))
 }
 
-fn size_rev_starts_core(
+/// Count how many reverse-start rows cover each compact suffix position.
+///
+/// ELI5: each `start` says “this row covers everything from here onward.” The
+/// implementation groups starts by boundary and sweeps those boundaries once,
+/// so wide suffixes do not cause repeated work.
+pub fn size_rev_starts_core(
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     let (min_start, width) = starts_domain(starts, index.len())?;
-    let mut result = vec![0_i64; width];
+    // ELI5: a suffix row is active from its start onward. Count rows at each
+    // start boundary, then sweep those boundaries once while carrying the
+    // active-row count. The terminal bucket represents `start ==
+    // index.len()` and is intentionally not emitted. Counts are enough, so
+    // the temporary memory is proportional to the compact output width.
+    let mut events = vec![0_i64; width + 1];
     for start in starts {
-        for value in result.iter_mut().skip(*start as usize - min_start) {
-            *value += 1;
-        }
+        events[*start as usize - min_start] += 1;
     }
-    Ok((starts_labels(min_start, index), Array1::from_vec(result)))
+
+    let mut running = 0_i64;
+    for event in events.iter_mut().take(width) {
+        running += *event;
+        *event = running;
+    }
+    events.truncate(width);
+    Ok((starts_labels(min_start, index), Array1::from_vec(events)))
 }
 
 #[pyfunction]
@@ -299,6 +336,19 @@ mod tests {
         );
         assert!(size_rev_starts_core(array![-1_i64].view(), index.view()).is_err());
         assert!(size_rev_ends_core(array![1_i64].view(), array![].view()).is_err());
+    }
+
+    #[test]
+    fn skips_zero_width_rows_without_affecting_other_rows() {
+        let index = array![10_i64, 20, 30];
+        assert_eq!(
+            size_rev_starts_core(array![1_i64, 3].view(), index.view()),
+            Ok((array![20, 30], array![1, 1]))
+        );
+        assert_eq!(
+            size_rev_ends_core(array![0_i64, 2].view(), index.view()),
+            Ok((array![10, 20], array![1, 1]))
+        );
     }
 }
 

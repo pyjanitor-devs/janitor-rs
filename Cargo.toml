@@ -61,4 +61,7 @@ harness = false
 
 [[bench]]
 name = "rev_sum_sweep"
+
+[[bench]]
+name = "rev_size_sweep"
 harness = false
