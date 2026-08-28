@@ -16,9 +16,10 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use numpy::ndarray::{Array1, ArrayView1};
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+mod support;
+use support::count_allocations;
 
 use janitor_rs::bench_support::{
     binary_search_ge_first_core, binary_search_gt_first_core, binary_search_le_first_core,
@@ -31,59 +32,6 @@ use janitor_rs::bench_support::{
     sum_start_core, sum_start_end_core, sum_start_u32_core, trim_index_core, CompareOp,
 };
 use std::collections::HashMap;
-
-/// Counts bytes, calls, and outstanding (live) bytes allocated through the
-/// global allocator, so `bench_bin_search_first` can report an allocation
-/// delta -- and `bench_bin_search_first_old_vs_new` a peak-memory delta --
-/// for a single call alongside criterion's timing. Criterion itself only
-/// measures wall time, and the whole point of the one-pass conversion
-/// (issue #24) and the follow-up grow-on-demand fix is fewer allocations
-/// and less peak memory, not just less time.
-struct CountingAllocator;
-
-static BYTES_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
-static ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
-static CURRENT_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        BYTES_ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
-        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        let current = CURRENT_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-        PEAK_BYTES.fetch_max(current, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        CURRENT_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: CountingAllocator = CountingAllocator;
-
-/// Runs `f` once and returns `(bytes allocated, allocation calls, peak
-/// live bytes)` charged to it specifically, isolated from whatever the
-/// harness itself has already allocated/holds by taking before/after
-/// deltas rather than absolute counts. `PEAK_BYTES` is reset to the
-/// pre-call live-byte baseline immediately before `f` runs (safe because
-/// these benches are single-threaded and sequential) so the returned peak
-/// is the high-water mark reached *during this call*, not since process
-/// start.
-fn count_allocations<T>(f: impl FnOnce() -> T) -> (usize, usize, usize) {
-    let bytes_before = BYTES_ALLOCATED.load(Ordering::Relaxed);
-    let calls_before = ALLOC_CALLS.load(Ordering::Relaxed);
-    let current_before = CURRENT_BYTES.load(Ordering::Relaxed);
-    PEAK_BYTES.store(current_before, Ordering::Relaxed);
-    black_box(f());
-    let peak_during = PEAK_BYTES.load(Ordering::Relaxed);
-    (
-        BYTES_ALLOCATED.load(Ordering::Relaxed) - bytes_before,
-        ALLOC_CALLS.load(Ordering::Relaxed) - calls_before,
-        peak_during.saturating_sub(current_before),
-    )
-}
 
 /// Every benchmark below builds its inputs via a small, purpose-built
 /// `<Kernel>Fixture::new(n)` -- one convention across the file, rather

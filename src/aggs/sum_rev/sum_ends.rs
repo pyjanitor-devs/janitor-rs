@@ -42,29 +42,31 @@ where
     validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
 
-    // ELI5: an end-bound row covers a prefix. Sweep from right to left so a
-    // row becomes active once, at position `end - 1`, and remains active for
-    // every position to its left. Store the sum of values at each activation
-    // boundary, then carry those boundary sums across the output. Integer
-    // wrapping addition is associative, so this grouping preserves results
-    // while using memory proportional only to the compact output width.
-    let mut events = vec![A::ZERO; max_end + 1];
+    // ELI5: an end-bound row covers a prefix. Put its value at the last slot
+    // it covers, then sweep right-to-left and carry the running sum leftward.
+    // Integer wrapping addition is associative, so grouping values at a
+    // boundary preserves results. Using `end - 1` means each event can be
+    // replaced by its final value after it is read; `end == 0` is an empty
+    // prefix and has no event.
+    let mut events = vec![A::ZERO; max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
         if !*boolean {
-            let bucket = *end as usize;
-            events[bucket] = events[bucket].wrap_add(convert(*current));
+            let end = *end as usize;
+            if end > 0 {
+                let bucket = end - 1;
+                events[bucket] = events[bucket].wrap_add(convert(*current));
+            }
         }
     }
 
     let mut running = A::ZERO;
-    let mut values = vec![A::ZERO; max_end];
-    for position in (0..max_end).rev() {
-        running = running.wrap_add(events[position + 1]);
-        values[position] = running;
+    for event in events.iter_mut().rev() {
+        running = running.wrap_add(*event);
+        *event = running;
     }
     Ok((
         ends_labels(max_end, index),
-        numpy::ndarray::Array1::from_vec(values),
+        numpy::ndarray::Array1::from_vec(events),
     ))
 }
 
@@ -271,6 +273,28 @@ mod tests {
 
         assert!(result.0.is_empty());
         assert!(result.1.is_empty());
+    }
+
+    #[test]
+    fn in_place_sweep_handles_zero_one_and_full_width_ends() {
+        let arr = array![5_i64, 7, 11];
+        let ends = array![0_i64, 1, 3];
+        let index = array![10_i64, 30, 20];
+        let booleans = array![false, false, false];
+
+        let (indexers, result) = sum_rev_ends_int_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+
+        // The end=0 row covers nothing; end=1 covers only slot 0; end=3
+        // covers all three slots. The labels remain in right-index order.
+        assert_eq!(indexers, array![10, 30, 20]);
+        assert_eq!(result, array![18, 11, 11]);
     }
 
     #[test]
