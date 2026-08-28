@@ -37,7 +37,7 @@ fn should_sweep(rows: usize, width: usize) -> bool {
 
 /// Groups reverse-maximum starts by compact candidate ordinal.
 /// ELI5: all suffixes share a contiguous union, so one slot per ordinal replaces the HashMaps.
-pub fn max_rev_starts_core<T: PartialOrd + Copy>(
+pub fn max_rev_starts_core<T: PartialOrd + PartialEq + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
@@ -93,7 +93,10 @@ pub fn max_rev_starts_core<T: PartialOrd + Copy>(
         while row != usize::MAX {
             let current = arr[row];
             if !booleans[row]
-                && (current_winner.is_none() || current > current_winner.as_ref().unwrap().0)
+                && (current_winner.is_none()
+                    || current > current_winner.as_ref().unwrap().0
+                    || (current == current_winner.as_ref().unwrap().0
+                        && (row as i64) < current_winner.as_ref().unwrap().1))
             {
                 current_winner = Some((current, row as i64));
             }
@@ -192,5 +195,23 @@ mod tests {
         let (labels, positions) = got.unwrap();
         assert_eq!(labels, index);
         assert!(positions.iter().all(|position| *position == 1));
+    }
+
+    #[test]
+    fn sweep_preserves_smallest_row_on_equal_maximum() {
+        let mut arr = Array1::from_elem(20, 99_i64);
+        arr[2] = 7;
+        arr[18] = 7;
+        let mut starts = Array1::from_elem(20, 20_i64);
+        starts[2] = 19;
+        starts[18] = 0;
+        let index = Array1::from_iter(0..20_i64);
+        let mut booleans = Array1::from_elem(20, true);
+        booleans[2] = false;
+        booleans[18] = false;
+        let got = max_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
+        let expected =
+            Array1::from_iter((0..20).map(|position| if position == 19 { 2 } else { 18 }));
+        assert_eq!(got, Ok((Array1::from_iter(0..20_i64), expected)));
     }
 }

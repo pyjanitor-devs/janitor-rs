@@ -37,7 +37,7 @@ fn should_sweep(rows: usize, width: usize) -> bool {
 
 /// Groups reverse-maximum ends by compact candidate ordinal.
 /// ELI5: every prefix starts at zero, so the largest end is the exact slot count.
-pub fn max_rev_ends_core<T: PartialOrd + Copy>(
+pub fn max_rev_ends_core<T: PartialOrd + PartialEq + Copy>(
     arr: ArrayView1<'_, T>,
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
@@ -89,7 +89,10 @@ pub fn max_rev_ends_core<T: PartialOrd + Copy>(
         while row != usize::MAX {
             let current = arr[row];
             if !booleans[row]
-                && (current_winner.is_none() || current > current_winner.as_ref().unwrap().0)
+                && (current_winner.is_none()
+                    || current > current_winner.as_ref().unwrap().0
+                    || (current == current_winner.as_ref().unwrap().0
+                        && (row as i64) < current_winner.as_ref().unwrap().1))
             {
                 current_winner = Some((current, row as i64));
             }
@@ -194,5 +197,21 @@ mod tests {
         assert_eq!(positions[0], 1);
         assert_eq!(positions[499], 1);
         assert_eq!(positions[500], 0);
+    }
+
+    #[test]
+    fn sweep_preserves_smallest_row_on_equal_maximum() {
+        let mut arr = Array1::from_elem(20, 99_i64);
+        arr[2] = 7;
+        arr[18] = 7;
+        let mut ends = Array1::zeros(20);
+        ends[2] = 20;
+        ends[18] = 1;
+        let index = Array1::from_iter(0..20_i64);
+        let mut booleans = Array1::from_elem(20, true);
+        booleans[2] = false;
+        booleans[18] = false;
+        let got = max_rev_ends_core(arr.view(), ends.view(), index.view(), booleans.view());
+        assert_eq!(got, Ok((index, Array1::from_elem(20, 2_i64))));
     }
 }
