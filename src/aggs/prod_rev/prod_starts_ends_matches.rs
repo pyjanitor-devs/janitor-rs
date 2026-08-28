@@ -6,7 +6,6 @@ use pyo3::prelude::*;
 use crate::aggs::{
     checked_range, ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches,
 };
-use std::collections::HashMap;
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
@@ -56,7 +55,22 @@ macro_rules! compute_ints {
                 .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
                 .sum();
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut dictionary: HashMap<i64, $acc> = HashMap::with_capacity(index.len());
+            // The fold below finds the smallest enclosing valid slice.
+            // ELI5: it stretches one ruler just enough to cover every range.
+            // Each right-side ordinal in the smallest enclosing range
+            // gets a product bucket. `seen` keeps matched labels visible even
+            // when null or zero-count rows contribute the identity.
+            let (min_start, max_end) = starts
+                .iter()
+                .zip(ends.iter())
+                .filter_map(|(s, e)| checked_range(*s, *e, index.len()))
+                .fold((usize::MAX, 0), |(min_start, max_end), (start, end)| {
+                    (min_start.min(start), max_end.max(end))
+                });
+            let width = max_end.saturating_sub(min_start);
+            let mut seen = vec![false; width];
+            let mut touched = Vec::new();
+            let mut products = vec![1 as $acc; width];
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -75,8 +89,11 @@ macro_rules! compute_ints {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(1);
+                    let slot = item - min_start;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        touched.push(slot);
+                    }
                     if (*boolean) || (*count == 0) {
                         n += 1;
                         continue;
@@ -84,17 +101,12 @@ macro_rules! compute_ints {
                     // ELI5: integer products are allowed to wrap like NumPy
                     // integers; wrapping_mul keeps debug and release builds
                     // on the same path instead of panicking on overflow.
-                    *total = total.wrapping_mul(current_);
+                    products[slot] = products[slot].wrapping_mul(current_);
                     n += 1;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<$acc>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let indexers = Array1::from_iter(touched.iter().map(|&slot| index[min_start + slot]));
+            let result = Array1::from_iter(touched.iter().map(|&slot| products[slot]));
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -155,7 +167,19 @@ macro_rules! compute_floats {
                 .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
                 .sum();
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(index.len());
+            // The float path uses the same enclosing-slice calculation as the
+            // integer path; only the product storage differs.
+            let (min_start, max_end) = starts
+                .iter()
+                .zip(ends.iter())
+                .filter_map(|(s, e)| checked_range(*s, *e, index.len()))
+                .fold((usize::MAX, 0), |(min_start, max_end), (start, end)| {
+                    (min_start.min(start), max_end.max(end))
+                });
+            let width = max_end.saturating_sub(min_start);
+            let mut seen = vec![false; width];
+            let mut touched = Vec::new();
+            let mut products = vec![1.; width];
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -174,23 +198,21 @@ macro_rules! compute_floats {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(1.);
+                    let slot = item - min_start;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        touched.push(slot);
+                    }
                     if (*boolean) || (*count == 0) {
                         n += 1;
                         continue;
                     }
-                    *total *= current_;
+                    products[slot] *= current_;
                     n += 1;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<f64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let indexers = Array1::from_iter(touched.iter().map(|&slot| index[min_start + slot]));
+            let result = Array1::from_iter(touched.iter().map(|&slot| products[slot]));
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
