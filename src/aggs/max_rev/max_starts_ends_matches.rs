@@ -27,7 +27,6 @@ macro_rules! compute {
             counts: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
         // The macro will expand into the contents of this block.
         {
@@ -53,9 +52,8 @@ macro_rules! compute {
                 .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
                 .sum();
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let length = length as usize;
-            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-            let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
+            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
+            let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(index.len());
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -157,7 +155,6 @@ mod tests {
                 counts.readonly(),
                 matches.readonly(),
                 booleans.readonly(),
-                1,
             )
             .unwrap_err();
 

@@ -60,9 +60,7 @@ macro_rules! compute {
             ends: PyReadonlyArray1<'py, i64>,
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
-            let _ = length;
             into_starts_ends_result(
                 py,
                 min_rev_ends_core(

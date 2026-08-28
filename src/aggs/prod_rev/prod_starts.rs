@@ -72,9 +72,7 @@ macro_rules! compute_ints {
             starts: PyReadonlyArray1<'py, i64>,
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)> {
-            let _ = length;
             into_starts_ends_result(
                 py,
                 prod_rev_starts_int_core(
@@ -97,9 +95,7 @@ macro_rules! compute_floats {
             starts: PyReadonlyArray1<'py, i64>,
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)> {
-            let _ = length;
             into_starts_ends_result(
                 py,
                 prod_rev_starts_float_core(

@@ -98,7 +98,6 @@ macro_rules! compute_ints {
             ends: PyReadonlyArray1<'py, i64>,
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)>
         // The macro will expand into the contents of this block.
         {
@@ -108,7 +107,6 @@ macro_rules! compute_ints {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            let _ = length;
             into_starts_ends_result(
                 py,
                 sum_rev_ends_int_core(arr, ends, index, booleans, |value| value as $acc),
@@ -137,7 +135,6 @@ macro_rules! compute_floats {
             ends: PyReadonlyArray1<'py, i64>,
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>
         // The macro will expand into the contents of this block.
         {
@@ -147,7 +144,6 @@ macro_rules! compute_floats {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            let _ = length;
             into_starts_ends_result(
                 py,
                 sum_rev_ends_float_core(arr, ends, index, booleans, |value| value as f64),

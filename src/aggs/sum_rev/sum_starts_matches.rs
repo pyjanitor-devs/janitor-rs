@@ -28,7 +28,6 @@ macro_rules! compute_ints {
             index: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)>
         // The macro will expand into the contents of this block.
         {
@@ -52,8 +51,7 @@ macro_rules! compute_ints {
                 .map(|s| end_.saturating_sub(*s as usize))
                 .sum();
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let length = length as usize;
-            let mut dictionary: HashMap<i64, $acc> = HashMap::with_capacity(length);
+            let mut dictionary: HashMap<i64, $acc> = HashMap::with_capacity(end_);
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -120,7 +118,6 @@ macro_rules! compute_floats {
             index: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>
         // The macro will expand into the contents of this block.
         {
@@ -144,9 +141,8 @@ macro_rules! compute_floats {
                 .map(|s| end_.saturating_sub(*s as usize))
                 .sum();
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let length = length as usize;
-            let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
-            let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
+            let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(end_);
+            let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(end_);
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -248,7 +244,6 @@ mod tests {
                 index.readonly(),
                 matches.readonly(),
                 booleans.readonly(),
-                1,
             )
             .unwrap();
             assert_eq!(labels.readonly().as_slice().unwrap(), &[10]);

@@ -44,9 +44,7 @@ pub fn compute_size_rev_end<'py>(
     py: Python<'py>,
     ends: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
-    length: i64,
 ) -> SizeRevResult<'py> {
-    let _ = length;
     into_starts_ends_result(py, size_rev_ends_core(ends.as_array(), index.as_array()))
 }
 
@@ -55,9 +53,7 @@ pub fn compute_size_rev_start<'py>(
     py: Python<'py>,
     starts: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
-    length: i64,
 ) -> SizeRevResult<'py> {
-    let _ = length;
     into_starts_ends_result(
         py,
         size_rev_starts_core(starts.as_array(), index.as_array()),
@@ -73,7 +69,6 @@ pub fn compute_size_rev_end_matches<'py>(
     ends: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
-    length: i64,
 ) -> SizeRevResult<'py> {
     let ends = ends.as_array();
     let index = index.as_array();
@@ -93,8 +88,7 @@ pub fn compute_size_rev_end_matches<'py>(
         .filter_map(|e| checked_end(*e, index.len()))
         .sum();
     ensure_exact_tape_width(expected_matches_width, matches.len())?;
-    let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
     let start_: usize = 0_usize;
     let mut n: usize = 0;
     for end in ends.into_iter() {
@@ -131,7 +125,6 @@ pub fn compute_size_rev_start_matches<'py>(
     starts: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
-    length: i64,
 ) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let index = index.as_array();
@@ -152,8 +145,7 @@ pub fn compute_size_rev_start_matches<'py>(
         .map(|s| end_.saturating_sub(*s as usize))
         .sum();
     ensure_exact_tape_width(expected_matches_width, matches.len())?;
-    let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
     let mut n: usize = 0;
     for start in starts.into_iter() {
         let start_ = *start as usize;
@@ -188,7 +180,6 @@ pub fn compute_size_rev_start_end_matches<'py>(
     ends: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
-    length: i64,
 ) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
@@ -211,8 +202,7 @@ pub fn compute_size_rev_start_end_matches<'py>(
         .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
         .sum();
     ensure_exact_tape_width(expected_matches_width, matches.len())?;
-    let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
     let mut n: usize = 0;
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
@@ -319,7 +309,6 @@ pub fn compute_size_rev_positions<'py>(
     ends: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
     positions: PyReadonlyArray1<'py, i64>,
-    length: i64,
 ) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
@@ -331,8 +320,7 @@ pub fn compute_size_rev_positions<'py>(
             "starts, ends, index, and positions cannot be empty",
         ));
     }
-    let length = length as usize;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
+    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
         let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {

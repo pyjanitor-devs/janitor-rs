@@ -31,7 +31,6 @@ macro_rules! compute_ints {
             counts: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)>
         // The macro will expand into the contents of this block.
         {
@@ -57,8 +56,7 @@ macro_rules! compute_ints {
                 .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
                 .sum();
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let length = length as usize;
-            let mut dictionary: HashMap<i64, $acc> = HashMap::with_capacity(length);
+            let mut dictionary: HashMap<i64, $acc> = HashMap::with_capacity(index.len());
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -129,7 +127,6 @@ macro_rules! compute_floats {
             counts: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>
         // The macro will expand into the contents of this block.
         {
@@ -155,9 +152,8 @@ macro_rules! compute_floats {
                 .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
                 .sum();
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let length = length as usize;
-            let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(length);
-            let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(length);
+            let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(index.len());
+            let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(index.len());
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -264,7 +260,6 @@ mod tests {
                 counts.readonly(),
                 matches.readonly(),
                 booleans.readonly(),
-                1,
             )
             .unwrap();
             assert_eq!(labels.readonly().as_slice().unwrap(), &[10]);

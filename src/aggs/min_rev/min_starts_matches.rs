@@ -24,7 +24,6 @@ macro_rules! compute {
             index: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-            length: i64,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>
         // The macro will expand into the contents of this block.
         {
@@ -38,10 +37,9 @@ macro_rules! compute {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            let length = length as usize;
-            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(length);
-            let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(length);
             let end_: usize = index.len();
+            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(end_);
+            let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(end_);
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
