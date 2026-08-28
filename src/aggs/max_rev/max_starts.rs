@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels};
+use crate::aggs::{into_starts_ends_result, should_sweep, starts_domain, starts_labels};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -13,26 +13,6 @@ fn validate_inputs<T>(
         return Err("arr, starts, and booleans must have equal lengths");
     }
     Ok(())
-}
-
-/// Choose the sweep only when it has enough work to repay its row metadata.
-///
-/// The old loop performs approximately `rows * width` winner checks. The
-/// sweep performs approximately `rows + width` event/output work, but also
-/// allocates a flat bucket head array and one link per row. The `8x` margin is
-/// deliberately conservative: it avoids paying that metadata and setup cost
-/// when the ranges are narrow, while still selecting the sweep for the wide
-/// inputs where the nested loop repeats the same work many times. The value
-/// was selected from the tiny/large/very-large/narrow benchmark matrix rather
-/// than from an input-size assumption. Saturating arithmetic keeps this
-/// estimate safe even for dimensions near `usize::MAX`.
-///
-/// ELI5: use the shortcut only when there are enough repeated chores for the
-/// shortcut to be worth setting up; for a tiny job, just do the chores.
-fn should_sweep(rows: usize, width: usize) -> bool {
-    let repeated_work = rows.saturating_mul(width);
-    let sweep_work = rows.saturating_add(width);
-    repeated_work > sweep_work.saturating_mul(8)
 }
 
 /// Groups reverse-maximum starts by compact candidate ordinal.
@@ -46,7 +26,7 @@ pub fn max_rev_starts_core<T: PartialOrd + PartialEq + Copy>(
     validate_inputs(arr, starts, booleans)?;
     let (min_start, width) = starts_domain(starts, index.len())?;
 
-    if !should_sweep(arr.len(), width) {
+    if !should_sweep(arr.len(), width, std::mem::size_of::<T>()) {
         let mut values = vec![arr[0]; width];
         let mut positions = vec![-1_i64; width];
         for (row, ((current, start), boolean)) in arr

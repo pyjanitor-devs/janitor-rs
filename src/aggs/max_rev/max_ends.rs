@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ends_labels, into_starts_ends_result};
+use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, should_sweep};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -15,26 +15,6 @@ fn validate_inputs<T>(
     Ok(())
 }
 
-/// Choose the sweep only when it has enough work to repay its row metadata.
-///
-/// The old loop performs approximately `rows * width` winner checks. The
-/// sweep performs approximately `rows + width` event/output work, but also
-/// allocates a flat bucket head array and one link per row. The `8x` margin is
-/// deliberately conservative: it avoids paying that metadata and setup cost
-/// when the ranges are narrow, while still selecting the sweep for the wide
-/// inputs where the nested loop repeats the same work many times. The value
-/// was selected from the tiny/large/very-large/narrow benchmark matrix rather
-/// than from an input-size assumption. Saturating arithmetic keeps this
-/// estimate safe even for dimensions near `usize::MAX`.
-///
-/// ELI5: use the shortcut only when there are enough repeated chores for the
-/// shortcut to be worth setting up; for a tiny job, just do the chores.
-fn should_sweep(rows: usize, width: usize) -> bool {
-    let repeated_work = rows.saturating_mul(width);
-    let sweep_work = rows.saturating_add(width);
-    repeated_work > sweep_work.saturating_mul(8)
-}
-
 /// Groups reverse-maximum ends by compact candidate ordinal.
 /// ELI5: every prefix starts at zero, so the largest end is the exact slot count.
 pub fn max_rev_ends_core<T: PartialOrd + PartialEq + Copy>(
@@ -44,9 +24,9 @@ pub fn max_rev_ends_core<T: PartialOrd + PartialEq + Copy>(
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     validate_inputs(arr, ends, booleans)?;
-    let max_end = ends.iter().copied().max().unwrap() as usize;
+    let max_end = ends_domain(ends, index.len())?;
 
-    if !should_sweep(arr.len(), max_end) {
+    if !should_sweep(arr.len(), max_end, std::mem::size_of::<T>()) {
         let mut values = vec![arr[0]; max_end];
         let mut positions = vec![-1_i64; max_end];
         for (row, ((current, end), boolean)) in
@@ -178,6 +158,27 @@ mod tests {
             ),
             Ok((array![], array![]))
         );
+        assert!(max_rev_ends_core(
+            Array1::<i64>::zeros(0).view(),
+            Array1::<i64>::zeros(0).view(),
+            Array1::<i64>::zeros(0).view(),
+            Array1::<bool>::default(0).view()
+        )
+        .is_err());
+        assert!(max_rev_ends_core(
+            array![1_i64].view(),
+            array![-1_i64].view(),
+            array![1_i64].view(),
+            array![false].view()
+        )
+        .is_err());
+        assert!(max_rev_ends_core(
+            array![1_i64].view(),
+            array![2_i64].view(),
+            array![1_i64].view(),
+            array![false].view()
+        )
+        .is_err());
     }
 
     #[test]
