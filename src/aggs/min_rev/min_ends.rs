@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, should_sweep, sweep_min};
+use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, should_sweep, sweep_winner};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -34,13 +34,14 @@ pub fn min_rev_ends_core<T: PartialOrd + Copy>(
         // right to left, and retain the current minimum. Equal values are
         // explicitly resolved by the smallest input row index in `sweep_min`,
         // matching the direct path regardless of bucket traversal order.
-        let positions = sweep_min(
+        let positions = sweep_winner(
             arr,
             booleans,
             max_end,
             |row| ends[row] as usize,
             |position| position + 1,
             (0..max_end).rev(),
+            |current, winner| current < winner,
         );
         return Ok((ends_labels(max_end, index), positions));
     }
