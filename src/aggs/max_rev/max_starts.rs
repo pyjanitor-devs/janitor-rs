@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels};
+use crate::aggs::{into_starts_ends_result, starts_labels};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -43,7 +43,7 @@ pub fn max_rev_starts_core<T: PartialOrd + Copy>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, starts, index, booleans)?;
+    validate_inputs(arr, starts, booleans)?;
     let min_start = starts.iter().copied().min().unwrap() as usize;
     let width = index.len() - min_start;
 
