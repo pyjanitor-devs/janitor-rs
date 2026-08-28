@@ -1,10 +1,17 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches};
+
+fn is_positional_index(index: ArrayView1<'_, i64>) -> bool {
+    index
+        .iter()
+        .enumerate()
+        .all(|(position, label)| *label == position as i64)
+}
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
@@ -51,6 +58,51 @@ macro_rules! compute_ints {
                 .map(|s| end_.saturating_sub(*s as usize))
                 .sum();
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
+
+            // A positional, unique index lets us use the candidate ordinal as
+            // the accumulator slot directly. This removes one hash lookup per
+            // live candidate. The check intentionally rejects arbitrary and
+            // duplicate labels, which still require label-based grouping.
+            // ELI5: when labels are 0, 1, 2, ... the shelf number is already
+            // the key, so we do not need a dictionary to find the shelf.
+            if is_positional_index(index) {
+                let mut totals = vec![0 as $acc; end_];
+                let mut seen = vec![false; end_];
+                let mut labels = Vec::new();
+                let mut n: usize = 0;
+                for (current, start, count, boolean) in izip!(
+                    arr.into_iter(),
+                    starts.into_iter(),
+                    counts.into_iter(),
+                    booleans.into_iter()
+                ) {
+                    let start_ = *start as usize;
+                    let current_ = *current as $acc;
+                    for item in start_..end_ {
+                        if matches[n] == 0 {
+                            n += 1;
+                            continue;
+                        }
+                        if !seen[item] {
+                            seen[item] = true;
+                            labels.push(item as i64);
+                        }
+                        if !*boolean && *count != 0 {
+                            totals[item] += current_;
+                        }
+                        n += 1;
+                    }
+                }
+                let result = labels
+                    .iter()
+                    .map(|label| totals[*label as usize])
+                    .collect::<Vec<_>>();
+                return Ok((
+                    Array1::from_vec(labels).into_pyarray(py),
+                    Array1::from_vec(result).into_pyarray(py),
+                ));
+            }
+
             let mut dictionary: HashMap<i64, $acc> = HashMap::with_capacity(end_);
             let zipped = izip!(
                 arr.into_iter(),
@@ -217,9 +269,17 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_sum_rev_start_match_uint64;
+    use super::{compute_sum_rev_start_match_uint64, is_positional_index};
+    use numpy::ndarray::array;
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::Python;
+
+    #[test]
+    fn dense_path_requires_unique_positional_labels() {
+        assert!(is_positional_index(array![0_i64, 1, 2].view()));
+        assert!(!is_positional_index(array![10_i64, 11, 12].view()));
+        assert!(!is_positional_index(array![0_i64, 0, 1].view()));
+    }
 
     #[test]
     fn u64_accumulator_preserves_values_at_and_above_i64_max() {
