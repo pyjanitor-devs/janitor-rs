@@ -4,8 +4,9 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    checked_end, checked_index, checked_range, ends_labels, ensure_equal_lengths,
-    ensure_exact_tape_width, ensure_nonempty_matches, into_starts_ends_result, starts_labels,
+    checked_end, checked_index, checked_range, ends_domain, ends_labels, ensure_equal_lengths,
+    ensure_exact_tape_width, ensure_nonempty_matches, into_starts_ends_result, starts_domain,
+    starts_labels,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
@@ -19,17 +20,7 @@ pub fn size_rev_ends_core(
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    if ends.is_empty() || index.is_empty() {
-        return Err("ends and index cannot be empty");
-    }
-    if ends.iter().any(|end| {
-        usize::try_from(*end)
-            .map(|end| end > index.len())
-            .unwrap_or(true)
-    }) {
-        return Err("ends must satisfy 0 <= end <= right_len");
-    }
-    let max_end = ends.iter().copied().max().unwrap_or(0) as usize;
+    let max_end = ends_domain(ends, index.len())?;
     // ELI5: a prefix row is active to the left of its end. Count how many
     // rows end at each boundary, then sweep from right to left and carry the
     // active-row count across the output. `end == 0` is an empty prefix and
@@ -69,8 +60,7 @@ pub fn size_rev_starts_core(
     }) {
         return Err("starts must satisfy 0 <= start <= right_len");
     }
-    let min_start = starts.iter().copied().min().unwrap() as usize;
-    let width = index.len() - min_start;
+    let (min_start, width) = starts_domain(starts, index.len())?;
     // ELI5: a suffix row is active from its start onward. Count rows at each
     // start boundary, then sweep those boundaries once while carrying the
     // active-row count. The terminal bucket represents `start ==
@@ -82,12 +72,12 @@ pub fn size_rev_starts_core(
     }
 
     let mut running = 0_i64;
-    let mut result = Vec::with_capacity(width);
-    for event in events.iter().take(width) {
-        running += event;
-        result.push(running);
+    for event in events.iter_mut().take(width) {
+        running += *event;
+        *event = running;
     }
-    Ok((starts_labels(min_start, index), Array1::from_vec(result)))
+    events.truncate(width);
+    Ok((starts_labels(min_start, index), Array1::from_vec(events)))
 }
 
 #[pyfunction]
