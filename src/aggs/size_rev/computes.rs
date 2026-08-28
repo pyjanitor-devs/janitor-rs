@@ -202,7 +202,27 @@ pub fn compute_size_rev_start_end_matches<'py>(
         .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
         .sum();
     ensure_exact_tape_width(expected_matches_width, matches.len())?;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
+    // Find the smallest contiguous slice that contains every valid range.
+    // Invalid ranges are deliberately ignored here because `checked_range`
+    // gives them the existing reverse-kernel "skip this row" behavior.
+    //
+    // ELI5: if the valid ranges are [2, 5) and [4, 9), we only need buckets
+    // for positions [2, 9), not for the entire right index. A bucket's local
+    // slot is `position - min_start`; `seen` records matched labels for the
+    // compact output.
+    // The fold carries the current smallest start and largest end as it visits
+    // each valid range; it is equivalent to a simple running min/max loop.
+    let (min_start, max_end) = starts
+        .iter()
+        .zip(ends.iter())
+        .filter_map(|(s, e)| checked_range(*s, *e, index.len()))
+        .fold((usize::MAX, 0), |(min_start, max_end), (start, end)| {
+            (min_start.min(start), max_end.max(end))
+        });
+    let width = max_end.saturating_sub(min_start);
+    let mut seen = vec![false; width];
+    let mut touched = Vec::new();
+    let mut counts = vec![0_i64; width];
     let mut n: usize = 0;
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
@@ -214,20 +234,17 @@ pub fn compute_size_rev_start_end_matches<'py>(
                 n += 1;
                 continue;
             }
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
-            *total += 1;
+            let slot = item - min_start;
+            if !seen[slot] {
+                seen[slot] = true;
+                touched.push(slot);
+            }
+            counts[slot] += 1;
             n += 1;
         }
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let indexers = Array1::from_iter(touched.iter().map(|&slot| index[min_start + slot]));
+    let result = Array1::from_iter(touched.iter().map(|&slot| counts[slot]));
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
