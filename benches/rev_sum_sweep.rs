@@ -59,7 +59,10 @@ fn old_starts(
     let min_start = starts.iter().copied().min().unwrap() as usize;
     let width = index.len() - min_start;
     let mut values = vec![0_i64; width];
-    for (current, start) in arr.iter().zip(starts.iter()) {
+    for ((current, start), boolean) in arr.iter().zip(starts.iter()).zip(booleans.iter()) {
+        if *boolean {
+            continue;
+        }
         for value in values.iter_mut().skip(*start as usize - min_start) {
             *value = value.wrapping_add(*current);
         }
@@ -82,7 +85,10 @@ fn old_ends(
         .unwrap_or(false)));
     let max_end = ends.iter().copied().max().unwrap() as usize;
     let mut values = vec![0_i64; max_end];
-    for (current, end) in arr.iter().zip(ends.iter()) {
+    for ((current, end), boolean) in arr.iter().zip(ends.iter()).zip(booleans.iter()) {
+        if *boolean {
+            continue;
+        }
         for value in values.iter_mut().take(*end as usize) {
             *value = value.wrapping_add(*current);
         }

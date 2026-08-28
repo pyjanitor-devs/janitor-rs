@@ -60,12 +60,12 @@ where
     }
 
     let mut running = A::ZERO;
-    let mut result = Vec::with_capacity(width);
-    for event in events.iter().take(width) {
+    for event in events.iter_mut().take(width) {
         running = running.wrap_add(*event);
-        result.push(running);
+        *event = running;
     }
-    Ok((starts_labels(min_start, index), Array1::from_vec(result)))
+    events.truncate(width);
+    Ok((starts_labels(min_start, index), Array1::from_vec(events)))
 }
 
 macro_rules! compute_ints {
@@ -330,6 +330,21 @@ mod tests {
         .unwrap();
         assert_eq!(indexers, array![20]);
         assert_eq!(result, array![value]);
+    }
+
+    #[test]
+    fn integer_accumulator_wraps_on_overflow() {
+        let (indexers, result) = sum_rev_starts_int_core(
+            array![i64::MAX, 1].view(),
+            array![0_i64, 0].view(),
+            array![0_i64].view(),
+            array![false, false].view(),
+            |value| value,
+        )
+        .unwrap();
+
+        assert_eq!(indexers, array![0]);
+        assert_eq!(result, array![i64::MIN]);
     }
 
     #[test]
