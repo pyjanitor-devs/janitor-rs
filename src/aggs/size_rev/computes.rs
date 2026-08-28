@@ -4,9 +4,8 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    checked_end, checked_index, checked_range, ends_domain, ends_labels, ensure_equal_lengths,
-    ensure_exact_tape_width, ensure_nonempty_matches, into_starts_ends_result, starts_domain,
-    starts_labels,
+    checked_end, checked_index, checked_range, ends_labels, ensure_equal_lengths,
+    ensure_exact_tape_width, ensure_nonempty_matches, into_starts_ends_result, starts_labels,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
