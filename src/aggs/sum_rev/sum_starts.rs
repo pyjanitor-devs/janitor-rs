@@ -28,6 +28,7 @@ fn validate_starts_inputs(
 /// type: every integer dtype instantiates this with `A = i64`, except
 /// `uint64`, which instantiates it with `A = u64` so values `>= 2**63`
 /// don't get sign-flipped by a forced `i64` cast (see `WrapAdd`).
+#[allow(private_bounds)]
 pub fn sum_rev_starts_int_core<T, A, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -40,10 +41,8 @@ where
     A: WrapAdd,
     F: FnMut(T) -> A,
 {
-    let end_ = index.len();
-    validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
-    let min_start = starts.iter().copied().min().unwrap() as usize;
-    let width = end_ - min_start;
+    validate_starts_inputs(arr.len(), starts.len(), booleans.len())?;
+    let (min_start, width) = starts_domain(starts, index.len())?;
 
     // ELI5: a suffix starts once and then stays active. Instead of adding a
     // row's value to every later output slot, put the row's value into the
@@ -52,26 +51,21 @@ where
     // boundary preserves the result while using memory proportional only to
     // the compact output width. The final bucket is reserved for start ==
     // end_, a valid zero-width suffix which is never emitted.
-    let mut events = vec![0_i64; width + 1];
+    let mut events = vec![A::ZERO; width + 1];
     for (current, start, boolean) in izip!(arr, starts, booleans) {
         if !*boolean {
             let bucket = *start as usize - min_start;
-            events[bucket] = events[bucket].wrapping_add(to_i64(*current));
+            events[bucket] = events[bucket].wrap_add(convert(*current));
         }
     }
 
-    let mut running = 0_i64;
+    let mut running = A::ZERO;
     let mut result = Vec::with_capacity(width);
     for event in events.iter().take(width) {
-        running = running.wrapping_add(*event);
+        running = running.wrap_add(*event);
         result.push(running);
     }
-    let mut indexers = Vec::with_capacity(width);
-    for slot in 0..width {
-        let item = min_start + slot;
-        indexers.push(index[item]);
-    }
-    Ok((Array1::from_vec(indexers), Array1::from_vec(result)))
+    Ok((starts_labels(min_start, index), Array1::from_vec(result)))
 }
 
 macro_rules! compute_ints {
@@ -138,10 +132,8 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    let end_ = index.len();
-    validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
-    let min_start = starts.iter().copied().min().unwrap() as usize;
-    let width = end_ - min_start;
+    validate_starts_inputs(arr.len(), starts.len(), booleans.len())?;
+    let (min_start, width) = starts_domain(starts, index.len())?;
     // Keep the existing per-position Neumaier accumulation for floats. A
     // single running sweep would change the original row order at positions
     // where rows become active at different boundaries. Compensation improves

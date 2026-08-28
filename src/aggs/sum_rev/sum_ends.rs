@@ -3,7 +3,7 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    ends_domain, ends_labels, ensure_equal_lengths, into_starts_ends_result, WrapAdd,
+    checked_range, ends_domain, ends_labels, ensure_equal_lengths, into_starts_ends_result, WrapAdd,
 };
 
 fn validate_ends_inputs(
@@ -26,6 +26,7 @@ fn validate_ends_inputs(
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
 /// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
 /// `WrapAdd`).
+#[allow(private_bounds)]
 pub fn sum_rev_ends_int_core<T, A, F>(
     arr: numpy::ndarray::ArrayView1<T>,
     ends: numpy::ndarray::ArrayView1<i64>,
@@ -38,12 +39,8 @@ where
     A: WrapAdd,
     F: FnMut(T) -> A,
 {
-    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
-    let max_end = ends
-        .iter()
-        .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
-        .max()
-        .unwrap_or(0);
+    validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
+    let max_end = ends_domain(ends, index.len())?;
 
     // ELI5: an end-bound row covers a prefix. Sweep from right to left so a
     // row becomes active once, at position `end - 1`, and remains active for
@@ -51,23 +48,22 @@ where
     // boundary, then carry those boundary sums across the output. Integer
     // wrapping addition is associative, so this grouping preserves results
     // while using memory proportional only to the compact output width.
-    let mut events = vec![0_i64; max_end + 1];
+    let mut events = vec![A::ZERO; max_end + 1];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
         if !*boolean {
             let bucket = *end as usize;
-            events[bucket] = events[bucket].wrapping_add(to_i64(*current));
+            events[bucket] = events[bucket].wrap_add(convert(*current));
         }
     }
 
-    let mut running = 0_i64;
-    let mut values = vec![0_i64; max_end];
+    let mut running = A::ZERO;
+    let mut values = vec![A::ZERO; max_end];
     for position in (0..max_end).rev() {
-        running = running.wrapping_add(events[position + 1]);
+        running = running.wrap_add(events[position + 1]);
         values[position] = running;
     }
-    let indexers = (0..max_end).map(|item| index[item]).collect();
     Ok((
-        numpy::ndarray::Array1::from_vec(indexers),
+        ends_labels(max_end, index),
         numpy::ndarray::Array1::from_vec(values),
     ))
 }
@@ -83,7 +79,7 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
+    validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
     let max_end = ends
         .iter()
         .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
