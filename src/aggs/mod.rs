@@ -135,6 +135,9 @@ pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool
     let sweep_work = rows.saturating_add(width);
     // The direct path keeps one value and one row position per output slot.
     // The labels are common to both paths, so they are intentionally omitted.
+    // This is a conservative approximation: it models the direct path's
+    // value and position buffers and the sweep's row-link and bucket arrays,
+    // but excludes allocator headers and the small scalar winner state.
     let direct_bytes = width.saturating_mul(value_size + std::mem::size_of::<i64>());
     let sweep_metadata = rows
         .saturating_add(width.saturating_add(1))
