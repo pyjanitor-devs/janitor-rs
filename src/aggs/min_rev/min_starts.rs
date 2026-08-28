@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels};
+use crate::aggs::{into_starts_ends_result, should_sweep, starts_domain, starts_labels};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -15,24 +15,11 @@ fn validate_inputs<T>(
     Ok(())
 }
 
-/// Choose the sweep only when it has enough repeated work to repay its
-/// per-row event metadata. The 8x margin is conservative and was selected
-/// from the tiny/large/very-large/narrow benchmark matrix; saturating
-/// arithmetic keeps the estimate safe for very large dimensions.
-///
-/// ELI5: set up the shortcut only when there are enough repeated chores to
-/// make the setup worthwhile.
-fn should_sweep(rows: usize, width: usize) -> bool {
-    let repeated_work = rows.saturating_mul(width);
-    let sweep_work = rows.saturating_add(width);
-    repeated_work > sweep_work.saturating_mul(8)
-}
-
 /// Groups reverse-minimum starts by compact candidate ordinal.
 ///
 /// ELI5: every suffix touches a contiguous tail of `index`, so one slot per
 /// position in the union of those tails replaces both key/value HashMaps.
-pub fn min_rev_starts_core<T: PartialOrd + Copy>(
+pub fn min_rev_starts_core<T: PartialOrd + PartialEq + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
@@ -60,7 +47,10 @@ pub fn min_rev_starts_core<T: PartialOrd + Copy>(
             while row != usize::MAX {
                 let current = arr[row];
                 if !booleans[row]
-                    && (current_winner.is_none() || current < current_winner.as_ref().unwrap().0)
+                    && (current_winner.is_none()
+                        || current < current_winner.as_ref().unwrap().0
+                        || (current == current_winner.as_ref().unwrap().0
+                            && (row as i64) < current_winner.as_ref().unwrap().1))
                 {
                     current_winner = Some((current, row as i64));
                 }
@@ -70,8 +60,7 @@ pub fn min_rev_starts_core<T: PartialOrd + Copy>(
                 positions[bucket] = row;
             }
         }
-        let indexers = (min_start..index.len()).map(|item| index[item]).collect();
-        return Ok((indexers, Array1::from_vec(positions)));
+        return Ok((starts_labels(min_start, index), Array1::from_vec(positions)));
     }
 
     let mut values = vec![arr[0]; width];
@@ -172,6 +161,22 @@ mod tests {
         let booleans = array![true, false, true];
         let got = min_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
         assert_eq!(got, Ok((array![10, 20, 30], array![-1, 1, 1])));
+    }
+
+    #[test]
+    fn sweep_preserves_smallest_row_on_equal_minimum() {
+        let mut arr = Array1::from_elem(20, 99_i64);
+        arr[2] = 7;
+        arr[18] = 7;
+        let mut starts = Array1::from_elem(20, 20_i64);
+        starts[2] = 19;
+        starts[18] = 0;
+        let index = Array1::from_iter(0..20_i64);
+        let booleans = Array1::from_elem(20, false);
+        let got = min_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
+        let expected =
+            Array1::from_iter((0..20).map(|position| if position == 19 { 2 } else { 18 }));
+        assert_eq!(got, Ok((Array1::from_iter(0..20_i64), expected)));
     }
 
     #[test]

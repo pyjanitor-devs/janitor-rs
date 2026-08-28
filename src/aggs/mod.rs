@@ -124,6 +124,17 @@ pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<
     (0..max_end).map(|item| index[item]).collect()
 }
 
+/// Choose the boundary sweep only when its one-time setup should repay the
+/// repeated work in the direct nested loop.
+///
+/// ELI5: build the shortcut only when there are enough repeated chores to
+/// make the setup worthwhile.
+pub(crate) fn should_sweep(rows: usize, width: usize) -> bool {
+    let repeated_work = rows.saturating_mul(width);
+    let sweep_work = rows.saturating_add(width);
+    repeated_work > sweep_work.saturating_mul(8)
+}
+
 /// Shared return shape for every `*_rev_starts`/`*_rev_ends` `#[pyfunction]`
 /// wrapper: a pair of numpy arrays, generic over the value array's element
 /// type `U` so it fits min/max/size (`i64`) and prod/sum's int (`i64`) and
