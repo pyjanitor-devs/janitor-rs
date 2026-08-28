@@ -4,13 +4,18 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{checked_index, checked_range, ensure_equal_lengths};
-use std::collections::HashMap;
-
 /// Find the minimum value for each label reached through `positions`.
 ///
-/// ELI5: each label gets a small slot number. The label, best row position,
-/// and best value are kept in Vecs, while the HashMap only translates a label
-/// to its slot. A null row can create a label, but cannot become its winner.
+/// `positions` contains ordinal offsets into `index`; the right-side row
+/// identities are expected to be unique by the pyjanitor contract. The dense
+/// implementation uses the ordinal itself as the slot, so each candidate can
+/// update its state with direct indexing instead of a label HashMap lookup.
+///
+/// ELI5: position 7 always means `index[7]`. We keep a small box for each
+/// referenced position, remember which boxes were touched, and copy only
+/// those boxes into the compact output. A null row can create a label, but
+/// cannot become its winner. Invalid position sentinels are skipped by
+/// `checked_index`.
 pub fn min_positions_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -18,13 +23,19 @@ pub fn min_positions_core<T: PartialOrd + Copy>(
     index: ArrayView1<'_, i64>,
     positions: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-    capacity: usize,
 ) -> (Vec<i64>, Vec<i64>) {
-    let capacity = capacity.min(index.len()).min(positions.len());
-    let mut slots: HashMap<i64, usize> = HashMap::with_capacity(capacity);
-    let mut labels = Vec::with_capacity(capacity);
-    let mut best_positions = Vec::with_capacity(capacity);
-    let mut best_values = Vec::with_capacity(capacity);
+    // Position ordinals are direct vector slots. Bound the vectors by the
+    // highest valid referenced slot, not by an unrelated unused tail of index.
+    // ELI5: make boxes only as far as the last reachable right row.
+    let width = positions
+        .iter()
+        .filter_map(|position| checked_index(*position, index.len()))
+        .max()
+        .map_or(0, |position| position + 1);
+    let mut seen = vec![false; width];
+    let mut touched = Vec::new();
+    let mut best_positions = vec![-1_i64; width];
+    let mut best_values: Vec<Option<T>> = vec![None; width];
 
     for (posn, (current, start, end, boolean)) in izip!(
         arr.into_iter(),
@@ -41,28 +52,28 @@ pub fn min_positions_core<T: PartialOrd + Copy>(
             let Some(indexer_) = checked_index(positions[nn], index.len()) else {
                 continue;
             };
-            let label = index[indexer_];
-            let slot = match slots.entry(label) {
-                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    best_positions.push(-1);
-                    best_values.push(*current);
-                    slot
-                }
-            };
+            if !seen[indexer_] {
+                seen[indexer_] = true;
+                touched.push(indexer_);
+                best_values[indexer_] = Some(*current);
+            }
             if *boolean {
                 continue;
             }
-            if (best_positions[slot] == -1) || (*current < best_values[slot]) {
-                best_values[slot] = *current;
-                best_positions[slot] = posn as i64;
+            if (best_positions[indexer_] == -1)
+                || (*current < best_values[indexer_].expect("seen position has a value"))
+            {
+                best_values[indexer_] = Some(*current);
+                best_positions[indexer_] = posn as i64;
             }
         }
     }
 
+    let labels = touched.iter().map(|&position| index[position]).collect();
+    let best_positions = touched
+        .iter()
+        .map(|&position| best_positions[position])
+        .collect();
     (labels, best_positions)
 }
 
@@ -94,15 +105,8 @@ macro_rules! compute {
                     "arr, starts, ends, booleans, index, and positions cannot be empty",
                 ));
             }
-            let (labels, best_positions) = min_positions_core(
-                arr,
-                starts,
-                ends,
-                index,
-                positions,
-                booleans,
-                index.len().min(positions.len()),
-            );
+            let (labels, best_positions) =
+                min_positions_core(arr, starts, ends, index, positions, booleans);
             let indexers = Array1::from_vec(labels);
             let result = Array1::from_vec(best_positions);
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
@@ -146,11 +150,11 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn positions_keep_first_seen_labels_and_minimum_rows() {
+    fn positions_keep_first_seen_unique_labels_and_minimum_rows() {
         let arr = array![5_i64, 2, 8];
         let starts = array![0_i64, 2, 4];
         let ends = array![2_i64, 4, 5];
-        let index = array![10_i64, 20, 10];
+        let index = array![10_i64, 20, 30];
         let positions = array![0_i64, 1, 2, 1, -1];
         let booleans = array![false, false, false];
 
@@ -161,11 +165,10 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            100,
         );
 
-        assert_eq!(labels, vec![10, 20]);
-        assert_eq!(rows, vec![1, 1]);
+        assert_eq!(labels, vec![10, 20, 30]);
+        assert_eq!(rows, vec![0, 1, 1]);
     }
 
     #[test]
@@ -184,7 +187,6 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
         );
 
         assert_eq!(labels, vec![4]);
