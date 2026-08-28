@@ -4,12 +4,17 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{checked_index, checked_range, ensure_equal_lengths, WrapMul};
-use std::collections::HashMap;
-
 /// Multiply values for each label reached through the positions tape.
 ///
-/// ELI5: the HashMap gives each label a compact slot, while labels and
-/// products live in Vecs. New labels start at the multiplicative identity 1.
+/// `positions` contains ordinal offsets into `index`; right-side row
+/// identities are expected to be unique by the pyjanitor contract. The dense
+/// implementation uses each ordinal as its state slot, avoiding a label
+/// HashMap lookup for every candidate. New slots start at the multiplicative
+/// identity 1, and invalid position sentinels are skipped by `checked_index`.
+///
+/// ELI5: position 7 always means `index[7]`. We keep one product box per
+/// referenced position, remember which boxes were touched, and copy only
+/// those boxes into the compact output.
 /// Integer products use wrapping arithmetic, so overflow has the same
 /// deterministic result in debug and release builds. `A` is the accumulator
 /// type: every integer dtype instantiates this with `A = i64`, except
@@ -22,7 +27,6 @@ pub fn prod_positions_int_core<T, A, F>(
     index: ArrayView1<'_, i64>,
     positions: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-    capacity: usize,
     to_value: F,
 ) -> (Vec<i64>, Vec<A>)
 where
@@ -30,10 +34,17 @@ where
     A: WrapMul,
     F: Fn(T) -> A,
 {
-    let capacity = capacity.min(index.len()).min(positions.len());
-    let mut slots: HashMap<i64, usize> = HashMap::with_capacity(capacity);
-    let mut labels = Vec::with_capacity(capacity);
-    let mut products = Vec::with_capacity(capacity);
+    // Allocate dense product state only through the highest valid ordinal
+    // present in the positions tape; invalid sentinels do not enlarge it.
+    // ELI5: ignore broken pointers and make boxes only for real right rows.
+    let width = positions
+        .iter()
+        .filter_map(|position| checked_index(*position, index.len()))
+        .max()
+        .map_or(0, |position| position + 1);
+    let mut seen = vec![false; width];
+    let mut touched = Vec::new();
+    let mut products = vec![A::ONE; width];
     for (current, start, end, boolean) in izip!(
         arr.into_iter(),
         starts.into_iter(),
@@ -48,25 +59,20 @@ where
             let Some(indexer_) = checked_index(positions[nn], index.len()) else {
                 continue;
             };
-            let label = index[indexer_];
-            let slot = match slots.entry(label) {
-                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    products.push(A::ONE);
-                    slot
-                }
-            };
+            if !seen[indexer_] {
+                seen[indexer_] = true;
+                touched.push(indexer_);
+            }
             if !*boolean {
                 // ELI5: use the same defined wraparound arithmetic as the
                 // forward kernel, so debug and release builds agree when an
                 // integer product exceeds its type's range.
-                products[slot] = products[slot].wrap_mul(current_);
+                products[indexer_] = products[indexer_].wrap_mul(current_);
             }
         }
     }
+    let labels = touched.iter().map(|&position| index[position]).collect();
+    let products = touched.iter().map(|&position| products[position]).collect();
     (labels, products)
 }
 
@@ -77,17 +83,23 @@ pub fn prod_positions_float_core<T, F>(
     index: ArrayView1<'_, i64>,
     positions: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-    capacity: usize,
     to_value: F,
 ) -> (Vec<i64>, Vec<f64>)
 where
     T: Copy,
     F: Fn(T) -> f64,
 {
-    let capacity = capacity.min(index.len()).min(positions.len());
-    let mut slots: HashMap<i64, usize> = HashMap::with_capacity(capacity);
-    let mut labels = Vec::with_capacity(capacity);
-    let mut products = Vec::with_capacity(capacity);
+    // Keep the floating-point path's state boundary identical to the integer
+    // path: highest valid referenced ordinal, followed by compact output.
+    // ELI5: both number types use the same set of reachable boxes.
+    let width = positions
+        .iter()
+        .filter_map(|position| checked_index(*position, index.len()))
+        .max()
+        .map_or(0, |position| position + 1);
+    let mut seen = vec![false; width];
+    let mut touched = Vec::new();
+    let mut products = vec![1.; width];
     for (current, start, end, boolean) in izip!(
         arr.into_iter(),
         starts.into_iter(),
@@ -102,22 +114,17 @@ where
             let Some(indexer_) = checked_index(positions[nn], index.len()) else {
                 continue;
             };
-            let label = index[indexer_];
-            let slot = match slots.entry(label) {
-                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    products.push(1.);
-                    slot
-                }
-            };
+            if !seen[indexer_] {
+                seen[indexer_] = true;
+                touched.push(indexer_);
+            }
             if !*boolean {
-                products[slot] *= current_;
+                products[indexer_] *= current_;
             }
         }
     }
+    let labels = touched.iter().map(|&position| index[position]).collect();
+    let products = touched.iter().map(|&position| products[position]).collect();
     (labels, products)
 }
 
@@ -149,16 +156,10 @@ macro_rules! compute_ints {
                     "arr, starts, ends, booleans, index, and positions cannot be empty",
                 ));
             }
-            let (labels, products) = prod_positions_int_core(
-                arr,
-                starts,
-                ends,
-                index,
-                positions,
-                booleans,
-                index.len().min(positions.len()),
-                |value| value as $acc,
-            );
+            let (labels, products) =
+                prod_positions_int_core(arr, starts, ends, index, positions, booleans, |value| {
+                    value as $acc
+                });
             let indexers = Array1::from_vec(labels);
             let result = Array1::from_vec(products);
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
@@ -205,16 +206,10 @@ macro_rules! compute_floats {
                     "arr, starts, ends, booleans, index, and positions cannot be empty",
                 ));
             }
-            let (labels, products) = prod_positions_float_core(
-                arr,
-                starts,
-                ends,
-                index,
-                positions,
-                booleans,
-                index.len().min(positions.len()),
-                |value| value as f64,
-            );
+            let (labels, products) =
+                prod_positions_float_core(arr, starts, ends, index, positions, booleans, |value| {
+                    value as f64
+                });
             let indexers = Array1::from_vec(labels);
             let result = Array1::from_vec(products);
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
@@ -254,7 +249,7 @@ mod tests {
         let arr = array![2_i64, 3, 4];
         let starts = array![0_i64, 2, 4];
         let ends = array![2_i64, 4, 5];
-        let index = array![10_i64, 20, 10];
+        let index = array![10_i64, 20, 30];
         let positions = array![0_i64, 1, 2, 1, -1];
         let booleans = array![false, false, false];
         let (labels, products) = prod_positions_int_core(
@@ -264,11 +259,10 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            100,
             |value| value,
         );
-        assert_eq!(labels, vec![10, 20]);
-        assert_eq!(products, vec![6, 6]);
+        assert_eq!(labels, vec![10, 20, 30]);
+        assert_eq!(products, vec![2, 24, 3]);
     }
 
     #[test]
@@ -286,7 +280,6 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
             |value| value,
         );
         assert_eq!(labels, vec![4]);
@@ -298,7 +291,7 @@ mod tests {
         let arr = array![2.0_f64, 3.0, 4.0, 0.0];
         let starts = array![0_i64, 2, 4, 6];
         let ends = array![2_i64, 4, 6, 8];
-        let index = array![10_i64, 20, 10];
+        let index = array![10_i64, 20, 30];
         let positions = array![0_i64, 1, 2, 1, 0, 2, 0, 2];
         let booleans = array![false, false, false, false];
 
@@ -309,12 +302,11 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            3,
             |value| value,
         );
 
-        assert_eq!(labels, vec![10, 20]);
-        assert_eq!(products, vec![0.0, 6.0]);
+        assert_eq!(labels, vec![10, 20, 30]);
+        assert_eq!(products, vec![0.0, 6.0, 0.0]);
     }
 
     #[test]
@@ -333,7 +325,6 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
             |value| value,
         );
 
@@ -357,7 +348,6 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
             |v: u64| v,
         );
         assert_eq!(labels, vec![5]);
@@ -380,7 +370,6 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
             |value| value,
         );
 
