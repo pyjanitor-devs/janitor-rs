@@ -1,27 +1,17 @@
 use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ensure_equal_lengths, validate_range};
+use crate::aggs::{ensure_equal_lengths, into_starts_ends_result, starts_domain, starts_labels};
 
 fn validate_starts_inputs(
     arr_len: usize,
-    starts: ArrayView1<'_, i64>,
-    right_len: usize,
+    starts_len: usize,
     booleans_len: usize,
 ) -> Result<(), &'static str> {
-    if arr_len != starts.len() || arr_len != booleans_len {
+    if arr_len != starts_len || arr_len != booleans_len {
         return Err("arr, starts, and booleans must have equal lengths");
-    }
-    if arr_len == 0 || right_len == 0 {
-        return Err("arr, starts, booleans, and index cannot be empty");
-    }
-    if starts
-        .iter()
-        .any(|start| validate_range(*start, right_len as i64, right_len).is_err())
-    {
-        return Err("starts must satisfy 0 <= start <= right_len");
     }
     Ok(())
 }
@@ -44,10 +34,8 @@ where
     T: Copy,
     F: FnMut(T) -> i64,
 {
-    let end_ = index.len();
-    validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
-    let min_start = starts.iter().copied().min().unwrap() as usize;
-    let width = end_ - min_start;
+    validate_starts_inputs(arr.len(), starts.len(), booleans.len())?;
+    let (min_start, width) = starts_domain(starts, index.len())?;
     let mut values = vec![0_i64; width];
     let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
     for (current, start, boolean) in zipped {
@@ -61,14 +49,7 @@ where
             *value = value.wrapping_add(current_);
         }
     }
-    let mut indexers = Vec::new();
-    let mut result = Vec::new();
-    for (slot, value) in values.iter().enumerate().take(width) {
-        let item = min_start + slot;
-        indexers.push(index[item]);
-        result.push(*value);
-    }
-    Ok((Array1::from_vec(indexers), Array1::from_vec(result)))
+    Ok((starts_labels(min_start, index), Array1::from_vec(values)))
 }
 
 macro_rules! compute_ints {
@@ -101,15 +82,16 @@ macro_rules! compute_ints {
             // from `index.len()` instead of trusting this number -- see
             // the doc comment on `sum_rev_starts_int_core`.
             let _ = length;
-            let (indexers, result) = sum_rev_starts_int_core(
-                arr.as_array(),
-                starts.as_array(),
-                index.as_array(),
-                booleans.as_array(),
-                |value| value as i64,
+            into_starts_ends_result(
+                py,
+                sum_rev_starts_int_core(
+                    arr.as_array(),
+                    starts.as_array(),
+                    index.as_array(),
+                    booleans.as_array(),
+                    |value| value as i64,
+                ),
             )
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
 }
@@ -138,10 +120,8 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    let end_ = index.len();
-    validate_starts_inputs(arr.len(), starts, end_, booleans.len())?;
-    let min_start = starts.iter().copied().min().unwrap() as usize;
-    let width = end_ - min_start;
+    validate_starts_inputs(arr.len(), starts.len(), booleans.len())?;
+    let (min_start, width) = starts_domain(starts, index.len())?;
     let mut slots = vec![(0.0_f64, 0.0_f64); width];
     let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
     for (current, start, boolean) in zipped {
@@ -165,14 +145,8 @@ where
             *total = increment;
         }
     }
-    let mut indexers = Vec::new();
-    let mut result = Vec::new();
-    for (slot, (total, _)) in slots.iter().enumerate().take(width) {
-        let item = min_start + slot;
-        indexers.push(index[item]);
-        result.push(*total);
-    }
-    Ok((Array1::from_vec(indexers), Array1::from_vec(result)))
+    let result = slots.into_iter().map(|(total, _)| total).collect();
+    Ok((starts_labels(min_start, index), result))
 }
 
 macro_rules! compute_floats {
@@ -201,15 +175,16 @@ macro_rules! compute_floats {
                 booleans.as_array().len(),
             )?;
             let _ = length;
-            let (indexers, result) = sum_rev_starts_float_core(
-                arr.as_array(),
-                starts.as_array(),
-                index.as_array(),
-                booleans.as_array(),
-                |value| value as f64,
+            into_starts_ends_result(
+                py,
+                sum_rev_starts_float_core(
+                    arr.as_array(),
+                    starts.as_array(),
+                    index.as_array(),
+                    booleans.as_array(),
+                    |value| value as f64,
+                ),
             )
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
 }

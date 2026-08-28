@@ -1,26 +1,16 @@
 use itertools::izip;
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths, validate_range};
+use crate::aggs::{ends_domain, ends_labels, ensure_equal_lengths, into_starts_ends_result};
 
 fn validate_ends_inputs(
     arr_len: usize,
-    ends: numpy::ndarray::ArrayView1<'_, i64>,
-    right_len: usize,
+    ends_len: usize,
     booleans_len: usize,
 ) -> Result<(), &'static str> {
-    if arr_len != ends.len() || arr_len != booleans_len {
+    if arr_len != ends_len || arr_len != booleans_len {
         return Err("arr, ends, and booleans must have equal lengths");
-    }
-    if arr_len == 0 || right_len == 0 {
-        return Err("arr, ends, booleans, and index cannot be empty");
-    }
-    if ends
-        .iter()
-        .any(|end| validate_range(0, *end, right_len).is_err())
-    {
-        return Err("ends must satisfy 0 <= end <= right_len");
     }
     Ok(())
 }
@@ -41,12 +31,8 @@ where
     T: Copy,
     F: FnMut(T) -> i64,
 {
-    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
-    let max_end = ends
-        .iter()
-        .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
-        .max()
-        .unwrap_or(0);
+    validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
+    let max_end = ends_domain(ends, index.len())?;
     let mut values = vec![0_i64; max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
         let current_ = to_i64(*current);
@@ -57,15 +43,9 @@ where
             *value = value.wrapping_add(current_);
         }
     }
-    let mut indexers = Vec::new();
-    let mut result = Vec::new();
-    for (item, value) in values.iter().enumerate().take(max_end) {
-        indexers.push(index[item]);
-        result.push(*value);
-    }
     Ok((
-        numpy::ndarray::Array1::from_vec(indexers),
-        numpy::ndarray::Array1::from_vec(result),
+        ends_labels(max_end, index),
+        numpy::ndarray::Array1::from_vec(values),
     ))
 }
 
@@ -80,12 +60,8 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    validate_ends_inputs(arr.len(), ends, index.len(), booleans.len())?;
-    let max_end = ends
-        .iter()
-        .filter_map(|end| checked_range(0, *end, index.len()).map(|(_, end)| end))
-        .max()
-        .unwrap();
+    validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
+    let max_end = ends_domain(ends, index.len())?;
     let mut slots = vec![(0.0_f64, 0.0_f64); max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
         let current_ = to_f64(*current);
@@ -102,16 +78,8 @@ where
             *total = increment;
         }
     }
-    let mut indexers = Vec::new();
-    let mut result = Vec::new();
-    for (item, (total, _)) in slots.iter().enumerate().take(max_end) {
-        indexers.push(index[item]);
-        result.push(*total);
-    }
-    Ok((
-        numpy::ndarray::Array1::from_vec(indexers),
-        numpy::ndarray::Array1::from_vec(result),
-    ))
+    let result = slots.into_iter().map(|(total, _)| total).collect();
+    Ok((ends_labels(max_end, index), result))
 }
 
 macro_rules! compute_ints {
@@ -134,10 +102,10 @@ macro_rules! compute_ints {
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let _ = length;
-            let (indexers, result) =
-                sum_rev_ends_int_core(arr, ends, index, booleans, |value| value as i64)
-                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+            into_starts_ends_result(
+                py,
+                sum_rev_ends_int_core(arr, ends, index, booleans, |value| value as i64),
+            )
         }
     };
 }
@@ -171,10 +139,10 @@ macro_rules! compute_floats {
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let _ = length;
-            let (indexers, result) =
-                sum_rev_ends_float_core(arr, ends, index, booleans, |value| value as f64)
-                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+            into_starts_ends_result(
+                py,
+                sum_rev_ends_float_core(arr, ends, index, booleans, |value| value as f64),
+            )
         }
     };
 }
@@ -224,6 +192,31 @@ mod tests {
 
         assert_eq!(indexers, array![10, 30]);
         assert_eq!(result, array![5, 5]);
+    }
+
+    #[test]
+    fn float_core_accepts_all_zero_ends_instead_of_panicking() {
+        // Regression test: the pre-refactor `.max().unwrap()` on a
+        // zero-width-filtered iterator panicked here because every `end`
+        // was 0, leaving nothing to take a max of. `ends_domain` takes the
+        // max of the raw `ends` array instead, so an all-zero domain
+        // resolves to `0` rather than panicking.
+        let arr = array![5.0_f64];
+        let ends = array![0_i64];
+        let index = array![0_i64];
+        let booleans = array![false];
+
+        let result = sum_rev_ends_float_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+
+        assert!(result.0.is_empty());
+        assert!(result.1.is_empty());
     }
 
     #[test]
