@@ -4,7 +4,6 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{checked_range, ensure_equal_lengths};
-use std::collections::{hash_map::Entry, HashMap};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -28,29 +27,18 @@ fn validate_inputs<T>(
     Ok(())
 }
 
-fn capacity_hint(
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    right_len: usize,
-) -> usize {
-    // ELI5: every covered index position can introduce at most one new label.
-    // This gives the map a useful upper bound without trusting a Python-side
-    // length value or reserving more buckets than the right index contains.
-    starts
-        .iter()
-        .zip(ends.iter())
-        .filter_map(|(start, end)| checked_range(*start, *end, right_len))
-        .fold(0_usize, |total, (start, end)| {
-            total.saturating_add(end - start)
-        })
-        .min(right_len)
-}
-
 /// Find the row containing the maximum value for each distinct right label.
 ///
-/// ELI5: each label gets one numbered drawer. The drawer stores the best
-/// row seen so far and its value; repeated labels reuse that drawer instead
-/// of maintaining two separate dictionaries.
+/// `index` contains unique right-row identities supplied by pyjanitor. The
+/// identities may be reordered by sorting or contain gaps; `item`, the
+/// position in `index`, is the state slot, while `index[item]` is the output
+/// label. `starts` and `ends` index this compact array and describe half-open
+/// ranges `[start, end)`. Invalid or zero-width ranges are skipped by
+/// `checked_range`, and empty input arrays are rejected.
+///
+/// ELI5: each right-row position gets one numbered drawer. The number printed
+/// on the row may be 42, 7, or 100, but the drawer is still its position on
+/// the shelf. We remember the best left row in that drawer.
 pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -60,11 +48,13 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     validate_inputs(arr, starts, ends, index, booleans)?;
 
-    let hint = capacity_hint(starts, ends, index.len());
-    let mut slots = HashMap::with_capacity(hint);
-    let mut labels = Vec::new();
-    let mut values = Vec::new();
-    let mut rows = Vec::new();
+    // ELI5: a vector is faster than asking a dictionary for a drawer on every
+    // visit. `Option` lets us leave the value uninitialized until a range
+    // first touches that ordinal position.
+    let mut seen = vec![false; index.len()];
+    let mut touched = Vec::new();
+    let mut values = vec![None; index.len()];
+    let mut rows = vec![-1_i64; index.len()];
 
     for (row, (current, start, end, boolean)) in
         izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter()).enumerate()
@@ -73,28 +63,23 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
             continue;
         };
         for item in start..end {
-            let label = index[item];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    values.push(*current);
-                    rows.push(-1_i64);
-                    slot
-                }
-            };
+            if !seen[item] {
+                seen[item] = true;
+                touched.push(item);
+                values[item] = Some(*current);
+            }
             if *boolean {
                 continue;
             }
-            if rows[slot] == -1 || *current > values[slot] {
-                values[slot] = *current;
-                rows[slot] = row as i64;
+            if rows[item] == -1 || *current > values[item].unwrap() {
+                values[item] = Some(*current);
+                rows[item] = row as i64;
             }
         }
     }
 
+    let labels = touched.iter().map(|&item| index[item]).collect();
+    let rows = touched.iter().map(|&item| rows[item]).collect();
     Ok((Array1::from_vec(labels), Array1::from_vec(rows)))
 }
 
@@ -160,15 +145,15 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn compact_slots_find_maximum_for_duplicate_labels() {
+    fn dense_slots_find_maximum_for_unique_gapped_labels() {
         let got = max_rev_start_end_core(
             array![5_i64, 2, 4].view(),
             array![0_i64, 1, 0].view(),
             array![2_i64, 3, 1].view(),
-            array![10_i64, 20, 10].view(),
+            array![42_i64, 7, 100].view(),
             array![false, false, false].view(),
         );
-        assert_eq!(got, Ok((array![10, 20], array![0, 0])));
+        assert_eq!(got, Ok((array![42, 7, 100], array![0, 0, 1])));
     }
 
     #[test]
