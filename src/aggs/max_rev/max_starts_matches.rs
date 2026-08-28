@@ -1,8 +1,6 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
 use crate::aggs::{ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches};
 
@@ -15,6 +13,10 @@ macro_rules! compute {
         /// scan the tape to enforce that value-level contract. Normally
         /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
         /// full candidate-tape width.
+        ///
+        /// `index` contains unique right-row identities. They may be reordered
+        /// or contain gaps; the suffix ordinal `item` selects dense state, and
+        /// `index[item]` is the output label.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -38,17 +40,29 @@ macro_rules! compute {
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let end_: usize = index.len();
-            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(end_);
-            let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(end_);
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = starts
-                .iter()
-                .map(|s| end_.saturating_sub(*s as usize))
-                .sum();
+            let (expected_matches_width, min_start) =
+                starts
+                    .iter()
+                    .fold((0_usize, end_), |(width, min_start), start| {
+                        let Some(start_) = usize::try_from(*start).ok().filter(|&s| s <= end_)
+                        else {
+                            return (width, min_start);
+                        };
+                        (width + end_ - start_, min_start.min(start_))
+                    });
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
+            // ELI5: if every suffix starts at 900 in a 1,000-row right frame,
+            // only 100 ordinal slots can be reached. Allocate that suffix
+            // domain, not one slot per label in the whole frame.
+            let width = end_ - min_start;
+            let mut seen = vec![false; width];
+            let mut touched = Vec::new();
+            let mut rows = vec![-1_i64; width];
+            let mut values = vec![<$type>::default(); width];
             let zipped = izip!(
                 arr.into_iter(),
                 starts.into_iter(),
@@ -57,33 +71,35 @@ macro_rules! compute {
             );
             let mut n: usize = 0;
             for (posn, (current, start, count, boolean)) in zipped.enumerate() {
-                let start_ = *start as usize;
+                let Some(start_) = usize::try_from(*start).ok().filter(|&s| s <= end_) else {
+                    continue;
+                };
                 for item in start_..end_ {
                     if (matches[n] == 0) {
                         n += 1;
                         continue;
                     }
-                    let pos = index[item];
-                    let base = dictionary.entry(pos).or_insert(-1);
-                    let base_val = mapping.entry(pos).or_insert(*current);
+                    let slot = item - min_start;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        touched.push(slot);
+                    }
                     if *boolean || (*count == 0) {
                         n += 1;
                         continue;
                     }
-                    if (*base == -1) || (*current > *base_val) {
-                        *base_val = *current;
-                        *base = posn as i64;
+                    if rows[slot] == -1 || *current > values[slot] {
+                        values[slot] = *current;
+                        rows[slot] = posn as i64;
                     }
                     n += 1;
                 }
             }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<i64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
+            let indexers: Vec<i64> = touched
+                .iter()
+                .map(|&slot| index[slot + min_start])
+                .collect();
+            let result: Vec<i64> = touched.iter().map(|&slot| rows[slot]).collect();
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
         }
     };
@@ -117,4 +133,43 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_max_rev_start_match_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_max_rev_start_match_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_max_rev_start_match_int64;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::Python;
+
+    #[test]
+    fn dense_suffix_slots_preserve_permuted_gapped_labels() {
+        Python::initialize();
+        Python::attach(|py| {
+            if py.import("numpy").is_err() {
+                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
+                return;
+            }
+
+            let arr = PyArray1::from_vec(py, vec![5_i64, 7]);
+            let starts = PyArray1::from_vec(py, vec![1_i64, 0]);
+            let counts = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let index = PyArray1::from_vec(py, vec![42_i64, 7, 100]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 0, 1, 1, 1]);
+            let booleans = PyArray1::from_vec(py, vec![false, false]);
+
+            let (labels, rows) = compute_max_rev_start_match_int64(
+                py,
+                arr.readonly(),
+                starts.readonly(),
+                counts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+                booleans.readonly(),
+            )
+            .unwrap();
+
+            assert_eq!(labels.readonly().as_slice().unwrap(), &[7, 42, 100]);
+            assert_eq!(rows.readonly().as_slice().unwrap(), &[1, 1, 1]);
+        });
+    }
 }
