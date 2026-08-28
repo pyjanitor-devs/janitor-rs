@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, should_sweep};
+use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, should_sweep, sweep_min};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -34,35 +34,15 @@ pub fn min_rev_ends_core<T: PartialOrd + Copy>(
         // right to left, and retain the current minimum. Flat linked buckets
         // preserve input order, so equal values retain the old first-row tie
         // behavior.
-        let mut head = vec![usize::MAX; max_end + 1];
-        let mut next = vec![usize::MAX; arr.len()];
-        for (row, end) in ends.iter().enumerate().rev() {
-            next[row] = head[*end as usize];
-            head[*end as usize] = row;
-        }
-        let mut positions = vec![-1_i64; max_end];
-        let mut current_winner: Option<(T, i64)> = None;
-        for position in (0..max_end).rev() {
-            let mut row = head[position + 1];
-            while row != usize::MAX {
-                let current = arr[row];
-                let replaces_winner = match current_winner.as_ref() {
-                    None => true,
-                    Some((winner_value, winner_row)) => {
-                        current < *winner_value
-                            || (current == *winner_value && (row as i64) < *winner_row)
-                    }
-                };
-                if !booleans[row] && replaces_winner {
-                    current_winner = Some((current, row as i64));
-                }
-                row = next[row];
-            }
-            if let Some((_, row)) = current_winner {
-                positions[position] = row;
-            }
-        }
-        return Ok((ends_labels(max_end, index), Array1::from_vec(positions)));
+        let positions = sweep_min(
+            arr,
+            booleans,
+            max_end,
+            |row| ends[row] as usize,
+            |position| position + 1,
+            (0..max_end).rev(),
+        );
+        return Ok((ends_labels(max_end, index), positions));
     }
 
     let mut values = vec![arr[0]; max_end];

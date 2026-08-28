@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{into_starts_ends_result, should_sweep, starts_domain, starts_labels};
+use crate::aggs::{into_starts_ends_result, should_sweep, starts_domain, starts_labels, sweep_min};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -33,36 +33,15 @@ pub fn min_rev_starts_core<T: PartialOrd + Copy>(
         // start. Bucket each row at that boundary, then compare it with the
         // current champion only once. Flat linked buckets preserve input
         // order, so equal values retain the old first-row tie behavior.
-        let mut head = vec![usize::MAX; width + 1];
-        let mut next = vec![usize::MAX; arr.len()];
-        for (row, start) in starts.iter().enumerate().rev() {
-            let bucket = *start as usize - min_start;
-            next[row] = head[bucket];
-            head[bucket] = row;
-        }
-        let mut positions = vec![-1_i64; width];
-        let mut current_winner: Option<(T, i64)> = None;
-        for bucket in 0..width {
-            let mut row = head[bucket];
-            while row != usize::MAX {
-                let current = arr[row];
-                let replaces_winner = match current_winner.as_ref() {
-                    None => true,
-                    Some((winner_value, winner_row)) => {
-                        current < *winner_value
-                            || (current == *winner_value && (row as i64) < *winner_row)
-                    }
-                };
-                if !booleans[row] && replaces_winner {
-                    current_winner = Some((current, row as i64));
-                }
-                row = next[row];
-            }
-            if let Some((_, row)) = current_winner {
-                positions[bucket] = row;
-            }
-        }
-        return Ok((starts_labels(min_start, index), Array1::from_vec(positions)));
+        let positions = sweep_min(
+            arr,
+            booleans,
+            width,
+            |row| starts[row] as usize - min_start,
+            |position| position,
+            0..width,
+        );
+        return Ok((starts_labels(min_start, index), positions));
     }
 
     let mut values = vec![arr[0]; width];

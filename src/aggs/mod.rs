@@ -135,6 +135,59 @@ pub(crate) fn should_sweep(rows: usize, width: usize) -> bool {
     repeated_work > sweep_work.saturating_mul(8)
 }
 
+/// Run a boundary sweep that returns the winning row for each output slot.
+///
+/// ELI5: put every row into the bucket where it becomes eligible, then walk
+/// the output buckets in order while carrying the best row seen so far. The
+/// two small closures describe the starts/ends-specific bucket numbering;
+/// the winner and tie-breaking logic lives here exactly once.
+pub(crate) fn sweep_min<T, RowBucket, OutputBucket, OutputPositions>(
+    arr: ArrayView1<'_, T>,
+    booleans: ArrayView1<'_, bool>,
+    width: usize,
+    row_bucket: RowBucket,
+    output_bucket: OutputBucket,
+    output_positions: OutputPositions,
+) -> Array1<i64>
+where
+    T: PartialOrd + Copy,
+    RowBucket: Fn(usize) -> usize,
+    OutputBucket: Fn(usize) -> usize,
+    OutputPositions: IntoIterator<Item = usize>,
+{
+    let mut head = vec![usize::MAX; width + 1];
+    let mut next = vec![usize::MAX; arr.len()];
+    for row in (0..arr.len()).rev() {
+        let bucket = row_bucket(row);
+        next[row] = head[bucket];
+        head[bucket] = row;
+    }
+
+    let mut positions = vec![-1_i64; width];
+    let mut current_winner: Option<(T, i64)> = None;
+    for position in output_positions {
+        let mut row = head[output_bucket(position)];
+        while row != usize::MAX {
+            let current = arr[row];
+            let replaces_winner = match current_winner.as_ref() {
+                None => true,
+                Some((winner_value, winner_row)) => {
+                    current < *winner_value
+                        || (current == *winner_value && (row as i64) < *winner_row)
+                }
+            };
+            if !booleans[row] && replaces_winner {
+                current_winner = Some((current, row as i64));
+            }
+            row = next[row];
+        }
+        if let Some((_, row)) = current_winner {
+            positions[position] = row;
+        }
+    }
+    Array1::from_vec(positions)
+}
+
 /// Shared return shape for every `*_rev_starts`/`*_rev_ends` `#[pyfunction]`
 /// wrapper: a pair of numpy arrays, generic over the value array's element
 /// type `U` so it fits min/max/size (`i64`) and prod/sum's int (`i64`) and
