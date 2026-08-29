@@ -3,42 +3,9 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use janitor_rs::bench_support::{max_rev_ends_core, max_rev_starts_core};
 use numpy::ndarray::{Array1, ArrayView1};
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-struct CountingAllocator;
-static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
-static CURRENT: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
-        let live = CURRENT.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-        PEAK.fetch_max(live, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        CURRENT.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: CountingAllocator = CountingAllocator;
-
-fn allocation_report<T>(f: impl FnOnce() -> T) -> (usize, usize) {
-    let before_allocated = ALLOCATED.load(Ordering::Relaxed);
-    let before_current = CURRENT.load(Ordering::Relaxed);
-    PEAK.store(before_current, Ordering::Relaxed);
-    black_box(f());
-    (
-        ALLOCATED.load(Ordering::Relaxed) - before_allocated,
-        PEAK.load(Ordering::Relaxed).saturating_sub(before_current),
-    )
-}
+mod support;
+use support::count_allocations;
 
 fn old_starts(
     arr: ArrayView1<'_, i64>,
@@ -138,24 +105,24 @@ fn bench(c: &mut Criterion) {
         );
 
         let old_start_memory =
-            allocation_report(|| old_starts(arr.view(), starts.view(), right_len));
-        let new_start_memory = allocation_report(|| {
+            count_allocations(|| old_starts(arr.view(), starts.view(), right_len));
+        let new_start_memory = count_allocations(|| {
             max_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view())
         });
-        let old_end_memory = allocation_report(|| old_ends(arr.view(), ends.view(), right_len));
-        let new_end_memory = allocation_report(|| {
+        let old_end_memory = count_allocations(|| old_ends(arr.view(), ends.view(), right_len));
+        let new_end_memory = count_allocations(|| {
             max_rev_ends_core(arr.view(), ends.view(), index.view(), booleans.view())
         });
         eprintln!(
             "{name}: starts old {}B/{}B new {}B/{}B; ends old {}B/{}B new {}B/{}B",
             old_start_memory.0,
-            old_start_memory.1,
+            old_start_memory.2,
             new_start_memory.0,
-            new_start_memory.1,
+            new_start_memory.2,
             old_end_memory.0,
-            old_end_memory.1,
+            old_end_memory.2,
             new_end_memory.0,
-            new_end_memory.1
+            new_end_memory.2
         );
 
         group.bench_function(format!("starts/old/{name}"), |b| {
