@@ -27,10 +27,9 @@ pub fn size_rev_ends_core(
     // naturally has no activation bucket visited by the output loop. Counts
     // are enough here, so memory depends on the compact output width—not the
     // number of rows in the batch.
-    // Store each non-empty prefix at its final covered position. This lets
-    // the right-to-left sweep overwrite the event after reading it, so the
-    // output and event counts share one allocation. `end == 0` is an empty
-    // prefix and has no event to record.
+    // Events are streamed directly from `ends`; `sweep_reduce` stores both the
+    // boundary totals and the final running counts in one width-sized bucket
+    // vector. `end == 0` is an empty prefix and has no event to record.
     let events = ends
         .iter()
         .filter(|end| **end > 0)
