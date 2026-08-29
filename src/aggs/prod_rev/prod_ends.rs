@@ -1,8 +1,9 @@
+use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, WrapMul};
+use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, sweep_reduce, WrapMul};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -19,6 +20,7 @@ fn validate_inputs<T>(
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
 /// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
 /// `WrapMul`).
+#[allow(private_bounds)]
 pub fn prod_rev_ends_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     arr: ArrayView1<'_, T>,
     ends: ArrayView1<'_, i64>,
@@ -28,17 +30,22 @@ pub fn prod_rev_ends_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
 ) -> Result<(Array1<i64>, Array1<A>), &'static str> {
     validate_inputs(arr, ends, booleans)?;
     let max_end = ends_domain(ends, index.len())?;
-    let mut values = vec![A::ONE; max_end];
-    for ((current, end), boolean) in arr.iter().zip(ends.iter()).zip(booleans.iter()) {
-        if *boolean {
-            continue;
-        }
-        let current = convert(*current);
-        for value in values.iter_mut().take(*end as usize) {
-            *value = value.wrap_mul(current);
-        }
-    }
-    Ok((ends_labels(max_end, index), Array1::from_vec(values)))
+    // ELI5: a prefix row joins the running product just to the left of its
+    // end. Combine rows at the same end into one product event, then sweep
+    // right-to-left and apply each event once. Wrapping multiplication is
+    // associative, so no per-row `next` metadata is needed; `end == 0` has
+    // no emitted slot and therefore contributes nothing.
+    let events = izip!(arr, ends, booleans)
+        .filter(|(_, end, boolean)| !**boolean && **end > 0)
+        .map(|(current, end, _)| (*end as usize - 1, convert(*current)));
+    let values = sweep_reduce(
+        max_end,
+        A::ONE,
+        events,
+        (0..max_end).rev(),
+        |left, right| left.wrap_mul(right),
+    )?;
+    Ok((ends_labels(max_end, index), values))
 }
 
 pub fn prod_rev_ends_float_core<T: Copy, F: FnMut(T) -> f64>(
@@ -50,12 +57,20 @@ pub fn prod_rev_ends_float_core<T: Copy, F: FnMut(T) -> f64>(
 ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
     validate_inputs(arr, ends, booleans)?;
     let max_end = ends_domain(ends, index.len())?;
+    // Keep floats on the direct nested loop. Unlike integer wrapping
+    // multiplication, IEEE-754 multiplication is not safely regroupable:
+    // changing the order can change rounding and the propagation of NaN or
+    // infinity. ELI5: integer products are exact on a wrapping number wheel,
+    // but decimal-like floats can give a different answer when we rearrange
+    // the multiplication, so this path preserves the old row/position order.
     let mut values = vec![1_f64; max_end];
-    for ((current, end), boolean) in arr.iter().zip(ends.iter()).zip(booleans.iter()) {
+    for (current, end, boolean) in izip!(arr, ends, booleans) {
         if *boolean {
             continue;
         }
         let current = to_f64(*current);
+        // Example: `end = 3` means the row contributes to slots 0, 1, and 2;
+        // `take(3)` selects exactly that prefix for multiplication.
         for value in values.iter_mut().take(*end as usize) {
             *value *= current;
         }
@@ -209,5 +224,22 @@ mod tests {
             ),
             Ok((array![], array![]))
         );
+    }
+
+    #[test]
+    fn integer_sweep_preserves_products_and_zero_width_rows() {
+        let arr = Array1::from_elem(100, 2_i64);
+        let mut ends = Array1::from_elem(100, 1000_i64);
+        ends[99] = 0;
+        let index = Array1::from_iter(0_i64..1000);
+        let booleans = Array1::from_elem(100, false);
+        let got = prod_rev_ends_int_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        );
+        assert_eq!(got.unwrap().1, Array1::from_elem(1000, 0_i64));
     }
 }

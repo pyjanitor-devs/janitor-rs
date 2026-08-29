@@ -1,8 +1,9 @@
+use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, should_sweep, sweep_min};
+use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, should_sweep, sweep_winner};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -32,15 +33,17 @@ pub fn min_rev_ends_core<T: PartialOrd + Copy>(
         // ELI5: a prefix row is eligible while the sweep is left of its end.
         // Bucket each row at its end, activate it once while sweeping from
         // right to left, and retain the current minimum. Equal values are
-        // explicitly resolved by the smallest input row index in `sweep_min`,
+        // explicitly resolved by the smallest input row index in
+        // `sweep_winner`,
         // matching the direct path regardless of bucket traversal order.
-        let positions = sweep_min(
+        let positions = sweep_winner(
             arr,
             booleans,
             max_end,
             |row| ends[row] as usize,
             |position| position + 1,
             (0..max_end).rev(),
+            |current, winner| current < winner,
         );
         return Ok((ends_labels(max_end, index), positions));
     }
@@ -48,17 +51,17 @@ pub fn min_rev_ends_core<T: PartialOrd + Copy>(
     let mut values = vec![arr[0]; max_end];
     let mut positions = vec![-1_i64; max_end];
 
-    for (row, ((current, end), boolean)) in
-        arr.iter().zip(ends.iter()).zip(booleans.iter()).enumerate()
-    {
+    for (row, (current, end, boolean)) in izip!(arr, ends, booleans).enumerate() {
+        if *boolean {
+            continue;
+        }
+        // Example: `end = 3` covers slots 0, 1, and 2. `take(3)` visits those
+        // paired slots only, so the row cannot affect position 3 or later.
         for (position, value) in positions
             .iter_mut()
             .zip(values.iter_mut())
             .take(*end as usize)
         {
-            if *boolean {
-                continue;
-            }
             if *position == -1 || *current < *value {
                 *position = row as i64;
                 *value = *current;

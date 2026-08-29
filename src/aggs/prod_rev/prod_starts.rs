@@ -1,8 +1,9 @@
+use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels, WrapMul};
+use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels, sweep_reduce, WrapMul};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -19,6 +20,7 @@ fn validate_inputs<T>(
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
 /// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
 /// `WrapMul`).
+#[allow(private_bounds)]
 pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -28,17 +30,17 @@ pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
 ) -> Result<(Array1<i64>, Array1<A>), &'static str> {
     validate_inputs(arr, starts, booleans)?;
     let (min_start, width) = starts_domain(starts, index.len())?;
-    let mut values = vec![A::ONE; width];
-    for ((current, start), boolean) in arr.iter().zip(starts.iter()).zip(booleans.iter()) {
-        if *boolean {
-            continue;
-        }
-        let current = convert(*current);
-        for value in values.iter_mut().skip(*start as usize - min_start) {
-            *value = value.wrap_mul(current);
-        }
-    }
-    Ok((starts_labels(min_start, index), Array1::from_vec(values)))
+    // ELI5: a suffix row joins the running product at its start bucket. The
+    // shared reducer combines rows sharing a boundary, then carries one
+    // product forward. Wrapping multiplication is associative, so this
+    // removes repeated per-row work without changing integer overflow rules.
+    let events = izip!(arr, starts, booleans)
+        .filter(|(_, start, boolean)| !**boolean && **start < index.len() as i64)
+        .map(|(current, start, _)| (*start as usize - min_start, convert(*current)));
+    let result = sweep_reduce(width, A::ONE, events, 0..width, |left, right| {
+        left.wrap_mul(right)
+    })?;
+    Ok((starts_labels(min_start, index), result))
 }
 
 pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
@@ -50,12 +52,21 @@ pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
 ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
     validate_inputs(arr, starts, booleans)?;
     let (min_start, width) = starts_domain(starts, index.len())?;
+    // Keep floats on the direct nested loop. Unlike integer wrapping
+    // multiplication, IEEE-754 multiplication is not safely regroupable:
+    // changing the order can change rounding and the propagation of NaN or
+    // infinity. ELI5: integer products are exact on a wrapping number wheel,
+    // but decimal-like floats can give a different answer when we rearrange
+    // the multiplication, so this path preserves the old row/position order.
     let mut values = vec![1_f64; width];
-    for ((current, start), boolean) in arr.iter().zip(starts.iter()).zip(booleans.iter()) {
+    for (current, start, boolean) in izip!(arr, starts, booleans) {
         if *boolean {
             continue;
         }
         let current = to_f64(*current);
+        // Example: with `min_start = 2` and `start = 5`, `skip(3)` maps the
+        // compact slot 3 back to original position 5 and multiplies this row
+        // through the rest of its suffix.
         for value in values.iter_mut().skip(*start as usize - min_start) {
             *value *= current;
         }
@@ -180,16 +191,33 @@ mod tests {
     }
 
     #[test]
-    fn u64_accumulator_preserves_values_at_and_above_i64_max() {
-        let value = (i64::MAX as u64) + 5;
+    fn integer_sweep_preserves_products_and_zero_width_rows() {
+        let arr = Array1::from_elem(100, 2_i64);
+        let mut starts = Array1::from_elem(100, 0_i64);
+        starts[99] = 1000;
+        let index = Array1::from_iter(0_i64..1000);
+        let booleans = Array1::from_elem(100, false);
+        let got = prod_rev_starts_int_core(
+            arr.view(),
+            starts.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        );
+        assert_eq!(got.unwrap().1, Array1::from_elem(1000, 0_i64));
+    }
+
+    #[test]
+    fn uint64_core_preserves_values_above_i64_max() {
+        let value = (i64::MAX as u64) + 1;
         let got = prod_rev_starts_int_core(
             array![value].view(),
             array![0_i64].view(),
-            array![20_i64].view(),
+            array![10_i64].view(),
             array![false].view(),
-            |v: u64| v,
+            |current| current,
         );
-        assert_eq!(got, Ok((array![20], array![value])));
+        assert_eq!(got, Ok((array![10], array![value])));
     }
 
     #[test]

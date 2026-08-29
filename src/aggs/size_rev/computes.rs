@@ -6,37 +6,60 @@ use std::collections::HashMap;
 use crate::aggs::{
     checked_end, checked_index, checked_range, ends_domain, ends_labels, ensure_equal_lengths,
     ensure_exact_tape_width, ensure_nonempty_matches, into_starts_ends_result, starts_domain,
-    starts_labels,
+    starts_labels, sweep_reduce,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
 
-fn size_rev_ends_core(
+/// Count how many reverse-end rows cover each compact prefix position.
+///
+/// ELI5: each `end` says “this row covers everything before here.” Instead of
+/// walking that whole prefix for every row, the implementation activates rows
+/// once during a right-to-left sweep and carries the running count.
+pub fn size_rev_ends_core(
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     let max_end = ends_domain(ends, index.len())?;
-    let mut result = vec![0_i64; max_end];
-    for end in ends {
-        for value in result.iter_mut().take(*end as usize) {
-            *value += 1;
-        }
-    }
-    Ok((ends_labels(max_end, index), Array1::from_vec(result)))
+    // ELI5: a prefix row is active to the left of its end. Count how many
+    // rows end at each boundary, then sweep from right to left and carry the
+    // active-row count across the output. `end == 0` is an empty prefix and
+    // naturally has no activation bucket visited by the output loop. Counts
+    // are enough here, so memory depends on the compact output width—not the
+    // number of rows in the batch.
+    // Events are streamed directly from `ends`; `sweep_reduce` stores both the
+    // boundary totals and the final running counts in one width-sized bucket
+    // vector. `end == 0` is an empty prefix and has no event to record.
+    let events = ends
+        .iter()
+        .filter(|end| **end > 0)
+        .map(|end| (*end as usize - 1, 1_i64));
+    let result = sweep_reduce(max_end, 0_i64, events, (0..max_end).rev(), |left, right| {
+        left + right
+    })?;
+    Ok((ends_labels(max_end, index), result))
 }
 
-fn size_rev_starts_core(
+/// Count how many reverse-start rows cover each compact suffix position.
+///
+/// ELI5: each `start` says “this row covers everything from here onward.” The
+/// implementation groups starts by boundary and sweeps those boundaries once,
+/// so wide suffixes do not cause repeated work.
+pub fn size_rev_starts_core(
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     let (min_start, width) = starts_domain(starts, index.len())?;
-    let mut result = vec![0_i64; width];
-    for start in starts {
-        for value in result.iter_mut().skip(*start as usize - min_start) {
-            *value += 1;
-        }
-    }
-    Ok((starts_labels(min_start, index), Array1::from_vec(result)))
+    // ELI5: a suffix row is active from its start onward. The shared reducer
+    // counts rows at each start boundary, then carries the active-row count
+    // forward. The valid `start == index.len()` bucket has no emitted slot and
+    // is naturally outside the compact output domain.
+    let events = starts
+        .iter()
+        .filter(|start| **start < index.len() as i64)
+        .map(|start| (*start as usize - min_start, 1_i64));
+    let result = sweep_reduce(width, 0_i64, events, 0..width, |left, right| left + right)?;
+    Ok((starts_labels(min_start, index), result))
 }
 
 #[pyfunction]
@@ -299,6 +322,19 @@ mod tests {
         );
         assert!(size_rev_starts_core(array![-1_i64].view(), index.view()).is_err());
         assert!(size_rev_ends_core(array![1_i64].view(), array![].view()).is_err());
+    }
+
+    #[test]
+    fn skips_zero_width_rows_without_affecting_other_rows() {
+        let index = array![10_i64, 20, 30];
+        assert_eq!(
+            size_rev_starts_core(array![1_i64, 3].view(), index.view()),
+            Ok((array![20, 30], array![1, 1]))
+        );
+        assert_eq!(
+            size_rev_ends_core(array![0_i64, 2].view(), index.view()),
+            Ok((array![10, 20], array![1, 1]))
+        );
     }
 }
 

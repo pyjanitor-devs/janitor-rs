@@ -50,3 +50,19 @@ harness = false
 [[bench]]
 name = "rev_min_sweep"
 harness = false
+
+[[bench]]
+name = "rev_max_sweep"
+harness = false
+
+[[bench]]
+name = "rev_prod_sweep"
+harness = false
+
+[[bench]]
+name = "rev_sum_sweep"
+harness = false
+
+[[bench]]
+name = "rev_size_sweep"
+harness = false

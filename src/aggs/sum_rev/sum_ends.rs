@@ -3,7 +3,7 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    ends_domain, ends_labels, ensure_equal_lengths, into_starts_ends_result, WrapAdd,
+    ends_domain, ends_labels, ensure_equal_lengths, into_starts_ends_result, sweep_reduce, WrapAdd,
 };
 
 fn validate_ends_inputs(
@@ -26,6 +26,7 @@ fn validate_ends_inputs(
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
 /// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
 /// `WrapAdd`).
+#[allow(private_bounds)]
 pub fn sum_rev_ends_int_core<T, A, F>(
     arr: numpy::ndarray::ArrayView1<T>,
     ends: numpy::ndarray::ArrayView1<i64>,
@@ -40,20 +41,24 @@ where
 {
     validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
-    let mut values = vec![A::ZERO; max_end];
-    for (current, end, boolean) in izip!(arr, ends, booleans) {
-        let current_ = convert(*current);
-        for value in values.iter_mut().take(*end as usize) {
-            if *boolean {
-                continue;
-            }
-            *value = value.wrap_add(current_);
-        }
-    }
-    Ok((
-        ends_labels(max_end, index),
-        numpy::ndarray::Array1::from_vec(values),
-    ))
+
+    // ELI5: an end-bound row covers a prefix. Put its value at the last slot
+    // it covers, then sweep right-to-left and carry the running sum leftward.
+    // Integer wrapping addition is associative, so grouping values at a
+    // boundary preserves results. Using `end - 1` means each event can be
+    // replaced by its final value after it is read; `end == 0` is an empty
+    // prefix and has no event.
+    let events = izip!(arr, ends, booleans)
+        .filter(|(_, end, boolean)| !**boolean && **end > 0)
+        .map(|(current, end, _)| (*end as usize - 1, convert(*current)));
+    let values = sweep_reduce(
+        max_end,
+        A::ZERO,
+        events,
+        (0..max_end).rev(),
+        |left, right| left.wrap_add(right),
+    )?;
+    Ok((ends_labels(max_end, index), values))
 }
 
 pub fn sum_rev_ends_float_core<T, F>(
@@ -69,13 +74,17 @@ where
 {
     validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
+    // Keep the existing per-position Neumaier accumulation for floats for
+    // the same row-order reason as the starts path.
     let mut slots = vec![(0.0_f64, 0.0_f64); max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
+        if *boolean {
+            continue;
+        }
         let current_ = to_f64(*current);
+        // Example: `end = 3` selects slots 0, 1, and 2. The row contributes
+        // to that prefix and cannot change slot 3 or anything after it.
         for (total, compensation) in slots.iter_mut().take(*end as usize) {
-            if *boolean {
-                continue;
-            }
             let difference = current_ - *compensation;
             let increment = *total + difference;
             *compensation = (increment - *total) - difference;
@@ -257,6 +266,28 @@ mod tests {
 
         assert!(result.0.is_empty());
         assert!(result.1.is_empty());
+    }
+
+    #[test]
+    fn in_place_sweep_handles_zero_one_and_full_width_ends() {
+        let arr = array![5_i64, 7, 11];
+        let ends = array![0_i64, 1, 3];
+        let index = array![10_i64, 30, 20];
+        let booleans = array![false, false, false];
+
+        let (indexers, result) = sum_rev_ends_int_core(
+            arr.view(),
+            ends.view(),
+            index.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+
+        // The end=0 row covers nothing; end=1 covers only slot 0; end=3
+        // covers all three slots. The labels remain in right-index order.
+        assert_eq!(indexers, array![10, 30, 20]);
+        assert_eq!(result, array![18, 11, 11]);
     }
 
     #[test]

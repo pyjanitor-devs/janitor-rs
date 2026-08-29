@@ -19,6 +19,8 @@ use numpy::ndarray::{Array1, ArrayView1};
 use std::hint::black_box;
 
 mod support;
+// ELI5: every benchmark executable uses the same scorekeeper for allocations,
+// so memory numbers mean the same thing across old and optimized kernels.
 use support::count_allocations;
 
 use janitor_rs::bench_support::{

@@ -124,8 +124,28 @@ pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<
     (0..max_end).map(|item| index[item]).collect()
 }
 
+// These knobs deliberately live beside the gate: they describe the policy for
+// choosing an implementation, not the correctness of either implementation.
+const SWEEP_WORK_RATIO: usize = 8;
+const SWEEP_MEMORY_MULTIPLIER: usize = 8;
+
 /// Choose the boundary sweep only when its one-time setup should repay the
 /// repeated work in the direct nested loop without an excessive memory cost.
+///
+/// The direct implementation does roughly `rows * width` work. The sweep does
+/// roughly `rows + width` work, but it also needs row-to-bucket metadata and a
+/// bucket array. We estimate the direct path's retained storage as one value
+/// and one `i64` label per output slot, then allow sweep metadata up to
+/// `SWEEP_MEMORY_MULTIPLIER` times that estimate. This is intentionally a
+/// conservative, allocation-independent estimate: it omits allocator headers,
+/// shared label storage, and small scalar state, and therefore is a dispatch
+/// guard rather than a memory guarantee.
+///
+/// `SWEEP_WORK_RATIO` prevents building metadata when the sweep would save only
+/// a small amount of repeated work. The memory multiplier prevents a very large
+/// row batch with a narrow output domain from turning the optimization into a
+/// memory spike. Both are policy knobs that can be benchmark-tuned without
+/// changing aggregation semantics.
 ///
 /// ELI5: build the shortcut only when there are enough repeated chores to
 /// make the setup worthwhile, and do not trade a tiny job for a huge bucket
@@ -142,34 +162,83 @@ pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool
     let sweep_metadata = rows
         .saturating_add(width.saturating_add(1))
         .saturating_mul(std::mem::size_of::<usize>());
-    let memory_budget = direct_bytes.saturating_mul(8);
-    repeated_work > sweep_work.saturating_mul(8) && sweep_metadata <= memory_budget
+    // These are policy knobs, not correctness conditions: the work ratio
+    // avoids building metadata for tiny jobs, while the memory multiplier
+    // limits the extra row-link/bucket storage relative to the direct path.
+    let memory_budget = direct_bytes.saturating_mul(SWEEP_MEMORY_MULTIPLIER);
+    repeated_work > sweep_work.saturating_mul(SWEEP_WORK_RATIO) && sweep_metadata <= memory_budget
+}
+
+/// Reduce boundary events into one value per compact output position.
+///
+/// ELI5: each row drops its contribution into the bucket where it becomes
+/// active. We combine values sharing a bucket, then walk the buckets in the
+/// caller's direction while carrying a running result. Starts and ends use
+/// different bucket numbering, so callers provide those mappings; allocation
+/// and sweep mechanics live here once.
+///
+/// Event and output buckets outside `0..width` are rejected instead of being
+/// allowed to panic through an indexing operation. Domain helpers normally
+/// establish this precondition before the reducer is called, but keeping the
+/// guard here makes the shared helper safe for future callers too.
+pub(crate) fn sweep_reduce<T, Events, OutputPositions, Combine>(
+    width: usize,
+    identity: T,
+    events: Events,
+    output_positions: OutputPositions,
+    combine: Combine,
+) -> Result<Array1<T>, &'static str>
+where
+    T: Copy,
+    Events: IntoIterator<Item = (usize, T)>,
+    OutputPositions: IntoIterator<Item = usize>,
+    Combine: Fn(T, T) -> T,
+{
+    let mut result = vec![identity; width];
+    for (bucket, value) in events {
+        let slot = result
+            .get_mut(bucket)
+            .ok_or("sweep event bucket is outside the output width")?;
+        *slot = combine(*slot, value);
+    }
+
+    let mut running = identity;
+    for position in output_positions {
+        if position >= width {
+            return Err("sweep output bucket is outside the output width");
+        }
+        running = combine(running, result[position]);
+        result[position] = running;
+    }
+    Ok(Array1::from_vec(result))
 }
 
 /// Run a boundary sweep that returns the winning row for each output slot.
 ///
 /// ELI5: put every row into the bucket where it becomes eligible, then walk
 /// the output buckets in order while carrying the best row seen so far. The
-/// two small closures describe the starts/ends-specific bucket numbering;
-/// the winner and tie-breaking logic lives here exactly once.
+/// boundary-specific mapping is supplied by the caller; null handling and
+/// smallest-row tie-breaking live here exactly once.
 ///
 /// `booleans` is the null mask supplied by pyjanitor. In particular, pyjanitor
 /// marks floating-point NaN values as null before calling this backend, so the
-/// kernel deliberately relies on that mask rather than implementing a second
-/// NaN policy for every supported dtype.
-pub(crate) fn sweep_min<T, RowBucket, OutputBucket, OutputPositions>(
+/// kernel relies on that mask rather than implementing a second NaN policy for
+/// every supported dtype.
+pub(crate) fn sweep_winner<T, RowBucket, OutputBucket, OutputPositions, Better>(
     arr: ArrayView1<'_, T>,
     booleans: ArrayView1<'_, bool>,
     width: usize,
     row_bucket: RowBucket,
     output_bucket: OutputBucket,
     output_positions: OutputPositions,
+    better: Better,
 ) -> Array1<i64>
 where
     T: PartialOrd + Copy,
     RowBucket: Fn(usize) -> usize,
     OutputBucket: Fn(usize) -> usize,
     OutputPositions: IntoIterator<Item = usize>,
+    Better: Fn(T, T) -> bool,
 {
     let mut head = vec![usize::MAX; width + 1];
     let mut next = vec![usize::MAX; arr.len()];
@@ -192,7 +261,7 @@ where
             let replaces_winner = match current_winner.as_ref() {
                 None => true,
                 Some((winner_value, winner_row)) => {
-                    current < *winner_value
+                    better(current, *winner_value)
                         || (current == *winner_value && (row as i64) < *winner_row)
                 }
             };
@@ -206,6 +275,64 @@ where
         }
     }
     Array1::from_vec(positions)
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use numpy::ndarray::array;
+
+    use super::{should_sweep, sweep_reduce, sweep_winner};
+
+    #[test]
+    fn sweep_gate_accounts_for_row_link_memory_and_dtype() {
+        assert!(!should_sweep(1_000_000, 9, std::mem::size_of::<i64>()));
+        assert!(!should_sweep(1_000_000, 9, std::mem::size_of::<u8>()));
+        assert!(should_sweep(1_000, 10_000, std::mem::size_of::<i64>()));
+    }
+
+    #[test]
+    fn sweep_winner_covers_max_ties_nulls_and_both_directions() {
+        let arr = array![7_i64, 7, 7];
+        let booleans = array![true, false, false];
+
+        let forward = sweep_winner(
+            arr.view(),
+            booleans.view(),
+            3,
+            |row| [0, 2, 1][row],
+            |position| position,
+            0..3,
+            |current, winner| current > winner,
+        );
+        assert_eq!(forward, array![-1, 2, 1]);
+
+        let reverse = sweep_winner(
+            arr.view(),
+            booleans.view(),
+            3,
+            |row| [3, 1, 2][row],
+            |position| position + 1,
+            (0..3).rev(),
+            |current, winner| current > winner,
+        );
+        assert_eq!(reverse, array![1, 2, -1]);
+    }
+
+    #[test]
+    fn sweep_reduce_supports_forward_and_reverse_event_orders() {
+        let forward = sweep_reduce(3, 0_i64, [(0, 2), (1, 3), (0, 4)], 0..3, |left, right| {
+            left + right
+        });
+        assert_eq!(forward, Ok(array![6, 9, 9]));
+
+        let reverse = sweep_reduce(3, 1_i64, [(0, 2), (2, 3)], (0..3).rev(), |left, right| {
+            left * right
+        });
+        assert_eq!(reverse, Ok(array![6, 3, 3]));
+
+        let invalid = sweep_reduce(2, 0_i64, [(2, 1)], 0..2, |left, right| left + right);
+        assert!(invalid.is_err());
+    }
 }
 
 /// Shared return shape for every `*_rev_starts`/`*_rev_ends` `#[pyfunction]`
@@ -396,46 +523,6 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     sum::register(m)?;
     sum_rev::register(m)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod sweep_tests {
-    use numpy::ndarray::array;
-
-    use super::{should_sweep, sweep_min};
-
-    #[test]
-    fn sweep_gate_accounts_for_row_link_memory() {
-        assert!(!should_sweep(1_000_000, 9, std::mem::size_of::<i64>()));
-        assert!(!should_sweep(1_000_000, 9, std::mem::size_of::<u8>()));
-        assert!(should_sweep(1_000, 10_000, std::mem::size_of::<i64>()));
-    }
-
-    #[test]
-    fn sweep_min_handles_ties_nulls_and_both_directions() {
-        let arr = array![7_i64, 7, 7];
-        let booleans = array![true, false, false];
-
-        let forward = sweep_min(
-            arr.view(),
-            booleans.view(),
-            3,
-            |row| [0, 2, 1][row],
-            |position| position,
-            0..3,
-        );
-        assert_eq!(forward, array![-1, 2, 1]);
-
-        let reverse = sweep_min(
-            arr.view(),
-            booleans.view(),
-            3,
-            |row| [3, 1, 2][row],
-            |position| position + 1,
-            (0..3).rev(),
-        );
-        assert_eq!(reverse, array![1, 2, -1]);
-    }
 }
 
 #[cfg(test)]

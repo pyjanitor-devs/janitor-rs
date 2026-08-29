@@ -923,3 +923,25 @@ record, not merely local investigation notes.
 properly formatted comparison with the old implementation, covering runtime
 and memory for the agreed tiny, large, very-large, and super-large cases and
 duplicate/unique label distributions. State benchmark limitations explicitly.
+
+### [2026-08-28] Refresh `origin/main` before branch work
+
+**Context**: Related optimization PRs advance in parallel, so a locally cached
+`origin/main` can be stale even when the working tree is clean.
+**Learning**: The current remote main branch is the comparison and integration
+baseline for every new branch update and benchmark.
+**Recommendation**: Fetch `origin main` immediately before creating or
+updating a worktree, rebase onto that fetched ref when needed, and record the
+exact `origin/main` commit used for benchmarks. Never assume the PR's original
+base is still current.
+
+### [2026-08-29] Load the Xcode Python framework for local Rust execution
+
+**Context**: This macOS checkout uses the Command Line Tools Python 3.9
+framework, which is installed inside Xcode but is not always discoverable by
+`dyld` when running PyO3-linked tests or benchmarks.
+**Recommendation**: If a test or benchmark fails with a missing
+`Python3.framework/Versions/3.9/Python3`, run it with:
+`DYLD_FRAMEWORK_PATH=/Applications/Xcode.app/Contents/Developer/Library/Frameworks`
+prepended to the command. This is a local loader workaround; do not encode the
+machine-specific path in Cargo or production code.

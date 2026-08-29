@@ -1,8 +1,11 @@
+use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels};
+use crate::aggs::{
+    into_starts_ends_result, should_sweep, starts_domain, starts_labels, sweep_winner,
+};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -25,29 +28,44 @@ pub fn max_rev_starts_core<T: PartialOrd + Copy>(
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     validate_inputs(arr, starts, booleans)?;
     let (min_start, width) = starts_domain(starts, index.len())?;
-    let mut values = vec![arr[0]; width];
-    let mut positions = vec![-1_i64; width];
-    for (row, ((current, start), boolean)) in arr
-        .iter()
-        .zip(starts.iter())
-        .zip(booleans.iter())
-        .enumerate()
-    {
-        for (position, value) in positions
-            .iter_mut()
-            .zip(values.iter_mut())
-            .skip(*start as usize - min_start)
+
+    if !should_sweep(arr.len(), width, std::mem::size_of::<T>()) {
+        let mut values = vec![arr[0]; width];
+        let mut positions = vec![-1_i64; width];
+        for (row, (current, start, boolean)) in
+            izip!(arr.iter(), starts.iter(), booleans.iter()).enumerate()
         {
             if *boolean {
                 continue;
             }
-            if *position == -1 || *current > *value {
-                *position = row as i64;
-                *value = *current;
+            // Example: with `min_start = 2` and `start = 5`, the compact
+            // output begins at offset `5 - 2 = 3`. Skipping three paired
+            // slots means this row updates positions 5 through the suffix
+            // end, while `positions` and `values` stay aligned.
+            for (position, value) in positions
+                .iter_mut()
+                .zip(values.iter_mut())
+                .skip(*start as usize - min_start)
+            {
+                if *position == -1 || *current > *value {
+                    *position = row as i64;
+                    *value = *current;
+                }
             }
         }
+        return Ok((starts_labels(min_start, index), Array1::from_vec(positions)));
     }
-    Ok((starts_labels(min_start, index), Array1::from_vec(positions)))
+
+    let positions = sweep_winner(
+        arr,
+        booleans,
+        width,
+        |row| starts[row] as usize - min_start,
+        |position| position,
+        0..width,
+        |current, winner| current > winner,
+    );
+    Ok((starts_labels(min_start, index), positions))
 }
 
 macro_rules! compute {
@@ -121,5 +139,69 @@ mod tests {
             array![false].view()
         )
         .is_err());
+    }
+
+    #[test]
+    fn sweep_preserves_first_tie_and_skips_null_rows() {
+        let mut arr = Array1::from_elem(100, 7_i64);
+        arr[0] = 5;
+        let mut starts = Array1::zeros(100);
+        starts[99] = 500;
+        let index = Array1::from_iter(0_i64..1000);
+        let mut booleans = Array1::from_elem(100, false);
+        booleans[99] = true;
+        let got = max_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
+        let (labels, positions) = got.unwrap();
+        assert_eq!(labels, index);
+        assert!(positions.iter().all(|position| *position == 1));
+    }
+
+    #[test]
+    fn sweep_preserves_smallest_row_on_equal_maximum() {
+        let mut arr = Array1::from_elem(20, 99_i64);
+        arr[2] = 7;
+        arr[18] = 7;
+        let mut starts = Array1::from_elem(20, 20_i64);
+        starts[2] = 19;
+        starts[18] = 0;
+        let index = Array1::from_iter(0..20_i64);
+        let mut booleans = Array1::from_elem(20, true);
+        booleans[2] = false;
+        booleans[18] = false;
+        let got = max_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
+        let expected =
+            Array1::from_iter((0..20).map(|position| if position == 19 { 2 } else { 18 }));
+        assert_eq!(got, Ok((Array1::from_iter(0..20_i64), expected)));
+    }
+
+    #[test]
+    fn sweep_matches_direct_reference_with_null_and_nonuniform_starts() {
+        let arr = Array1::from_iter((0..20).map(|row| (row % 7) as i64));
+        let starts = Array1::from_iter((0..20).map(|row| (row * 3 % 21) as i64));
+        let index = Array1::from_iter(0..20_i64);
+        let mut booleans = Array1::from_elem(20, false);
+        booleans[4] = true;
+        booleans[17] = true;
+
+        let min_start = starts.iter().copied().min().unwrap() as usize;
+        let width = index.len() - min_start;
+        let mut values = vec![arr[0]; width];
+        let mut expected = vec![-1_i64; width];
+        for row in 0..arr.len() {
+            if booleans[row] {
+                continue;
+            }
+            for position in (starts[row] as usize - min_start)..width {
+                if expected[position] == -1 || arr[row] > values[position] {
+                    expected[position] = row as i64;
+                    values[position] = arr[row];
+                }
+            }
+        }
+
+        let (labels, positions) =
+            max_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view()).unwrap();
+        assert_eq!(labels, index);
+        assert_eq!(positions, Array1::from_vec(expected));
     }
 }

@@ -1,8 +1,11 @@
+use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{into_starts_ends_result, should_sweep, starts_domain, starts_labels, sweep_min};
+use crate::aggs::{
+    into_starts_ends_result, should_sweep, starts_domain, starts_labels, sweep_winner,
+};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -32,15 +35,16 @@ pub fn min_rev_starts_core<T: PartialOrd + Copy>(
         // ELI5: a suffix row becomes eligible when the sweep reaches its
         // start. Bucket each row at that boundary, then compare it with the
         // current champion only once. Equal values are explicitly resolved by
-        // the smallest input row index in `sweep_min`, matching the direct
+        // the smallest input row index in `sweep_winner`, matching the direct
         // path regardless of bucket traversal order.
-        let positions = sweep_min(
+        let positions = sweep_winner(
             arr,
             booleans,
             width,
             |row| starts[row] as usize - min_start,
             |position| position,
             0..width,
+            |current, winner| current < winner,
         );
         return Ok((starts_labels(min_start, index), positions));
     }
@@ -48,20 +52,18 @@ pub fn min_rev_starts_core<T: PartialOrd + Copy>(
     let mut values = vec![arr[0]; width];
     let mut positions = vec![-1_i64; width];
 
-    for (row, ((current, start), boolean)) in arr
-        .iter()
-        .zip(starts.iter())
-        .zip(booleans.iter())
-        .enumerate()
-    {
+    for (row, (current, start, boolean)) in izip!(arr, starts, booleans).enumerate() {
+        if *boolean {
+            continue;
+        }
+        // Example: with `min_start = 2` and `start = 5`, the compact offset
+        // is `5 - 2 = 3`. Skipping three paired slots leaves this row's
+        // suffix, positions 5 onward, for the minimum comparison.
         for (position, value) in positions
             .iter_mut()
             .zip(values.iter_mut())
             .skip(*start as usize - min_start)
         {
-            if *boolean {
-                continue;
-            }
             if *position == -1 || *current < *value {
                 *position = row as i64;
                 *value = *current;
