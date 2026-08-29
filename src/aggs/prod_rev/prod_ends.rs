@@ -46,7 +46,7 @@ pub fn prod_rev_ends_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
         events,
         (0..max_end).rev(),
         |left, right| left.wrap_mul(right),
-    );
+    )?;
     Ok((ends_labels(max_end, index), values))
 }
 

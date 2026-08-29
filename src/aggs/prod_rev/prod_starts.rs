@@ -41,7 +41,7 @@ pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
         .map(|((current, start), _)| (*start as usize - min_start, convert(*current)));
     let result = sweep_reduce(width, A::ONE, events, 0..width, |left, right| {
         left.wrap_mul(right)
-    });
+    })?;
     Ok((starts_labels(min_start, index), result))
 }
 
@@ -204,6 +204,19 @@ mod tests {
             |value| value,
         );
         assert_eq!(got.unwrap().1, Array1::from_elem(1000, 0_i64));
+    }
+
+    #[test]
+    fn uint64_core_preserves_values_above_i64_max() {
+        let value = (i64::MAX as u64) + 1;
+        let got = prod_rev_starts_int_core(
+            array![value].view(),
+            array![0_i64].view(),
+            array![10_i64].view(),
+            array![false].view(),
+            |current| current,
+        );
+        assert_eq!(got, Ok((array![10], array![value])));
     }
 
     #[test]

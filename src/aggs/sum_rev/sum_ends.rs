@@ -57,7 +57,7 @@ where
         events,
         (0..max_end).rev(),
         |left, right| left.wrap_add(right),
-    );
+    )?;
     Ok((ends_labels(max_end, index), values))
 }
 

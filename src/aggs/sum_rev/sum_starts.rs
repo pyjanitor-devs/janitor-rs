@@ -54,7 +54,7 @@ where
         .map(|(current, start, _)| (*start as usize - min_start, convert(*current)));
     let result = sweep_reduce(width, A::ZERO, events, 0..width, |left, right| {
         left.wrap_add(right)
-    });
+    })?;
     Ok((starts_labels(min_start, index), result))
 }
 

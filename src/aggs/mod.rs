@@ -177,15 +177,17 @@ pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool
 /// different bucket numbering, so callers provide those mappings; allocation
 /// and sweep mechanics live here once.
 ///
-/// Callers must provide bucket values in `0..width`. Domain helpers validate
-/// the starts/ends before this low-level reducer is called.
+/// Event and output buckets outside `0..width` are rejected instead of being
+/// allowed to panic through an indexing operation. Domain helpers normally
+/// establish this precondition before the reducer is called, but keeping the
+/// guard here makes the shared helper safe for future callers too.
 pub(crate) fn sweep_reduce<T, Events, OutputPositions, Combine>(
     width: usize,
     identity: T,
     events: Events,
     output_positions: OutputPositions,
     combine: Combine,
-) -> Array1<T>
+) -> Result<Array1<T>, &'static str>
 where
     T: Copy,
     Events: IntoIterator<Item = (usize, T)>,
@@ -194,15 +196,21 @@ where
 {
     let mut result = vec![identity; width];
     for (bucket, value) in events {
-        result[bucket] = combine(result[bucket], value);
+        let slot = result
+            .get_mut(bucket)
+            .ok_or("sweep event bucket is outside the output width")?;
+        *slot = combine(*slot, value);
     }
 
     let mut running = identity;
     for position in output_positions {
+        if position >= width {
+            return Err("sweep output bucket is outside the output width");
+        }
         running = combine(running, result[position]);
         result[position] = running;
     }
-    Array1::from_vec(result)
+    Ok(Array1::from_vec(result))
 }
 
 /// Run a boundary sweep that returns the winning row for each output slot.
@@ -315,12 +323,15 @@ mod sweep_tests {
         let forward = sweep_reduce(3, 0_i64, [(0, 2), (1, 3), (0, 4)], 0..3, |left, right| {
             left + right
         });
-        assert_eq!(forward, array![6, 9, 9]);
+        assert_eq!(forward, Ok(array![6, 9, 9]));
 
         let reverse = sweep_reduce(3, 1_i64, [(0, 2), (2, 3)], (0..3).rev(), |left, right| {
             left * right
         });
-        assert_eq!(reverse, array![6, 3, 3]);
+        assert_eq!(reverse, Ok(array![6, 3, 3]));
+
+        let invalid = sweep_reduce(2, 0_i64, [(2, 1)], 0..2, |left, right| left + right);
+        assert!(invalid.is_err());
     }
 }
 

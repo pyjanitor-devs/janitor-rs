@@ -69,11 +69,11 @@ fn bench(c: &mut Criterion) {
         eprintln!(
             "{name}: starts old {}B/{}B new {}B/{}B; ends old {}B/{}B new {}B/{}B",
             old_start_memory.0,
-            old_start_memory.1,
+            old_start_memory.2,
             new_start_memory.0,
             new_start_memory.2,
             old_end_memory.0,
-            old_end_memory.1,
+            old_end_memory.2,
             new_end_memory.0,
             new_end_memory.2
         );
