@@ -934,3 +934,14 @@ baseline for every new branch update and benchmark.
 updating a worktree, rebase onto that fetched ref when needed, and record the
 exact `origin/main` commit used for benchmarks. Never assume the PR's original
 base is still current.
+
+### [2026-08-29] Load the Xcode Python framework for local Rust execution
+
+**Context**: This macOS checkout uses the Command Line Tools Python 3.9
+framework, which is installed inside Xcode but is not always discoverable by
+`dyld` when running PyO3-linked tests or benchmarks.
+**Recommendation**: If a test or benchmark fails with a missing
+`Python3.framework/Versions/3.9/Python3`, run it with:
+`DYLD_FRAMEWORK_PATH=/Applications/Xcode.app/Contents/Developer/Library/Frameworks`
+prepended to the command. This is a local loader workaround; do not encode the
+machine-specific path in Cargo or production code.
