@@ -57,14 +57,14 @@ pub fn min_rev_starts_core<T: PartialOrd + Copy>(
         .zip(booleans.iter())
         .enumerate()
     {
+        if *boolean {
+            continue;
+        }
         for (position, value) in positions
             .iter_mut()
             .zip(values.iter_mut())
             .skip(*start as usize - min_start)
         {
-            if *boolean {
-                continue;
-            }
             if *position == -1 || *current < *value {
                 *position = row as i64;
                 *value = *current;
