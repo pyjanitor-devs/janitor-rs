@@ -32,7 +32,8 @@ pub fn min_rev_ends_core<T: PartialOrd + Copy>(
         // ELI5: a prefix row is eligible while the sweep is left of its end.
         // Bucket each row at its end, activate it once while sweeping from
         // right to left, and retain the current minimum. Equal values are
-        // explicitly resolved by the smallest input row index in `sweep_min`,
+        // explicitly resolved by the smallest input row index in
+        // `sweep_winner`,
         // matching the direct path regardless of bucket traversal order.
         let positions = sweep_winner(
             arr,

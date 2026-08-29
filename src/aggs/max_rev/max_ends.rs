@@ -32,14 +32,14 @@ pub fn max_rev_ends_core<T: PartialOrd + Copy>(
         for (row, ((current, end), boolean)) in
             arr.iter().zip(ends.iter()).zip(booleans.iter()).enumerate()
         {
+            if *boolean {
+                continue;
+            }
             for (position, value) in positions
                 .iter_mut()
                 .zip(values.iter_mut())
                 .take(*end as usize)
             {
-                if *boolean {
-                    continue;
-                }
                 if *position == -1 || *current > *value {
                     *position = row as i64;
                     *value = *current;
