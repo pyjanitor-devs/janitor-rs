@@ -37,7 +37,7 @@ pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
         .iter()
         .zip(starts.iter())
         .zip(booleans.iter())
-        .filter(|((_, _), boolean)| !**boolean)
+        .filter(|((_, start), boolean)| !**boolean && **start < index.len() as i64)
         .map(|((current, start), _)| (*start as usize - min_start, convert(*current)));
     let result = sweep_reduce(width, A::ONE, events, 0..width, |left, right| {
         left.wrap_mul(right)

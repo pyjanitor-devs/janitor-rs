@@ -57,6 +57,7 @@ pub fn size_rev_starts_core(
     // is naturally outside the compact output domain.
     let events = starts
         .iter()
+        .filter(|start| **start < index.len() as i64)
         .map(|start| (*start as usize - min_start, 1_i64));
     let result = sweep_reduce(width, 0_i64, events, 0..width, |left, right| left + right);
     Ok((starts_labels(min_start, index), result))

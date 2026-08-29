@@ -50,7 +50,7 @@ where
     // forward, so a wide suffix is not rescanned for every row. Integer
     // wrapping addition is associative, so this regrouping preserves results.
     let events = izip!(arr, starts, booleans)
-        .filter(|(_, _, boolean)| !**boolean)
+        .filter(|(_, start, boolean)| !**boolean && **start < index.len() as i64)
         .map(|(current, start, _)| (*start as usize - min_start, convert(*current)));
     let result = sweep_reduce(width, A::ZERO, events, 0..width, |left, right| {
         left.wrap_add(right)
