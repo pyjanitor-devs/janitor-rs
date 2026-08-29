@@ -78,11 +78,11 @@ where
     // the same row-order reason as the starts path.
     let mut slots = vec![(0.0_f64, 0.0_f64); max_end];
     for (current, end, boolean) in izip!(arr, ends, booleans) {
+        if *boolean {
+            continue;
+        }
         let current_ = to_f64(*current);
         for (total, compensation) in slots.iter_mut().take(*end as usize) {
-            if *boolean {
-                continue;
-            }
             let difference = current_ - *compensation;
             let increment = *total + difference;
             *compensation = (increment - *total) - difference;

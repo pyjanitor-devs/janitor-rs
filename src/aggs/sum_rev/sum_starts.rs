@@ -131,11 +131,11 @@ where
     let mut slots = vec![(0.0_f64, 0.0_f64); width];
     let zipped = izip!(arr.into_iter(), starts.into_iter(), booleans.into_iter());
     for (current, start, boolean) in zipped {
+        if *boolean {
+            continue;
+        }
         let current_ = to_f64(*current);
         for (total, compensation) in slots.iter_mut().skip(*start as usize - min_start) {
-            if *boolean {
-                continue;
-            }
             let difference = current_ - *compensation;
             let increment = *total + difference;
             *compensation = (increment - *total) - difference;
