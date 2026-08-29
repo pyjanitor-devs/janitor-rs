@@ -135,6 +135,9 @@ where
             continue;
         }
         let current_ = to_f64(*current);
+        // Example: with `min_start = 2` and `start = 5`, skipping `5 - 2 = 3`
+        // paired slots starts this row's contribution at original position 5
+        // and carries it through the rest of the suffix.
         for (total, compensation) in slots.iter_mut().skip(*start as usize - min_start) {
             let difference = current_ - *compensation;
             let increment = *total + difference;

@@ -1,3 +1,4 @@
+use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
@@ -29,12 +30,15 @@ pub fn max_rev_ends_core<T: PartialOrd + Copy>(
     if !should_sweep(arr.len(), max_end, std::mem::size_of::<T>()) {
         let mut values = vec![arr[0]; max_end];
         let mut positions = vec![-1_i64; max_end];
-        for (row, ((current, end), boolean)) in
-            arr.iter().zip(ends.iter()).zip(booleans.iter()).enumerate()
+        for (row, (current, end, boolean)) in
+            izip!(arr.iter(), ends.iter(), booleans.iter()).enumerate()
         {
             if *boolean {
                 continue;
             }
+            // Example: `end = 3` means this prefix covers output slots 0, 1,
+            // and 2. `take(3)` visits exactly those three paired position and
+            // value slots, then stops before slot 3.
             for (position, value) in positions
                 .iter_mut()
                 .zip(values.iter_mut())

@@ -1,3 +1,4 @@
+use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
@@ -34,12 +35,9 @@ pub fn prod_rev_ends_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     // right-to-left and apply each event once. Wrapping multiplication is
     // associative, so no per-row `next` metadata is needed; `end == 0` has
     // no emitted slot and therefore contributes nothing.
-    let events = arr
-        .iter()
-        .zip(ends.iter())
-        .zip(booleans.iter())
-        .filter(|((_, end), boolean)| !**boolean && **end > 0)
-        .map(|((current, end), _)| (*end as usize - 1, convert(*current)));
+    let events = izip!(arr, ends, booleans)
+        .filter(|(_, end, boolean)| !**boolean && **end > 0)
+        .map(|(current, end, _)| (*end as usize - 1, convert(*current)));
     let values = sweep_reduce(
         max_end,
         A::ONE,
@@ -66,11 +64,13 @@ pub fn prod_rev_ends_float_core<T: Copy, F: FnMut(T) -> f64>(
     // but decimal-like floats can give a different answer when we rearrange
     // the multiplication, so this path preserves the old row/position order.
     let mut values = vec![1_f64; max_end];
-    for ((current, end), boolean) in arr.iter().zip(ends.iter()).zip(booleans.iter()) {
+    for (current, end, boolean) in izip!(arr, ends, booleans) {
         if *boolean {
             continue;
         }
         let current = to_f64(*current);
+        // Example: `end = 3` means the row contributes to slots 0, 1, and 2;
+        // `take(3)` selects exactly that prefix for multiplication.
         for value in values.iter_mut().take(*end as usize) {
             *value *= current;
         }

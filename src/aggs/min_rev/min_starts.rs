@@ -1,3 +1,4 @@
+use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
@@ -51,15 +52,13 @@ pub fn min_rev_starts_core<T: PartialOrd + Copy>(
     let mut values = vec![arr[0]; width];
     let mut positions = vec![-1_i64; width];
 
-    for (row, ((current, start), boolean)) in arr
-        .iter()
-        .zip(starts.iter())
-        .zip(booleans.iter())
-        .enumerate()
-    {
+    for (row, (current, start, boolean)) in izip!(arr, starts, booleans).enumerate() {
         if *boolean {
             continue;
         }
+        // Example: with `min_start = 2` and `start = 5`, the compact offset
+        // is `5 - 2 = 3`. Skipping three paired slots leaves this row's
+        // suffix, positions 5 onward, for the minimum comparison.
         for (position, value) in positions
             .iter_mut()
             .zip(values.iter_mut())

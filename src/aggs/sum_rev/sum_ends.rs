@@ -82,6 +82,8 @@ where
             continue;
         }
         let current_ = to_f64(*current);
+        // Example: `end = 3` selects slots 0, 1, and 2. The row contributes
+        // to that prefix and cannot change slot 3 or anything after it.
         for (total, compensation) in slots.iter_mut().take(*end as usize) {
             let difference = current_ - *compensation;
             let increment = *total + difference;

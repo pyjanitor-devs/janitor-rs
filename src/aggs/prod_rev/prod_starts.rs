@@ -1,3 +1,4 @@
+use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
@@ -33,12 +34,9 @@ pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     // shared reducer combines rows sharing a boundary, then carries one
     // product forward. Wrapping multiplication is associative, so this
     // removes repeated per-row work without changing integer overflow rules.
-    let events = arr
-        .iter()
-        .zip(starts.iter())
-        .zip(booleans.iter())
-        .filter(|((_, start), boolean)| !**boolean && **start < index.len() as i64)
-        .map(|((current, start), _)| (*start as usize - min_start, convert(*current)));
+    let events = izip!(arr, starts, booleans)
+        .filter(|(_, start, boolean)| !**boolean && **start < index.len() as i64)
+        .map(|(current, start, _)| (*start as usize - min_start, convert(*current)));
     let result = sweep_reduce(width, A::ONE, events, 0..width, |left, right| {
         left.wrap_mul(right)
     })?;
@@ -61,11 +59,14 @@ pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
     // but decimal-like floats can give a different answer when we rearrange
     // the multiplication, so this path preserves the old row/position order.
     let mut values = vec![1_f64; width];
-    for ((current, start), boolean) in arr.iter().zip(starts.iter()).zip(booleans.iter()) {
+    for (current, start, boolean) in izip!(arr, starts, booleans) {
         if *boolean {
             continue;
         }
         let current = to_f64(*current);
+        // Example: with `min_start = 2` and `start = 5`, `skip(3)` maps the
+        // compact slot 3 back to original position 5 and multiplies this row
+        // through the rest of its suffix.
         for value in values.iter_mut().skip(*start as usize - min_start) {
             *value *= current;
         }

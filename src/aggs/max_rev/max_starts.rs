@@ -1,3 +1,4 @@
+use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
@@ -31,15 +32,16 @@ pub fn max_rev_starts_core<T: PartialOrd + Copy>(
     if !should_sweep(arr.len(), width, std::mem::size_of::<T>()) {
         let mut values = vec![arr[0]; width];
         let mut positions = vec![-1_i64; width];
-        for (row, ((current, start), boolean)) in arr
-            .iter()
-            .zip(starts.iter())
-            .zip(booleans.iter())
-            .enumerate()
+        for (row, (current, start, boolean)) in
+            izip!(arr.iter(), starts.iter(), booleans.iter()).enumerate()
         {
             if *boolean {
                 continue;
             }
+            // Example: with `min_start = 2` and `start = 5`, the compact
+            // output begins at offset `5 - 2 = 3`. Skipping three paired
+            // slots means this row updates positions 5 through the suffix
+            // end, while `positions` and `values` stay aligned.
             for (position, value) in positions
                 .iter_mut()
                 .zip(values.iter_mut())
