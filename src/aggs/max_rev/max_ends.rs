@@ -46,8 +46,7 @@ pub fn max_rev_ends_core<T: PartialOrd + Copy>(
                 }
             }
         }
-        let indexers = (0..max_end).map(|item| index[item]).collect();
-        return Ok((indexers, Array1::from_vec(positions)));
+        return Ok((ends_labels(max_end, index), Array1::from_vec(positions)));
     }
 
     let positions = sweep_winner(

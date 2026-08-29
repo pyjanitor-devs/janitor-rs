@@ -51,8 +51,7 @@ pub fn max_rev_starts_core<T: PartialOrd + Copy>(
                 }
             }
         }
-        let indexers = (min_start..index.len()).map(|item| index[item]).collect();
-        return Ok((indexers, Array1::from_vec(positions)));
+        return Ok((starts_labels(min_start, index), Array1::from_vec(positions)));
     }
 
     let positions = sweep_winner(
