@@ -5,8 +5,9 @@ Guidance for contributors and coding agents working on `janitor-rs`.
 ## Before changing code
 
 - Read this file in full, along with the nearest relevant source/module
-  documentation. PR reviews, including delegated or forked reviews, need the
-  repository contracts as context rather than inspecting only the diff.
+  documentation. Before reviewing any PR, including through a delegated or
+  forked reviewer, load these repository contracts rather than inspecting only
+  the diff.
 - Fetch `origin/main` immediately before creating or updating a worktree.
 - Use a separate git worktree for each branch; do not disturb unrelated user
   changes in another checkout.
@@ -40,6 +41,9 @@ from the Python module if registration is forgotten. Keep benchmark-only Rust
 helpers behind the narrow `lib.rs` `bench_support` facade. Benchmark binaries
 need the crate's `rlib` artifact and public re-exports, but internal kernel
 modules must not be made broadly public just to satisfy benchmark linkage.
+
+Before assuming a Rust item name is the Python export name, check for an
+explicit `#[pyfunction(name = "...")]` override.
 
 ## Commands
 
@@ -140,6 +144,8 @@ newly-visible warnings.
   for tiny, large, very-large, and super-large inputs where relevant.
 - Report runtime and temporary memory, and distinguish unique labels from
   duplicate labels. State benchmark limitations.
+- Record the exact `origin/main` commit used for benchmark comparisons so
+  results remain reproducible when parallel branches advance.
 - Benchmark fixtures must not accidentally turn bounded-width work into an
   unintended O(n²) workload.
 - Keep forward aggregation benchmark interval width bounded independently of
