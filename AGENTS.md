@@ -98,6 +98,9 @@ production code or Cargo configuration.
 - `-1` is commonly a no-result sentinel for positional outputs. Check the
   downstream consumer before using it: it is unsafe if passed directly to
   pandas positional indexing without filtering.
+- Position-valued aggregation outputs must initialize no-match and zero-match
+  rows to `-1`, and flat match-tape cursors must still advance past each
+  row's candidate range even when that row contributes no result.
 - Null-mask arrays are whole-call inputs, not per-row conveniences:
   `booleans.len()` must equal the value array length before any aggregation
   loop starts. Validate this once rather than relying on `zip` or discovering
