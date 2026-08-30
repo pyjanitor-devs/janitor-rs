@@ -1,10 +1,8 @@
-use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths};
-use std::collections::{hash_map::Entry, HashMap};
+use crate::aggs::{ensure_equal_lengths, materialize_labels, range_reduce};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -28,29 +26,26 @@ fn validate_inputs<T>(
     Ok(())
 }
 
-fn capacity_hint(
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    right_len: usize,
-) -> usize {
-    // ELI5: every covered index position can introduce at most one new label.
-    // This gives the map a useful upper bound without trusting a Python-side
-    // length value or reserving more buckets than the right index contains.
-    starts
-        .iter()
-        .zip(ends.iter())
-        .filter_map(|(start, end)| checked_range(*start, *end, right_len))
-        .fold(0_usize, |total, (start, end)| {
-            total.saturating_add(end - start)
-        })
-        .min(right_len)
-}
-
 /// Find the row containing the minimum value for each distinct right label.
 ///
-/// ELI5: each label gets one numbered drawer. The drawer stores the best
-/// row seen so far and its value; repeated labels reuse that drawer instead
-/// of maintaining two separate dictionaries.
+/// janitor-rs is primarily called by pyjanitor. Its conditional-join path
+/// resets the right DataFrame index to unique row labels before sorting or
+/// filtering, so labels can be reordered or gapped but are not duplicated.
+/// `item`, the ordinal position in `index`, is the state slot; `index[item]`
+/// is the output label. `starts` and `ends` describe half-open ranges
+/// `[start, end)`. Invalid or zero-width ranges are skipped by `checked_range`,
+/// and empty input arrays are rejected.
+///
+/// # Preconditions
+///
+/// `index` must contain unique labels in positional order. pyjanitor provides
+/// this by normalizing the right side to `range(len(right))`; direct callers
+/// must provide it themselves. Duplicate labels are unsupported and are not
+/// merged by the positional accumulator.
+///
+/// ELI5: each right-row position gets one numbered drawer. The number printed
+/// on the row may be 42, 7, or 100, but the drawer is still its position on
+/// the shelf. We remember the best left row in that drawer.
 pub fn min_rev_start_end_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -60,46 +55,36 @@ pub fn min_rev_start_end_core<T: PartialOrd + Copy>(
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     validate_inputs(arr, starts, ends, index, booleans)?;
 
-    let hint = capacity_hint(starts, ends, index.len());
-    let mut slots = HashMap::with_capacity(hint);
-    let mut labels = Vec::new();
-    let mut values = Vec::new();
-    let mut rows = Vec::new();
-
-    for (row, (current, start, end, boolean)) in
-        izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter()).enumerate()
-    {
-        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
-        for item in start..end {
-            let label = index[item];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    values.push(*current);
-                    rows.push(-1_i64);
-                    slot
-                }
-            };
-            if *boolean {
-                continue;
+    // ELI5: a vector is faster than asking a dictionary for a drawer on every
+    // visit. `Option` lets us leave the value uninitialized until a range
+    // first touches that ordinal position.
+    let (touched, states) = range_reduce(
+        starts,
+        ends,
+        index.len(),
+        (None, -1_i64),
+        |row, _item, (value, winner)| {
+            if booleans[row] {
+                return;
             }
-            if rows[slot] == -1 || *current < values[slot] {
-                values[slot] = *current;
-                rows[slot] = row as i64;
+            let current = arr[row];
+            if value.is_none() || current < value.unwrap() {
+                *value = Some(current);
+                *winner = row as i64;
             }
-        }
-    }
+        },
+    );
 
-    Ok((Array1::from_vec(labels), Array1::from_vec(rows)))
+    let labels = materialize_labels(&touched, index);
+    let rows = states.into_iter().map(|(_, row)| row).collect();
+    Ok((labels, Array1::from_vec(rows)))
 }
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
+        /// `index` must be a unique positional domain. pyjanitor supplies a
+        /// normalized `range(len(right))`; direct callers must provide it.
+        /// This correctness precondition is unchecked to avoid an extra pass.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -160,7 +145,19 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn compact_slots_find_minimum_for_duplicate_labels() {
+    fn dense_slots_find_minimum_for_unique_gapped_labels() {
+        let got = min_rev_start_end_core(
+            array![5_i64, 2, 4].view(),
+            array![0_i64, 1, 0].view(),
+            array![2_i64, 3, 1].view(),
+            array![42_i64, 7, 100].view(),
+            array![false, false, false].view(),
+        );
+        assert_eq!(got, Ok((array![42, 7, 100], array![2, 1, 1])));
+    }
+
+    #[test]
+    fn duplicate_index_labels_are_explicitly_unsupported() {
         let got = min_rev_start_end_core(
             array![5_i64, 2, 4].view(),
             array![0_i64, 1, 0].view(),
@@ -168,7 +165,8 @@ mod tests {
             array![10_i64, 20, 10].view(),
             array![false, false, false].view(),
         );
-        assert_eq!(got, Ok((array![10, 20], array![1, 1])));
+        // Ordinal slots are independent; duplicate labels are not merged.
+        assert_eq!(got, Ok((array![10, 20, 10], array![2, 1, 1])));
     }
 
     #[test]

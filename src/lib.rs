@@ -13,15 +13,21 @@ mod left_le_right;
 /// hundreds of Python wrappers.
 #[doc(hidden)]
 pub mod bench_support {
+    use numpy::ndarray::{Array1, ArrayView1};
+
     pub use crate::aggs::max_rev::max_ends::max_rev_ends_core;
     pub use crate::aggs::max_rev::max_positions::max_positions_core;
     pub use crate::aggs::max_rev::max_starts::max_rev_starts_core;
+    pub use crate::aggs::max_rev::max_starts_ends::max_rev_start_end_core;
     pub use crate::aggs::min_rev::min_ends::min_rev_ends_core;
     pub use crate::aggs::min_rev::min_positions::min_positions_core;
     pub use crate::aggs::min_rev::min_starts::min_rev_starts_core;
+    pub use crate::aggs::min_rev::min_starts_ends::min_rev_start_end_core;
     pub use crate::aggs::prod_rev::prod_ends::prod_rev_ends_int_core;
     pub use crate::aggs::prod_rev::prod_starts::prod_rev_starts_int_core;
-    pub use crate::aggs::size_rev::computes::{size_rev_ends_core, size_rev_starts_core};
+    pub use crate::aggs::size_rev::computes::{
+        size_rev_ends_core, size_rev_start_end_core, size_rev_starts_core,
+    };
     pub use crate::aggs::sum::sum_ends::sum_end_core;
     pub use crate::aggs::sum::sum_starts::{sum_start_core, sum_start_u32_core};
     pub use crate::aggs::sum::sum_starts_ends::sum_start_end_core;
@@ -49,6 +55,74 @@ pub mod bench_support {
     };
     pub use crate::compare::op::CompareOp;
     pub use crate::index_builder::{repeat_index_core, trim_index_core};
+
+    pub fn sum_rev_start_end_i64(
+        arr: ArrayView1<'_, i64>,
+        starts: ArrayView1<'_, i64>,
+        ends: ArrayView1<'_, i64>,
+        index: ArrayView1<'_, i64>,
+        booleans: ArrayView1<'_, bool>,
+    ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+        crate::aggs::sum_rev::sum_starts_ends::sum_rev_start_end_int_core(
+            arr,
+            starts,
+            ends,
+            index,
+            booleans,
+            |value| value,
+        )
+    }
+
+    pub fn sum_rev_start_end_f64(
+        arr: ArrayView1<'_, f64>,
+        starts: ArrayView1<'_, i64>,
+        ends: ArrayView1<'_, i64>,
+        index: ArrayView1<'_, i64>,
+        booleans: ArrayView1<'_, bool>,
+    ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
+        crate::aggs::sum_rev::sum_starts_ends::sum_rev_start_end_float_core(
+            arr,
+            starts,
+            ends,
+            index,
+            booleans,
+            |value| value,
+        )
+    }
+
+    pub fn prod_rev_start_end_i64(
+        arr: ArrayView1<'_, i64>,
+        starts: ArrayView1<'_, i64>,
+        ends: ArrayView1<'_, i64>,
+        index: ArrayView1<'_, i64>,
+        booleans: ArrayView1<'_, bool>,
+    ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+        crate::aggs::prod_rev::prod_starts_ends::prod_rev_start_end_int_core(
+            arr,
+            starts,
+            ends,
+            index,
+            booleans,
+            |value| value,
+        )
+    }
+
+    pub fn prod_rev_start_end_f64(
+        arr: ArrayView1<'_, f64>,
+        starts: ArrayView1<'_, i64>,
+        ends: ArrayView1<'_, i64>,
+        index: ArrayView1<'_, i64>,
+        booleans: ArrayView1<'_, bool>,
+    ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
+        crate::aggs::prod_rev::prod_starts_ends::prod_rev_start_end_float_core(
+            arr,
+            starts,
+            ends,
+            index,
+            booleans,
+            |value| value,
+        )
+    }
 }
 
 /// Top-level composition point: each family owns and registers its own

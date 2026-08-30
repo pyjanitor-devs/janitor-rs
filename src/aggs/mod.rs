@@ -33,6 +33,7 @@ pub mod sum;
 pub mod sum_rev;
 
 use pyo3::exceptions::PyValueError;
+use std::collections::HashMap;
 
 /// Reject parallel arrays that cannot describe the same number of rows.
 ///
@@ -106,6 +107,13 @@ pub(crate) fn ensure_equal_lengths_core(
 // Shared domain contract for the plain reverse `*_rev_starts` and
 // `*_rev_ends` aggregation shapes (min/max/prod/sum/size).
 //
+// janitor-rs is primarily the Rust backend for pyjanitor. In pyjanitor's
+// conditional-join path, the right DataFrame index is reset to unique row
+// labels before sorting or filtering. Those labels can therefore be reordered
+// or have gaps by the time they reach Rust, but they remain unique. The dense
+// state below is indexed by the ordinal `item` in `index`; the value
+// `index[item]` is the label emitted back to pyjanitor.
+//
 // ELI5: every row's suffix `[start, right_len)` or prefix `[0, end)`
 // touches a contiguous slice of the right side. The union of all those
 // slices is one compact domain -- `min_start..right_len` for starts,
@@ -118,6 +126,14 @@ pub(crate) fn ensure_equal_lengths_core(
 // stays with each site -- only the domain and its labels are shared here.
 // Validating equal lengths against `arr`/`booleans` also stays with each
 // site: `size` doesn't have those arrays, so it isn't a shared concern.
+//
+// The uniqueness requirement is deliberately a caller contract rather than a
+// `debug_assert!`. Checking it would require an O(index_len) HashSet or sort
+// pass on every debug and test invocation, while release builds would still
+// accept duplicates. It would also make the explicit unsupported-input tests
+// panic instead of documenting the resulting ordinal (non-merged) behavior.
+// The pyjanitor wrapper establishes the invariant before reaching these
+// kernels; direct janitor-rs callers must do the same.
 
 /// Validate a non-empty `starts` boundary array against `right_len` and
 /// derive the compact accumulator domain it implies.
@@ -248,6 +264,182 @@ pub(crate) fn starts_labels(min_start: usize, index: ArrayView1<'_, i64>) -> Arr
 /// The label view is borrowed; the returned array owns its copied labels.
 pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<i64> {
     (0..max_end).map(|item| index[item]).collect()
+}
+
+enum RangeStorage<State> {
+    /// A dictionary stores only positions that a range has actually touched.
+    /// This keeps sparse queries from allocating for the entire right index.
+    ///
+    /// ELI5: write down only the drawer numbers someone asked for instead of
+    /// building a million-drawer cabinet for a two-drawer request.
+    Sparse(HashMap<usize, State>),
+    /// Arrays make repeated access cheap once enough distinct positions are
+    /// active to justify allocating the complete positional domain.
+    ///
+    /// ELI5: once most drawers are in use, a numbered cabinet is faster than
+    /// looking every drawer up in an address book.
+    Dense { seen: Vec<bool>, states: Vec<State> },
+}
+
+// Promote once roughly half of the positional domain is represented densely.
+// This is deliberately separate from `should_sweep`: that dispatcher chooses
+// between boundary-sweep and nested-loop algorithms, while this threshold
+// chooses the storage representation inside `range_reduce`.
+const RANGE_DENSE_THRESHOLD_DIVISOR: usize = 2;
+
+/// Reduce arbitrary ranges with dense state when the queried domain is dense,
+/// and sparse state when the ranges touch only a small part of the index.
+///
+/// # Arguments
+///
+/// * `starts` - Inclusive start boundary for each input row.
+/// * `ends` - Exclusive end boundary for each input row.
+/// * `index_len` - Number of positional slots in the right-hand index.
+/// * `identity` - Initial state for each newly touched ordinal.
+/// * `update` - Aggregation-specific update called with `(row, item, state)`.
+///
+/// # Returns
+///
+/// Returns touched ordinals in first-touch order and one compacted state for
+/// each ordinal. Invalid or zero-width ranges are skipped by `checked_range`.
+/// The reducer starts with sparse state and promotes to dense state once the
+/// number of distinct touched ordinals reaches half of `index_len`.
+///
+/// ELI5: use a row of drawers when most drawers are needed, but use a small
+/// address book when the request visits only a few drawers.
+pub(crate) fn range_reduce<State, Update>(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index_len: usize,
+    identity: State,
+    mut update: Update,
+) -> (Vec<usize>, Vec<State>)
+where
+    State: Clone,
+    Update: FnMut(usize, usize, &mut State),
+{
+    range_reduce_with_row_value(
+        starts,
+        ends,
+        index_len,
+        identity,
+        |_| (),
+        |row, item, _, state| update(row, item, state),
+    )
+}
+
+/// Reduce ranges while preparing one value for each input row.
+///
+/// The row value is prepared after the row's range is validated and is then
+/// borrowed by every item update in that range. This preserves the old loop
+/// shape for conversions that are expensive or stateful, without a cache and
+/// branch inside the item loop.
+///
+/// ELI5: prepare one customer's order once, then hand that same prepared order
+/// to each shelf visit instead of asking every shelf to prepare it again.
+pub(crate) fn range_reduce_with_row_value<State, RowValue, Prepare, Update>(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index_len: usize,
+    identity: State,
+    mut prepare: Prepare,
+    mut update: Update,
+) -> (Vec<usize>, Vec<State>)
+where
+    State: Clone,
+    Prepare: FnMut(usize) -> RowValue,
+    Update: FnMut(usize, usize, &RowValue, &mut State),
+{
+    // Start sparse and let distinct positions, rather than summed range
+    // widths, decide whether dense storage is worthwhile. This avoids a
+    // second checked-range pass and avoids reserving for overlapping visits.
+    // ELI5: begin with a small address book; only build the full cabinet after
+    // we know that enough different drawers are actually being used.
+    let mut storage = RangeStorage::Sparse(HashMap::new());
+    let mut touched = Vec::new();
+
+    for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        let Some((start, end)) = checked_range(*start, *end, index_len) else {
+            continue;
+        };
+        let row_value = prepare(row);
+        for item in start..end {
+            match &mut storage {
+                RangeStorage::Dense { seen, states } => {
+                    if !seen[item] {
+                        seen[item] = true;
+                        touched.push(item);
+                    }
+                    update(row, item, &row_value, &mut states[item]);
+                }
+                RangeStorage::Sparse(states) => {
+                    let state = states.entry(item).or_insert_with(|| {
+                        touched.push(item);
+                        identity.clone()
+                    });
+                    update(row, item, &row_value, state);
+
+                    // Promote only after the number of distinct positions is
+                    // dense; repeated visits to a tiny window remain sparse
+                    // regardless of how many rows overlap that window.
+                    if states.len().saturating_mul(RANGE_DENSE_THRESHOLD_DIVISOR) >= index_len {
+                        // Replace the enum temporarily so the map can be moved
+                        // out without unsafe code or parallel Option state.
+                        // The old map remains live while the dense vectors are
+                        // allocated, creating a short-lived peak. That peak is
+                        // the cost of choosing based on the exact distinct
+                        // positions seen so far: an upfront sum of range
+                        // widths would misclassify heavily overlapping sparse
+                        // workloads and allocate the full dense domain too
+                        // early. The production benchmark reports total and
+                        // peak allocations for this trade-off.
+                        let old = std::mem::replace(
+                            &mut storage,
+                            RangeStorage::Dense {
+                                seen: Vec::new(),
+                                states: Vec::new(),
+                            },
+                        );
+                        let RangeStorage::Sparse(states) = old else {
+                            unreachable!("storage changed while borrowed");
+                        };
+                        let mut seen = vec![false; index_len];
+                        let mut dense = vec![identity.clone(); index_len];
+                        for (item, state) in states {
+                            seen[item] = true;
+                            dense[item] = state;
+                        }
+                        storage = RangeStorage::Dense {
+                            seen,
+                            states: dense,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    match storage {
+        RangeStorage::Dense { states, .. } => {
+            let compacted = touched.iter().map(|&item| states[item].clone()).collect();
+            (touched, compacted)
+        }
+        RangeStorage::Sparse(states) => {
+            let compacted = touched
+                .iter()
+                .map(|item| states.get(item).unwrap().clone())
+                .collect();
+            (touched, compacted)
+        }
+    }
+}
+
+/// Materialize labels for positional ordinals returned by a range reducer.
+///
+/// ELI5: the reducer remembers shelf positions; this helper writes the label
+/// printed on each corresponding shelf slot into the output array.
+pub(crate) fn materialize_labels(touched: &[usize], index: ArrayView1<'_, i64>) -> Array1<i64> {
+    touched.iter().map(|&item| index[item]).collect()
 }
 
 // These knobs deliberately live beside the gate: they describe the policy for
@@ -509,7 +701,48 @@ where
 mod sweep_tests {
     use numpy::ndarray::array;
 
-    use super::{should_sweep, sweep_reduce, sweep_winner};
+    use super::{range_reduce, should_sweep, sweep_reduce, sweep_winner};
+
+    #[test]
+    fn range_reduce_uses_sparse_state_for_a_narrow_domain() {
+        let (touched, totals) = range_reduce(
+            array![10_i64].view(),
+            array![12_i64].view(),
+            1_000_000,
+            0_i64,
+            |_row, _item, total| *total += 1,
+        );
+        assert_eq!(touched, vec![10, 11]);
+        assert_eq!(totals, vec![1, 1]);
+    }
+
+    #[test]
+    fn range_reduce_preserves_first_touch_order_for_dense_domain() {
+        let (touched, totals) = range_reduce(
+            array![0_i64, 1].view(),
+            array![3_i64, 2].view(),
+            3,
+            0_i64,
+            |_row, _item, total| *total += 1,
+        );
+        assert_eq!(touched, vec![0, 1, 2]);
+        assert_eq!(totals, vec![1, 2, 1]);
+    }
+
+    #[test]
+    fn range_reduce_counts_distinct_positions_not_overlapping_visits() {
+        let starts = array![0_i64, 0, 0];
+        let ends = array![2_i64, 2, 2];
+        let (touched, totals) = range_reduce(
+            starts.view(),
+            ends.view(),
+            1_000_000,
+            0_i64,
+            |_row, _item, total| *total += 1,
+        );
+        assert_eq!(touched, vec![0, 1]);
+        assert_eq!(totals, vec![3, 3]);
+    }
 
     #[test]
     fn sweep_gate_accounts_for_row_link_memory_and_dtype() {

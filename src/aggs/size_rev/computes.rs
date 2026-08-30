@@ -5,8 +5,9 @@ use std::collections::HashMap;
 
 use crate::aggs::{
     checked_end, checked_index, checked_range, ends_domain, ends_labels, ensure_equal_lengths,
-    ensure_exact_tape_width, ensure_nonempty_matches, into_starts_ends_result, starts_domain,
-    starts_labels, sweep_reduce,
+    ensure_equal_lengths_core, ensure_exact_tape_width, ensure_nonempty_matches,
+    into_starts_ends_result, materialize_labels, range_reduce, starts_domain, starts_labels,
+    sweep_reduce,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
@@ -206,7 +207,6 @@ pub fn compute_size_rev_start_end_matches<'py>(
 ) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
-    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let matches = matches.as_array();
     if starts.is_empty() || index.is_empty() {
@@ -254,6 +254,45 @@ pub fn compute_size_rev_start_end_matches<'py>(
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
+/// Count covered right-row positions for each distinct right-row identity.
+///
+/// janitor-rs is primarily called by pyjanitor. Its conditional-join path
+/// resets the right DataFrame index to unique row labels before sorting or
+/// filtering, so labels can be reordered or gapped but are not duplicated.
+/// `item`, the ordinal position in `index`, is the state slot; `index[item]`
+/// is the output label. `starts` and `ends` describe half-open ranges
+/// `[start, end)`. Invalid or zero-width ranges are skipped by `checked_range`;
+/// empty `starts`, `ends`, or `index` inputs are rejected.
+///
+/// # Preconditions
+///
+/// `index` must contain unique labels in positional order. pyjanitor provides
+/// this by normalizing the right side to `range(len(right))`; direct callers
+/// must provide it themselves. Duplicate labels are unsupported and are not
+/// merged by the positional accumulator.
+///
+/// ELI5: each right-row position gets a drawer. Every range adds one to each
+/// covered drawer, then we print the row identity stored in `index[item]`.
+pub fn size_rev_start_end_core(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+    ensure_equal_lengths_core(
+        starts.len(),
+        ends.len(),
+        "starts and ends must have equal lengths",
+    )?;
+    if starts.is_empty() || index.is_empty() {
+        return Err("starts, ends, and index cannot be empty");
+    }
+    let (touched, result) = range_reduce(starts, ends, index.len(), 0_i64, |_row, _item, count| {
+        *count += 1
+    });
+    let indexers = materialize_labels(&touched, index);
+    Ok((indexers, result.into_iter().collect()))
+}
+
 #[pyfunction]
 pub fn compute_size_rev_start_end<'py>(
     py: Python<'py>,
@@ -265,40 +304,15 @@ pub fn compute_size_rev_start_end<'py>(
     let ends = ends.as_array();
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
-    if starts.is_empty() || index.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "starts, ends, and index cannot be empty",
-        ));
-    }
-    // There can be at most one output slot per right-side row. This local
-    // bound replaces the old caller-supplied capacity hint and cannot change
-    // the result when labels are duplicated.
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
-    let zipped = starts.into_iter().zip(ends);
-    for (start, end) in zipped {
-        let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
-        for item in start_..end_ {
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
-            *total += 1;
-        }
-    }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
-    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+    let result = size_rev_start_end_core(starts, ends, index)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok((result.0.into_pyarray(py), result.1.into_pyarray(py)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use numpy::ndarray::array;
+    use numpy::{ndarray::array, PyArrayMethods};
 
     #[test]
     fn counts_prefixes_and_suffixes_in_compact_slots() {
@@ -311,6 +325,25 @@ mod tests {
             size_rev_starts_core(array![1_i64, 0, 2].view(), index.view()),
             Ok((array![50, 10, 90], array![1, 2, 3]))
         );
+    }
+
+    #[test]
+    fn duplicate_index_labels_are_explicitly_unsupported() {
+        Python::initialize();
+        Python::attach(|py| {
+            let starts = PyArray1::from_array(py, &array![0_i64, 1, 0]);
+            let ends = PyArray1::from_array(py, &array![2_i64, 3, 1]);
+            let index = PyArray1::from_array(py, &array![10_i64, 20, 10]);
+            let (labels, counts) = compute_size_rev_start_end(
+                py,
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+            )
+            .unwrap();
+            assert_eq!(labels.readonly().as_array(), array![10, 20, 10].view());
+            assert_eq!(counts.readonly().as_array(), array![2, 2, 1].view());
+        });
     }
 
     #[test]

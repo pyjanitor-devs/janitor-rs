@@ -1,10 +1,10 @@
-use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths, WrapMul};
-use std::collections::{hash_map::Entry, HashMap};
+use crate::aggs::{
+    ensure_equal_lengths, materialize_labels, range_reduce, range_reduce_with_row_value, WrapMul,
+};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -28,32 +28,31 @@ fn validate_inputs<T>(
     Ok(())
 }
 
-fn capacity_hint(
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    right_len: usize,
-) -> usize {
-    // ELI5: the total number of covered positions is a safe ceiling for the
-    // number of distinct labels, so it limits rehashing without trusting a
-    // Python-side size or reserving beyond the right index.
-    starts
-        .iter()
-        .zip(ends.iter())
-        .filter_map(|(start, end)| checked_range(*start, *end, right_len))
-        .fold(0_usize, |total, (start, end)| {
-            total.saturating_add(end - start)
-        })
-        .min(right_len)
-}
-
-/// Multiply values into one compact state slot for each distinct label.
+/// Multiply values into one state slot per right-row ordinal.
 ///
-/// ELI5: every label has one numbered drawer containing its product. A null
-/// row leaves the drawer at the multiplicative identity, `1`, just as the
-/// old implementation did. `A` is the accumulator type: every integer dtype
-/// instantiates this with `A = i64`, except `uint64`, which instantiates it
-/// with `A = u64` so values `>= 2**63` don't get sign-flipped by a forced
-/// `i64` cast (see `WrapMul`).
+/// janitor-rs is primarily called by pyjanitor. Its conditional-join path
+/// resets the right DataFrame index to unique row labels before sorting or
+/// filtering, so labels can be reordered or gapped but are not duplicated.
+/// `item`, the ordinal position in `index`, is the state slot; `index[item]`
+/// is the output label. `starts` and `ends` describe half-open ranges
+/// `[start, end)`. Invalid or zero-width ranges are skipped by `checked_range`,
+/// and empty input arrays are rejected.
+///
+/// # Preconditions
+///
+/// `index` must contain unique labels in positional order. pyjanitor provides
+/// this by normalizing the right side to `range(len(right))`; direct callers
+/// must provide it themselves. Duplicate labels are unsupported and are not
+/// merged by the positional accumulator.
+///
+/// A null row leaves a touched slot at the multiplicative identity, `1`.
+/// Integer accumulators use `wrapping_mul` through `WrapMul`, matching the
+/// project's overflow contract. `A` is `i64` for ordinary integer dtypes and
+/// `u64` for `uint64`, preserving values at and above `2**63`.
+///
+/// ELI5: every right-row position gets a numbered drawer containing its
+/// product. The printed row identity may be 42, 7, or 100; the drawer number
+/// is its position on the shelf, not the printed identity.
 pub fn prod_rev_start_end_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -68,31 +67,14 @@ where
     F: FnMut(T) -> A,
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
-    let mut slots = HashMap::with_capacity(capacity_hint(starts, ends, index.len()));
-    let mut labels = Vec::new();
-    let mut products = Vec::new();
-    for (current, start, end, boolean) in izip!(arr, starts, ends, booleans) {
-        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
-        for item in start..end {
-            let label = index[item];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    products.push(A::ONE);
-                    slot
-                }
-            };
-            if !*boolean {
-                products[slot] = products[slot].wrap_mul(convert(*current));
+    let (touched, products) =
+        range_reduce(starts, ends, index.len(), A::ONE, |row, _item, product| {
+            if !booleans[row] {
+                *product = product.wrap_mul(convert(arr[row]));
             }
-        }
-    }
-    Ok((Array1::from_vec(labels), Array1::from_vec(products)))
+        });
+    let labels = materialize_labels(&touched, index);
+    Ok((labels, Array1::from_vec(products)))
 }
 
 pub fn prod_rev_start_end_float_core<T, F>(
@@ -108,35 +90,38 @@ where
     F: FnMut(T) -> f64,
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
-    let mut slots = HashMap::with_capacity(capacity_hint(starts, ends, index.len()));
-    let mut labels = Vec::new();
-    let mut products = Vec::new();
-    for (current, start, end, boolean) in izip!(arr, starts, ends, booleans) {
-        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
-        for item in start..end {
-            let label = index[item];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    products.push(1.0_f64);
-                    slot
-                }
-            };
-            if !*boolean {
-                products[slot] *= to_f64(*current);
+    // Integer products use `WrapMul` because integer overflow is intentionally
+    // modular in the reverse kernels. Floating-point multiplication follows
+    // IEEE-754 instead: overflow yields signed infinity, and invalid cases
+    // such as zero times infinity yield NaN. There is no float analogue of
+    // integer `wrapping_mul`, so applying the integer rule here would change
+    // the established float semantics.
+    //
+    // ELI5: integer arithmetic goes around a fixed-size loop; float arithmetic
+    // can leave the loop and say “infinity” or “not a number.”
+    // Prepare the conversion once per row, then reuse it for every item while
+    // retaining the shared reducer's sparse/dense ordinal storage.
+    let (touched, products) = range_reduce_with_row_value(
+        starts,
+        ends,
+        index.len(),
+        1.0_f64,
+        |row| (!booleans[row]).then(|| to_f64(arr[row])),
+        |_row, _item, current, product| {
+            if let Some(current) = *current {
+                *product *= current;
             }
-        }
-    }
-    Ok((Array1::from_vec(labels), Array1::from_vec(products)))
+        },
+    );
+    let labels = materialize_labels(&touched, index);
+    Ok((labels, Array1::from_vec(products)))
 }
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
+        /// `index` must be a unique positional domain. pyjanitor supplies a
+        /// normalized `range(len(right))`; direct callers must provide it.
+        /// This correctness precondition is unchecked to avoid an extra pass.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -165,6 +150,9 @@ macro_rules! compute_ints {
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// `index` must be a unique positional domain. pyjanitor supplies a
+        /// normalized `range(len(right))`; direct callers must provide it.
+        /// This correctness precondition is unchecked to avoid an extra pass.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -239,7 +227,20 @@ mod tests {
     }
 
     #[test]
-    fn compact_slots_multiply_duplicate_labels() {
+    fn dense_slots_multiply_unique_gapped_labels() {
+        let got = prod_rev_start_end_int_core(
+            array![2_i64, 3, 4].view(),
+            array![0_i64, 1, 0].view(),
+            array![2_i64, 3, 1].view(),
+            array![42_i64, 7, 100].view(),
+            array![false, false, false].view(),
+            |value| value,
+        );
+        assert_eq!(got, Ok((array![42, 7, 100], array![8, 6, 3])));
+    }
+
+    #[test]
+    fn duplicate_index_labels_are_explicitly_unsupported() {
         let got = prod_rev_start_end_int_core(
             array![2_i64, 3, 4].view(),
             array![0_i64, 1, 0].view(),
@@ -248,7 +249,8 @@ mod tests {
             array![false, false, false].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![10, 20], array![24, 6])));
+        // Ordinal slots are independent; duplicate labels are not merged.
+        assert_eq!(got, Ok((array![10, 20, 10], array![8, 6, 3])));
     }
 
     #[test]
