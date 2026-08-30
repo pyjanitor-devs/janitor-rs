@@ -5,6 +5,10 @@
 //! justify a production rewrite.
 
 use criterion::{criterion_group, criterion_main, Criterion};
+use janitor_rs::bench_support::{
+    prod_rev_start_end_i64, sum_rev_start_end_f64, sum_rev_start_end_i64,
+};
+use numpy::ndarray::ArrayView1;
 use std::collections::HashMap;
 use std::hint::black_box;
 
@@ -16,6 +20,9 @@ struct Input<'a> {
     starts: &'a [usize],
     ends: &'a [usize],
     index: &'a [i64],
+    starts_i64: &'a [i64],
+    ends_i64: &'a [i64],
+    booleans: &'a [bool],
 }
 
 struct FloatInput<'a> {
@@ -23,6 +30,50 @@ struct FloatInput<'a> {
     starts: &'a [usize],
     ends: &'a [usize],
     index: &'a [i64],
+    starts_i64: &'a [i64],
+    ends_i64: &'a [i64],
+    booleans: &'a [bool],
+}
+
+fn sort_pairs<T>(mut pairs: Vec<(i64, T)>) -> Vec<(i64, T)> {
+    pairs.sort_by_key(|(label, _)| *label);
+    pairs
+}
+
+fn production_sum(input: &Input<'_>) -> Vec<(i64, i64)> {
+    let (labels, values) = sum_rev_start_end_i64(
+        ArrayView1::from(input.values),
+        ArrayView1::from(input.starts_i64),
+        ArrayView1::from(input.ends_i64),
+        ArrayView1::from(input.index),
+        ArrayView1::from(input.booleans),
+    )
+    .expect("benchmark input must satisfy production preconditions");
+    sort_pairs(labels.into_iter().zip(values).collect())
+}
+
+fn production_float_sum(input: &FloatInput<'_>) -> Vec<(i64, f64)> {
+    let (labels, values) = sum_rev_start_end_f64(
+        ArrayView1::from(input.values),
+        ArrayView1::from(input.starts_i64),
+        ArrayView1::from(input.ends_i64),
+        ArrayView1::from(input.index),
+        ArrayView1::from(input.booleans),
+    )
+    .expect("benchmark input must satisfy production preconditions");
+    sort_pairs(labels.into_iter().zip(values).collect())
+}
+
+fn production_product(input: &Input<'_>) -> Vec<(i64, i64)> {
+    let (labels, values) = prod_rev_start_end_i64(
+        ArrayView1::from(input.values),
+        ArrayView1::from(input.starts_i64),
+        ArrayView1::from(input.ends_i64),
+        ArrayView1::from(input.index),
+        ArrayView1::from(input.booleans),
+    )
+    .expect("benchmark input must satisfy production preconditions");
+    sort_pairs(labels.into_iter().zip(values).collect())
 }
 
 fn hash_sum(input: &Input<'_>) -> Vec<(i64, i64)> {
@@ -385,6 +436,9 @@ fn bench(c: &mut Criterion) {
             .iter()
             .map(|&start| start + width)
             .collect::<Vec<_>>();
+        let starts_i64 = starts.iter().map(|&value| value as i64).collect::<Vec<_>>();
+        let ends_i64 = ends.iter().map(|&value| value as i64).collect::<Vec<_>>();
+        let booleans = vec![false; rows];
         let reversed = name.ends_with("reversed");
         let index = (0..right_len)
             .map(|item| {
@@ -402,6 +456,9 @@ fn bench(c: &mut Criterion) {
             starts: &starts,
             ends: &ends,
             index: &index,
+            starts_i64: &starts_i64,
+            ends_i64: &ends_i64,
+            booleans: &booleans,
         };
         let float_values = values.iter().map(|&value| value as f64).collect::<Vec<_>>();
         let float_input = FloatInput {
@@ -409,6 +466,9 @@ fn bench(c: &mut Criterion) {
             starts: &starts,
             ends: &ends,
             index: &index,
+            starts_i64: &starts_i64,
+            ends_i64: &ends_i64,
+            booleans: &booleans,
         };
 
         let hash = hash_sum(&input);
@@ -423,6 +483,12 @@ fn bench(c: &mut Criterion) {
             assert_eq!(hash_winner(&input, false), dense_winner(&input, false));
             assert_eq!(hash_size(&input), dense_size(&input));
             assert_eq!(hash_float_sum(&float_input), dense_float_sum(&float_input));
+            assert_eq!(production_sum(&input), hash_sum(&input));
+            assert_eq!(production_product(&input), hash_product(&input));
+            assert_eq!(
+                production_float_sum(&float_input),
+                hash_float_sum(&float_input)
+            );
         }
         eprintln!(
             "{name}: hash_sum {:?}, dense_sum {:?}, ordinal_sum {:?}, sweep_sum {:?}, sweep_sum_compact {:?}, hash_size {:?}, sweep_size {:?}, sweep_size_compact {:?}",
@@ -450,6 +516,17 @@ fn bench(c: &mut Criterion) {
         group.bench_function(format!("sum/hash/{name}"), |b| {
             b.iter(|| hash_sum(black_box(&input)))
         });
+        if !duplicate {
+            group.bench_function(format!("sum/production/{name}"), |b| {
+                b.iter(|| production_sum(black_box(&input)))
+            });
+            group.bench_function(format!("prod/production/{name}"), |b| {
+                b.iter(|| production_product(black_box(&input)))
+            });
+            group.bench_function(format!("float_sum/production/{name}"), |b| {
+                b.iter(|| production_float_sum(black_box(&float_input)))
+            });
+        }
         group.bench_function(format!("sum/ordinal/{name}"), |b| {
             b.iter(|| ordinal_sum(black_box(&input)))
         });
