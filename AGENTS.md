@@ -54,6 +54,9 @@ modules must not be made broadly public just to satisfy benchmark linkage.
 Before assuming a Rust item name is the Python export name, check for an
 explicit `#[pyfunction(name = "...")]` override.
 
+The top-level `lib.rs` should compose family `register` functions rather than
+registering individual dtype-specialized exports directly.
+
 ## Commands
 
 ```sh
@@ -89,6 +92,9 @@ production code or Cargo configuration.
   (`wrapping_add`/`wrapping_mul`) so debug and release behavior agree. Do not
   disable overflow checks for the whole test profile: unrelated index,
   counter, and allocation-length arithmetic must still fail loudly in tests.
+- `uint64` sum/product paths must accumulate as `u64`; values at or above
+  `i64::MAX` must not be routed through a signed accumulator or silently
+  reinterpret their high bit.
 - `-1` is commonly a no-result sentinel for positional outputs. Check the
   downstream consumer before using it: it is unsafe if passed directly to
   pandas positional indexing without filtering.
@@ -126,6 +132,9 @@ production code or Cargo configuration.
   candidate width; `counts_array.sum()` normally describes surviving matches
   and corresponds to `matches.sum()` when values are 0/1. Pyjanitor owns the
   0/1 value contract; Rust validates shape without scanning every flag.
+- A tape-width pre-pass must count exactly the rows and ranges the main loop
+  will consume; rows rejected by that loop contribute zero cursor advancement.
+  Otherwise validation can reject valid tapes or leave the cursor misaligned.
 - Many reverse kernels group arbitrary labels in `HashMap`s. Hash-map
   iteration order is not an output-order contract; tests must sort or compare
   label/value pairs without assuming map iteration order unless a kernel
