@@ -23,6 +23,7 @@ The main areas are:
 - `src/bin_search/` - binary-search kernels;
 - `src/compare/` - ragged comparison kernels;
 - `src/index_builder.rs` - index and positional helpers;
+- `src/left_le_right.rs` - left/right positional comparison helper;
 - `src/aggs/` - forward and reverse sum, min, max, product, and size kernels;
 - `benches/` - Criterion benchmarks and allocation measurements.
 
@@ -42,6 +43,8 @@ kernel modules broadly public just to satisfy benchmark linkage.
 # Tests and benchmarks must disable PyO3's extension-module feature.
 cargo test --no-default-features
 cargo bench --no-default-features
+# CI's fast benchmark gate only compiles benchmark harnesses.
+cargo bench --no-default-features --no-run
 
 # Static checks.
 cargo fmt --check
@@ -82,6 +85,10 @@ production code or Cargo configuration.
   candidate width; `counts_array.sum()` normally describes surviving matches
   and corresponds to `matches.sum()` when values are 0/1. Pyjanitor owns the
   0/1 value contract; Rust validates shape without scanning every flag.
+- Many reverse kernels group arbitrary labels in `HashMap`s. Hash-map
+  iteration order is not an output-order contract; tests must sort or compare
+  label/value pairs without assuming map iteration order unless a kernel
+  explicitly promises ordering.
 - Empty-input and zero-width behavior is part of each kernel's documented
   contract. Preserve it when sharing or generalizing helpers.
 
