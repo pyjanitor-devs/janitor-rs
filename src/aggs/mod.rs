@@ -310,6 +310,38 @@ where
     State: Clone,
     Update: FnMut(usize, usize, &mut State),
 {
+    range_reduce_with_row_value(
+        starts,
+        ends,
+        index_len,
+        identity,
+        |_| (),
+        |row, item, _, state| update(row, item, state),
+    )
+}
+
+/// Reduce ranges while preparing one value for each input row.
+///
+/// The row value is prepared after the row's range is validated and is then
+/// borrowed by every item update in that range. This preserves the old loop
+/// shape for conversions that are expensive or stateful, without a cache and
+/// branch inside the item loop.
+///
+/// ELI5: prepare one customer's order once, then hand that same prepared order
+/// to each shelf visit instead of asking every shelf to prepare it again.
+pub(crate) fn range_reduce_with_row_value<State, RowValue, Prepare, Update>(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index_len: usize,
+    identity: State,
+    mut prepare: Prepare,
+    mut update: Update,
+) -> (Vec<usize>, Vec<State>)
+where
+    State: Clone,
+    Prepare: FnMut(usize) -> RowValue,
+    Update: FnMut(usize, usize, &RowValue, &mut State),
+{
     // Start sparse and let distinct positions, rather than summed range
     // widths, decide whether dense storage is worthwhile. This avoids a
     // second checked-range pass and avoids reserving for overlapping visits.
@@ -322,6 +354,7 @@ where
         let Some((start, end)) = checked_range(*start, *end, index_len) else {
             continue;
         };
+        let row_value = prepare(row);
         for item in start..end {
             match &mut storage {
                 RangeStorage::Dense { seen, states } => {
@@ -329,14 +362,14 @@ where
                         seen[item] = true;
                         touched.push(item);
                     }
-                    update(row, item, &mut states[item]);
+                    update(row, item, &row_value, &mut states[item]);
                 }
                 RangeStorage::Sparse(states) => {
                     let state = states.entry(item).or_insert_with(|| {
                         touched.push(item);
                         identity.clone()
                     });
-                    update(row, item, state);
+                    update(row, item, &row_value, state);
 
                     // Promote only after the number of distinct positions is
                     // dense; repeated visits to a tiny window remain sparse

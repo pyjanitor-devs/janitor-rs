@@ -1,9 +1,10 @@
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
-use crate::aggs::{checked_range, ensure_equal_lengths, materialize_labels, range_reduce, WrapMul};
+use crate::aggs::{
+    ensure_equal_lengths, materialize_labels, range_reduce, range_reduce_with_row_value, WrapMul,
+};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -98,31 +99,22 @@ where
     //
     // ELI5: integer arithmetic goes around a fixed-size loop; float arithmetic
     // can leave the loop and say “infinity” or “not a number.”
-    // Convert once per row before entering the item loop. This specialized
-    // path keeps the old hot-loop shape and avoids a cache branch per item.
-    let mut products = HashMap::<usize, f64>::new();
-    let mut touched = Vec::new();
-    for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
-        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
-        let current = (!booleans[row]).then(|| to_f64(arr[row]));
-        for item in start..end {
-            let product = products.entry(item).or_insert_with(|| {
-                touched.push(item);
-                1.0
-            });
-            let Some(current) = current else {
-                continue;
-            };
-            *product *= current;
-        }
-    }
+    // Prepare the conversion once per row, then reuse it for every item while
+    // retaining the shared reducer's sparse/dense ordinal storage.
+    let (touched, products) = range_reduce_with_row_value(
+        starts,
+        ends,
+        index.len(),
+        1.0_f64,
+        |row| (!booleans[row]).then(|| to_f64(arr[row])),
+        |_row, _item, current, product| {
+            if let Some(current) = *current {
+                *product *= current;
+            }
+        },
+    );
     let labels = materialize_labels(&touched, index);
-    let products = touched
-        .iter()
-        .map(|item| products.get(item).unwrap().to_owned())
-        .collect();
+    let products = products.into_iter().collect();
     Ok((labels, Array1::from_vec(products)))
 }
 
