@@ -94,10 +94,11 @@ where
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
 
-    // Cache one conversion per participating non-null row. The range reducer
-    // invokes its callback once per covered item, but a row's value is the
-    // same for every item in that row's range.
-    let mut converted = vec![None; arr.len()];
+    // Cache only the current row's conversion. The reducer visits one row's
+    // range contiguously, so a scalar cache gets the old once-per-row cost
+    // without allocating an O(arr.len()) side buffer.
+    let mut cached_row = usize::MAX;
+    let mut cached_value = 0.0_f64;
 
     // Integer reverse sums use `WrapAdd` because the project defines their
     // overflow behavior as modular wrapping. Floats do not have an
@@ -118,14 +119,11 @@ where
             if booleans[row] {
                 return;
             }
-            let current = match converted[row] {
-                Some(value) => value,
-                None => {
-                    let value = to_f64(arr[row]);
-                    converted[row] = Some(value);
-                    value
-                }
-            };
+            if row != cached_row {
+                cached_row = row;
+                cached_value = to_f64(arr[row]);
+            }
+            let current = cached_value;
             let difference = current - *compensation;
             let increment = *total + difference;
             *compensation = (increment - *total) - difference;

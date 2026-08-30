@@ -293,6 +293,10 @@ enum RangeStorage<State> {
     Dense { seen: Vec<bool>, states: Vec<State> },
 }
 
+// Promote once roughly half of the positional domain is represented densely.
+// Keeping this as a named policy knob makes the allocation trade-off visible.
+const RANGE_DENSE_THRESHOLD_DIVISOR: usize = 2;
+
 pub(crate) fn range_reduce<State, Update>(
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
@@ -304,7 +308,21 @@ where
     State: Clone,
     Update: FnMut(usize, usize, &mut State),
 {
-    let mut storage = RangeStorage::Sparse(HashMap::new());
+    // Reserve only the sparse-side estimate. Broad workloads promote to dense
+    // shortly afterwards, while narrow workloads avoid repeated map growth.
+    // Each range width is an upper bound on the number of distinct positions
+    // it can add; overlap may make this estimate larger than the final map.
+    let initial_capacity = starts
+        .iter()
+        .zip(ends.iter())
+        .filter_map(|(start, end)| checked_range(*start, *end, index_len))
+        .fold(0_usize, |total, (start, end)| {
+            total.saturating_add(end.saturating_sub(start))
+        })
+        .min(index_len / RANGE_DENSE_THRESHOLD_DIVISOR);
+    // ELI5: give the address book enough blank lines for likely unique
+    // drawers, but do not print a full cabinet's worth before it is needed.
+    let mut storage = RangeStorage::Sparse(HashMap::with_capacity(initial_capacity));
     let mut touched = Vec::new();
 
     for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
@@ -330,7 +348,7 @@ where
                     // Promote only after the number of distinct positions is
                     // dense; repeated visits to a tiny window remain sparse
                     // regardless of how many rows overlap that window.
-                    if states.len().saturating_mul(2) >= index_len {
+                    if states.len().saturating_mul(RANGE_DENSE_THRESHOLD_DIVISOR) >= index_len {
                         // Replace the enum temporarily so the map can be moved
                         // out without unsafe code or parallel Option state.
                         let old = std::mem::replace(

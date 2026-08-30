@@ -88,7 +88,11 @@ where
     F: FnMut(T) -> f64,
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
-    let mut converted = vec![None; arr.len()];
+    // Cache only the current row's conversion. The reducer visits one row's
+    // range contiguously, so this avoids both repeated conversion and an
+    // O(arr.len()) memoization allocation.
+    let mut cached_row = usize::MAX;
+    let mut cached_value = 0.0_f64;
     // Integer products use `WrapMul` because integer overflow is intentionally
     // modular in the reverse kernels. Floating-point multiplication follows
     // IEEE-754 instead: overflow yields signed infinity, and invalid cases
@@ -101,14 +105,11 @@ where
     let (touched, products) =
         range_reduce(starts, ends, index.len(), 1.0_f64, |row, _item, product| {
             if !booleans[row] {
-                let current = match converted[row] {
-                    Some(value) => value,
-                    None => {
-                        let value = to_f64(arr[row]);
-                        converted[row] = Some(value);
-                        value
-                    }
-                };
+                if row != cached_row {
+                    cached_row = row;
+                    cached_value = to_f64(arr[row]);
+                }
+                let current = cached_value;
                 *product *= current;
             }
         });
