@@ -312,7 +312,8 @@ where
 /// # Arguments
 ///
 /// * `arr` - Aggregate input values, one value per pyjanitor input row.
-/// * `booleans` - Null mask; `true` rows are skipped.
+/// * `booleans` - Null mask with the same length as `arr`; `true` rows are
+///   skipped. The caller must uphold this length invariant.
 /// * `width` - Number of compact output buckets.
 /// * `row_bucket` - Maps an input row to the bucket where it becomes active.
 /// * `output_bucket` - Maps an output position to its active bucket.
@@ -323,6 +324,12 @@ where
 ///
 /// An array of input-row positions, using `-1` where no non-null winner
 /// exists. Equal values use the smallest input-row position as a tie-breaker.
+///
+/// # Panics
+///
+/// Panics if `booleans` is shorter than `arr`, or if a caller-supplied bucket
+/// mapping produces a value outside `0..width`. The production wrappers
+/// establish these invariants before calling the shared reducer.
 pub(crate) fn sweep_winner<T, RowBucket, OutputBucket, OutputPositions, Better>(
     arr: ArrayView1<'_, T>,
     booleans: ArrayView1<'_, bool>,

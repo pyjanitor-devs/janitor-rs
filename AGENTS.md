@@ -69,7 +69,9 @@ production code or Cargo configuration.
 - Preserve pyjanitor-facing null, dtype, label, tie-break, and overflow
   semantics.
 - Integer sum/product aggregation intentionally uses wrapping arithmetic
-  (`wrapping_add`/`wrapping_mul`) so debug and release behavior agree.
+  (`wrapping_add`/`wrapping_mul`) so debug and release behavior agree. Do not
+  disable overflow checks for the whole test profile: unrelated index,
+  counter, and allocation-length arithmetic must still fail loudly in tests.
 - `-1` is commonly a no-result sentinel for positional outputs. Check the
   downstream consumer before using it: it is unsafe if passed directly to
   pandas positional indexing without filtering.
@@ -79,6 +81,9 @@ production code or Cargo configuration.
 - For validated range kernels, negative, oversized, and inverted ranges are
   handled according to the function's documented contract. Do not silently
   change skip-versus-error behavior while optimizing.
+- When a pre-pass computes the width of an unguarded `a..b` range, use
+  `b.saturating_sub(a)`, not `b - a`. This matches Rust's range length when
+  `a >= b` and keeps sentinel values from wrapping the expected tape width.
 - Parallel arrays describing the same rows must be checked for equal length
   before a `zip`; otherwise Rust can silently truncate work.
 - Match-based kernels consume a flat candidate tape. `matches.len()` is its
@@ -135,7 +140,9 @@ include:
 
 - #23 - reverse aggregation correctness and optimization;
 - #116 - adaptive reverse sweep work;
-- #120 - dense reverse aggregation work;
+- #120 - branchless masked accumulation and contiguous-slice access for the
+  `_matches` shape;
+- #129 - shared reverse aggregation boundary sweeps;
 - #163 - shared-helper Rustdoc audit.
 
 When a task requests a sub-issue, attach it formally to the requested parent
