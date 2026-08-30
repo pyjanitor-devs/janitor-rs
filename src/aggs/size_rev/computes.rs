@@ -207,7 +207,6 @@ pub fn compute_size_rev_start_end_matches<'py>(
 ) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
-    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let matches = matches.as_array();
     if starts.is_empty() || index.is_empty() {

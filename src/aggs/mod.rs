@@ -266,26 +266,6 @@ pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<
     (0..max_end).map(|item| index[item]).collect()
 }
 
-/// Reduce arbitrary ranges with dense state when the queried domain is dense,
-/// and sparse state when the ranges touch only a small part of the index.
-///
-/// # Arguments
-///
-/// * `starts` - Inclusive start boundary for each input row.
-/// * `ends` - Exclusive end boundary for each input row.
-/// * `index_len` - Number of positional slots in the right-hand index.
-/// * `identity` - Initial state for each newly touched ordinal.
-/// * `update` - Aggregation-specific update called with `(row, item, state)`.
-///
-/// # Returns
-///
-/// Returns touched ordinals in first-touch order and one compacted state for
-/// each ordinal. Invalid or zero-width ranges are skipped by `checked_range`.
-/// The reducer starts with sparse state and promotes to dense state once the
-/// number of distinct touched ordinals reaches half of `index_len`.
-///
-/// ELI5: use a row of drawers when most drawers are needed, but use a small
-/// address book when the request visits only a few drawers.
 enum RangeStorage<State> {
     /// A dictionary stores only positions that a range has actually touched.
     /// This keeps sparse queries from allocating for the entire right index.
@@ -307,6 +287,26 @@ enum RangeStorage<State> {
 // chooses the storage representation inside `range_reduce`.
 const RANGE_DENSE_THRESHOLD_DIVISOR: usize = 2;
 
+/// Reduce arbitrary ranges with dense state when the queried domain is dense,
+/// and sparse state when the ranges touch only a small part of the index.
+///
+/// # Arguments
+///
+/// * `starts` - Inclusive start boundary for each input row.
+/// * `ends` - Exclusive end boundary for each input row.
+/// * `index_len` - Number of positional slots in the right-hand index.
+/// * `identity` - Initial state for each newly touched ordinal.
+/// * `update` - Aggregation-specific update called with `(row, item, state)`.
+///
+/// # Returns
+///
+/// Returns touched ordinals in first-touch order and one compacted state for
+/// each ordinal. Invalid or zero-width ranges are skipped by `checked_range`.
+/// The reducer starts with sparse state and promotes to dense state once the
+/// number of distinct touched ordinals reaches half of `index_len`.
+///
+/// ELI5: use a row of drawers when most drawers are needed, but use a small
+/// address book when the request visits only a few drawers.
 pub(crate) fn range_reduce<State, Update>(
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
