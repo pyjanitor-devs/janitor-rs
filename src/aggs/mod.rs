@@ -407,10 +407,11 @@ where
 /// The caller must provide a `booleans` mask at least as long as `arr`; a
 /// shorter mask can panic when a visited row is checked. A caller-supplied
 /// bucket mapping can panic if it produces a value outside `0..=width`, and an
-/// output position outside `0..width` can panic when a winner exists for that
-/// position. If no winner exists, that invalid output position is silently
-/// skipped by the current implementation. The production wrappers establish
-/// these invariants before calling the shared helper.
+/// output position outside `0..width` violates the helper's precondition. The
+/// current implementation may panic for that invalid position when a winner
+/// exists, or skip the write when no winner exists; neither outcome is a
+/// supported contract to rely on. The production wrappers establish these
+/// invariants before calling the shared helper.
 ///
 /// The input views are borrowed and not modified. The bucket closures and
 /// output-position iterator are consumed, and the returned positions array
