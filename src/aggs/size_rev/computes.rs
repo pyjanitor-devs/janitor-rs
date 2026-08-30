@@ -4,9 +4,9 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    checked_end, checked_index, checked_range, dense_range_reduce, ends_domain, ends_labels,
-    ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches,
-    into_starts_ends_result, starts_domain, starts_labels, sweep_reduce,
+    checked_end, checked_index, checked_range, ends_domain, ends_labels, ensure_equal_lengths,
+    ensure_exact_tape_width, ensure_nonempty_matches, into_starts_ends_result, materialize_labels,
+    range_reduce, starts_domain, starts_labels, sweep_reduce,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
@@ -265,6 +265,13 @@ pub fn compute_size_rev_start_end_matches<'py>(
 /// `[start, end)`. Invalid or zero-width ranges are skipped by `checked_range`;
 /// empty `starts`, `ends`, or `index` inputs are rejected.
 ///
+/// # Preconditions
+///
+/// `index` must contain unique labels in positional order. pyjanitor provides
+/// this by normalizing the right side to `range(len(right))`; direct callers
+/// must provide it themselves. Duplicate labels are unsupported and are not
+/// merged by the positional accumulator.
+///
 /// ELI5: each right-row position gets a drawer. Every range adds one to each
 /// covered drawer, then we print the row identity stored in `index[item]`.
 pub fn compute_size_rev_start_end<'py>(
@@ -282,11 +289,10 @@ pub fn compute_size_rev_start_end<'py>(
             "starts, ends, and index cannot be empty",
         ));
     }
-    let (touched, result) =
-        dense_range_reduce(starts, ends, index.len(), 0_i64, |_row, _item, count| {
-            *count += 1
-        });
-    let indexers: Vec<i64> = touched.iter().map(|&item| index[item]).collect();
+    let (touched, result) = range_reduce(starts, ends, index.len(), 0_i64, |_row, _item, count| {
+        *count += 1
+    });
+    let indexers = materialize_labels(&touched, index);
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 

@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{dense_range_reduce, ensure_equal_lengths, WrapMul};
+use crate::aggs::{ensure_equal_lengths, materialize_labels, range_reduce, WrapMul};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -36,6 +36,13 @@ fn validate_inputs<T>(
 /// `[start, end)`. Invalid or zero-width ranges are skipped by `checked_range`,
 /// and empty input arrays are rejected.
 ///
+/// # Preconditions
+///
+/// `index` must contain unique labels in positional order. pyjanitor provides
+/// this by normalizing the right side to `range(len(right))`; direct callers
+/// must provide it themselves. Duplicate labels are unsupported and are not
+/// merged by the positional accumulator.
+///
 /// A null row leaves a touched slot at the multiplicative identity, `1`.
 /// Integer accumulators use `wrapping_mul` through `WrapMul`, matching the
 /// project's overflow contract. `A` is `i64` for ordinary integer dtypes and
@@ -59,13 +66,13 @@ where
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
     let (touched, products) =
-        dense_range_reduce(starts, ends, index.len(), A::ONE, |row, _item, product| {
+        range_reduce(starts, ends, index.len(), A::ONE, |row, _item, product| {
             if !booleans[row] {
                 *product = product.wrap_mul(convert(arr[row]));
             }
         });
-    let labels = touched.iter().map(|&item| index[item]).collect();
-    Ok((Array1::from_vec(labels), Array1::from_vec(products)))
+    let labels = materialize_labels(&touched, index);
+    Ok((labels, Array1::from_vec(products)))
 }
 
 pub fn prod_rev_start_end_float_core<T, F>(
@@ -81,6 +88,7 @@ where
     F: FnMut(T) -> f64,
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
+    let mut converted = vec![None; arr.len()];
     // Integer products use `WrapMul` because integer overflow is intentionally
     // modular in the reverse kernels. Floating-point multiplication follows
     // IEEE-754 instead: overflow yields signed infinity, and invalid cases
@@ -91,13 +99,21 @@ where
     // ELI5: integer arithmetic goes around a fixed-size loop; float arithmetic
     // can leave the loop and say “infinity” or “not a number.”
     let (touched, products) =
-        dense_range_reduce(starts, ends, index.len(), 1.0_f64, |row, _item, product| {
+        range_reduce(starts, ends, index.len(), 1.0_f64, |row, _item, product| {
             if !booleans[row] {
-                *product *= to_f64(arr[row]);
+                let current = match converted[row] {
+                    Some(value) => value,
+                    None => {
+                        let value = to_f64(arr[row]);
+                        converted[row] = Some(value);
+                        value
+                    }
+                };
+                *product *= current;
             }
         });
-    let labels = touched.iter().map(|&item| index[item]).collect();
-    Ok((Array1::from_vec(labels), Array1::from_vec(products)))
+    let labels = materialize_labels(&touched, index);
+    Ok((labels, Array1::from_vec(products)))
 }
 
 macro_rules! compute_ints {

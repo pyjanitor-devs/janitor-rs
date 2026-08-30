@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{dense_range_reduce, ensure_equal_lengths};
+use crate::aggs::{ensure_equal_lengths, materialize_labels, range_reduce};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -36,6 +36,13 @@ fn validate_inputs<T>(
 /// `[start, end)`. Invalid or zero-width ranges are skipped by `checked_range`,
 /// and empty input arrays are rejected.
 ///
+/// # Preconditions
+///
+/// `index` must contain unique labels in positional order. pyjanitor provides
+/// this by normalizing the right side to `range(len(right))`; direct callers
+/// must provide it themselves. Duplicate labels are unsupported and are not
+/// merged by the positional accumulator.
+///
 /// ELI5: each right-row position gets one numbered drawer. The number printed
 /// on the row may be 42, 7, or 100, but the drawer is still its position on
 /// the shelf. We remember the best left row in that drawer.
@@ -51,7 +58,7 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
     // ELI5: a vector is faster than asking a dictionary for a drawer on every
     // visit. `Option` lets us leave the value uninitialized until a range
     // first touches that ordinal position.
-    let (touched, states) = dense_range_reduce(
+    let (touched, states) = range_reduce(
         starts,
         ends,
         index.len(),
@@ -68,9 +75,9 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
         },
     );
 
-    let labels = touched.iter().map(|&item| index[item]).collect();
+    let labels = materialize_labels(&touched, index);
     let rows = states.into_iter().map(|(_, row)| row).collect();
-    Ok((Array1::from_vec(labels), Array1::from_vec(rows)))
+    Ok((labels, Array1::from_vec(rows)))
 }
 
 macro_rules! compute {

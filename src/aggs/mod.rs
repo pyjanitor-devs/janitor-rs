@@ -33,6 +33,7 @@ pub mod sum;
 pub mod sum_rev;
 
 use pyo3::exceptions::PyValueError;
+use std::collections::HashMap;
 
 /// Reject parallel arrays that cannot describe the same number of rows.
 ///
@@ -276,6 +277,10 @@ pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<
 /// state value for each ordinal. Invalid or zero-width ranges are skipped by
 /// `checked_range`, matching the reverse aggregation contract.
 ///
+/// This helper is positional: callers that map the returned ordinals back to
+/// labels must provide a unique label for each ordinal. Duplicate labels are
+/// not merged.
+///
 /// ELI5: each row points at a slice of numbered drawers. This helper walks
 /// those slices once, remembers which drawers were opened, and lets the
 /// specific aggregation decide what to put in each drawer.
@@ -309,6 +314,65 @@ where
 
     let compacted = touched.iter().map(|&item| states[item].clone()).collect();
     (touched, compacted)
+}
+
+/// Reduce arbitrary ranges with dense state when the queried domain is dense,
+/// and sparse state when the ranges touch only a small part of the index.
+///
+/// ELI5: use a row of drawers when most drawers are needed, but use a small
+/// address book when the request visits only a few drawers.
+pub(crate) fn range_reduce<State, Update>(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index_len: usize,
+    identity: State,
+    mut update: Update,
+) -> (Vec<usize>, Vec<State>)
+where
+    State: Clone,
+    Update: FnMut(usize, usize, &mut State),
+{
+    let covered_width = starts
+        .iter()
+        .zip(ends.iter())
+        .filter_map(|(start, end)| checked_range(*start, *end, index_len))
+        .map(|(start, end)| end - start)
+        .fold(0usize, usize::saturating_add);
+
+    // Dense state is beneficial only when at least half of the positional
+    // domain is covered. Below that point, the sparse map avoids allocating
+    // state for untouched positions.
+    if covered_width.saturating_mul(2) >= index_len {
+        dense_range_reduce(starts, ends, index_len, identity, update)
+    } else {
+        let mut states = HashMap::new();
+        let mut touched = Vec::new();
+        for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+            let Some((start, end)) = checked_range(*start, *end, index_len) else {
+                continue;
+            };
+            for item in start..end {
+                let state = states.entry(item).or_insert_with(|| {
+                    touched.push(item);
+                    identity.clone()
+                });
+                update(row, item, state);
+            }
+        }
+        let compacted = touched
+            .iter()
+            .map(|item| states.remove(item).unwrap())
+            .collect();
+        (touched, compacted)
+    }
+}
+
+/// Materialize labels for positional ordinals returned by a range reducer.
+///
+/// ELI5: the reducer remembers shelf positions; this helper writes the label
+/// printed on each corresponding shelf slot into the output array.
+pub(crate) fn materialize_labels(touched: &[usize], index: ArrayView1<'_, i64>) -> Array1<i64> {
+    touched.iter().map(|&item| index[item]).collect()
 }
 
 // These knobs deliberately live beside the gate: they describe the policy for
@@ -570,7 +634,33 @@ where
 mod sweep_tests {
     use numpy::ndarray::array;
 
-    use super::{should_sweep, sweep_reduce, sweep_winner};
+    use super::{range_reduce, should_sweep, sweep_reduce, sweep_winner};
+
+    #[test]
+    fn range_reduce_uses_sparse_state_for_a_narrow_domain() {
+        let (touched, totals) = range_reduce(
+            array![10_i64].view(),
+            array![12_i64].view(),
+            1_000_000,
+            0_i64,
+            |_row, _item, total| *total += 1,
+        );
+        assert_eq!(touched, vec![10, 11]);
+        assert_eq!(totals, vec![1, 1]);
+    }
+
+    #[test]
+    fn range_reduce_preserves_first_touch_order_for_dense_domain() {
+        let (touched, totals) = range_reduce(
+            array![0_i64, 1].view(),
+            array![3_i64, 2].view(),
+            3,
+            0_i64,
+            |_row, _item, total| *total += 1,
+        );
+        assert_eq!(touched, vec![0, 1, 2]);
+        assert_eq!(totals, vec![1, 2, 1]);
+    }
 
     #[test]
     fn sweep_gate_accounts_for_row_link_memory_and_dtype() {

@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{dense_range_reduce, ensure_equal_lengths, WrapAdd};
+use crate::aggs::{ensure_equal_lengths, materialize_labels, range_reduce, WrapAdd};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -40,6 +40,13 @@ fn validate_inputs<T>(
 ///
 /// Empty `arr`/`index` inputs are rejected. Invalid or zero-width ranges are
 /// skipped by `checked_range`, and valid ranges are half-open `[start, end)`.
+///
+/// # Preconditions
+///
+/// `index` must contain unique labels in positional order. This is not checked
+/// here: pyjanitor supplies a normalized `range(len(right))` index, while a
+/// direct caller is responsible for this correctness precondition. Duplicate
+/// labels are unsupported and are accumulated independently by ordinal.
 /// `A` is the accumulator type: every integer dtype instantiates this with
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
 /// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
@@ -63,14 +70,14 @@ where
     // already a perfect drawer number. Gaps in the identity values do not
     // matter: `[7, 3, 11]` still has drawers `0`, `1`, and `2`.
     let (touched, totals) =
-        dense_range_reduce(starts, ends, index.len(), A::ZERO, |row, _item, total| {
+        range_reduce(starts, ends, index.len(), A::ZERO, |row, _item, total| {
             if !booleans[row] {
                 *total = total.wrap_add(convert(arr[row]));
             }
         });
 
-    let labels = touched.iter().map(|&item| index[item]).collect();
-    Ok((Array1::from_vec(labels), Array1::from_vec(totals)))
+    let labels = materialize_labels(&touched, index);
+    Ok((labels, Array1::from_vec(totals)))
 }
 
 pub fn sum_rev_start_end_float_core<T, F>(
@@ -87,6 +94,11 @@ where
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
 
+    // Cache one conversion per participating non-null row. The range reducer
+    // invokes its callback once per covered item, but a row's value is the
+    // same for every item in that row's range.
+    let mut converted = vec![None; arr.len()];
+
     // Integer reverse sums use `WrapAdd` because the project defines their
     // overflow behavior as modular wrapping. Floats do not have an
     // equivalent wrapping operation: IEEE-754 addition deliberately produces
@@ -97,7 +109,7 @@ where
     // ELI5: an integer odometer rolls back to zero after its last digit; a
     // float thermometer goes to infinity (or becomes NaN) instead. They need
     // different arithmetic rules.
-    let (touched, totals) = dense_range_reduce(
+    let (touched, totals) = range_reduce(
         starts,
         ends,
         index.len(),
@@ -106,7 +118,14 @@ where
             if booleans[row] {
                 return;
             }
-            let current = to_f64(arr[row]);
+            let current = match converted[row] {
+                Some(value) => value,
+                None => {
+                    let value = to_f64(arr[row]);
+                    converted[row] = Some(value);
+                    value
+                }
+            };
             let difference = current - *compensation;
             let increment = *total + difference;
             *compensation = (increment - *total) - difference;
@@ -120,9 +139,9 @@ where
         },
     );
 
-    let labels = touched.iter().map(|&item| index[item]).collect();
+    let labels = materialize_labels(&touched, index);
     let totals = totals.into_iter().map(|(total, _)| total).collect();
-    Ok((Array1::from_vec(labels), Array1::from_vec(totals)))
+    Ok((labels, Array1::from_vec(totals)))
 }
 
 macro_rules! compute_ints {
@@ -301,6 +320,22 @@ mod tests {
             |value| value,
         );
         assert_eq!(got, Ok((array![42, 7, 100], array![4, 3, 2])));
+    }
+
+    #[test]
+    fn duplicate_index_labels_are_explicitly_unsupported() {
+        // The dense reducer is positional, not label-keyed. This input is
+        // intentionally unsupported: equal labels remain separate slots
+        // rather than being merged as they were by the old HashMap path.
+        let got = sum_rev_start_end_int_core(
+            array![1_i64, 2, 3].view(),
+            array![0_i64, 1, 0].view(),
+            array![2_i64, 3, 1].view(),
+            array![10_i64, 20, 10].view(),
+            array![false, false, false].view(),
+            |value| value,
+        );
+        assert_eq!(got, Ok((array![10, 20, 10], array![4, 3, 2])));
     }
 
     #[test]
