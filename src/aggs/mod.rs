@@ -73,6 +73,10 @@ pub(crate) fn ensure_equal_lengths(
 
 /// Check equal-length parallel inputs inside an extracted Rust core.
 ///
+/// ELI5: the core receives several lists describing the same rows, so it
+/// checks their lengths before zipping them and returns a plain Rust error
+/// rather than requiring the aggregation algorithm to know about Python.
+///
 /// Unlike [`ensure_equal_lengths`], this helper does not construct a PyO3
 /// exception. Keeping the core-layer result as a static Rust error means the
 /// algorithm remains directly testable without a Python interpreter; the
