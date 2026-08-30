@@ -5,8 +5,9 @@ use std::collections::HashMap;
 
 use crate::aggs::{
     checked_end, checked_index, checked_range, ends_domain, ends_labels, ensure_equal_lengths,
-    ensure_exact_tape_width, ensure_nonempty_matches, into_starts_ends_result, materialize_labels,
-    range_reduce, starts_domain, starts_labels, sweep_reduce,
+    ensure_equal_lengths_core, ensure_exact_tape_width, ensure_nonempty_matches,
+    into_starts_ends_result, materialize_labels, range_reduce, starts_domain, starts_labels,
+    sweep_reduce,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
@@ -278,9 +279,11 @@ pub fn size_rev_start_end_core(
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    if starts.len() != ends.len() {
-        return Err("starts and ends must have equal lengths");
-    }
+    ensure_equal_lengths_core(
+        starts.len(),
+        ends.len(),
+        "starts and ends must have equal lengths",
+    )?;
     if starts.is_empty() || index.is_empty() {
         return Err("starts, ends, and index cannot be empty");
     }
