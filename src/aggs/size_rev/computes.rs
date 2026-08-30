@@ -254,7 +254,6 @@ pub fn compute_size_rev_start_end_matches<'py>(
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
-#[pyfunction]
 /// Count covered right-row positions for each distinct right-row identity.
 ///
 /// janitor-rs is primarily called by pyjanitor. Its conditional-join path
@@ -274,6 +273,25 @@ pub fn compute_size_rev_start_end_matches<'py>(
 ///
 /// ELI5: each right-row position gets a drawer. Every range adds one to each
 /// covered drawer, then we print the row identity stored in `index[item]`.
+pub fn size_rev_start_end_core(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+    if starts.len() != ends.len() {
+        return Err("starts and ends must have equal lengths");
+    }
+    if starts.is_empty() || index.is_empty() {
+        return Err("starts, ends, and index cannot be empty");
+    }
+    let (touched, result) = range_reduce(starts, ends, index.len(), 0_i64, |_row, _item, count| {
+        *count += 1
+    });
+    let indexers = materialize_labels(&touched, index);
+    Ok((indexers, result.into_iter().collect()))
+}
+
+#[pyfunction]
 pub fn compute_size_rev_start_end<'py>(
     py: Python<'py>,
     starts: PyReadonlyArray1<'py, i64>,
@@ -284,16 +302,9 @@ pub fn compute_size_rev_start_end<'py>(
     let ends = ends.as_array();
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
-    if starts.is_empty() || index.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "starts, ends, and index cannot be empty",
-        ));
-    }
-    let (touched, result) = range_reduce(starts, ends, index.len(), 0_i64, |_row, _item, count| {
-        *count += 1
-    });
-    let indexers = materialize_labels(&touched, index);
-    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+    let result = size_rev_start_end_core(starts, ends, index)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok((result.0.into_pyarray(py), result.1.into_pyarray(py)))
 }
 
 #[cfg(test)]

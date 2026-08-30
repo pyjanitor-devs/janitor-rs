@@ -18,12 +18,16 @@ pub mod bench_support {
     pub use crate::aggs::max_rev::max_ends::max_rev_ends_core;
     pub use crate::aggs::max_rev::max_positions::max_positions_core;
     pub use crate::aggs::max_rev::max_starts::max_rev_starts_core;
+    pub use crate::aggs::max_rev::max_starts_ends::max_rev_start_end_core;
     pub use crate::aggs::min_rev::min_ends::min_rev_ends_core;
     pub use crate::aggs::min_rev::min_positions::min_positions_core;
     pub use crate::aggs::min_rev::min_starts::min_rev_starts_core;
+    pub use crate::aggs::min_rev::min_starts_ends::min_rev_start_end_core;
     pub use crate::aggs::prod_rev::prod_ends::prod_rev_ends_int_core;
     pub use crate::aggs::prod_rev::prod_starts::prod_rev_starts_int_core;
-    pub use crate::aggs::size_rev::computes::{size_rev_ends_core, size_rev_starts_core};
+    pub use crate::aggs::size_rev::computes::{
+        size_rev_ends_core, size_rev_start_end_core, size_rev_starts_core,
+    };
     pub use crate::aggs::sum::sum_ends::sum_end_core;
     pub use crate::aggs::sum::sum_starts::{sum_start_core, sum_start_u32_core};
     pub use crate::aggs::sum::sum_starts_ends::sum_start_end_core;

@@ -6,7 +6,8 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use janitor_rs::bench_support::{
-    prod_rev_start_end_i64, sum_rev_start_end_f64, sum_rev_start_end_i64,
+    max_rev_start_end_core, min_rev_start_end_core, prod_rev_start_end_i64,
+    size_rev_start_end_core, sum_rev_start_end_f64, sum_rev_start_end_i64,
 };
 use numpy::ndarray::ArrayView1;
 use std::collections::HashMap;
@@ -72,6 +73,40 @@ fn production_product(input: &Input<'_>) -> Vec<(i64, i64)> {
     )
     .expect("benchmark input must satisfy production preconditions");
     sort_pairs(labels.into_iter().zip(values).collect())
+}
+
+fn production_min(input: &Input<'_>) -> Vec<(i64, i64)> {
+    let (labels, rows) = min_rev_start_end_core(
+        ArrayView1::from(input.values),
+        ArrayView1::from(input.starts_i64),
+        ArrayView1::from(input.ends_i64),
+        ArrayView1::from(input.index),
+        ArrayView1::from(input.booleans),
+    )
+    .expect("benchmark input must satisfy production preconditions");
+    sort_pairs(labels.into_iter().zip(rows).collect())
+}
+
+fn production_max(input: &Input<'_>) -> Vec<(i64, i64)> {
+    let (labels, rows) = max_rev_start_end_core(
+        ArrayView1::from(input.values),
+        ArrayView1::from(input.starts_i64),
+        ArrayView1::from(input.ends_i64),
+        ArrayView1::from(input.index),
+        ArrayView1::from(input.booleans),
+    )
+    .expect("benchmark input must satisfy production preconditions");
+    sort_pairs(labels.into_iter().zip(rows).collect())
+}
+
+fn production_size(input: &Input<'_>) -> Vec<(i64, i64)> {
+    let (labels, counts) = size_rev_start_end_core(
+        ArrayView1::from(input.starts_i64),
+        ArrayView1::from(input.ends_i64),
+        ArrayView1::from(input.index),
+    )
+    .expect("benchmark input must satisfy production preconditions");
+    sort_pairs(labels.into_iter().zip(counts).collect())
 }
 
 fn hash_sum(input: &Input<'_>) -> Vec<(i64, i64)> {
@@ -429,6 +464,9 @@ fn bench(c: &mut Criterion) {
             assert_eq!(hash_size(&input), dense_size(&input));
             assert_eq!(production_sum(&input), hash_sum(&input));
             assert_eq!(production_product(&input), hash_product(&input));
+            assert_eq!(production_min(&input), hash_winner(&input, false));
+            assert_eq!(production_max(&input), hash_winner(&input, true));
+            assert_eq!(production_size(&input), hash_size(&input));
             assert_eq!(
                 production_float_sum(&float_input),
                 hash_sum(&input)
@@ -448,6 +486,17 @@ fn bench(c: &mut Criterion) {
             allocations(|| sweep_size(&input)),
             allocations(|| sweep_size_compact(&input)),
         );
+        if !duplicate {
+            eprintln!(
+                "{name}: production allocations sum {:?}, prod {:?}, min {:?}, max {:?}, size {:?}, float_sum {:?}",
+                allocations(|| production_sum(&input)),
+                allocations(|| production_product(&input)),
+                allocations(|| production_min(&input)),
+                allocations(|| production_max(&input)),
+                allocations(|| production_size(&input)),
+                allocations(|| production_float_sum(&float_input)),
+            );
+        }
         group.bench_function(format!("sum/hash/{name}"), |b| {
             b.iter(|| hash_sum(black_box(&input)))
         });
@@ -460,6 +509,15 @@ fn bench(c: &mut Criterion) {
             });
             group.bench_function(format!("float_sum/production/{name}"), |b| {
                 b.iter(|| production_float_sum(black_box(&float_input)))
+            });
+            group.bench_function(format!("min/production/{name}"), |b| {
+                b.iter(|| production_min(black_box(&input)))
+            });
+            group.bench_function(format!("max/production/{name}"), |b| {
+                b.iter(|| production_max(black_box(&input)))
+            });
+            group.bench_function(format!("size/production/{name}"), |b| {
+                b.iter(|| production_size(black_box(&input)))
             });
         }
         group.bench_function(format!("sum/ordinal/{name}"), |b| {

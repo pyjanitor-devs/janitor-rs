@@ -344,6 +344,14 @@ where
                     if states.len().saturating_mul(RANGE_DENSE_THRESHOLD_DIVISOR) >= index_len {
                         // Replace the enum temporarily so the map can be moved
                         // out without unsafe code or parallel Option state.
+                        // The old map remains live while the dense vectors are
+                        // allocated, creating a short-lived peak. That peak is
+                        // the cost of choosing based on the exact distinct
+                        // positions seen so far: an upfront sum of range
+                        // widths would misclassify heavily overlapping sparse
+                        // workloads and allocate the full dense domain too
+                        // early. The production benchmark reports total and
+                        // peak allocations for this trade-off.
                         let old = std::mem::replace(
                             &mut storage,
                             RangeStorage::Dense {
