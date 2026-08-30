@@ -208,10 +208,10 @@ newly-visible warnings.
 
 ## Repository coordination
 
-The authoritative historical context is in GitHub. Relevant ongoing areas
-include:
+The authoritative historical context is in GitHub. Relevant active and
+recently completed areas include:
 
-- #23 - reverse aggregation correctness and optimization; preserve structural
+- #23 - completed reverse aggregation correctness work; preserve structural
   emission order unless ascending labels are an explicit contract—do not add
   an O(k log k) sort merely to make reverse output look ordered;
 - #116 - adaptive reverse sweep work;
@@ -220,7 +220,7 @@ include:
 - #24 - binary-search and comparison kernel improvements;
 - #25 - index-builder hardening and unsafe-cast/length contracts;
 - #26 - adaptive dense/sparse range-sum kernels;
-- #129 - shared reverse aggregation boundary sweeps;
+- #129 - completed shared reverse aggregation boundary sweeps;
 - #163 - shared-helper Rustdoc audit.
 
 When a task requests a sub-issue, attach it formally to the requested parent

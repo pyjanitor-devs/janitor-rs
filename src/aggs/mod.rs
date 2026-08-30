@@ -324,6 +324,14 @@ where
 ///   be in `0..width` because it indexes the output array.
 /// * `better` - Returns whether the current value beats the stored winner.
 ///
+/// # Type Parameters
+///
+/// * `T` - Aggregate value type.
+/// * `RowBucket` - Closure mapping each input row to its activation bucket.
+/// * `OutputBucket` - Closure mapping each output position to its active bucket.
+/// * `OutputPositions` - Iterator yielding output positions in scan order.
+/// * `Better` - Comparator deciding whether a value replaces the winner.
+///
 /// # Returns
 ///
 /// An array of input-row positions, using `-1` where no non-null winner
@@ -362,6 +370,10 @@ where
     let mut positions = vec![-1_i64; width];
     let mut current_winner: Option<(T, i64)> = None;
     for position in output_positions {
+        assert!(
+            position < width,
+            "sweep output position is outside the output width"
+        );
         let mut row = head[output_bucket(position)];
         while row != usize::MAX {
             if booleans[row] {
@@ -427,6 +439,23 @@ mod sweep_tests {
             |current, winner| current > winner,
         );
         assert_eq!(reverse, array![1, 2, -1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "sweep output position is outside the output width")]
+    fn sweep_winner_rejects_invalid_position_before_a_null_prefix_can_hide_it() {
+        let arr = array![7_i64];
+        let booleans = array![true];
+
+        sweep_winner(
+            arr.view(),
+            booleans.view(),
+            1,
+            |_| 0,
+            |_| 0,
+            [1, 0],
+            |current, winner| current > winner,
+        );
     }
 
     #[test]
