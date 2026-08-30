@@ -2,7 +2,9 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ensure_equal_lengths, materialize_labels, range_reduce, WrapAdd};
+use crate::aggs::{
+    cached_row_value, ensure_equal_lengths, materialize_labels, range_reduce, WrapAdd,
+};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -119,11 +121,8 @@ where
             if booleans[row] {
                 return;
             }
-            if row != cached_row {
-                cached_row = row;
-                cached_value = to_f64(arr[row]);
-            }
-            let current = cached_value;
+            let current =
+                cached_row_value(row, arr, &mut cached_row, &mut cached_value, &mut to_f64);
             let difference = current - *compensation;
             let increment = *total + difference;
             *compensation = (increment - *total) - difference;

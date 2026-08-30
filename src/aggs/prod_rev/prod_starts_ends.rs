@@ -2,7 +2,9 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ensure_equal_lengths, materialize_labels, range_reduce, WrapMul};
+use crate::aggs::{
+    cached_row_value, ensure_equal_lengths, materialize_labels, range_reduce, WrapMul,
+};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -105,11 +107,8 @@ where
     let (touched, products) =
         range_reduce(starts, ends, index.len(), 1.0_f64, |row, _item, product| {
             if !booleans[row] {
-                if row != cached_row {
-                    cached_row = row;
-                    cached_value = to_f64(arr[row]);
-                }
-                let current = cached_value;
+                let current =
+                    cached_row_value(row, arr, &mut cached_row, &mut cached_value, &mut to_f64);
                 *product *= current;
             }
         });
