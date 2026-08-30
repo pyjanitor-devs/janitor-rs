@@ -126,6 +126,14 @@ pub(crate) fn ensure_equal_lengths_core(
 // stays with each site -- only the domain and its labels are shared here.
 // Validating equal lengths against `arr`/`booleans` also stays with each
 // site: `size` doesn't have those arrays, so it isn't a shared concern.
+//
+// The uniqueness requirement is deliberately a caller contract rather than a
+// `debug_assert!`. Checking it would require an O(index_len) HashSet or sort
+// pass on every debug and test invocation, while release builds would still
+// accept duplicates. It would also make the explicit unsupported-input tests
+// panic instead of documenting the resulting ordinal (non-merged) behavior.
+// The pyjanitor wrapper establishes the invariant before reaching these
+// kernels; direct janitor-rs callers must do the same.
 
 /// Validate a non-empty `starts` boundary array against `right_len` and
 /// derive the compact accumulator domain it implies.
