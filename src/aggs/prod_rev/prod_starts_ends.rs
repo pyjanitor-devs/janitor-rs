@@ -1,9 +1,8 @@
-use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths, WrapMul};
+use crate::aggs::{dense_range_reduce, ensure_equal_lengths, WrapMul};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -59,25 +58,13 @@ where
     F: FnMut(T) -> A,
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
-    let mut seen = vec![false; index.len()];
-    let mut touched = Vec::new();
-    let mut products = vec![A::ONE; index.len()];
-    for (current, start, end, boolean) in izip!(arr, starts, ends, booleans) {
-        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
-        for item in start..end {
-            if !seen[item] {
-                seen[item] = true;
-                touched.push(item);
+    let (touched, products) =
+        dense_range_reduce(starts, ends, index.len(), A::ONE, |row, _item, product| {
+            if !booleans[row] {
+                *product = product.wrap_mul(convert(arr[row]));
             }
-            if !*boolean {
-                products[item] = products[item].wrap_mul(convert(*current));
-            }
-        }
-    }
+        });
     let labels = touched.iter().map(|&item| index[item]).collect();
-    let products = touched.iter().map(|&item| products[item]).collect();
     Ok((Array1::from_vec(labels), Array1::from_vec(products)))
 }
 
@@ -94,25 +81,22 @@ where
     F: FnMut(T) -> f64,
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
-    let mut seen = vec![false; index.len()];
-    let mut touched = Vec::new();
-    let mut products = vec![1.0_f64; index.len()];
-    for (current, start, end, boolean) in izip!(arr, starts, ends, booleans) {
-        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
-        for item in start..end {
-            if !seen[item] {
-                seen[item] = true;
-                touched.push(item);
+    // Integer products use `WrapMul` because integer overflow is intentionally
+    // modular in the reverse kernels. Floating-point multiplication follows
+    // IEEE-754 instead: overflow yields signed infinity, and invalid cases
+    // such as zero times infinity yield NaN. There is no float analogue of
+    // integer `wrapping_mul`, so applying the integer rule here would change
+    // the established float semantics.
+    //
+    // ELI5: integer arithmetic goes around a fixed-size loop; float arithmetic
+    // can leave the loop and say “infinity” or “not a number.”
+    let (touched, products) =
+        dense_range_reduce(starts, ends, index.len(), 1.0_f64, |row, _item, product| {
+            if !booleans[row] {
+                *product *= to_f64(arr[row]);
             }
-            if !*boolean {
-                products[item] *= to_f64(*current);
-            }
-        }
-    }
+        });
     let labels = touched.iter().map(|&item| index[item]).collect();
-    let products = touched.iter().map(|&item| products[item]).collect();
     Ok((Array1::from_vec(labels), Array1::from_vec(products)))
 }
 

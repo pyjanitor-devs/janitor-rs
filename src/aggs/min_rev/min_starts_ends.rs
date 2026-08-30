@@ -1,9 +1,8 @@
-use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths};
+use crate::aggs::{dense_range_reduce, ensure_equal_lengths};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -52,35 +51,25 @@ pub fn min_rev_start_end_core<T: PartialOrd + Copy>(
     // ELI5: a vector is faster than asking a dictionary for a drawer on every
     // visit. `Option` lets us leave the value uninitialized until a range
     // first touches that ordinal position.
-    let mut seen = vec![false; index.len()];
-    let mut touched = Vec::new();
-    let mut values = vec![None; index.len()];
-    let mut rows = vec![-1_i64; index.len()];
-
-    for (row, (current, start, end, boolean)) in
-        izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter()).enumerate()
-    {
-        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
-        for item in start..end {
-            if !seen[item] {
-                seen[item] = true;
-                touched.push(item);
-                values[item] = Some(*current);
+    let (touched, states) = dense_range_reduce(
+        starts,
+        ends,
+        index.len(),
+        (None, -1_i64),
+        |row, _item, (value, winner)| {
+            if booleans[row] {
+                return;
             }
-            if *boolean {
-                continue;
+            let current = arr[row];
+            if value.is_none() || current < value.unwrap() {
+                *value = Some(current);
+                *winner = row as i64;
             }
-            if rows[item] == -1 || *current < values[item].unwrap() {
-                values[item] = Some(*current);
-                rows[item] = row as i64;
-            }
-        }
-    }
+        },
+    );
 
     let labels = touched.iter().map(|&item| index[item]).collect();
-    let rows = touched.iter().map(|&item| rows[item]).collect();
+    let rows = states.into_iter().map(|(_, row)| row).collect();
     Ok((Array1::from_vec(labels), Array1::from_vec(rows)))
 }
 

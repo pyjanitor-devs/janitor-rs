@@ -257,6 +257,60 @@ pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<
     (0..max_end).map(|item| index[item]).collect()
 }
 
+/// Visit every valid positional item in a batch of arbitrary half-open ranges
+/// and return the touched ordinals with their compacted state.
+///
+/// # Arguments
+///
+/// * `starts` - Inclusive start boundary for each input row.
+/// * `ends` - Exclusive end boundary for each input row.
+/// * `index_len` - Number of positional slots in the right-hand index.
+/// * `identity` - Initial state for every right-hand ordinal.
+/// * `update` - Aggregation-specific update called with `(row, item, state)`
+///   for every valid covered ordinal. The callback owns null handling and the
+///   aggregate's arithmetic or comparison semantics.
+///
+/// # Returns
+///
+/// Returns touched right-hand ordinals in first-touch order and one compacted
+/// state value for each ordinal. Invalid or zero-width ranges are skipped by
+/// `checked_range`, matching the reverse aggregation contract.
+///
+/// ELI5: each row points at a slice of numbered drawers. This helper walks
+/// those slices once, remembers which drawers were opened, and lets the
+/// specific aggregation decide what to put in each drawer.
+pub(crate) fn dense_range_reduce<State, Update>(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index_len: usize,
+    identity: State,
+    mut update: Update,
+) -> (Vec<usize>, Vec<State>)
+where
+    State: Clone,
+    Update: FnMut(usize, usize, &mut State),
+{
+    let mut seen = vec![false; index_len];
+    let mut touched = Vec::new();
+    let mut states = vec![identity; index_len];
+
+    for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        let Some((start, end)) = checked_range(*start, *end, index_len) else {
+            continue;
+        };
+        for item in start..end {
+            if !seen[item] {
+                seen[item] = true;
+                touched.push(item);
+            }
+            update(row, item, &mut states[item]);
+        }
+    }
+
+    let compacted = touched.iter().map(|&item| states[item].clone()).collect();
+    (touched, compacted)
+}
+
 // These knobs deliberately live beside the gate: they describe the policy for
 // choosing an implementation, not the correctness of either implementation.
 const SWEEP_WORK_RATIO: usize = 8;

@@ -4,9 +4,9 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    checked_end, checked_index, checked_range, ends_domain, ends_labels, ensure_equal_lengths,
-    ensure_exact_tape_width, ensure_nonempty_matches, into_starts_ends_result, starts_domain,
-    starts_labels, sweep_reduce,
+    checked_end, checked_index, checked_range, dense_range_reduce, ends_domain, ends_labels,
+    ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches,
+    into_starts_ends_result, starts_domain, starts_labels, sweep_reduce,
 };
 
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
@@ -282,24 +282,11 @@ pub fn compute_size_rev_start_end<'py>(
             "starts, ends, and index cannot be empty",
         ));
     }
-    let mut seen = vec![false; index.len()];
-    let mut touched = Vec::new();
-    let mut result = vec![0_i64; index.len()];
-    let zipped = starts.into_iter().zip(ends);
-    for (start, end) in zipped {
-        let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
-        for item in start_..end_ {
-            if !seen[item] {
-                seen[item] = true;
-                touched.push(item);
-            }
-            result[item] += 1;
-        }
-    }
+    let (touched, result) =
+        dense_range_reduce(starts, ends, index.len(), 0_i64, |_row, _item, count| {
+            *count += 1
+        });
     let indexers: Vec<i64> = touched.iter().map(|&item| index[item]).collect();
-    let result: Vec<i64> = touched.iter().map(|&item| result[item]).collect();
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 

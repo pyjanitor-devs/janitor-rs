@@ -1,9 +1,8 @@
-use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths, WrapAdd};
+use crate::aggs::{dense_range_reduce, ensure_equal_lengths, WrapAdd};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -63,30 +62,14 @@ where
     // ELI5: because each right row is unique, its position in `index` is
     // already a perfect drawer number. Gaps in the identity values do not
     // matter: `[7, 3, 11]` still has drawers `0`, `1`, and `2`.
-    let mut seen = vec![false; index.len()];
-    let mut touched = Vec::new();
-    let mut totals = vec![A::ZERO; index.len()];
-
-    for (current, start, end, boolean) in
-        izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter())
-    {
-        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
-        for item in start..end {
-            if !seen[item] {
-                seen[item] = true;
-                touched.push(item);
+    let (touched, totals) =
+        dense_range_reduce(starts, ends, index.len(), A::ZERO, |row, _item, total| {
+            if !booleans[row] {
+                *total = total.wrap_add(convert(arr[row]));
             }
-            if *boolean {
-                continue;
-            }
-            totals[item] = totals[item].wrap_add(convert(*current));
-        }
-    }
+        });
 
     let labels = touched.iter().map(|&item| index[item]).collect();
-    let totals = touched.iter().map(|&item| totals[item]).collect();
     Ok((Array1::from_vec(labels), Array1::from_vec(totals)))
 }
 
@@ -104,41 +87,41 @@ where
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
 
-    let mut seen = vec![false; index.len()];
-    let mut touched = Vec::new();
-    let mut totals = vec![0.0; index.len()];
-    let mut compensations = vec![0.0; index.len()];
-
-    for (current, start, end, boolean) in
-        izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter())
-    {
-        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
-        let current = to_f64(*current);
-        for item in start..end {
-            if !seen[item] {
-                seen[item] = true;
-                touched.push(item);
+    // Integer reverse sums use `WrapAdd` because the project defines their
+    // overflow behavior as modular wrapping. Floats do not have an
+    // equivalent wrapping operation: IEEE-754 addition deliberately produces
+    // infinities or NaN for overflow/invalid arithmetic. Keep the existing
+    // compensated floating-point sequence instead of forcing integer rules
+    // onto floating-point values.
+    //
+    // ELI5: an integer odometer rolls back to zero after its last digit; a
+    // float thermometer goes to infinity (or becomes NaN) instead. They need
+    // different arithmetic rules.
+    let (touched, totals) = dense_range_reduce(
+        starts,
+        ends,
+        index.len(),
+        (0.0_f64, 0.0_f64),
+        |row, _item, (total, compensation)| {
+            if booleans[row] {
+                return;
             }
-            if *boolean {
-                continue;
-            }
-            let difference = current - compensations[item];
-            let increment = totals[item] + difference;
-            compensations[item] = (increment - totals[item]) - difference;
+            let current = to_f64(arr[row]);
+            let difference = current - *compensation;
+            let increment = *total + difference;
+            *compensation = (increment - *total) - difference;
             // ELI5: compensation remembers tiny rounding crumbs. If an
             // infinity makes that crumb NaN, discard the crumb so the actual
             // infinity remains the result, matching pandas' summation rules.
-            if !compensations[item].is_finite() {
-                compensations[item] = 0.0;
+            if !compensation.is_finite() {
+                *compensation = 0.0;
             }
-            totals[item] = increment;
-        }
-    }
+            *total = increment;
+        },
+    );
 
     let labels = touched.iter().map(|&item| index[item]).collect();
-    let totals = touched.iter().map(|&item| totals[item]).collect();
+    let totals = totals.into_iter().map(|(total, _)| total).collect();
     Ok((Array1::from_vec(labels), Array1::from_vec(totals)))
 }
 
