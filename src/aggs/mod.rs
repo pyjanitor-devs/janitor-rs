@@ -278,6 +278,21 @@ pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<
 ///
 /// ELI5: use a row of drawers when most drawers are needed, but use a small
 /// address book when the request visits only a few drawers.
+enum RangeStorage<State> {
+    /// A dictionary stores only positions that a range has actually touched.
+    /// This keeps sparse queries from allocating for the entire right index.
+    ///
+    /// ELI5: write down only the drawer numbers someone asked for instead of
+    /// building a million-drawer cabinet for a two-drawer request.
+    Sparse(HashMap<usize, State>),
+    /// Arrays make repeated access cheap once enough distinct positions are
+    /// active to justify allocating the complete positional domain.
+    ///
+    /// ELI5: once most drawers are in use, a numbered cabinet is faster than
+    /// looking every drawer up in an address book.
+    Dense { seen: Vec<bool>, states: Vec<State> },
+}
+
 pub(crate) fn range_reduce<State, Update>(
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
@@ -289,9 +304,7 @@ where
     State: Clone,
     Update: FnMut(usize, usize, &mut State),
 {
-    let mut sparse = Some(HashMap::new());
-    let mut dense_seen: Option<Vec<bool>> = None;
-    let mut dense_states: Option<Vec<State>> = None;
+    let mut storage = RangeStorage::Sparse(HashMap::new());
     let mut touched = Vec::new();
 
     for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
@@ -299,50 +312,65 @@ where
             continue;
         };
         for item in start..end {
-            if let Some(states) = dense_states.as_mut() {
-                let seen = dense_seen.as_mut().unwrap();
-                if !seen[item] {
-                    seen[item] = true;
-                    touched.push(item);
+            match &mut storage {
+                RangeStorage::Dense { seen, states } => {
+                    if !seen[item] {
+                        seen[item] = true;
+                        touched.push(item);
+                    }
+                    update(row, item, &mut states[item]);
                 }
-                update(row, item, &mut states[item]);
-                continue;
-            }
+                RangeStorage::Sparse(states) => {
+                    let state = states.entry(item).or_insert_with(|| {
+                        touched.push(item);
+                        identity.clone()
+                    });
+                    update(row, item, state);
 
-            let states = sparse.as_mut().unwrap();
-            let state = states.entry(item).or_insert_with(|| {
-                touched.push(item);
-                identity.clone()
-            });
-            update(row, item, state);
-
-            // Promote only after the number of distinct positions is dense;
-            // repeated visits to a tiny window remain sparse regardless of
-            // how many input rows overlap that window.
-            if states.len().saturating_mul(2) >= index_len {
-                let states = sparse.take().unwrap();
-                let mut seen = vec![false; index_len];
-                let mut dense = vec![identity.clone(); index_len];
-                for (item, state) in states {
-                    seen[item] = true;
-                    dense[item] = state;
+                    // Promote only after the number of distinct positions is
+                    // dense; repeated visits to a tiny window remain sparse
+                    // regardless of how many rows overlap that window.
+                    if states.len().saturating_mul(2) >= index_len {
+                        // Replace the enum temporarily so the map can be moved
+                        // out without unsafe code or parallel Option state.
+                        let old = std::mem::replace(
+                            &mut storage,
+                            RangeStorage::Dense {
+                                seen: Vec::new(),
+                                states: Vec::new(),
+                            },
+                        );
+                        let RangeStorage::Sparse(states) = old else {
+                            unreachable!("storage changed while borrowed");
+                        };
+                        let mut seen = vec![false; index_len];
+                        let mut dense = vec![identity.clone(); index_len];
+                        for (item, state) in states {
+                            seen[item] = true;
+                            dense[item] = state;
+                        }
+                        storage = RangeStorage::Dense {
+                            seen,
+                            states: dense,
+                        };
+                    }
                 }
-                dense_seen = Some(seen);
-                dense_states = Some(dense);
             }
         }
     }
 
-    if let Some(states) = dense_states {
-        let compacted = touched.iter().map(|&item| states[item].clone()).collect();
-        (touched, compacted)
-    } else {
-        let states = sparse.unwrap();
-        let compacted = touched
-            .iter()
-            .map(|item| states.get(item).unwrap().clone())
-            .collect();
-        (touched, compacted)
+    match storage {
+        RangeStorage::Dense { states, .. } => {
+            let compacted = touched.iter().map(|&item| states[item].clone()).collect();
+            (touched, compacted)
+        }
+        RangeStorage::Sparse(states) => {
+            let compacted = touched
+                .iter()
+                .map(|item| states.get(item).unwrap().clone())
+                .collect();
+            (touched, compacted)
+        }
     }
 }
 
