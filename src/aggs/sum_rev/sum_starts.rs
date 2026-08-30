@@ -4,20 +4,9 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    ensure_equal_lengths, into_starts_ends_result, starts_domain, starts_labels, sweep_reduce,
-    WrapAdd,
+    ensure_equal_lengths, ensure_equal_lengths_core, into_starts_ends_result, starts_domain,
+    starts_labels, sweep_reduce, WrapAdd,
 };
-
-fn validate_starts_inputs(
-    arr_len: usize,
-    starts_len: usize,
-    booleans_len: usize,
-) -> Result<(), &'static str> {
-    if arr_len != starts_len || arr_len != booleans_len {
-        return Err("arr, starts, and booleans must have equal lengths");
-    }
-    Ok(())
-}
 
 /// Accumulate reverse-sum `starts` rows in slots for the touched candidate
 /// suffix, then emit the original right labels from `index`.
@@ -42,7 +31,16 @@ where
     A: WrapAdd,
     F: FnMut(T) -> A,
 {
-    validate_starts_inputs(arr.len(), starts.len(), booleans.len())?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        starts.len(),
+        "arr, starts, and booleans must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        booleans.len(),
+        "arr, starts, and booleans must have equal lengths",
+    )?;
     let (min_start, width) = starts_domain(starts, index.len())?;
 
     // ELI5: a suffix starts once and then stays active. The shared reducer puts
@@ -122,7 +120,16 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    validate_starts_inputs(arr.len(), starts.len(), booleans.len())?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        starts.len(),
+        "arr, starts, and booleans must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        booleans.len(),
+        "arr, starts, and booleans must have equal lengths",
+    )?;
     let (min_start, width) = starts_domain(starts, index.len())?;
     // Keep the existing per-position Neumaier accumulation for floats. A
     // single running sweep would change the original row order at positions

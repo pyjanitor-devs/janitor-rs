@@ -3,18 +3,10 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{into_starts_ends_result, starts_domain, starts_labels, sweep_reduce, WrapMul};
-
-fn validate_inputs<T>(
-    arr: ArrayView1<'_, T>,
-    starts: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> Result<(), &'static str> {
-    if arr.len() != starts.len() || arr.len() != booleans.len() {
-        return Err("arr, starts, and booleans must have equal lengths");
-    }
-    Ok(())
-}
+use crate::aggs::{
+    ensure_equal_lengths_core, into_starts_ends_result, starts_domain, starts_labels, sweep_reduce,
+    WrapMul,
+};
 
 /// `A` is the accumulator type: every integer dtype instantiates this with
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
@@ -28,7 +20,16 @@ pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     booleans: ArrayView1<'_, bool>,
     mut convert: F,
 ) -> Result<(Array1<i64>, Array1<A>), &'static str> {
-    validate_inputs(arr, starts, booleans)?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        starts.len(),
+        "arr, starts, and booleans must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        booleans.len(),
+        "arr, starts, and booleans must have equal lengths",
+    )?;
     let (min_start, width) = starts_domain(starts, index.len())?;
     // ELI5: a suffix row joins the running product at its start bucket. The
     // shared reducer combines rows sharing a boundary, then carries one
@@ -50,7 +51,16 @@ pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
     booleans: ArrayView1<'_, bool>,
     mut to_f64: F,
 ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
-    validate_inputs(arr, starts, booleans)?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        starts.len(),
+        "arr, starts, and booleans must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        booleans.len(),
+        "arr, starts, and booleans must have equal lengths",
+    )?;
     let (min_start, width) = starts_domain(starts, index.len())?;
     // Keep floats on the direct nested loop. Unlike integer wrapping
     // multiplication, IEEE-754 multiplication is not safely regroupable:
