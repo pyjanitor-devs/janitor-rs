@@ -1,10 +1,9 @@
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+use std::collections::HashMap;
 
-use crate::aggs::{
-    cached_row_value, ensure_equal_lengths, materialize_labels, range_reduce, WrapAdd,
-};
+use crate::aggs::{checked_range, ensure_equal_lengths, materialize_labels, range_reduce, WrapAdd};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -96,12 +95,6 @@ where
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
 
-    // Cache only the current row's conversion. The reducer visits one row's
-    // range contiguously, so a scalar cache gets the old once-per-row cost
-    // without allocating an O(arr.len()) side buffer.
-    let mut cached_row = usize::MAX;
-    let mut cached_value = 0.0_f64;
-
     // Integer reverse sums use `WrapAdd` because the project defines their
     // overflow behavior as modular wrapping. Floats do not have an
     // equivalent wrapping operation: IEEE-754 addition deliberately produces
@@ -112,17 +105,26 @@ where
     // ELI5: an integer odometer rolls back to zero after its last digit; a
     // float thermometer goes to infinity (or becomes NaN) instead. They need
     // different arithmetic rules.
-    let (touched, totals) = range_reduce(
-        starts,
-        ends,
-        index.len(),
-        (0.0_f64, 0.0_f64),
-        |row, _item, (total, compensation)| {
-            if booleans[row] {
-                return;
-            }
-            let current =
-                cached_row_value(row, arr, &mut cached_row, &mut cached_value, &mut to_f64);
+    // Keep the row/value conversion outside the item loop. The generic
+    // callback reducer cannot express that lifetime without a per-item cache
+    // branch, while this specialized float kernel can retain the old hot-loop
+    // shape directly.
+    let mut totals = HashMap::<usize, (f64, f64)>::new();
+    let mut touched = Vec::new();
+    for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+            continue;
+        };
+        let current = (!booleans[row]).then(|| to_f64(arr[row]));
+        for item in start..end {
+            let total = totals.entry(item).or_insert_with(|| {
+                touched.push(item);
+                (0.0, 0.0)
+            });
+            let Some(current) = current else {
+                continue;
+            };
+            let (total, compensation) = total;
             let difference = current - *compensation;
             let increment = *total + difference;
             *compensation = (increment - *total) - difference;
@@ -133,11 +135,14 @@ where
                 *compensation = 0.0;
             }
             *total = increment;
-        },
-    );
+        }
+    }
 
     let labels = materialize_labels(&touched, index);
-    let totals = totals.into_iter().map(|(total, _)| total).collect();
+    let totals = touched
+        .iter()
+        .map(|item| totals.get(item).unwrap().0)
+        .collect();
     Ok((labels, Array1::from_vec(totals)))
 }
 

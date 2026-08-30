@@ -297,32 +297,6 @@ enum RangeStorage<State> {
 // Keeping this as a named policy knob makes the allocation trade-off visible.
 const RANGE_DENSE_THRESHOLD_DIVISOR: usize = 2;
 
-/// Convert one row's value once while a range reducer visits that row.
-///
-/// `range_reduce` invokes its callback for every item in a row's contiguous
-/// range. Keeping the cache as two scalars avoids repeating an expensive dtype
-/// conversion without allocating one cache entry for every input row.
-///
-/// ELI5: while we are serving one customer's consecutive requests, remember
-/// their converted value; throw it away when the next customer arrives.
-pub(crate) fn cached_row_value<T, F>(
-    row: usize,
-    arr: ArrayView1<'_, T>,
-    cached_row: &mut usize,
-    cached_value: &mut f64,
-    convert: &mut F,
-) -> f64
-where
-    T: Copy,
-    F: FnMut(T) -> f64,
-{
-    if row != *cached_row {
-        *cached_row = row;
-        *cached_value = convert(arr[row]);
-    }
-    *cached_value
-}
-
 pub(crate) fn range_reduce<State, Update>(
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,

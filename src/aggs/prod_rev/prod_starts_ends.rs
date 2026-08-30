@@ -1,10 +1,9 @@
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+use std::collections::HashMap;
 
-use crate::aggs::{
-    cached_row_value, ensure_equal_lengths, materialize_labels, range_reduce, WrapMul,
-};
+use crate::aggs::{checked_range, ensure_equal_lengths, materialize_labels, range_reduce, WrapMul};
 
 fn validate_inputs<T>(
     arr: ArrayView1<'_, T>,
@@ -90,11 +89,6 @@ where
     F: FnMut(T) -> f64,
 {
     validate_inputs(arr, starts, ends, index, booleans)?;
-    // Cache only the current row's conversion. The reducer visits one row's
-    // range contiguously, so this avoids both repeated conversion and an
-    // O(arr.len()) memoization allocation.
-    let mut cached_row = usize::MAX;
-    let mut cached_value = 0.0_f64;
     // Integer products use `WrapMul` because integer overflow is intentionally
     // modular in the reverse kernels. Floating-point multiplication follows
     // IEEE-754 instead: overflow yields signed infinity, and invalid cases
@@ -104,15 +98,31 @@ where
     //
     // ELI5: integer arithmetic goes around a fixed-size loop; float arithmetic
     // can leave the loop and say “infinity” or “not a number.”
-    let (touched, products) =
-        range_reduce(starts, ends, index.len(), 1.0_f64, |row, _item, product| {
-            if !booleans[row] {
-                let current =
-                    cached_row_value(row, arr, &mut cached_row, &mut cached_value, &mut to_f64);
-                *product *= current;
-            }
-        });
+    // Convert once per row before entering the item loop. This specialized
+    // path keeps the old hot-loop shape and avoids a cache branch per item.
+    let mut products = HashMap::<usize, f64>::new();
+    let mut touched = Vec::new();
+    for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+            continue;
+        };
+        let current = (!booleans[row]).then(|| to_f64(arr[row]));
+        for item in start..end {
+            let product = products.entry(item).or_insert_with(|| {
+                touched.push(item);
+                1.0
+            });
+            let Some(current) = current else {
+                continue;
+            };
+            *product *= current;
+        }
+    }
     let labels = materialize_labels(&touched, index);
+    let products = touched
+        .iter()
+        .map(|item| products.get(item).unwrap().to_owned())
+        .collect();
     Ok((labels, Array1::from_vec(products)))
 }
 
