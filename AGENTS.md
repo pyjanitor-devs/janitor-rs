@@ -75,6 +75,10 @@ production code or Cargo configuration.
 - `-1` is commonly a no-result sentinel for positional outputs. Check the
   downstream consumer before using it: it is unsafe if passed directly to
   pandas positional indexing without filtering.
+- Null-mask arrays are whole-call inputs, not per-row conveniences:
+  `booleans.len()` must equal the value array length before any aggregation
+  loop starts. Validate this once rather than relying on `zip` or discovering
+  a short mask through an indexing panic.
 - A positional index is a real element index: it must satisfy `0 <= i < len`.
   An exclusive end boundary may satisfy `0 <= end <= len`; `end == len` is
   valid, while `start == len` represents an empty suffix.
@@ -86,6 +90,14 @@ production code or Cargo configuration.
   `a >= b` and keeps sentinel values from wrapping the expected tape width.
 - Parallel arrays describing the same rows must be checked for equal length
   before a `zip`; otherwise Rust can silently truncate work.
+- A caller-supplied single index has no safe empty-range fallback. No-range
+  left indices must be validated as nonnegative, in-bounds positions before
+  indexing; do not silently turn an invalid value into the `-1` sentinel.
+  Likewise, no-range right labels are arbitrary labels, not dense output
+  slots, unless the API explicitly promises positional labels.
+- Product kernels preserve the multiplicative identity `1` for empty or
+  rejected ranges. Bounds hardening must not replace that identity with the
+  accumulator's zero-initialized default.
 - Match-based kernels consume a flat candidate tape. `matches.len()` is its
   candidate width; `counts_array.sum()` normally describes surviving matches
   and corresponds to `matches.sum()` when values are 0/1. Pyjanitor owns the
