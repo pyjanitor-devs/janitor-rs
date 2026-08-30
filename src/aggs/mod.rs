@@ -227,7 +227,8 @@ const SWEEP_MEMORY_MULTIPLIER: usize = 8;
 /// The direct implementation does roughly `rows * width` work. The sweep does
 /// roughly `rows + width` work, but it also needs row-to-bucket metadata and a
 /// bucket array. We estimate the direct path's retained storage as one value
-/// and one `i64` label per output slot, then allow sweep metadata up to
+/// and one `i64` winner-row position per output slot, then allow sweep metadata
+/// up to
 /// `SWEEP_MEMORY_MULTIPLIER` times that estimate. This is intentionally a
 /// conservative, allocation-independent estimate: it omits allocator headers,
 /// shared label storage, and small scalar state, and therefore is a dispatch
@@ -398,10 +399,10 @@ where
 ///
 /// # Panics
 ///
-/// Panics if `booleans` and `arr` have different lengths, if a caller-supplied bucket
-/// mapping produces a value outside `0..=width`, or if `output_positions`
-/// contains a position outside `0..width`. The production wrappers establish
-/// these invariants before calling the shared reducer.
+/// Panics if `booleans` and `arr` have different lengths, if a caller-supplied
+/// bucket mapping produces a value outside `0..=width`, or if
+/// `output_positions` contains a position outside `0..width`. The production
+/// wrappers establish these invariants before calling the shared reducer.
 ///
 /// The input views are borrowed and not modified. The bucket closures and
 /// output-position iterator are consumed, and the returned positions array
