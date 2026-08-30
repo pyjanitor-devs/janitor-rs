@@ -183,8 +183,10 @@ pub(crate) fn ends_domain(
 /// # Returns
 ///
 /// Labels from `min_start` through the final right-side position.
-/// `min_start` must be no greater than `index.len()`; a value equal to the
-/// length produces an empty label array.
+/// A `min_start` equal to `index.len()` produces an empty label array. Values
+/// greater than `index.len()` also produce an empty array because the requested
+/// half-open range is empty; normal callers obtain `min_start` from
+/// `starts_domain`, which enforces the in-bounds contract.
 ///
 /// The label view is borrowed; the returned array owns its copied labels.
 pub(crate) fn starts_labels(min_start: usize, index: ArrayView1<'_, i64>) -> Array1<i64> {
@@ -386,11 +388,14 @@ where
 ///
 /// # Type Parameters
 ///
-/// * `T` - Aggregate value type.
+/// * `T` - Aggregate value type. It must be `Copy` because values are retained
+///   in the running winner and `PartialOrd` so `better` can compare them.
 /// * `RowBucket` - Closure mapping each input row to its activation bucket.
 /// * `OutputBucket` - Closure mapping each output position to its active bucket.
 /// * `OutputPositions` - Iterator yielding output positions in scan order.
-/// * `Better` - Comparator deciding whether a value replaces the winner.
+/// * `Better` - Comparator called as `better(current, winner)` to decide
+///   whether the current value strictly replaces the winner. Equal values are
+///   resolved by the helper using the smallest input row.
 ///
 /// # Returns
 ///
@@ -399,10 +404,13 @@ where
 ///
 /// # Panics
 ///
-/// Panics if `booleans` and `arr` have different lengths, if a caller-supplied
-/// bucket mapping produces a value outside `0..=width`, or if
-/// `output_positions` contains a position outside `0..width`. The production
-/// wrappers establish these invariants before calling the shared reducer.
+/// The caller must provide a `booleans` mask at least as long as `arr`; a
+/// shorter mask can panic when a visited row is checked. A caller-supplied
+/// bucket mapping can panic if it produces a value outside `0..=width`, and an
+/// output position outside `0..width` can panic when a winner exists for that
+/// position. If no winner exists, that invalid output position is silently
+/// skipped by the current implementation. The production wrappers establish
+/// these invariants before calling the shared helper.
 ///
 /// The input views are borrowed and not modified. The bucket closures and
 /// output-position iterator are consumed, and the returned positions array
