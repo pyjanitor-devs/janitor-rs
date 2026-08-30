@@ -3,19 +3,9 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    ends_domain, ends_labels, ensure_equal_lengths, into_starts_ends_result, sweep_reduce, WrapAdd,
+    ends_domain, ends_labels, ensure_equal_lengths, ensure_equal_lengths_core,
+    into_starts_ends_result, sweep_reduce, WrapAdd,
 };
-
-fn validate_ends_inputs(
-    arr_len: usize,
-    ends_len: usize,
-    booleans_len: usize,
-) -> Result<(), &'static str> {
-    if arr_len != ends_len || arr_len != booleans_len {
-        return Err("arr, ends, and booleans must have equal lengths");
-    }
-    Ok(())
-}
 
 /// Accumulate reverse-sum `ends` rows in compact candidate-ordinal slots.
 ///
@@ -39,7 +29,16 @@ where
     A: WrapAdd,
     F: FnMut(T) -> A,
 {
-    validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        ends.len(),
+        "arr, ends, and booleans must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        booleans.len(),
+        "arr, ends, and booleans must have equal lengths",
+    )?;
     let max_end = ends_domain(ends, index.len())?;
 
     // ELI5: an end-bound row covers a prefix. Put its value at the last slot
@@ -72,7 +71,16 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    validate_ends_inputs(arr.len(), ends.len(), booleans.len())?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        ends.len(),
+        "arr, ends, and booleans must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        booleans.len(),
+        "arr, ends, and booleans must have equal lengths",
+    )?;
     let max_end = ends_domain(ends, index.len())?;
     // Keep the existing per-position Neumaier accumulation for floats for
     // the same row-order reason as the starts path.

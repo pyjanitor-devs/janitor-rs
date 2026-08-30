@@ -4,19 +4,9 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    into_starts_ends_result, should_sweep, starts_domain, starts_labels, sweep_winner,
+    ensure_equal_lengths_core, into_starts_ends_result, should_sweep, starts_domain, starts_labels,
+    sweep_winner,
 };
-
-fn validate_inputs<T>(
-    arr: ArrayView1<'_, T>,
-    starts: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> Result<(), &'static str> {
-    if arr.len() != starts.len() || arr.len() != booleans.len() {
-        return Err("arr, starts, and booleans must have equal lengths");
-    }
-    Ok(())
-}
 
 /// Groups reverse-minimum starts by compact candidate ordinal.
 ///
@@ -28,7 +18,16 @@ pub fn min_rev_starts_core<T: PartialOrd + Copy>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, starts, booleans)?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        starts.len(),
+        "arr, starts, and booleans must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        booleans.len(),
+        "arr, starts, and booleans must have equal lengths",
+    )?;
     let (min_start, width) = starts_domain(starts, index.len())?;
 
     if should_sweep(arr.len(), width, std::mem::size_of::<T>()) {

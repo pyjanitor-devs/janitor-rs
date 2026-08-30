@@ -71,6 +71,34 @@ pub(crate) fn ensure_equal_lengths(
     )))
 }
 
+/// Check equal-length parallel inputs inside an extracted Rust core.
+///
+/// Unlike [`ensure_equal_lengths`], this helper does not construct a PyO3
+/// exception. Keeping the core-layer result as a static Rust error means the
+/// algorithm remains directly testable without a Python interpreter; the
+/// surrounding PyO3 wrapper can convert the error at the boundary.
+///
+/// # Arguments
+///
+/// * `left_len` - Length of the first parallel input.
+/// * `right_len` - Length of the second parallel input.
+/// * `message` - Static error message to return when the lengths differ.
+///
+/// # Errors
+///
+/// Returns `message` when the two lengths differ.
+pub(crate) fn ensure_equal_lengths_core(
+    left_len: usize,
+    right_len: usize,
+    message: &'static str,
+) -> Result<(), &'static str> {
+    if left_len == right_len {
+        Ok(())
+    } else {
+        Err(message)
+    }
+}
+
 // Shared domain contract for the plain reverse `*_rev_starts` and
 // `*_rev_ends` aggregation shapes (min/max/prod/sum/size).
 //
@@ -859,7 +887,6 @@ mod adversarial_bounds_tests {
     use pyo3::exceptions::PyValueError;
     use pyo3::Python;
 
-    use super::ensure_equal_lengths;
     use super::max::max_ends::max_end_core;
     use super::max::max_ends_matches::max_end_match_core;
     use super::max::max_positions::max_positions_core;
@@ -874,6 +901,7 @@ mod adversarial_bounds_tests {
     use super::min::min_starts_ends::min_start_end_core;
     use super::min::min_starts_ends_matches::min_start_end_match_core;
     use super::min::min_starts_matches::min_start_match_core;
+    use super::{ensure_equal_lengths, ensure_equal_lengths_core};
     use super::{ensure_exact_tape_width, ensure_nonempty_matches, ensure_tape_width};
 
     #[test]
@@ -898,6 +926,13 @@ mod adversarial_bounds_tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn core_equal_length_validation_accepts_and_rejects() {
+        assert!(ensure_equal_lengths_core(0, 0, "mismatch").is_ok());
+        assert!(ensure_equal_lengths_core(3, 3, "mismatch").is_ok());
+        assert_eq!(ensure_equal_lengths_core(2, 3, "mismatch"), Err("mismatch"));
     }
 
     #[test]

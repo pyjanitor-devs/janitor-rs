@@ -3,18 +3,10 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ends_domain, ends_labels, into_starts_ends_result, sweep_reduce, WrapMul};
-
-fn validate_inputs<T>(
-    arr: ArrayView1<'_, T>,
-    ends: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> Result<(), &'static str> {
-    if arr.len() != ends.len() || arr.len() != booleans.len() {
-        return Err("arr, ends, and booleans must have equal lengths");
-    }
-    Ok(())
-}
+use crate::aggs::{
+    ends_domain, ends_labels, ensure_equal_lengths_core, into_starts_ends_result, sweep_reduce,
+    WrapMul,
+};
 
 /// `A` is the accumulator type: every integer dtype instantiates this with
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
@@ -28,7 +20,16 @@ pub fn prod_rev_ends_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     booleans: ArrayView1<'_, bool>,
     mut convert: F,
 ) -> Result<(Array1<i64>, Array1<A>), &'static str> {
-    validate_inputs(arr, ends, booleans)?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        ends.len(),
+        "arr, ends, and booleans must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        booleans.len(),
+        "arr, ends, and booleans must have equal lengths",
+    )?;
     let max_end = ends_domain(ends, index.len())?;
     // ELI5: a prefix row joins the running product just to the left of its
     // end. Combine rows at the same end into one product event, then sweep
@@ -55,7 +56,16 @@ pub fn prod_rev_ends_float_core<T: Copy, F: FnMut(T) -> f64>(
     booleans: ArrayView1<'_, bool>,
     mut to_f64: F,
 ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
-    validate_inputs(arr, ends, booleans)?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        ends.len(),
+        "arr, ends, and booleans must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        booleans.len(),
+        "arr, ends, and booleans must have equal lengths",
+    )?;
     let max_end = ends_domain(ends, index.len())?;
     // Keep floats on the direct nested loop. Unlike integer wrapping
     // multiplication, IEEE-754 multiplication is not safely regroupable:
