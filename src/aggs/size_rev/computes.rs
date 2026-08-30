@@ -257,12 +257,13 @@ pub fn compute_size_rev_start_end_matches<'py>(
 #[pyfunction]
 /// Count covered right-row positions for each distinct right-row identity.
 ///
-/// `index` is supplied by pyjanitor and contains unique right-row identities.
-/// The identities may be reordered by sorting or contain gaps; `item`, the
-/// position in `index`, is the state slot, while `index[item]` is the output
-/// label. `starts` and `ends` index this compact array and describe half-open
-/// ranges `[start, end)`. Invalid or zero-width ranges are skipped by
-/// `checked_range`; empty `starts`, `ends`, or `index` inputs are rejected.
+/// janitor-rs is primarily called by pyjanitor. Its conditional-join path
+/// resets the right DataFrame index to unique row labels before sorting or
+/// filtering, so labels can be reordered or gapped but are not duplicated.
+/// `item`, the ordinal position in `index`, is the state slot; `index[item]`
+/// is the output label. `starts` and `ends` describe half-open ranges
+/// `[start, end)`. Invalid or zero-width ranges are skipped by `checked_range`;
+/// empty `starts`, `ends`, or `index` inputs are rejected.
 ///
 /// ELI5: each right-row position gets a drawer. Every range adds one to each
 /// covered drawer, then we print the row identity stored in `index[item]`.

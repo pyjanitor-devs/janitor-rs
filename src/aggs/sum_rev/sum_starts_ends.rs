@@ -29,13 +29,15 @@ fn validate_inputs<T>(
 
 /// Sum values into one compact state slot for each distinct right-hand label.
 ///
-/// ELI5: `starts` and `ends` describe little windows into `index`. We keep a
-/// numbered drawer for each right-hand row position, rather than asking a
-/// dictionary which drawer owns the position on every visit. `index[item]` is
-/// the output label for that drawer. The caller contract guarantees that
-/// `index` contains each right-row identity at most once; identities may be
-/// reordered or have gaps, because the drawer number is `item`, not the value
-/// stored in `index[item]`.
+/// janitor-rs is primarily called by pyjanitor. Its conditional-join path
+/// resets the right DataFrame index to unique row labels before sorting or
+/// filtering, so labels can be reordered or gapped but are not duplicated.
+/// `item`, the ordinal position in `index`, is the state slot; `index[item]` is
+/// the output label for that slot.
+///
+/// ELI5: `starts` and `ends` describe little windows into `index`. We use the
+/// shelf position as the drawer number, even when the printed labels have
+/// gaps, then print the original label from that drawer.
 ///
 /// Empty `arr`/`index` inputs are rejected. Invalid or zero-width ranges are
 /// skipped by `checked_range`, and valid ranges are half-open `[start, end)`.

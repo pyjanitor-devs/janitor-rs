@@ -29,12 +29,13 @@ fn validate_inputs<T>(
 
 /// Multiply values into one state slot per right-row ordinal.
 ///
-/// `index` contains unique right-row identities supplied by pyjanitor. The
-/// identities may be reordered by sorting or contain gaps; `item`, the
-/// position in `index`, is the state slot, while `index[item]` is the output
-/// label. `starts` and `ends` index this compact array and describe half-open
-/// ranges `[start, end)`. Invalid or zero-width ranges are skipped by
-/// `checked_range`, and empty input arrays are rejected.
+/// janitor-rs is primarily called by pyjanitor. Its conditional-join path
+/// resets the right DataFrame index to unique row labels before sorting or
+/// filtering, so labels can be reordered or gapped but are not duplicated.
+/// `item`, the ordinal position in `index`, is the state slot; `index[item]`
+/// is the output label. `starts` and `ends` describe half-open ranges
+/// `[start, end)`. Invalid or zero-width ranges are skipped by `checked_range`,
+/// and empty input arrays are rejected.
 ///
 /// A null row leaves a touched slot at the multiplicative identity, `1`.
 /// Integer accumulators use `wrapping_mul` through `WrapMul`, matching the

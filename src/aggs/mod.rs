@@ -106,6 +106,13 @@ pub(crate) fn ensure_equal_lengths_core(
 // Shared domain contract for the plain reverse `*_rev_starts` and
 // `*_rev_ends` aggregation shapes (min/max/prod/sum/size).
 //
+// janitor-rs is primarily the Rust backend for pyjanitor. In pyjanitor's
+// conditional-join path, the right DataFrame index is reset to unique row
+// labels before sorting or filtering. Those labels can therefore be reordered
+// or have gaps by the time they reach Rust, but they remain unique. The dense
+// state below is indexed by the ordinal `item` in `index`; the value
+// `index[item]` is the label emitted back to pyjanitor.
+//
 // ELI5: every row's suffix `[start, right_len)` or prefix `[0, end)`
 // touches a contiguous slice of the right side. The union of all those
 // slices is one compact domain -- `min_start..right_len` for starts,
