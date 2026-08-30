@@ -50,6 +50,10 @@ use pyo3::exceptions::PyValueError;
 /// # Errors
 ///
 /// Returns a `ValueError` when the two lengths differ.
+///
+/// # Returns
+///
+/// Returns `Ok(())` when the lengths are equal.
 pub(crate) fn ensure_equal_lengths(
     left_name: &str,
     left_len: usize,
@@ -83,6 +87,9 @@ pub(crate) fn ensure_equal_lengths(
 /// Validate a non-empty `starts` boundary array against `right_len` and
 /// derive the compact accumulator domain it implies.
 ///
+/// ELI5: find the first right-side position touched by any suffix, then keep
+/// one compact slot for every position from there to the end.
+///
 /// Returns `(min_start, width)` where `width = right_len - min_start` is
 /// the exact number of accumulator slots the compact scheme needs.
 ///
@@ -95,6 +102,10 @@ pub(crate) fn ensure_equal_lengths(
 ///
 /// Returns an error when `starts` or the right index is empty, or when a
 /// boundary is negative or larger than `right_len`.
+///
+/// # Returns
+///
+/// Returns `(min_start, right_len - min_start)` on success.
 pub(crate) fn starts_domain(
     starts: ArrayView1<'_, i64>,
     right_len: usize,
@@ -116,6 +127,9 @@ pub(crate) fn starts_domain(
 /// Validate a non-empty `ends` boundary array against `right_len` and
 /// derive the compact accumulator domain it implies.
 ///
+/// ELI5: find the last right-side position touched by any prefix, then keep
+/// one compact slot for every position before that boundary.
+///
 /// Returns `max_end`, the exact number of accumulator slots the compact
 /// scheme needs.
 ///
@@ -128,6 +142,10 @@ pub(crate) fn starts_domain(
 ///
 /// Returns an error when `ends` or the right index is empty, or when a
 /// boundary is negative or larger than `right_len`.
+///
+/// # Returns
+///
+/// Returns the largest valid exclusive end boundary on success.
 pub(crate) fn ends_domain(
     ends: ArrayView1<'_, i64>,
     right_len: usize,
@@ -147,6 +165,9 @@ pub(crate) fn ends_domain(
 
 /// Materialize output labels for a `starts_domain` result.
 ///
+/// ELI5: translate compact ordinal slots back into the original right-side
+/// labels, starting at the first slot represented by the domain.
+///
 /// # Arguments
 ///
 /// * `min_start` - First absolute right-side position in the compact domain.
@@ -155,11 +176,16 @@ pub(crate) fn ends_domain(
 /// # Returns
 ///
 /// Labels from `min_start` through the final right-side position.
+/// `min_start` must be no greater than `index.len()`; a value equal to the
+/// length produces an empty label array.
 pub(crate) fn starts_labels(min_start: usize, index: ArrayView1<'_, i64>) -> Array1<i64> {
     (min_start..index.len()).map(|item| index[item]).collect()
 }
 
 /// Materialize output labels for an `ends_domain` result.
+///
+/// ELI5: translate compact prefix slots back into the original right-side
+/// labels, stopping just before the exclusive end boundary.
 ///
 /// # Arguments
 ///
@@ -169,6 +195,12 @@ pub(crate) fn starts_labels(min_start: usize, index: ArrayView1<'_, i64>) -> Arr
 /// # Returns
 ///
 /// Labels from the first right-side position through `max_end - 1`.
+/// `max_end` must be at most `index.len()`.
+///
+/// # Panics
+///
+/// Panics if `max_end > index.len()` because the requested compact domain
+/// cannot be mapped to the supplied label array.
 pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<i64> {
     (0..max_end).map(|item| index[item]).collect()
 }
@@ -250,6 +282,10 @@ pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool
 /// * `output_positions` - Iterator giving the scan order, forward or reverse.
 /// * `combine` - Operation used to combine bucket and running values.
 ///
+/// `events` is consumed once. `output_positions` should yield each position
+/// in the intended scan order exactly once; omitting a position leaves its
+/// slot unscanned, while repeating one applies the running aggregate again.
+///
 /// # Type Parameters
 ///
 /// * `T` - Aggregate value type.
@@ -323,6 +359,11 @@ where
 /// * `output_positions` - Iterator giving the scan order; each position must
 ///   be in `0..width` because it indexes the output array.
 /// * `better` - Returns whether the current value beats the stored winner.
+///
+/// `row_bucket` is called once for each input row while building the linked
+/// buckets. `output_bucket` is called once for each yielded output position.
+/// `output_positions` should yield each output position in the intended scan
+/// order exactly once; it is consumed during the sweep.
 ///
 /// # Type Parameters
 ///
@@ -504,6 +545,10 @@ pub(crate) type StartsEndsResult<'py, U> =
 /// # Errors
 ///
 /// Converts a core error into a Python `ValueError`.
+///
+/// # Returns
+///
+/// Returns the converted label and aggregate arrays on success.
 pub(crate) fn into_starts_ends_result<'py, U: Element>(
     py: Python<'py>,
     core_result: Result<(Array1<i64>, Array1<U>), &'static str>,
@@ -529,6 +574,14 @@ pub(crate) trait WrapAdd: Copy {
     const ZERO: Self;
 
     /// Add two values with deliberate wrapping semantics.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - Value to add to the accumulator.
+    ///
+    /// # Returns
+    ///
+    /// The wrapping sum of `self` and `other`.
     fn wrap_add(self, other: Self) -> Self;
 }
 
@@ -555,6 +608,14 @@ pub(crate) trait WrapMul: Copy {
     const ONE: Self;
 
     /// Multiply two values with deliberate wrapping semantics.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - Value to multiply with the accumulator.
+    ///
+    /// # Returns
+    ///
+    /// The wrapping product of `self` and `other`.
     fn wrap_mul(self, other: Self) -> Self;
 }
 
