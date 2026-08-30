@@ -39,6 +39,24 @@ use pyo3::exceptions::PyValueError;
 /// ELI5: `zip` stops when either list runs out, so unequal lists can silently
 /// leave work undone. Check the two ticket books once before the hot loop and
 /// give Python a normal `ValueError` instead of plausible partial results.
+///
+/// # Arguments
+///
+/// * `left_name` - Name of the first parallel input, used in the error.
+/// * `left_len` - Length of the first parallel input.
+/// * `right_name` - Name of the second parallel input, used in the error.
+/// * `right_len` - Length of the second parallel input.
+///
+/// # Errors
+///
+/// Returns a `ValueError` when the two lengths differ.
+///
+/// # Returns
+///
+/// Returns `Ok(())` when the lengths are equal.
+///
+/// The length names are borrowed only for error formatting; no input data is
+/// modified.
 pub(crate) fn ensure_equal_lengths(
     left_name: &str,
     left_len: usize,
@@ -72,8 +90,27 @@ pub(crate) fn ensure_equal_lengths(
 /// Validate a non-empty `starts` boundary array against `right_len` and
 /// derive the compact accumulator domain it implies.
 ///
+/// ELI5: find the first right-side position touched by any suffix, then keep
+/// one compact slot for every position from there to the end.
+///
 /// Returns `(min_start, width)` where `width = right_len - min_start` is
 /// the exact number of accumulator slots the compact scheme needs.
+///
+/// # Arguments
+///
+/// * `starts` - One exclusive-suffix start boundary per pyjanitor row.
+/// * `right_len` - Number of positional rows in the right-side index.
+///
+/// # Errors
+///
+/// Returns an error when `starts` or the right-side domain is empty, or when a
+/// boundary is negative or larger than `right_len`.
+///
+/// # Returns
+///
+/// Returns `(min_start, right_len - min_start)` on success.
+///
+/// The boundary view is borrowed and is not modified.
 pub(crate) fn starts_domain(
     starts: ArrayView1<'_, i64>,
     right_len: usize,
@@ -95,8 +132,27 @@ pub(crate) fn starts_domain(
 /// Validate a non-empty `ends` boundary array against `right_len` and
 /// derive the compact accumulator domain it implies.
 ///
+/// ELI5: find the last right-side position touched by any prefix, then keep
+/// one compact slot for every position before that boundary.
+///
 /// Returns `max_end`, the exact number of accumulator slots the compact
 /// scheme needs.
+///
+/// # Arguments
+///
+/// * `ends` - One exclusive-prefix end boundary per pyjanitor row.
+/// * `right_len` - Number of positional rows in the right-side index.
+///
+/// # Errors
+///
+/// Returns an error when `ends` or the right-side domain is empty, or when a
+/// boundary is negative or larger than `right_len`.
+///
+/// # Returns
+///
+/// Returns the largest valid exclusive end boundary on success.
+///
+/// The boundary view is borrowed and is not modified.
 pub(crate) fn ends_domain(
     ends: ArrayView1<'_, i64>,
     right_len: usize,
@@ -115,11 +171,49 @@ pub(crate) fn ends_domain(
 }
 
 /// Materialize output labels for a `starts_domain` result.
+///
+/// ELI5: translate compact ordinal slots back into the original right-side
+/// labels, starting at the first slot represented by the domain.
+///
+/// # Arguments
+///
+/// * `min_start` - First absolute right-side position in the compact domain.
+/// * `index` - Original right-side labels, indexed by positional ordinal.
+///
+/// # Returns
+///
+/// Labels from `min_start` through the final right-side position.
+/// A `min_start` equal to `index.len()` produces an empty label array. Values
+/// greater than `index.len()` also produce an empty array because the requested
+/// half-open range is empty; normal callers obtain `min_start` from
+/// `starts_domain`, which enforces the in-bounds contract.
+///
+/// The label view is borrowed; the returned array owns its copied labels.
 pub(crate) fn starts_labels(min_start: usize, index: ArrayView1<'_, i64>) -> Array1<i64> {
     (min_start..index.len()).map(|item| index[item]).collect()
 }
 
 /// Materialize output labels for an `ends_domain` result.
+///
+/// ELI5: translate compact prefix slots back into the original right-side
+/// labels, stopping just before the exclusive end boundary.
+///
+/// # Arguments
+///
+/// * `max_end` - Exclusive end of the compact prefix domain.
+/// * `index` - Original right-side labels, indexed by positional ordinal.
+///
+/// # Returns
+///
+/// Labels from the first right-side position through `max_end - 1`.
+/// `max_end` must be at most `index.len()`.
+///
+/// # Panics
+///
+/// Panics if `max_end > index.len()` because the requested compact domain
+/// cannot be mapped to the supplied label array.
+///
+/// The label view is borrowed; the returned array owns its copied labels.
 pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<i64> {
     (0..max_end).map(|item| index[item]).collect()
 }
@@ -135,7 +229,8 @@ const SWEEP_MEMORY_MULTIPLIER: usize = 8;
 /// The direct implementation does roughly `rows * width` work. The sweep does
 /// roughly `rows + width` work, but it also needs row-to-bucket metadata and a
 /// bucket array. We estimate the direct path's retained storage as one value
-/// and one `i64` label per output slot, then allow sweep metadata up to
+/// and one `i64` winner-row position per output slot, then allow sweep metadata
+/// up to
 /// `SWEEP_MEMORY_MULTIPLIER` times that estimate. This is intentionally a
 /// conservative, allocation-independent estimate: it omits allocator headers,
 /// shared label storage, and small scalar state, and therefore is a dispatch
@@ -150,6 +245,17 @@ const SWEEP_MEMORY_MULTIPLIER: usize = 8;
 /// ELI5: build the shortcut only when there are enough repeated chores to
 /// make the setup worthwhile, and do not trade a tiny job for a huge bucket
 /// of row links.
+///
+/// # Arguments
+///
+/// * `rows` - Number of pyjanitor input rows contributing boundaries.
+/// * `width` - Number of positional slots in the compact right-side domain.
+/// * `value_size` - Number of bytes used by one aggregate value.
+///
+/// # Returns
+///
+/// `true` when the sweep's estimated work reduction and memory use meet the
+/// policy thresholds; otherwise `false` selects the direct implementation.
 pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool {
     let repeated_work = rows.saturating_mul(width);
     let sweep_work = rows.saturating_add(width);
@@ -181,6 +287,39 @@ pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool
 /// allowed to panic through an indexing operation. Domain helpers normally
 /// establish this precondition before the reducer is called, but keeping the
 /// guard here makes the shared helper safe for future callers too.
+///
+/// # Arguments
+///
+/// * `width` - Number of compact buckets in the output domain.
+/// * `identity` - Empty aggregate value, such as `0` for sum or `1` for product.
+/// * `events` - Iterator of `(bucket, value)` boundary contributions.
+/// * `output_positions` - Iterator giving the scan order, forward or reverse.
+/// * `combine` - Operation used to combine bucket and running values. It is
+///   called once for each event contribution and once for each scanned output
+///   position; it should be associative for the caller's intended result.
+///
+/// `events` is consumed once. `output_positions` should yield each position
+/// in the intended scan order exactly once; omitting a position leaves its
+/// slot unscanned, while repeating one applies the running aggregate again.
+///
+/// # Type Parameters
+///
+/// * `T` - Aggregate value type.
+/// * `Events` - Type that produces boundary events.
+/// * `OutputPositions` - Type that produces output bucket positions.
+/// * `Combine` - Callable type implementing the aggregation operation.
+///
+/// # Returns
+///
+/// An array containing one running aggregate per output position.
+///
+/// # Errors
+///
+/// Returns an error if an event or requested output position is outside the
+/// compact domain `0..width`.
+///
+/// The iterators and combining callback are consumed by the sweep; the
+/// returned `Array1` owns its aggregate values.
 pub(crate) fn sweep_reduce<T, Events, OutputPositions, Combine>(
     width: usize,
     identity: T,
@@ -224,6 +363,63 @@ where
 /// marks floating-point NaN values as null before calling this backend, so the
 /// kernel relies on that mask rather than implementing a second NaN policy for
 /// every supported dtype.
+///
+/// # Arguments
+///
+/// * `arr` - Aggregate input values, one value per pyjanitor input row.
+/// * `booleans` - Null mask with exactly the same length as `arr`; `true` rows
+///   are skipped. The caller must uphold this length invariant.
+/// * `width` - Number of compact output buckets.
+/// * `row_bucket` - Maps an input row to the bucket where it becomes active;
+///   the returned bucket may be in `0..=width` because the sentinel bucket at
+///   `width` represents a boundary just beyond the compact output domain.
+/// * `output_bucket` - Maps an output position to its active bucket, also in
+///   `0..=width`.
+/// * `output_positions` - Iterator giving the scan order; each position must
+///   be in `0..width` because it indexes the output array.
+/// * `better` - Returns whether the current value strictly beats the stored
+///   winner. Equal values are resolved by the helper using the smallest input
+///   row position, so the callback need not implement tie-breaking.
+///
+/// `row_bucket` is called once for each input row while building the linked
+/// buckets. `output_bucket` is called once for each yielded output position.
+/// `output_positions` should yield each output position in the intended scan
+/// order exactly once; it is consumed during the sweep.
+///
+/// # Type Parameters
+///
+/// * `T` - Aggregate value type. It must be `Copy` because values are retained
+///   in the running winner and `PartialOrd` so `better` can compare them.
+/// * `RowBucket` - Closure mapping each input row to its activation bucket.
+/// * `OutputBucket` - Closure mapping each output position to its active bucket.
+/// * `OutputPositions` - Iterator yielding output positions in scan order.
+/// * `Better` - Comparator called as `better(current, winner)` to decide
+///   whether the current value strictly replaces the winner. Equal values are
+///   resolved by the helper using the smallest input row.
+///
+/// # Returns
+///
+/// An array of input-row positions, using `-1` where no non-null winner
+/// exists. Equal values use the smallest input-row position as a tie-breaker.
+///
+/// # Panics
+///
+/// The caller must provide a `booleans` mask with exactly the same length as
+/// `arr`; a shorter mask can panic when a visited row is checked, while a
+/// longer mask is invalid even though the extra entries are not read. A
+/// caller-supplied bucket mapping can panic if it produces a value outside
+/// `0..=width`, and an output position outside `0..width` violates the helper's
+/// precondition. The current implementation may panic for that invalid
+/// position when a winner exists, or skip the write when no winner exists;
+/// neither outcome is a supported contract to rely on. The production wrappers
+/// establish these invariants before calling the shared helper. Specifically,
+/// the production reverse min/max core functions and their generated PyO3
+/// wrappers validate the input domains and supply the controlled bucket
+/// mappings and ranges.
+///
+/// The input views are borrowed and not modified. The bucket closures and
+/// output-position iterator are consumed, and the returned positions array
+/// owns its storage.
 pub(crate) fn sweep_winner<T, RowBucket, OutputBucket, OutputPositions, Better>(
     arr: ArrayView1<'_, T>,
     booleans: ArrayView1<'_, bool>,
@@ -339,6 +535,9 @@ mod sweep_tests {
 /// wrapper: a pair of numpy arrays, generic over the value array's element
 /// type `U` so it fits min/max/size (`i64`) and prod/sum's int (`i64`) and
 /// float (`f64`) variants alike.
+///
+/// The first array contains the original right-side labels; the second
+/// contains the aggregate values for those labels.
 pub(crate) type StartsEndsResult<'py, U> =
     PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<U>>)>;
 
@@ -347,6 +546,27 @@ pub(crate) type StartsEndsResult<'py, U> =
 ///
 /// ELI5: every wrapper in this family maps a core error to a `ValueError`
 /// and then converts both output arrays to numpy the same way.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter used to create NumPy array views.
+/// * `core_result` - Core output containing labels and aggregate values, or an
+///   internal error message.
+///
+/// # Type Parameters
+///
+/// * `U` - Element type of the aggregate-value array.
+///
+/// # Errors
+///
+/// Converts a core error into a Python `ValueError`.
+///
+/// # Returns
+///
+/// Returns the converted label and aggregate arrays on success.
+///
+/// The core arrays are consumed while their data is transferred into owned
+/// NumPy arrays associated with `py`.
 pub(crate) fn into_starts_ends_result<'py, U: Element>(
     py: Python<'py>,
     core_result: Result<(Array1<i64>, Array1<U>), &'static str>,
@@ -368,7 +588,18 @@ pub(crate) fn into_starts_ends_result<'py, U: Element>(
 /// per shape, so the `uint64` path can't quietly fall out of sync with its
 /// sibling the way it did between issue #90's fix and every other shape.
 pub(crate) trait WrapAdd: Copy {
+    /// Additive identity used to initialize an accumulator.
     const ZERO: Self;
+
+    /// Add two values with deliberate wrapping semantics.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - Value to add to the accumulator.
+    ///
+    /// # Returns
+    ///
+    /// The wrapping sum of `self` and `other`.
     fn wrap_add(self, other: Self) -> Self;
 }
 
@@ -391,7 +622,18 @@ impl WrapAdd for u64 {
 /// ELI5: `prod`'s counterpart to `WrapAdd` -- same reasoning, multiplication
 /// instead of addition, identity `1` instead of `0`.
 pub(crate) trait WrapMul: Copy {
+    /// Multiplicative identity used to initialize an accumulator.
     const ONE: Self;
+
+    /// Multiply two values with deliberate wrapping semantics.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - Value to multiply with the accumulator.
+    ///
+    /// # Returns
+    ///
+    /// The wrapping product of `self` and `other`.
     fn wrap_mul(self, other: Self) -> Self;
 }
 
@@ -415,6 +657,16 @@ impl WrapMul for u64 {
 /// `usize` values; they are rejected while they are still signed. Uses `<`
 /// (not `<=`) because this is an *index* -- `index == len` is out of
 /// bounds, unlike an exclusive end bound (see `checked_end`).
+///
+/// # Arguments
+///
+/// * `index` - Signed positional index supplied by a kernel or pyjanitor.
+/// * `len` - Number of elements available for indexing.
+///
+/// # Returns
+///
+/// `Some` with a safe `usize` index, or `None` for negative/out-of-bounds
+/// values.
 pub(crate) fn checked_index(index: i64, len: usize) -> Option<usize> {
     usize::try_from(index).ok().filter(|&index| index < len)
 }
@@ -423,6 +675,16 @@ pub(crate) fn checked_index(index: i64, len: usize) -> Option<usize> {
 ///
 /// ELI5: uses `<=` (not `<`) because `end` is a slice bound, not an index --
 /// `end == len` legitimately means "up to and including the last element".
+///
+/// # Arguments
+///
+/// * `end` - Signed exclusive slice boundary.
+/// * `len` - Number of elements available to the slice.
+///
+/// # Returns
+///
+/// `Some` with a safe `usize` boundary, or `None` for negative/oversized
+/// values.
 pub(crate) fn checked_end(end: i64, len: usize) -> Option<usize> {
     usize::try_from(end).ok().filter(|&end| end <= len)
 }
@@ -432,6 +694,16 @@ pub(crate) fn checked_end(end: i64, len: usize) -> Option<usize> {
 /// ELI5: `start` only needs `usize::try_from` (no upper-bound check of its
 /// own) because it's compared against the already-validated `end` next;
 /// `start < end <= len` proves `start < len` for free.
+///
+/// # Arguments
+///
+/// * `start` - Signed inclusive start boundary.
+/// * `end` - Signed exclusive end boundary.
+/// * `len` - Number of elements available to the range.
+///
+/// # Returns
+///
+/// `Some((start, end))` for a non-empty in-bounds range, otherwise `None`.
 pub(crate) fn checked_range(start: i64, end: i64, len: usize) -> Option<(usize, usize)> {
     let start = usize::try_from(start).ok()?;
     let end = checked_end(end, len)?;
@@ -443,6 +715,19 @@ pub(crate) fn checked_range(start: i64, end: i64, len: usize) -> Option<(usize, 
 ///
 /// ELI5: unlike `ensure_equal_lengths`, `matches.len()` is compared against
 /// the sum of all row widths. Existing callers use this as a lower bound.
+///
+/// # Arguments
+///
+/// * `expected_width` - Candidate positions required by the row ranges.
+/// * `matches_len` - Number of entries in the flat candidate tape.
+///
+/// # Errors
+///
+/// Returns a `ValueError` when the tape is shorter than `expected_width`.
+///
+/// # Returns
+///
+/// Returns `Ok(())` when the tape is at least `expected_width` entries long.
 pub(crate) fn ensure_tape_width(expected_width: usize, matches_len: usize) -> PyResult<()> {
     if expected_width <= matches_len {
         return Ok(());
@@ -457,6 +742,18 @@ pub(crate) fn ensure_tape_width(expected_width: usize, matches_len: usize) -> Py
 /// ELI5: the tape must contain at least one flag before a reverse aggregation
 /// starts consuming it. The exact candidate-width check is performed
 /// separately by `ensure_exact_tape_width`.
+///
+/// # Arguments
+///
+/// * `matches_len` - Number of entries in the flat candidate tape.
+///
+/// # Errors
+///
+/// Returns a `ValueError` when the tape is empty.
+///
+/// # Returns
+///
+/// Returns `Ok(())` when the tape contains at least one entry.
 pub(crate) fn ensure_nonempty_matches(matches_len: usize) -> PyResult<()> {
     // Keep this check separate from the width check: an all-zero-width batch
     // is handled by pyjanitor, while a direct Rust caller must provide a real
@@ -475,6 +772,19 @@ pub(crate) fn ensure_nonempty_matches(matches_len: usize) -> PyResult<()> {
 /// `matches.len()`. The producer (pyjanitor) is responsible for ensuring that
 /// every `matches` value is either 0 or 1; this helper intentionally does not
 /// scan the tape to enforce that value-level contract.
+///
+/// # Arguments
+///
+/// * `expected_width` - Candidate positions implied by the row ranges.
+/// * `matches_len` - Number of entries in the flat candidate tape.
+///
+/// # Errors
+///
+/// Returns a `ValueError` when the two widths differ.
+///
+/// # Returns
+///
+/// Returns `Ok(())` when the tape length exactly matches `expected_width`.
 pub(crate) fn ensure_exact_tape_width(expected_width: usize, matches_len: usize) -> PyResult<()> {
     if expected_width == matches_len {
         return Ok(());
@@ -495,6 +805,8 @@ pub(crate) fn ensure_exact_tape_width(expected_width: usize, matches_len: usize)
 /// surprise. One shared alias instead of a copy in each `_positions.rs`
 /// file, so a future signature change (e.g. a new parameter) only needs
 /// updating here.
+///
+/// The alias is test-only and is not part of the Python module's public API.
 #[cfg(test)]
 pub(crate) type PositionsFn<T, R> =
     for<'py> fn(
@@ -512,6 +824,21 @@ pub(crate) type PositionsFn<T, R> =
 /// ELI5: a department manager collects the guest lists from each of
 /// their teams and hands one combined list up the chain, instead of
 /// the front door needing to know every team by name.
+///
+/// # Arguments
+///
+/// * `m` - Python module receiving all aggregation exports.
+///
+/// # Errors
+///
+/// Propagates registration errors from any child aggregation module.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after every child module has registered successfully.
+///
+/// The module handle is borrowed while child registrations are performed; the
+/// child registration functions add exports but do not replace the module.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     min::register(m)?;
     prod::register(m)?;
