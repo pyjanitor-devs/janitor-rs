@@ -32,7 +32,8 @@ The main areas are:
 - `src/compare/` - ragged comparison kernels;
 - `src/index_builder.rs` - index and positional helpers;
 - `src/left_le_right.rs` - left/right positional comparison helper;
-- `src/aggs/` - forward and reverse sum, min, max, product, and size kernels;
+- `src/aggs/` - forward and reverse sum, min, max, and product kernels, plus
+  reverse-only size kernels;
 - `benches/` - Criterion benchmarks and allocation measurements.
 
 Use stable Rust; build the distributable Python wheel with `maturin`, not
