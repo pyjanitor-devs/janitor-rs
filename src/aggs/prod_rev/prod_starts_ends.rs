@@ -114,7 +114,6 @@ where
         },
     );
     let labels = materialize_labels(&touched, index);
-    let products = products.into_iter().collect();
     Ok((labels, Array1::from_vec(products)))
 }
 
