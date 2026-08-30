@@ -411,7 +411,9 @@ where
 /// current implementation may panic for that invalid position when a winner
 /// exists, or skip the write when no winner exists; neither outcome is a
 /// supported contract to rely on. The production wrappers establish these
-/// invariants before calling the shared helper.
+/// invariants before calling the shared helper. Specifically, the production
+/// reverse min/max core functions and their generated PyO3 wrappers validate
+/// the input domains and supply the controlled bucket mappings and ranges.
 ///
 /// The input views are borrowed and not modified. The bucket closures and
 /// output-position iterator are consumed, and the returned positions array
