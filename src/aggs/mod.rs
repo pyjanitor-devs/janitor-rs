@@ -367,8 +367,8 @@ where
 /// # Arguments
 ///
 /// * `arr` - Aggregate input values, one value per pyjanitor input row.
-/// * `booleans` - Null mask with the same length as `arr`; `true` rows are
-///   skipped. The caller must uphold this length invariant.
+/// * `booleans` - Null mask with exactly the same length as `arr`; `true` rows
+///   are skipped. The caller must uphold this length invariant.
 /// * `width` - Number of compact output buckets.
 /// * `row_bucket` - Maps an input row to the bucket where it becomes active;
 ///   the returned bucket may be in `0..=width` because the sentinel bucket at
@@ -404,16 +404,18 @@ where
 ///
 /// # Panics
 ///
-/// The caller must provide a `booleans` mask at least as long as `arr`; a
-/// shorter mask can panic when a visited row is checked. A caller-supplied
-/// bucket mapping can panic if it produces a value outside `0..=width`, and an
-/// output position outside `0..width` violates the helper's precondition. The
-/// current implementation may panic for that invalid position when a winner
-/// exists, or skip the write when no winner exists; neither outcome is a
-/// supported contract to rely on. The production wrappers establish these
-/// invariants before calling the shared helper. Specifically, the production
-/// reverse min/max core functions and their generated PyO3 wrappers validate
-/// the input domains and supply the controlled bucket mappings and ranges.
+/// The caller must provide a `booleans` mask with exactly the same length as
+/// `arr`; a shorter mask can panic when a visited row is checked, while a
+/// longer mask is invalid even though the extra entries are not read. A
+/// caller-supplied bucket mapping can panic if it produces a value outside
+/// `0..=width`, and an output position outside `0..width` violates the helper's
+/// precondition. The current implementation may panic for that invalid
+/// position when a winner exists, or skip the write when no winner exists;
+/// neither outcome is a supported contract to rely on. The production wrappers
+/// establish these invariants before calling the shared helper. Specifically,
+/// the production reverse min/max core functions and their generated PyO3
+/// wrappers validate the input domains and supply the controlled bucket
+/// mappings and ranges.
 ///
 /// The input views are borrowed and not modified. The bucket closures and
 /// output-position iterator are consumed, and the returned positions array
