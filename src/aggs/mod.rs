@@ -294,7 +294,9 @@ enum RangeStorage<State> {
 }
 
 // Promote once roughly half of the positional domain is represented densely.
-// Keeping this as a named policy knob makes the allocation trade-off visible.
+// This is deliberately separate from `should_sweep`: that dispatcher chooses
+// between boundary-sweep and nested-loop algorithms, while this threshold
+// chooses the storage representation inside `range_reduce`.
 const RANGE_DENSE_THRESHOLD_DIVISOR: usize = 2;
 
 pub(crate) fn range_reduce<State, Update>(
@@ -308,21 +310,12 @@ where
     State: Clone,
     Update: FnMut(usize, usize, &mut State),
 {
-    // Reserve only the sparse-side estimate. Broad workloads promote to dense
-    // shortly afterwards, while narrow workloads avoid repeated map growth.
-    // Each range width is an upper bound on the number of distinct positions
-    // it can add; overlap may make this estimate larger than the final map.
-    let initial_capacity = starts
-        .iter()
-        .zip(ends.iter())
-        .filter_map(|(start, end)| checked_range(*start, *end, index_len))
-        .fold(0_usize, |total, (start, end)| {
-            total.saturating_add(end.saturating_sub(start))
-        })
-        .min(index_len / RANGE_DENSE_THRESHOLD_DIVISOR);
-    // ELI5: give the address book enough blank lines for likely unique
-    // drawers, but do not print a full cabinet's worth before it is needed.
-    let mut storage = RangeStorage::Sparse(HashMap::with_capacity(initial_capacity));
+    // Start sparse and let distinct positions, rather than summed range
+    // widths, decide whether dense storage is worthwhile. This avoids a
+    // second checked-range pass and avoids reserving for overlapping visits.
+    // ELI5: begin with a small address book; only build the full cabinet after
+    // we know that enough different drawers are actually being used.
+    let mut storage = RangeStorage::Sparse(HashMap::new());
     let mut touched = Vec::new();
 
     for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {

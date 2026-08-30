@@ -27,8 +27,6 @@ struct Input<'a> {
 
 struct FloatInput<'a> {
     values: &'a [f64],
-    starts: &'a [usize],
-    ends: &'a [usize],
     index: &'a [i64],
     starts_i64: &'a [i64],
     ends_i64: &'a [i64],
@@ -105,57 +103,6 @@ fn dense_sum(input: &Input<'_>) -> Vec<(i64, i64)> {
         .map(|(item, &label)| (label, totals[item]))
         .collect::<Vec<_>>();
     out.sort_unstable();
-    out
-}
-
-fn compensated_add(total: &mut f64, compensation: &mut f64, value: f64) {
-    let difference = value - *compensation;
-    let increment = *total + difference;
-    *compensation = (increment - *total) - difference;
-    if !compensation.is_finite() {
-        *compensation = 0.0;
-    }
-    *total = increment;
-}
-
-fn hash_float_sum(input: &FloatInput<'_>) -> Vec<(i64, f64)> {
-    let mut map = HashMap::with_capacity(input.index.len());
-    for row in 0..input.values.len() {
-        for item in input.starts[row]..input.ends[row] {
-            let state = map.entry(input.index[item]).or_insert((0.0, 0.0));
-            compensated_add(&mut state.0, &mut state.1, input.values[row]);
-        }
-    }
-    let mut out = map
-        .into_iter()
-        .map(|(label, (total, _))| (label, total))
-        .collect::<Vec<_>>();
-    out.sort_by_key(|(label, _)| *label);
-    out
-}
-
-fn dense_float_sum(input: &FloatInput<'_>) -> Vec<(i64, f64)> {
-    let mut totals = vec![0.0; input.index.len()];
-    let mut compensations = vec![0.0; input.index.len()];
-    let mut seen = vec![false; input.index.len()];
-    for row in 0..input.values.len() {
-        for item in input.starts[row]..input.ends[row] {
-            seen[item] = true;
-            compensated_add(
-                &mut totals[item],
-                &mut compensations[item],
-                input.values[row],
-            );
-        }
-    }
-    let mut out = input
-        .index
-        .iter()
-        .enumerate()
-        .filter(|(item, _)| seen[*item])
-        .map(|(item, &label)| (label, totals[item]))
-        .collect::<Vec<_>>();
-    out.sort_by_key(|(label, _)| *label);
     out
 }
 
@@ -463,8 +410,6 @@ fn bench(c: &mut Criterion) {
         let float_values = values.iter().map(|&value| value as f64).collect::<Vec<_>>();
         let float_input = FloatInput {
             values: &float_values,
-            starts: &starts,
-            ends: &ends,
             index: &index,
             starts_i64: &starts_i64,
             ends_i64: &ends_i64,
@@ -482,12 +427,14 @@ fn bench(c: &mut Criterion) {
             assert_eq!(hash_winner(&input, true), dense_winner(&input, true));
             assert_eq!(hash_winner(&input, false), dense_winner(&input, false));
             assert_eq!(hash_size(&input), dense_size(&input));
-            assert_eq!(hash_float_sum(&float_input), dense_float_sum(&float_input));
             assert_eq!(production_sum(&input), hash_sum(&input));
             assert_eq!(production_product(&input), hash_product(&input));
             assert_eq!(
                 production_float_sum(&float_input),
-                hash_float_sum(&float_input)
+                hash_sum(&input)
+                    .into_iter()
+                    .map(|(label, value)| (label, value as f64))
+                    .collect::<Vec<_>>()
             );
         }
         eprintln!(
@@ -501,18 +448,6 @@ fn bench(c: &mut Criterion) {
             allocations(|| sweep_size(&input)),
             allocations(|| sweep_size_compact(&input)),
         );
-        eprintln!(
-            "{name}: float_sum hash {:?}, dense {:?}",
-            allocations(|| hash_float_sum(&float_input)),
-            if duplicate {
-                (0, 0)
-            } else {
-                allocations(|| dense_float_sum(&float_input))
-            },
-        );
-        group.bench_function(format!("float_sum/hash/{name}"), |b| {
-            b.iter(|| hash_float_sum(black_box(&float_input)))
-        });
         group.bench_function(format!("sum/hash/{name}"), |b| {
             b.iter(|| hash_sum(black_box(&input)))
         });
@@ -560,9 +495,6 @@ fn bench(c: &mut Criterion) {
             b.iter(|| hash_winner(black_box(&input), true))
         });
         if !duplicate {
-            group.bench_function(format!("float_sum/dense/{name}"), |b| {
-                b.iter(|| dense_float_sum(black_box(&float_input)))
-            });
             group.bench_function(format!("prod/dense/{name}"), |b| {
                 b.iter(|| dense_product(black_box(&input)))
             });
