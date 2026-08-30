@@ -125,6 +125,9 @@ production code or Cargo configuration.
 - Validate signed indices and range bounds before casting them to `usize`;
   checking a condition only after a negative sentinel has been cast can turn
   an intended skip into a huge out-of-bounds range.
+- When auditing unchecked casts or bounds, search the whole source tree, not
+  only the files named by the current issue; sibling kernel families often
+  share the same macro pattern and can retain the same bug.
 - For hot no-range kernels, validate each caller-supplied index immediately
   before its access rather than adding a second full pass, unless the API
   requires rejecting all invalid inputs before doing any work.
@@ -205,7 +208,9 @@ newly-visible warnings.
 The authoritative historical context is in GitHub. Relevant ongoing areas
 include:
 
-- #23 - reverse aggregation correctness and optimization;
+- #23 - reverse aggregation correctness and optimization; preserve structural
+  emission order unless ascending labels are an explicit contract—do not add
+  an O(k log k) sort merely to make reverse output look ordered;
 - #116 - adaptive reverse sweep work;
 - #120 - branchless masked accumulation and contiguous-slice access for the
   `_matches` shape;
@@ -224,7 +229,8 @@ and remaining risks.
 
 This file is a living repository contract. Agents MUST update it when:
 
-1. A user corrects repository workflow, scope, or technical behavior.
+1. A user makes any correction, including about workflow, scope, technical
+   behavior, tone, formatting, or process.
 2. Work reveals a reusable pattern, invariant, safety rule, or performance
    gotcha not already documented.
 3. A command, build requirement, or verification procedure changes.
