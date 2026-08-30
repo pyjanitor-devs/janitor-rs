@@ -194,6 +194,9 @@ newly-visible warnings.
   `n` unless measuring the dense crossover deliberately; include a large
   single-query non-`i64` case so full-column casts cannot hide behind useful
   multi-row work.
+- Do not assume that fusing validation with bound discovery is faster than a
+  separate pass; benchmark both forms on representative sparse and dense
+  workloads before changing the established implementation.
 - Before merging, test adversarial inputs: negative/sentinel values, zero,
   exact boundaries such as `start == len` and `start == end`, one-past-bound
   values, empty arrays, duplicate labels, null rows, and overflow values.
