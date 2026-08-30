@@ -205,6 +205,26 @@ fn hash_size(input: &Input<'_>) -> Vec<(i64, i64)> {
     out
 }
 
+fn dense_size(input: &Input<'_>) -> Vec<(i64, i64)> {
+    let mut counts = vec![0_i64; input.index.len()];
+    let mut seen = vec![false; input.index.len()];
+    for row in 0..input.values.len() {
+        for item in input.starts[row]..input.ends[row] {
+            seen[item] = true;
+            counts[item] += 1;
+        }
+    }
+    let mut out = input
+        .index
+        .iter()
+        .enumerate()
+        .filter(|(item, _)| seen[*item])
+        .map(|(item, &label)| (label, counts[item]))
+        .collect::<Vec<_>>();
+    out.sort_unstable();
+    out
+}
+
 fn sweep_sum(input: &Input<'_>) -> Vec<(i64, i64)> {
     let mut events = vec![0_i64; input.index.len() + 1];
     let mut active_events = vec![0_i64; input.index.len() + 1];
@@ -363,6 +383,7 @@ fn bench(c: &mut Criterion) {
             assert_eq!(hash_product(&input), dense_product(&input));
             assert_eq!(hash_winner(&input, true), dense_winner(&input, true));
             assert_eq!(hash_winner(&input, false), dense_winner(&input, false));
+            assert_eq!(hash_size(&input), dense_size(&input));
         }
         eprintln!(
             "{name}: hash_sum {:?}, dense_sum {:?}, ordinal_sum {:?}, sweep_sum {:?}, sweep_sum_compact {:?}, hash_size {:?}, sweep_size {:?}, sweep_size_compact {:?}",
@@ -390,6 +411,11 @@ fn bench(c: &mut Criterion) {
         group.bench_function(format!("size/hash/{name}"), |b| {
             b.iter(|| hash_size(black_box(&input)))
         });
+        if !duplicate {
+            group.bench_function(format!("size/dense/{name}"), |b| {
+                b.iter(|| dense_size(black_box(&input)))
+            });
+        }
         group.bench_function(format!("size/sweep/{name}"), |b| {
             b.iter(|| sweep_size(black_box(&input)))
         });
