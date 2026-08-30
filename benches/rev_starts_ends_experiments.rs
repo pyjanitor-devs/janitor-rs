@@ -234,9 +234,8 @@ fn ordinal_sum(input: &Input<'_>) -> Vec<(i64, i64)> {
     }
     let mut totals = vec![0_i64; labels.len()];
     let mut seen = vec![false; labels.len()];
-    for row in 0..input.values.len() {
-        for item in input.starts[row]..input.ends[row] {
-            let slot = ordinal_to_slot[item];
+    for (row, (&start, &end)) in input.starts.iter().zip(input.ends).enumerate() {
+        for &slot in ordinal_to_slot.iter().take(end).skip(start) {
             seen[slot] = true;
             totals[slot] += input.values[row];
         }
@@ -338,8 +337,8 @@ fn sweep_size(input: &Input<'_>) -> Vec<(i64, i64)> {
     }
     let mut running = 0_i64;
     let mut out = Vec::new();
-    for item in 0..input.index.len() {
-        running += events[item];
+    for (item, event) in events.iter().take(input.index.len()).enumerate() {
+        running += *event;
         if running != 0 {
             out.push((input.index[item], running));
         }
@@ -356,8 +355,8 @@ fn sweep_size_compact(input: &Input<'_>) -> Vec<(i64, i64)> {
     }
     let mut running = 0_i64;
     let mut compacted = HashMap::with_capacity(input.index.len());
-    for item in 0..input.index.len() {
-        running += events[item];
+    for (item, event) in events.iter().take(input.index.len()).enumerate() {
+        running += *event;
         if running != 0 {
             *compacted.entry(input.index[item]).or_insert(0) += running;
         }
