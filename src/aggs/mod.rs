@@ -54,6 +54,9 @@ use pyo3::exceptions::PyValueError;
 /// # Returns
 ///
 /// Returns `Ok(())` when the lengths are equal.
+///
+/// The length names are borrowed only for error formatting; no input data is
+/// modified.
 pub(crate) fn ensure_equal_lengths(
     left_name: &str,
     left_len: usize,
@@ -100,12 +103,14 @@ pub(crate) fn ensure_equal_lengths(
 ///
 /// # Errors
 ///
-/// Returns an error when `starts` or the right index is empty, or when a
+/// Returns an error when `starts` or the right-side domain is empty, or when a
 /// boundary is negative or larger than `right_len`.
 ///
 /// # Returns
 ///
 /// Returns `(min_start, right_len - min_start)` on success.
+///
+/// The boundary view is borrowed and is not modified.
 pub(crate) fn starts_domain(
     starts: ArrayView1<'_, i64>,
     right_len: usize,
@@ -140,12 +145,14 @@ pub(crate) fn starts_domain(
 ///
 /// # Errors
 ///
-/// Returns an error when `ends` or the right index is empty, or when a
+/// Returns an error when `ends` or the right-side domain is empty, or when a
 /// boundary is negative or larger than `right_len`.
 ///
 /// # Returns
 ///
 /// Returns the largest valid exclusive end boundary on success.
+///
+/// The boundary view is borrowed and is not modified.
 pub(crate) fn ends_domain(
     ends: ArrayView1<'_, i64>,
     right_len: usize,
@@ -178,6 +185,8 @@ pub(crate) fn ends_domain(
 /// Labels from `min_start` through the final right-side position.
 /// `min_start` must be no greater than `index.len()`; a value equal to the
 /// length produces an empty label array.
+///
+/// The label view is borrowed; the returned array owns its copied labels.
 pub(crate) fn starts_labels(min_start: usize, index: ArrayView1<'_, i64>) -> Array1<i64> {
     (min_start..index.len()).map(|item| index[item]).collect()
 }
@@ -201,6 +210,8 @@ pub(crate) fn starts_labels(min_start: usize, index: ArrayView1<'_, i64>) -> Arr
 ///
 /// Panics if `max_end > index.len()` because the requested compact domain
 /// cannot be mapped to the supplied label array.
+///
+/// The label view is borrowed; the returned array owns its copied labels.
 pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<i64> {
     (0..max_end).map(|item| index[item]).collect()
 }
@@ -280,7 +291,9 @@ pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool
 /// * `identity` - Empty aggregate value, such as `0` for sum or `1` for product.
 /// * `events` - Iterator of `(bucket, value)` boundary contributions.
 /// * `output_positions` - Iterator giving the scan order, forward or reverse.
-/// * `combine` - Operation used to combine bucket and running values.
+/// * `combine` - Operation used to combine bucket and running values. It is
+///   called once for each event contribution and once for each scanned output
+///   position; it should be associative for the caller's intended result.
 ///
 /// `events` is consumed once. `output_positions` should yield each position
 /// in the intended scan order exactly once; omitting a position leaves its
@@ -301,6 +314,9 @@ pub(crate) fn should_sweep(rows: usize, width: usize, value_size: usize) -> bool
 ///
 /// Returns an error if an event or requested output position is outside the
 /// compact domain `0..width`.
+///
+/// The iterators and combining callback are consumed by the sweep; the
+/// returned `Array1` owns its aggregate values.
 pub(crate) fn sweep_reduce<T, Events, OutputPositions, Combine>(
     width: usize,
     identity: T,
@@ -358,7 +374,9 @@ where
 ///   `0..=width`.
 /// * `output_positions` - Iterator giving the scan order; each position must
 ///   be in `0..width` because it indexes the output array.
-/// * `better` - Returns whether the current value beats the stored winner.
+/// * `better` - Returns whether the current value strictly beats the stored
+///   winner. Equal values are resolved by the helper using the smallest input
+///   row position, so the callback need not implement tie-breaking.
 ///
 /// `row_bucket` is called once for each input row while building the linked
 /// buckets. `output_bucket` is called once for each yielded output position.
@@ -380,10 +398,14 @@ where
 ///
 /// # Panics
 ///
-/// Panics if `booleans` is shorter than `arr`, if a caller-supplied bucket
+/// Panics if `booleans` and `arr` have different lengths, if a caller-supplied bucket
 /// mapping produces a value outside `0..=width`, or if `output_positions`
 /// contains a position outside `0..width`. The production wrappers establish
 /// these invariants before calling the shared reducer.
+///
+/// The input views are borrowed and not modified. The bucket closures and
+/// output-position iterator are consumed, and the returned positions array
+/// owns its storage.
 pub(crate) fn sweep_winner<T, RowBucket, OutputBucket, OutputPositions, Better>(
     arr: ArrayView1<'_, T>,
     booleans: ArrayView1<'_, bool>,
@@ -400,6 +422,11 @@ where
     OutputPositions: IntoIterator<Item = usize>,
     Better: Fn(T, T) -> bool,
 {
+    assert_eq!(
+        booleans.len(),
+        arr.len(),
+        "sweep winner null mask must match the value array length"
+    );
     let mut head = vec![usize::MAX; width + 1];
     let mut next = vec![usize::MAX; arr.len()];
     for row in (0..arr.len()).rev() {
@@ -549,6 +576,9 @@ pub(crate) type StartsEndsResult<'py, U> =
 /// # Returns
 ///
 /// Returns the converted label and aggregate arrays on success.
+///
+/// The core arrays are consumed while their data is transferred into owned
+/// NumPy arrays associated with `py`.
 pub(crate) fn into_starts_ends_result<'py, U: Element>(
     py: Python<'py>,
     core_result: Result<(Array1<i64>, Array1<U>), &'static str>,
@@ -706,6 +736,10 @@ pub(crate) fn checked_range(start: i64, end: i64, len: usize) -> Option<(usize, 
 /// # Errors
 ///
 /// Returns a `ValueError` when the tape is shorter than `expected_width`.
+///
+/// # Returns
+///
+/// Returns `Ok(())` when the tape is at least `expected_width` entries long.
 pub(crate) fn ensure_tape_width(expected_width: usize, matches_len: usize) -> PyResult<()> {
     if expected_width <= matches_len {
         return Ok(());
@@ -728,6 +762,10 @@ pub(crate) fn ensure_tape_width(expected_width: usize, matches_len: usize) -> Py
 /// # Errors
 ///
 /// Returns a `ValueError` when the tape is empty.
+///
+/// # Returns
+///
+/// Returns `Ok(())` when the tape contains at least one entry.
 pub(crate) fn ensure_nonempty_matches(matches_len: usize) -> PyResult<()> {
     // Keep this check separate from the width check: an all-zero-width batch
     // is handled by pyjanitor, while a direct Rust caller must provide a real
@@ -755,6 +793,10 @@ pub(crate) fn ensure_nonempty_matches(matches_len: usize) -> PyResult<()> {
 /// # Errors
 ///
 /// Returns a `ValueError` when the two widths differ.
+///
+/// # Returns
+///
+/// Returns `Ok(())` when the tape length exactly matches `expected_width`.
 pub(crate) fn ensure_exact_tape_width(expected_width: usize, matches_len: usize) -> PyResult<()> {
     if expected_width == matches_len {
         return Ok(());
@@ -802,6 +844,13 @@ pub(crate) type PositionsFn<T, R> =
 /// # Errors
 ///
 /// Propagates registration errors from any child aggregation module.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after every child module has registered successfully.
+///
+/// The module handle is borrowed while child registrations are performed; the
+/// child registration functions add exports but do not replace the module.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     min::register(m)?;
     prod::register(m)?;
