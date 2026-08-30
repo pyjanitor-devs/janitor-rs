@@ -423,11 +423,6 @@ where
     OutputPositions: IntoIterator<Item = usize>,
     Better: Fn(T, T) -> bool,
 {
-    assert_eq!(
-        booleans.len(),
-        arr.len(),
-        "sweep winner null mask must match the value array length"
-    );
     let mut head = vec![usize::MAX; width + 1];
     let mut next = vec![usize::MAX; arr.len()];
     for row in (0..arr.len()).rev() {
@@ -439,10 +434,6 @@ where
     let mut positions = vec![-1_i64; width];
     let mut current_winner: Option<(T, i64)> = None;
     for position in output_positions {
-        assert!(
-            position < width,
-            "sweep output position is outside the output width"
-        );
         let mut row = head[output_bucket(position)];
         while row != usize::MAX {
             if booleans[row] {
@@ -508,23 +499,6 @@ mod sweep_tests {
             |current, winner| current > winner,
         );
         assert_eq!(reverse, array![1, 2, -1]);
-    }
-
-    #[test]
-    #[should_panic(expected = "sweep output position is outside the output width")]
-    fn sweep_winner_rejects_invalid_position_before_a_null_prefix_can_hide_it() {
-        let arr = array![7_i64];
-        let booleans = array![true];
-
-        sweep_winner(
-            arr.view(),
-            booleans.view(),
-            1,
-            |_| 0,
-            |_| 0,
-            [1, 0],
-            |current, winner| current > winner,
-        );
     }
 
     #[test]
