@@ -82,6 +82,9 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
+        /// `index` must be a unique positional domain. pyjanitor supplies a
+        /// normalized `range(len(right))`; direct callers must provide it.
+        /// This correctness precondition is unchecked to avoid an extra pass.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -151,6 +154,19 @@ mod tests {
             array![false, false, false].view(),
         );
         assert_eq!(got, Ok((array![42, 7, 100], array![0, 0, 1])));
+    }
+
+    #[test]
+    fn duplicate_index_labels_are_explicitly_unsupported() {
+        let got = max_rev_start_end_core(
+            array![5_i64, 2, 4].view(),
+            array![0_i64, 1, 0].view(),
+            array![2_i64, 3, 1].view(),
+            array![10_i64, 20, 10].view(),
+            array![false, false, false].view(),
+        );
+        // Ordinal slots are independent; duplicate labels are not merged.
+        assert_eq!(got, Ok((array![10, 20, 10], array![0, 0, 1])));
     }
 
     #[test]

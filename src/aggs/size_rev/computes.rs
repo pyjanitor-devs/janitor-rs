@@ -299,7 +299,7 @@ pub fn compute_size_rev_start_end<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use numpy::ndarray::array;
+    use numpy::{ndarray::array, PyArrayMethods};
 
     #[test]
     fn counts_prefixes_and_suffixes_in_compact_slots() {
@@ -312,6 +312,25 @@ mod tests {
             size_rev_starts_core(array![1_i64, 0, 2].view(), index.view()),
             Ok((array![50, 10, 90], array![1, 2, 3]))
         );
+    }
+
+    #[test]
+    fn duplicate_index_labels_are_explicitly_unsupported() {
+        Python::initialize();
+        Python::attach(|py| {
+            let starts = PyArray1::from_array(py, &array![0_i64, 1, 0]);
+            let ends = PyArray1::from_array(py, &array![2_i64, 3, 1]);
+            let index = PyArray1::from_array(py, &array![10_i64, 20, 10]);
+            let (labels, counts) = compute_size_rev_start_end(
+                py,
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+            )
+            .unwrap();
+            assert_eq!(labels.readonly().as_array(), array![10, 20, 10].view());
+            assert_eq!(counts.readonly().as_array(), array![2, 2, 1].view());
+        });
     }
 
     #[test]

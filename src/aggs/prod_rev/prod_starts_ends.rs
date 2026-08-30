@@ -118,6 +118,9 @@ where
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
+        /// `index` must be a unique positional domain. pyjanitor supplies a
+        /// normalized `range(len(right))`; direct callers must provide it.
+        /// This correctness precondition is unchecked to avoid an extra pass.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -146,6 +149,9 @@ macro_rules! compute_ints {
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// `index` must be a unique positional domain. pyjanitor supplies a
+        /// normalized `range(len(right))`; direct callers must provide it.
+        /// This correctness precondition is unchecked to avoid an extra pass.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -230,6 +236,20 @@ mod tests {
             |value| value,
         );
         assert_eq!(got, Ok((array![42, 7, 100], array![8, 6, 3])));
+    }
+
+    #[test]
+    fn duplicate_index_labels_are_explicitly_unsupported() {
+        let got = prod_rev_start_end_int_core(
+            array![2_i64, 3, 4].view(),
+            array![0_i64, 1, 0].view(),
+            array![2_i64, 3, 1].view(),
+            array![10_i64, 20, 10].view(),
+            array![false, false, false].view(),
+            |value| value,
+        );
+        // Ordinal slots are independent; duplicate labels are not merged.
+        assert_eq!(got, Ok((array![10, 20, 10], array![8, 6, 3])));
     }
 
     #[test]

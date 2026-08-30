@@ -146,6 +146,9 @@ where
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
+        /// `index` must be a unique positional domain. pyjanitor supplies a
+        /// normalized `range(len(right))`; direct callers must provide it.
+        /// This correctness precondition is unchecked to avoid an extra pass.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -188,6 +191,9 @@ compute_ints!(compute_sum_rev_start_end_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// `index` must be a unique positional domain. pyjanitor supplies a
+        /// normalized `range(len(right))`; direct callers must provide it.
+        /// This correctness precondition is unchecked to avoid an extra pass.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

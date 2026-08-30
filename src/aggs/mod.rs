@@ -258,66 +258,23 @@ pub(crate) fn ends_labels(max_end: usize, index: ArrayView1<'_, i64>) -> Array1<
     (0..max_end).map(|item| index[item]).collect()
 }
 
-/// Visit every valid positional item in a batch of arbitrary half-open ranges
-/// and return the touched ordinals with their compacted state.
+/// Reduce arbitrary ranges with dense state when the queried domain is dense,
+/// and sparse state when the ranges touch only a small part of the index.
 ///
 /// # Arguments
 ///
 /// * `starts` - Inclusive start boundary for each input row.
 /// * `ends` - Exclusive end boundary for each input row.
 /// * `index_len` - Number of positional slots in the right-hand index.
-/// * `identity` - Initial state for every right-hand ordinal.
-/// * `update` - Aggregation-specific update called with `(row, item, state)`
-///   for every valid covered ordinal. The callback owns null handling and the
-///   aggregate's arithmetic or comparison semantics.
+/// * `identity` - Initial state for each newly touched ordinal.
+/// * `update` - Aggregation-specific update called with `(row, item, state)`.
 ///
 /// # Returns
 ///
-/// Returns touched right-hand ordinals in first-touch order and one compacted
-/// state value for each ordinal. Invalid or zero-width ranges are skipped by
-/// `checked_range`, matching the reverse aggregation contract.
-///
-/// This helper is positional: callers that map the returned ordinals back to
-/// labels must provide a unique label for each ordinal. Duplicate labels are
-/// not merged.
-///
-/// ELI5: each row points at a slice of numbered drawers. This helper walks
-/// those slices once, remembers which drawers were opened, and lets the
-/// specific aggregation decide what to put in each drawer.
-pub(crate) fn dense_range_reduce<State, Update>(
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    index_len: usize,
-    identity: State,
-    mut update: Update,
-) -> (Vec<usize>, Vec<State>)
-where
-    State: Clone,
-    Update: FnMut(usize, usize, &mut State),
-{
-    let mut seen = vec![false; index_len];
-    let mut touched = Vec::new();
-    let mut states = vec![identity; index_len];
-
-    for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
-        let Some((start, end)) = checked_range(*start, *end, index_len) else {
-            continue;
-        };
-        for item in start..end {
-            if !seen[item] {
-                seen[item] = true;
-                touched.push(item);
-            }
-            update(row, item, &mut states[item]);
-        }
-    }
-
-    let compacted = touched.iter().map(|&item| states[item].clone()).collect();
-    (touched, compacted)
-}
-
-/// Reduce arbitrary ranges with dense state when the queried domain is dense,
-/// and sparse state when the ranges touch only a small part of the index.
+/// Returns touched ordinals in first-touch order and one compacted state for
+/// each ordinal. Invalid or zero-width ranges are skipped by `checked_range`.
+/// The reducer starts with sparse state and promotes to dense state once the
+/// number of distinct touched ordinals reaches half of `index_len`.
 ///
 /// ELI5: use a row of drawers when most drawers are needed, but use a small
 /// address book when the request visits only a few drawers.
@@ -332,36 +289,58 @@ where
     State: Clone,
     Update: FnMut(usize, usize, &mut State),
 {
-    let covered_width = starts
-        .iter()
-        .zip(ends.iter())
-        .filter_map(|(start, end)| checked_range(*start, *end, index_len))
-        .map(|(start, end)| end - start)
-        .fold(0usize, usize::saturating_add);
+    let mut sparse = Some(HashMap::new());
+    let mut dense_seen: Option<Vec<bool>> = None;
+    let mut dense_states: Option<Vec<State>> = None;
+    let mut touched = Vec::new();
 
-    // Dense state is beneficial only when at least half of the positional
-    // domain is covered. Below that point, the sparse map avoids allocating
-    // state for untouched positions.
-    if covered_width.saturating_mul(2) >= index_len {
-        dense_range_reduce(starts, ends, index_len, identity, update)
-    } else {
-        let mut states = HashMap::new();
-        let mut touched = Vec::new();
-        for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
-            let Some((start, end)) = checked_range(*start, *end, index_len) else {
-                continue;
-            };
-            for item in start..end {
-                let state = states.entry(item).or_insert_with(|| {
+    for (row, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        let Some((start, end)) = checked_range(*start, *end, index_len) else {
+            continue;
+        };
+        for item in start..end {
+            if let Some(states) = dense_states.as_mut() {
+                let seen = dense_seen.as_mut().unwrap();
+                if !seen[item] {
+                    seen[item] = true;
                     touched.push(item);
-                    identity.clone()
-                });
-                update(row, item, state);
+                }
+                update(row, item, &mut states[item]);
+                continue;
+            }
+
+            let states = sparse.as_mut().unwrap();
+            let state = states.entry(item).or_insert_with(|| {
+                touched.push(item);
+                identity.clone()
+            });
+            update(row, item, state);
+
+            // Promote only after the number of distinct positions is dense;
+            // repeated visits to a tiny window remain sparse regardless of
+            // how many input rows overlap that window.
+            if states.len().saturating_mul(2) >= index_len {
+                let states = sparse.take().unwrap();
+                let mut seen = vec![false; index_len];
+                let mut dense = vec![identity.clone(); index_len];
+                for (item, state) in states {
+                    seen[item] = true;
+                    dense[item] = state;
+                }
+                dense_seen = Some(seen);
+                dense_states = Some(dense);
             }
         }
+    }
+
+    if let Some(states) = dense_states {
+        let compacted = touched.iter().map(|&item| states[item].clone()).collect();
+        (touched, compacted)
+    } else {
+        let states = sparse.unwrap();
         let compacted = touched
             .iter()
-            .map(|item| states.remove(item).unwrap())
+            .map(|item| states.get(item).unwrap().clone())
             .collect();
         (touched, compacted)
     }
@@ -660,6 +639,21 @@ mod sweep_tests {
         );
         assert_eq!(touched, vec![0, 1, 2]);
         assert_eq!(totals, vec![1, 2, 1]);
+    }
+
+    #[test]
+    fn range_reduce_counts_distinct_positions_not_overlapping_visits() {
+        let starts = array![0_i64, 0, 0];
+        let ends = array![2_i64, 2, 2];
+        let (touched, totals) = range_reduce(
+            starts.view(),
+            ends.view(),
+            1_000_000,
+            0_i64,
+            |_row, _item, total| *total += 1,
+        );
+        assert_eq!(touched, vec![0, 1]);
+        assert_eq!(totals, vec![3, 3]);
     }
 
     #[test]

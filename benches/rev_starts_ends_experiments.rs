@@ -5,35 +5,11 @@
 //! justify a production rewrite.
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-struct CountingAllocator;
-static TOTAL: AtomicUsize = AtomicUsize::new(0);
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
-        if !ptr.is_null() {
-            TOTAL.fetch_add(layout.size(), Ordering::Relaxed);
-            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK.fetch_max(live, Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+mod support;
+use support::count_allocations;
 
 struct Input<'a> {
     values: &'a [i64],
@@ -367,11 +343,8 @@ fn sweep_size_compact(input: &Input<'_>) -> Vec<(i64, i64)> {
 }
 
 fn allocations<T>(f: impl FnOnce() -> T) -> (usize, usize) {
-    TOTAL.store(0, Ordering::Relaxed);
-    LIVE.store(0, Ordering::Relaxed);
-    PEAK.store(0, Ordering::Relaxed);
-    black_box(f());
-    (TOTAL.load(Ordering::Relaxed), PEAK.load(Ordering::Relaxed))
+    let (bytes, _calls, peak) = count_allocations(|| black_box(f()));
+    (bytes, peak)
 }
 
 fn bench(c: &mut Criterion) {
