@@ -16,6 +16,9 @@ Guidance for contributors and coding agents working on `janitor-rs`.
 - `janitor-rs` exists solely as the compiled backend for pyjanitor. Coordinate
   Rust API, dtype-dispatch, and export changes with the pyjanitor repository.
 
+After each behavior-changing edit, run the narrowest relevant test first; run
+the full relevant suite before handoff.
+
 Direct Rust tests and benchmarks do not require a pyjanitor checkout. Validate
 Python-side behavior when changing dtype dispatch, exported names, signatures,
 or other extension-boundary behavior.
@@ -179,6 +182,8 @@ newly-visible warnings.
 - Before merging, test adversarial inputs: negative/sentinel values, zero,
   exact boundaries such as `start == len` and `start == end`, one-past-bound
   values, empty arrays, duplicate labels, null rows, and overflow values.
+- Review PRs by actively seeking counterexamples to their claimed invariants,
+  not merely by checking whether the diff looks plausible.
 - Review the final diff, branch base, generated exports, tests, docs, and
   worktree status. Never report a check as passing if it was only compiled or
   skipped.
