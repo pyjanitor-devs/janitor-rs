@@ -106,6 +106,23 @@ pub mod bench_support {
             |value| value,
         )
     }
+
+    pub fn prod_rev_start_end_f64(
+        arr: ArrayView1<'_, f64>,
+        starts: ArrayView1<'_, i64>,
+        ends: ArrayView1<'_, i64>,
+        index: ArrayView1<'_, i64>,
+        booleans: ArrayView1<'_, bool>,
+    ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
+        crate::aggs::prod_rev::prod_starts_ends::prod_rev_start_end_float_core(
+            arr,
+            starts,
+            ends,
+            index,
+            booleans,
+            |value| value,
+        )
+    }
 }
 
 /// Top-level composition point: each family owns and registers its own

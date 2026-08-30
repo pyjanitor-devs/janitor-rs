@@ -6,7 +6,7 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use janitor_rs::bench_support::{
-    max_rev_start_end_core, min_rev_start_end_core, prod_rev_start_end_i64,
+    max_rev_start_end_core, min_rev_start_end_core, prod_rev_start_end_f64, prod_rev_start_end_i64,
     size_rev_start_end_core, sum_rev_start_end_f64, sum_rev_start_end_i64,
 };
 use numpy::ndarray::ArrayView1;
@@ -65,6 +65,18 @@ fn production_float_sum(input: &FloatInput<'_>) -> Vec<(i64, f64)> {
 
 fn production_product(input: &Input<'_>) -> Vec<(i64, i64)> {
     let (labels, values) = prod_rev_start_end_i64(
+        ArrayView1::from(input.values),
+        ArrayView1::from(input.starts_i64),
+        ArrayView1::from(input.ends_i64),
+        ArrayView1::from(input.index),
+        ArrayView1::from(input.booleans),
+    )
+    .expect("benchmark input must satisfy production preconditions");
+    sort_pairs(labels.into_iter().zip(values).collect())
+}
+
+fn production_float_product(input: &FloatInput<'_>) -> Vec<(i64, f64)> {
+    let (labels, values) = prod_rev_start_end_f64(
         ArrayView1::from(input.values),
         ArrayView1::from(input.starts_i64),
         ArrayView1::from(input.ends_i64),
@@ -151,6 +163,19 @@ fn hash_product(input: &Input<'_>) -> Vec<(i64, i64)> {
     }
     let mut out = map.into_iter().collect::<Vec<_>>();
     out.sort_unstable();
+    out
+}
+
+fn hash_float_product(input: &FloatInput<'_>) -> Vec<(i64, f64)> {
+    let mut map = HashMap::with_capacity(input.index.len());
+    for row in 0..input.values.len() {
+        for item in input.starts_i64[row] as usize..input.ends_i64[row] as usize {
+            let product = map.entry(input.index[item]).or_insert(1.0_f64);
+            *product *= input.values[row];
+        }
+    }
+    let mut out = map.into_iter().collect::<Vec<_>>();
+    out.sort_unstable_by_key(|(label, _)| *label);
     out
 }
 
@@ -474,6 +499,10 @@ fn bench(c: &mut Criterion) {
                     .map(|(label, value)| (label, value as f64))
                     .collect::<Vec<_>>()
             );
+            assert_eq!(
+                production_float_product(&float_input),
+                hash_float_product(&float_input)
+            );
         }
         eprintln!(
             "{name}: hash_sum {:?}, dense_sum {:?}, ordinal_sum {:?}, sweep_sum {:?}, sweep_sum_compact {:?}, hash_size {:?}, sweep_size {:?}, sweep_size_compact {:?}",
@@ -488,13 +517,14 @@ fn bench(c: &mut Criterion) {
         );
         if !duplicate {
             eprintln!(
-                "{name}: production allocations sum {:?}, prod {:?}, min {:?}, max {:?}, size {:?}, float_sum {:?}",
+                "{name}: production allocations sum {:?}, prod {:?}, float_sum {:?}, float_prod {:?}, min {:?}, max {:?}, size {:?}",
                 allocations(|| production_sum(&input)),
                 allocations(|| production_product(&input)),
+                allocations(|| production_float_sum(&float_input)),
+                allocations(|| production_float_product(&float_input)),
                 allocations(|| production_min(&input)),
                 allocations(|| production_max(&input)),
                 allocations(|| production_size(&input)),
-                allocations(|| production_float_sum(&float_input)),
             );
         }
         group.bench_function(format!("sum/hash/{name}"), |b| {
@@ -509,6 +539,12 @@ fn bench(c: &mut Criterion) {
             });
             group.bench_function(format!("float_sum/production/{name}"), |b| {
                 b.iter(|| production_float_sum(black_box(&float_input)))
+            });
+            group.bench_function(format!("float_prod/production/{name}"), |b| {
+                b.iter(|| production_float_product(black_box(&float_input)))
+            });
+            group.bench_function(format!("float_prod/hash/{name}"), |b| {
+                b.iter(|| hash_float_product(black_box(&float_input)))
             });
             group.bench_function(format!("min/production/{name}"), |b| {
                 b.iter(|| production_min(black_box(&input)))
