@@ -315,9 +315,13 @@ where
 /// * `booleans` - Null mask with the same length as `arr`; `true` rows are
 ///   skipped. The caller must uphold this length invariant.
 /// * `width` - Number of compact output buckets.
-/// * `row_bucket` - Maps an input row to the bucket where it becomes active.
-/// * `output_bucket` - Maps an output position to its active bucket.
-/// * `output_positions` - Iterator giving the scan order.
+/// * `row_bucket` - Maps an input row to the bucket where it becomes active;
+///   the returned bucket may be in `0..=width` because the sentinel bucket at
+///   `width` represents a boundary just beyond the compact output domain.
+/// * `output_bucket` - Maps an output position to its active bucket, also in
+///   `0..=width`.
+/// * `output_positions` - Iterator giving the scan order; each position must
+///   be in `0..width` because it indexes the output array.
 /// * `better` - Returns whether the current value beats the stored winner.
 ///
 /// # Returns
@@ -327,9 +331,10 @@ where
 ///
 /// # Panics
 ///
-/// Panics if `booleans` is shorter than `arr`, or if a caller-supplied bucket
-/// mapping produces a value outside `0..width`. The production wrappers
-/// establish these invariants before calling the shared reducer.
+/// Panics if `booleans` is shorter than `arr`, if a caller-supplied bucket
+/// mapping produces a value outside `0..=width`, or if `output_positions`
+/// contains a position outside `0..width`. The production wrappers establish
+/// these invariants before calling the shared reducer.
 pub(crate) fn sweep_winner<T, RowBucket, OutputBucket, OutputPositions, Better>(
     arr: ArrayView1<'_, T>,
     booleans: ArrayView1<'_, bool>,
