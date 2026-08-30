@@ -150,8 +150,18 @@ and also link it textually. Keep issue/PR descriptions formatted with clear
 sections for summary, contract, implementation, performance, verification,
 and remaining risks.
 
-## Self-improvement
+## Self-improvement protocol
 
-Update this file only for durable workflow rules, current contracts, commands,
-or recurring repository gotchas. Record detailed incident history in GitHub,
-where it remains searchable without loading it into every coding session.
+This file is a living repository contract. Agents MUST update it when:
+
+1. A user corrects repository workflow, scope, or technical behavior.
+2. Work reveals a reusable pattern, invariant, safety rule, or performance
+   gotcha not already documented.
+3. A command, build requirement, or verification procedure changes.
+
+Record the resulting durable rule in the appropriate section of this file,
+especially `Implementation contracts`, `Benchmark and review rules`, or this
+section. Keep incident narratives, transient discussion, and detailed review
+history in the relevant GitHub issue or PR.
+
+Apply the correction immediately to the current task as well as documenting it.
