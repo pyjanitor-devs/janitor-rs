@@ -8,6 +8,7 @@ use crate::aggs::{checked_index, ensure_equal_lengths};
 
 macro_rules! generic_compare {
     ($fname:ident, $type:ty) => {
+        #[allow(clippy::too_many_arguments)]
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

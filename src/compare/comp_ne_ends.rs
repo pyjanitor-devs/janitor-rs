@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 
 use super::op::CompareOp;
 
+#[allow(clippy::too_many_arguments)]
 pub fn compare_ne_end_in_place_core<T: PartialOrd + Copy>(
     left: ArrayView1<T>,
     right: ArrayView1<T>,
@@ -68,6 +69,7 @@ pub fn compare_ne_end_in_place_core<T: PartialOrd + Copy>(
     (counts_array, total)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn compare_ne_end_allocating_core<T: PartialOrd + Copy>(
     left: ArrayView1<T>,
     right: ArrayView1<T>,
@@ -127,6 +129,7 @@ pub fn compare_ne_end_allocating_core<T: PartialOrd + Copy>(
 
 macro_rules! generic_compare {
     ($fname:ident, $type:ty) => {
+        #[allow(clippy::too_many_arguments)]
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

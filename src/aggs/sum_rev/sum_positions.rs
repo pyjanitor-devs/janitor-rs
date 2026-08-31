@@ -16,6 +16,7 @@ use std::collections::HashMap;
 /// type: every integer dtype instantiates this with `A = i64`, except
 /// `uint64`, which instantiates it with `A = u64` so values `>= 2**63`
 /// don't get sign-flipped by a forced `i64` cast (see `WrapAdd`).
+#[allow(clippy::too_many_arguments)]
 pub fn sum_positions_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -78,6 +79,7 @@ where
 ///
 /// ELI5: instead of looking up a label in two dictionaries, we find its slot
 /// once and update the total and its rounding-error correction in Vecs.
+#[allow(clippy::too_many_arguments)]
 pub fn sum_positions_float_core<T, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,

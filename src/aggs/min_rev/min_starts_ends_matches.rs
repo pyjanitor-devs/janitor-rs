@@ -17,6 +17,7 @@ macro_rules! compute {
         /// scan the tape to enforce that value-level contract. Normally
         /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
         /// full candidate-tape width.
+        #[allow(clippy::too_many_arguments)]
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

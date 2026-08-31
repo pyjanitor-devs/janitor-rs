@@ -15,6 +15,7 @@ use std::collections::HashMap;
 /// type: every integer dtype instantiates this with `A = i64`, except
 /// `uint64`, which instantiates it with `A = u64` so values `>= 2**63`
 /// don't get sign-flipped by a forced `i64` cast (see `WrapMul`).
+#[allow(clippy::too_many_arguments)]
 pub fn prod_positions_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -70,6 +71,7 @@ where
     (labels, products)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prod_positions_float_core<T, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
