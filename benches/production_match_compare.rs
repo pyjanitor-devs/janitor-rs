@@ -16,6 +16,15 @@ struct Fixture {
     matches: Vec<i8>,
 }
 
+struct Prepared<'py> {
+    arr: Bound<'py, PyArray1<i64>>,
+    index: Bound<'py, PyArray1<i64>>,
+    ends: Bound<'py, PyArray1<i64>>,
+    counts: Bound<'py, PyArray1<i64>>,
+    matches: Bound<'py, PyArray1<i8>>,
+    booleans: Bound<'py, PyArray1<bool>>,
+}
+
 impl Fixture {
     fn new(rows: usize, domain: usize, width: usize, survivors: usize) -> Self {
         let width = width.min(domain);
@@ -101,6 +110,60 @@ fn call(f: &Fixture, aggregation: &str) {
     });
 }
 
+fn call_prepared<'py>(py: Python<'py>, f: &Fixture, aggregation: &str, prepared: &Prepared<'py>) {
+    let _ = f;
+    match aggregation {
+        "max" => compute_max_rev_end_match_int64(
+            py,
+            prepared.arr.readonly(),
+            prepared.index.readonly(),
+            prepared.ends.readonly(),
+            prepared.counts.readonly(),
+            prepared.matches.readonly(),
+            prepared.booleans.readonly(),
+        )
+        .unwrap(),
+        "min" => compute_min_rev_end_match_int64(
+            py,
+            prepared.arr.readonly(),
+            prepared.index.readonly(),
+            prepared.ends.readonly(),
+            prepared.counts.readonly(),
+            prepared.matches.readonly(),
+            prepared.booleans.readonly(),
+        )
+        .unwrap(),
+        "sum" => compute_sum_rev_end_match_int64(
+            py,
+            prepared.arr.readonly(),
+            prepared.index.readonly(),
+            prepared.ends.readonly(),
+            prepared.counts.readonly(),
+            prepared.matches.readonly(),
+            prepared.booleans.readonly(),
+        )
+        .unwrap(),
+        "prod" => compute_prod_rev_end_match_int64(
+            py,
+            prepared.arr.readonly(),
+            prepared.index.readonly(),
+            prepared.ends.readonly(),
+            prepared.counts.readonly(),
+            prepared.matches.readonly(),
+            prepared.booleans.readonly(),
+        )
+        .unwrap(),
+        "size" => compute_size_rev_end_matches(
+            py,
+            prepared.ends.readonly(),
+            prepared.index.readonly(),
+            prepared.matches.readonly(),
+        )
+        .unwrap(),
+        _ => unreachable!(),
+    };
+}
+
 fn bench(c: &mut Criterion) {
     Python::initialize();
     let mut group = c.benchmark_group("production_match_wrappers");
@@ -110,8 +173,11 @@ fn bench(c: &mut Criterion) {
         (100, 1_000, 64, 50),
         (1_000, 10_000, 8, 1),
         (1_000, 10_000, 1_000, 50),
+        // Many rows over a narrow prefix: sparse despite the large batch.
         (10_000, 100_000, 8, 100),
         (10_000, 100_000, 10_000, 50),
+        // The whole positional domain is covered: dense storage is selected.
+        (1_000, 10_000, 10_000, 100),
         (1_000, 1_000_000, 8, 100),
     ] {
         let fixture = Fixture::new(rows, domain, width, survivors);
@@ -125,6 +191,42 @@ fn bench(c: &mut Criterion) {
         }
     }
     group.finish();
+
+    let mut prepared_group = c.benchmark_group("production_match_prebuilt_inputs");
+    prepared_group.measurement_time(Duration::from_millis(500));
+    for &(rows, domain, width, survivors) in &[
+        (100, 1_000, 1, 100),
+        (100, 1_000, 64, 50),
+        (1_000, 10_000, 8, 1),
+        (1_000, 10_000, 1_000, 50),
+        // Many rows over a narrow prefix: sparse despite the large batch.
+        (10_000, 100_000, 8, 100),
+        (10_000, 100_000, 10_000, 50),
+        // The whole positional domain is covered: dense storage is selected.
+        (1_000, 10_000, 10_000, 100),
+        (1_000, 1_000_000, 8, 100),
+    ] {
+        let fixture = Fixture::new(rows, domain, width, survivors);
+        let label = format!("rows={rows}/domain={domain}/width={width}/survivors={survivors}%");
+        Python::attach(|py| {
+            let prepared = Prepared {
+                arr: PyArray1::from_vec(py, fixture.arr.clone()),
+                index: PyArray1::from_vec(py, fixture.index.clone()),
+                ends: PyArray1::from_vec(py, fixture.ends.clone()),
+                counts: PyArray1::from_vec(py, fixture.counts.clone()),
+                matches: PyArray1::from_vec(py, fixture.matches.clone()),
+                booleans: PyArray1::from_vec(py, vec![false; fixture.arr.len()]),
+            };
+            for aggregation in ["max", "min", "sum", "prod", "size"] {
+                prepared_group.bench_with_input(
+                    BenchmarkId::new(aggregation, &label),
+                    &fixture,
+                    |b, fixture| b.iter(|| call_prepared(py, fixture, aggregation, &prepared)),
+                );
+            }
+        });
+    }
+    prepared_group.finish();
 }
 
 criterion_group!(benches, bench);

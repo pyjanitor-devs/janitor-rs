@@ -80,12 +80,11 @@ where
         let current_ = convert(*current);
         for item in 0..end_ {
             if matches[tape] != 0 {
-                if let std::collections::hash_map::Entry::Vacant(entry) = totals.entry(item) {
+                let total = totals.entry(item).or_insert_with(|| {
                     touched.push(item);
-                    entry.insert(A::ZERO);
-                }
+                    A::ZERO
+                });
                 if !*boolean && *count != 0 {
-                    let total = totals.get_mut(&item).expect("inserted above");
                     *total = total.wrap_add(current_);
                 }
             }
@@ -178,12 +177,11 @@ where
         let current_ = convert(*current);
         for item in 0..end_ {
             if matches[tape] != 0 {
-                if let std::collections::hash_map::Entry::Vacant(entry) = states.entry(item) {
+                let state = states.entry(item).or_insert_with(|| {
                     touched.push(item);
-                    entry.insert((0., 0.));
-                }
+                    (0., 0.)
+                });
                 if !*boolean && *count != 0 {
-                    let state = states.get_mut(&item).expect("inserted above");
                     let difference = current_ - state.1;
                     let increment = state.0 + difference;
                     state.1 = (increment - state.0) - difference;

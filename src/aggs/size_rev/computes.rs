@@ -156,11 +156,11 @@ pub fn compute_size_rev_end_matches<'py>(
                 n += 1;
                 continue;
             }
-            if let std::collections::hash_map::Entry::Vacant(entry) = dictionary.entry(item) {
+            let value = dictionary.entry(item).or_insert_with(|| {
                 touched.push(item);
-                entry.insert(0);
-            }
-            *dictionary.get_mut(&item).expect("inserted above") += 1;
+                0
+            });
+            *value += 1;
             n += 1;
         }
     }
@@ -248,11 +248,11 @@ pub fn compute_size_rev_start_matches<'py>(
                 n += 1;
                 continue;
             }
-            if let std::collections::hash_map::Entry::Vacant(entry) = dictionary.entry(item) {
+            let value = dictionary.entry(item).or_insert_with(|| {
                 touched.push(item);
-                entry.insert(0);
-            }
-            *dictionary.get_mut(&item).expect("inserted above") += 1;
+                0
+            });
+            *value += 1;
             n += 1;
         }
     }
@@ -342,11 +342,11 @@ pub fn compute_size_rev_start_end_matches<'py>(
         };
         for item in start_..end_ {
             if matches[n] != 0 {
-                if let std::collections::hash_map::Entry::Vacant(entry) = dictionary.entry(item) {
+                let value = dictionary.entry(item).or_insert_with(|| {
                     touched.push(item);
-                    entry.insert(0);
-                }
-                *dictionary.get_mut(&item).expect("inserted above") += 1;
+                    0
+                });
+                *value += 1;
             }
             n += 1;
         }
