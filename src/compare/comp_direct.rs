@@ -13,6 +13,7 @@ use super::op::CompareOp;
 /// on, then keeps the smallest or largest original right-row index. The
 /// candidate range may be sorted by a join column, so its scan order is not
 /// necessarily the user's original right-row order.
+#[allow(clippy::too_many_arguments)]
 pub fn select_start_end_core<T: PartialOrd + Copy>(
     left: &[numpy::ndarray::ArrayView1<'_, T>],
     right: &[numpy::ndarray::ArrayView1<'_, T>],
@@ -78,6 +79,7 @@ pub fn select_start_end_core<T: PartialOrd + Copy>(
 
 macro_rules! generic_direct {
     ($fname:ident, $type:ty) => {
+        #[allow(clippy::too_many_arguments)]
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

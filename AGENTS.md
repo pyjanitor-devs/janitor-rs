@@ -151,7 +151,7 @@ janitor-rs/
 │       └── size_rev/         # size (count) kernels, reverse-only
 ├── benches/kernels.rs        # criterion benchmarks for the extracted
 │                             # `*_core` functions (see below)
-├── clippy.toml                # too-many-arguments-threshold override
+├── clippy.toml                # documents the default Clippy argument policy
 └── .github/workflows/
     ├── release.yml            # builds/publishes the wheel (maturin)
     └── ci.yml                 # cargo test/clippy/fmt/bench --no-run

@@ -166,12 +166,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
-`clippy.toml` raises the `too_many_arguments` threshold to 10 for the
-whole crate: every `#[pyfunction]` kernel entry point intentionally
-exposes each input array/mask/length as a separate named Python-facing
-argument, which is a Python API-design choice, not something to fix by
-bundling arguments into an internal struct. Every other lint, and `-D
-warnings` itself, still applies in full.
+The default `too_many_arguments` threshold remains active for handwritten
+functions. Macro-generated `#[pyfunction]` wrappers have a local
+`#[allow(clippy::too_many_arguments)]` because their separate arrays, masks,
+and flags are the Python-facing API and should not be bundled into an
+internal struct solely to satisfy the linter. A small number of existing
+low-level comparison and aggregation cores have the same targeted allow
+because their public Rust signatures mirror those kernel inputs. New
+handwritten functions remain subject to Clippy's default threshold. Every
+other lint, and `-D warnings` itself, still applies in full.
 
 ## Relationship to other issues
 
