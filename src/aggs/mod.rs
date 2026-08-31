@@ -79,9 +79,9 @@ pub(crate) fn ensure_equal_lengths(
 /// rather than requiring the aggregation algorithm to know about Python.
 ///
 /// Unlike [`ensure_equal_lengths`], this helper does not construct a PyO3
-/// exception. Keeping the core-layer result as a static Rust error means the
+/// exception. Keeping the core-layer result as an owned Rust error means the
 /// algorithm remains directly testable without a Python interpreter; the
-/// surrounding PyO3 wrapper can convert the error at the boundary.
+/// surrounding PyO3 wrapper converts the error at the boundary.
 ///
 /// # Arguments
 ///
@@ -112,7 +112,8 @@ pub(crate) fn ensure_equal_lengths_core(
 /// justify allocating state for every possible right position.
 ///
 /// ELI5: a dictionary is best when only a few shelves are visited; arrays are
-/// best when at least half the shelves are visited. The caller still owns the
+/// best when at least half the shelves are visited. This keeps a huge sparse
+/// domain from triggering a huge dense allocation. The caller still owns the
 /// aggregation loop, so this helper only centralizes the dispatch policy.
 pub(crate) fn should_use_dense_match_storage(domain_len: usize, covered_len: usize) -> bool {
     domain_len != 0 && covered_len.saturating_mul(2) >= domain_len
@@ -1183,7 +1184,10 @@ mod adversarial_bounds_tests {
     use super::min::min_starts_ends::min_start_end_core;
     use super::min::min_starts_ends_matches::min_start_end_match_core;
     use super::min::min_starts_matches::min_start_match_core;
-    use super::{ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core};
+    use super::{
+        ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core,
+        should_use_dense_match_storage,
+    };
     use super::{ensure_exact_tape_width, ensure_nonempty_matches, ensure_tape_width};
 
     #[test]
@@ -1227,6 +1231,15 @@ mod adversarial_bounds_tests {
             ensure_nonempty_core("matches", 0),
             Err("matches cannot be empty".to_owned())
         );
+    }
+
+    #[test]
+    fn match_storage_dispatch_keeps_sparse_domains_sparse() {
+        assert!(!should_use_dense_match_storage(1_000_000, 8));
+        assert!(!should_use_dense_match_storage(10_000, 4_999));
+        assert!(should_use_dense_match_storage(10_000, 5_000));
+        assert!(should_use_dense_match_storage(10_000, 10_000));
+        assert!(!should_use_dense_match_storage(0, 0));
     }
 
     #[test]
