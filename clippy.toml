@@ -1,3 +1,4 @@
-# Keep Clippy's default argument threshold. Macro-generated Python functions
-# opt out locally because their separate parameters are part of the public
-# Python API; handwritten Rust functions remain subject to the default lint.
+# Keep Clippy's default argument threshold. Python-facing wrappers and selected
+# low-level `*_core` functions opt out locally when their signatures intentionally
+# mirror the kernel inputs. Other handwritten functions remain subject to the
+# default lint.
