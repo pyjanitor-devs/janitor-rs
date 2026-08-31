@@ -3,8 +3,8 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    ends_domain, ends_labels, ensure_equal_lengths, ensure_equal_lengths_core,
-    into_starts_ends_result, sweep_reduce, WrapAdd,
+    ends_domain, ends_labels, ensure_equal_lengths_core, into_starts_ends_result, sweep_reduce,
+    WrapAdd,
 };
 
 /// Accumulate reverse-sum `ends` rows in compact candidate-ordinal slots.
@@ -120,10 +120,8 @@ macro_rules! compute_ints {
         {
             let arr = arr.as_array();
             let ends = ends.as_array();
-            ensure_equal_lengths("arr", arr.len(), "ends", ends.len())?;
             let index = index.as_array();
             let booleans = booleans.as_array();
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             into_starts_ends_result(
                 py,
                 sum_rev_ends_int_core(arr, ends, index, booleans, |value| value as $acc),
@@ -157,10 +155,8 @@ macro_rules! compute_floats {
         {
             let arr = arr.as_array();
             let ends = ends.as_array();
-            ensure_equal_lengths("arr", arr.len(), "ends", ends.len())?;
             let index = index.as_array();
             let booleans = booleans.as_array();
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             into_starts_ends_result(
                 py,
                 sum_rev_ends_float_core(arr, ends, index, booleans, |value| value as f64),
