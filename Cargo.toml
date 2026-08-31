@@ -74,3 +74,7 @@ harness = false
 [[bench]]
 name = "matches_ordinal_experiments"
 harness = false
+
+[[bench]]
+name = "production_match_compare"
+harness = false
