@@ -1,12 +1,233 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
+use numpy::ndarray::ArrayView1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    checked_range, ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches,
+    checked_range, ensure_equal_lengths_core, ensure_exact_tape_width_core,
+    ensure_nonempty_matches_core, should_use_dense_match_storage, WrapAdd,
 };
+
+fn sum_rev_end_match_int_core<T, A, F>(
+    arr: ArrayView1<'_, T>,
+    index: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    counts: ArrayView1<'_, i64>,
+    matches: ArrayView1<'_, i8>,
+    booleans: ArrayView1<'_, bool>,
+    mut convert: F,
+) -> Result<(Vec<i64>, Vec<A>), &'static str>
+where
+    T: Copy,
+    A: Copy + WrapAdd,
+    F: FnMut(T) -> A,
+{
+    ensure_equal_lengths_core(
+        arr.len(),
+        ends.len(),
+        "arr and ends must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        counts.len(),
+        "arr and counts must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        booleans.len(),
+        "arr and booleans must have equal lengths",
+    )?;
+    ensure_nonempty_matches_core(matches.len())?;
+    let mut expected = 0_usize;
+    let mut max_end = 0_usize;
+    for end in ends.iter() {
+        if let Some((_, end_)) = checked_range(0, *end, index.len()) {
+            expected += end_;
+            max_end = max_end.max(end_);
+        }
+    }
+    ensure_exact_tape_width_core(expected, matches.len())?;
+    let dense = should_use_dense_match_storage(index.len(), max_end);
+    let mut touched = Vec::with_capacity(max_end);
+    let mut tape = 0_usize;
+    if dense {
+        let mut seen = vec![false; max_end];
+        let mut totals = vec![A::ZERO; max_end];
+        for (current, end, count, boolean) in
+            izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter())
+        {
+            let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+                continue;
+            };
+            let current_ = convert(*current);
+            for item in 0..end_ {
+                if matches[tape] != 0 {
+                    if !seen[item] {
+                        seen[item] = true;
+                        touched.push(item);
+                    }
+                    if !*boolean && *count != 0 {
+                        totals[item] = totals[item].wrap_add(current_);
+                    }
+                }
+                tape += 1;
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut values = Vec::with_capacity(touched.len());
+        for item in touched {
+            labels.push(index[item]);
+            values.push(totals[item]);
+        }
+        return Ok((labels, values));
+    }
+    let mut totals: HashMap<usize, A> = HashMap::with_capacity(max_end);
+    for (current, end, count, boolean) in
+        izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter())
+    {
+        let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+            continue;
+        };
+        let current_ = convert(*current);
+        for item in 0..end_ {
+            if matches[tape] != 0 {
+                if let std::collections::hash_map::Entry::Vacant(entry) = totals.entry(item) {
+                    touched.push(item);
+                    entry.insert(A::ZERO);
+                }
+                if !*boolean && *count != 0 {
+                    let total = totals.get_mut(&item).expect("inserted above");
+                    *total = total.wrap_add(current_);
+                }
+            }
+            tape += 1;
+        }
+    }
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut values = Vec::with_capacity(touched.len());
+    for item in touched {
+        labels.push(index[item]);
+        values.push(totals[&item]);
+    }
+    Ok((labels, values))
+}
+
+fn sum_rev_end_match_float_core<T, F>(
+    arr: ArrayView1<'_, T>,
+    index: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    counts: ArrayView1<'_, i64>,
+    matches: ArrayView1<'_, i8>,
+    booleans: ArrayView1<'_, bool>,
+    mut convert: F,
+) -> Result<(Vec<i64>, Vec<f64>), &'static str>
+where
+    T: Copy,
+    F: FnMut(T) -> f64,
+{
+    ensure_equal_lengths_core(
+        arr.len(),
+        ends.len(),
+        "arr and ends must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        counts.len(),
+        "arr and counts must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr.len(),
+        booleans.len(),
+        "arr and booleans must have equal lengths",
+    )?;
+    ensure_nonempty_matches_core(matches.len())?;
+    let mut expected = 0_usize;
+    let mut max_end = 0_usize;
+    for end in ends.iter() {
+        if let Some((_, end_)) = checked_range(0, *end, index.len()) {
+            expected += end_;
+            max_end = max_end.max(end_);
+        }
+    }
+    ensure_exact_tape_width_core(expected, matches.len())?;
+    let dense = should_use_dense_match_storage(index.len(), max_end);
+    let mut touched = Vec::with_capacity(max_end);
+    let mut tape = 0_usize;
+    if dense {
+        let mut seen = vec![false; max_end];
+        let mut states = vec![(0_f64, 0_f64); max_end];
+        for (current, end, count, boolean) in
+            izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter())
+        {
+            let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+                continue;
+            };
+            let current_ = convert(*current);
+            for item in 0..end_ {
+                if matches[tape] != 0 {
+                    if !seen[item] {
+                        seen[item] = true;
+                        touched.push(item);
+                    }
+                    if !*boolean && *count != 0 {
+                        let (total, compensation) = &mut states[item];
+                        let difference = current_ - *compensation;
+                        let increment = *total + difference;
+                        *compensation = (increment - *total) - difference;
+                        if !compensation.is_finite() {
+                            *compensation = 0.;
+                        }
+                        *total = increment;
+                    }
+                }
+                tape += 1;
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut values = Vec::with_capacity(touched.len());
+        for item in touched {
+            labels.push(index[item]);
+            values.push(states[item].0);
+        }
+        return Ok((labels, values));
+    }
+    let mut states: HashMap<usize, (f64, f64)> = HashMap::with_capacity(max_end);
+    for (current, end, count, boolean) in
+        izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter())
+    {
+        let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+            continue;
+        };
+        let current_ = convert(*current);
+        for item in 0..end_ {
+            if matches[tape] != 0 {
+                if let std::collections::hash_map::Entry::Vacant(entry) = states.entry(item) {
+                    touched.push(item);
+                    entry.insert((0., 0.));
+                }
+                if !*boolean && *count != 0 {
+                    let state = states.get_mut(&item).expect("inserted above");
+                    let difference = current_ - state.1;
+                    let increment = state.0 + difference;
+                    state.1 = (increment - state.0) - difference;
+                    if !state.1.is_finite() {
+                        state.1 = 0.;
+                    }
+                    state.0 = increment;
+                }
+            }
+            tape += 1;
+        }
+    }
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut values = Vec::with_capacity(touched.len());
+    for item in touched {
+        labels.push(index[item]);
+        values.push(states[&item].0);
+    }
+    Ok((labels, values))
+}
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
@@ -33,74 +254,17 @@ macro_rules! compute_ints {
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)>
         // The macro will expand into the contents of this block.
         {
-            let arr = arr.as_array();
-            let index = index.as_array();
-            let ends = ends.as_array();
-            ensure_equal_lengths("arr", arr.len(), "ends", ends.len())?;
-            let matches = matches.as_array();
-            ensure_nonempty_matches(matches.len())?;
-            let counts = counts.as_array();
-            ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
-            let booleans = booleans.as_array();
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            // ELI5: `matches[n]` advances once per candidate position, summed
-            // across every row -- not comparable to any single array's length.
-            // Total that width up front and check it against `matches.len()`
-            // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = ends
-                .iter()
-                .filter_map(|e| checked_range(0, *e, index.len()).map(|(_, e_)| e_))
-                .sum();
-            ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut dictionary: HashMap<i64, $acc> = HashMap::with_capacity(index.len());
-            let mut n: usize = 0;
-            let zipped = izip!(
-                arr.into_iter(),
-                ends.into_iter(),
-                counts.into_iter(),
-                booleans.into_iter()
-            );
-            for (current, end, count, boolean) in zipped {
-                // ELI5 (the guard): `end` indexes into `index`, not `arr`.
-                // Unlike the dual-bound `_starts_ends` shape, this single-
-                // bound producer (`src/compare/comp_ends.rs`) has no
-                // invalid-row concept of its own -- every `end` reaching
-                // here is already guaranteed `0 <= end <= index.len()`
-                // because `bin_search_lt_first`/`bin_search_gt_first` drop
-                // zero-width rows before `ends` is ever built. `end == 0`
-                // is valid and simply contributes no tape entries. This
-                // `checked_range` is defense in depth against that
-                // cross-module invariant breaking, not a condition the
-                // real pyjanitor call path can trigger; see issue #40 for
-                // the full trace and issue #41 for the tape-width check
-                // above, which is what actually guards `matches[n]`.
-                let Some((_, end_)) = checked_range(0, *end, index.len()) else {
-                    continue;
-                };
-                let current_ = *current as $acc;
-                for item in 0..end_ {
-                    if (matches[n] == 0) {
-                        n += 1;
-                        continue;
-                    }
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(0);
-                    if *boolean || (*count == 0) {
-                        n += 1;
-                        continue;
-                    }
-                    *total += current_;
-                    n += 1;
-                }
-            }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<$acc>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+            let (labels, values) = sum_rev_end_match_int_core(
+                arr.as_array(),
+                index.as_array(),
+                ends.as_array(),
+                counts.as_array(),
+                matches.as_array(),
+                booleans.as_array(),
+                |value| value as $acc,
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((labels.into_pyarray(py), values.into_pyarray(py)))
         }
     };
 }
@@ -137,76 +301,17 @@ macro_rules! compute_floats {
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>
         // The macro will expand into the contents of this block.
         {
-            let arr = arr.as_array();
-            let index = index.as_array();
-            let ends = ends.as_array();
-            ensure_equal_lengths("arr", arr.len(), "ends", ends.len())?;
-            let matches = matches.as_array();
-            ensure_nonempty_matches(matches.len())?;
-            let counts = counts.as_array();
-            ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
-            let booleans = booleans.as_array();
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            // ELI5: `matches[n]` advances once per candidate position, summed
-            // across every row -- not comparable to any single array's length.
-            // Total that width up front and check it against `matches.len()`
-            // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = ends
-                .iter()
-                .filter_map(|e| checked_range(0, *e, index.len()).map(|(_, e_)| e_))
-                .sum();
-            ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut dictionary: HashMap<i64, f64> = HashMap::with_capacity(index.len());
-            let mut mapping: HashMap<i64, f64> = HashMap::with_capacity(index.len());
-            let mut n: usize = 0;
-            let zipped = izip!(
-                arr.into_iter(),
-                ends.into_iter(),
-                counts.into_iter(),
-                booleans.into_iter()
-            );
-            for (current, end, count, boolean) in zipped {
-                let Some((_, end_)) = checked_range(0, *end, index.len()) else {
-                    continue;
-                };
-                let current_ = *current as f64;
-                for item in 0..end_ {
-                    if (matches[n] == 0) {
-                        n += 1;
-                        continue;
-                    }
-                    let pos = index[item];
-                    let total = dictionary.entry(pos).or_insert(0.);
-                    let compensation = mapping.entry(pos).or_insert(0.);
-                    if *boolean || (*count == 0) {
-                        n += 1;
-                        continue;
-                    }
-                    let difference = current_ - *compensation;
-                    let increment = *total + difference;
-                    *compensation = (increment - *total) - difference;
-                    // https://github.com/pandas-dev/pandas/blob/fee326fa8338d57230f742a6d8a2ce527f3479bc/pandas/_libs/groupby.pyx#L801
-                    // adapted from pandas' cython code
-                    // # GH#53606; GH#60303
-                    // # If val is +/- infinity compensation is NaN
-                    // # which would lead to results being NaN instead
-                    // # of +/- infinity. We cannot use util.is_nan
-                    // # because of no gil
-                    if !compensation.is_finite() {
-                        *compensation = 0.;
-                    }
-                    *total = increment;
-                    n += 1;
-                }
-            }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<f64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+            let (labels, values) = sum_rev_end_match_float_core(
+                arr.as_array(),
+                index.as_array(),
+                ends.as_array(),
+                counts.as_array(),
+                matches.as_array(),
+                booleans.as_array(),
+                |value| value as f64,
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((labels.into_pyarray(py), values.into_pyarray(py)))
         }
     };
 }

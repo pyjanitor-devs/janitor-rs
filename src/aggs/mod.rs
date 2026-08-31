@@ -104,6 +104,16 @@ pub(crate) fn ensure_equal_lengths_core(
     }
 }
 
+/// Choose dense ordinal state only when the covered domain is large enough to
+/// justify allocating state for every possible right position.
+///
+/// ELI5: a dictionary is best when only a few shelves are visited; arrays are
+/// best when at least half the shelves are visited. The caller still owns the
+/// aggregation loop, so this helper only centralizes the dispatch policy.
+pub(crate) fn should_use_dense_match_storage(domain_len: usize, covered_len: usize) -> bool {
+    domain_len != 0 && covered_len.saturating_mul(2) >= domain_len
+}
+
 // Shared domain contract for the plain reverse `*_rev_starts` and
 // `*_rev_ends` aggregation shapes (min/max/prod/sum/size).
 //
@@ -1029,6 +1039,15 @@ pub(crate) fn ensure_nonempty_matches(matches_len: usize) -> PyResult<()> {
     Ok(())
 }
 
+/// Rust-only counterpart to [`ensure_nonempty_matches`].
+pub(crate) fn ensure_nonempty_matches_core(matches_len: usize) -> Result<(), &'static str> {
+    if matches_len == 0 {
+        Err("matches cannot be empty")
+    } else {
+        Ok(())
+    }
+}
+
 /// Reject a flat `matches` tape whose length differs from the candidate width.
 ///
 /// ELI5: `matches.len()` is the number of candidate positions represented by
@@ -1057,6 +1076,18 @@ pub(crate) fn ensure_exact_tape_width(expected_width: usize, matches_len: usize)
     Err(PyValueError::new_err(format!(
         "matches must have length {expected_width}; got {matches_len}"
     )))
+}
+
+/// Rust-only counterpart to [`ensure_exact_tape_width`].
+pub(crate) fn ensure_exact_tape_width_core(
+    expected_width: usize,
+    matches_len: usize,
+) -> Result<(), &'static str> {
+    if expected_width == matches_len {
+        Ok(())
+    } else {
+        Err("matches length does not equal the expected tape width")
+    }
 }
 
 /// Shared function-pointer shape for the `_positions` family's `#[cfg(test)]`

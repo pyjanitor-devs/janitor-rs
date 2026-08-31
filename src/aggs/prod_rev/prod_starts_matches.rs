@@ -1,5 +1,5 @@
 use itertools::izip;
-use numpy::ndarray::{Array1, ArrayView1};
+use numpy::ndarray::ArrayView1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
@@ -79,49 +79,79 @@ macro_rules! compute_ints {
             // here, before the loop below ever indexes into the tape.
             let expected_matches_width = expected_matches_width(starts, end_)?;
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
-            let mut labels = Vec::new();
-            let mut totals: Vec<$acc> = Vec::new();
-            let zipped = izip!(
-                arr.into_iter(),
-                starts.into_iter(),
-                counts.into_iter(),
-                booleans.into_iter()
-            );
-            let mut n: usize = 0;
-            for (current, start, count, boolean) in zipped {
-                let start_ = *start as usize;
+            let min_start = starts
+                .iter()
+                .filter_map(|s| usize::try_from(*s).ok())
+                .min()
+                .unwrap_or(end_);
+            let width = end_.saturating_sub(min_start);
+            let dense = crate::aggs::should_use_dense_match_storage(end_, width);
+            let mut touched = Vec::with_capacity(width);
+            let mut n = 0_usize;
+            if dense {
+                let mut seen = vec![false; width];
+                let mut totals = vec![1 as $acc; width];
+                for (current, start, count, boolean) in
+                    izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
+                {
+                    let Some(start_) = usize::try_from(*start).ok().filter(|s| *s <= end_) else {
+                        continue;
+                    };
+                    let current_ = *current as $acc;
+                    for item in start_..end_ {
+                        if matches[n] != 0 {
+                            let slot = item - min_start;
+                            if !seen[slot] {
+                                seen[slot] = true;
+                                touched.push(slot);
+                            }
+                            if !*boolean && *count != 0 {
+                                totals[slot] = totals[slot].wrapping_mul(current_);
+                            }
+                        }
+                        n += 1;
+                    }
+                }
+                let mut labels = Vec::with_capacity(touched.len());
+                let mut values = Vec::with_capacity(touched.len());
+                for slot in touched {
+                    labels.push(index[min_start + slot]);
+                    values.push(totals[slot]);
+                }
+                return Ok((labels.into_pyarray(py), values.into_pyarray(py)));
+            }
+            let mut totals: HashMap<usize, $acc> = HashMap::with_capacity(width);
+            for (current, start, count, boolean) in
+                izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
+            {
+                let Some(start_) = usize::try_from(*start).ok().filter(|s| *s <= end_) else {
+                    continue;
+                };
                 let current_ = *current as $acc;
                 for item in start_..end_ {
-                    if (matches[n] == 0) {
-                        n += 1;
-                        continue;
+                    if matches[n] != 0 {
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            totals.entry(item - min_start)
+                        {
+                            touched.push(item - min_start);
+                            entry.insert(1 as $acc);
+                        }
+                        if !*boolean && *count != 0 {
+                            let total =
+                                totals.get_mut(&(item - min_start)).expect("inserted above");
+                            *total = total.wrapping_mul(current_);
+                        }
                     }
-                    let pos = index[item];
-                    let slot = if let Some(slot) = slots.get(&pos) {
-                        *slot
-                    } else {
-                        let slot = totals.len();
-                        slots.insert(pos, slot);
-                        labels.push(pos);
-                        totals.push(1);
-                        slot
-                    };
-                    if (*boolean) || (*count == 0) {
-                        n += 1;
-                        continue;
-                    }
-                    // ELI5: NumPy integer products wrap at the dtype boundary;
-                    // `wrapping_mul` preserves that behavior in debug builds
-                    // instead of panicking when the product overflows.
-                    totals[slot] = totals[slot].wrapping_mul(current_);
                     n += 1;
                 }
             }
-            Ok((
-                Array1::from_vec(labels).into_pyarray(py),
-                Array1::from_vec(totals).into_pyarray(py),
-            ))
+            let mut labels = Vec::with_capacity(touched.len());
+            let mut values = Vec::with_capacity(touched.len());
+            for slot in touched {
+                labels.push(index[min_start + slot]);
+                values.push(totals[&slot]);
+            }
+            Ok((labels.into_pyarray(py), values.into_pyarray(py)))
         }
     };
 }
@@ -164,12 +194,6 @@ macro_rules! compute_floats {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            let zipped = izip!(
-                arr.into_iter(),
-                starts.into_iter(),
-                counts.into_iter(),
-                booleans.into_iter()
-            );
             let mut n: usize = 0;
             let end_: usize = index.len();
             if arr.is_empty() {
@@ -193,39 +217,72 @@ macro_rules! compute_floats {
             // here, before the loop below ever indexes into the tape.
             let expected_matches_width = expected_matches_width(starts, end_)?;
             ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut slots: HashMap<i64, usize> = HashMap::with_capacity(end_);
-            let mut labels = Vec::new();
-            let mut totals = Vec::new();
-            for (current, start, count, boolean) in zipped {
-                let start_ = *start as usize;
+            let min_start = starts
+                .iter()
+                .filter_map(|s| usize::try_from(*s).ok())
+                .min()
+                .unwrap_or(end_);
+            let width = end_.saturating_sub(min_start);
+            let dense = crate::aggs::should_use_dense_match_storage(end_, width);
+            let mut touched = Vec::with_capacity(width);
+            if dense {
+                let mut seen = vec![false; width];
+                let mut totals = vec![1.0_f64; width];
+                for (current, start, count, boolean) in
+                    izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
+                {
+                    let start_ = usize::try_from(*start).expect("validated above");
+                    let current_ = *current as f64;
+                    for item in start_..end_ {
+                        if matches[n] != 0 {
+                            let slot = item - min_start;
+                            if !seen[slot] {
+                                seen[slot] = true;
+                                touched.push(slot);
+                            }
+                            if !*boolean && *count != 0 {
+                                totals[slot] *= current_;
+                            }
+                        }
+                        n += 1;
+                    }
+                }
+                let mut labels = Vec::with_capacity(touched.len());
+                let mut values = Vec::with_capacity(touched.len());
+                for slot in touched {
+                    labels.push(index[min_start + slot]);
+                    values.push(totals[slot]);
+                }
+                return Ok((labels.into_pyarray(py), values.into_pyarray(py)));
+            }
+            let mut totals: HashMap<usize, f64> = HashMap::with_capacity(width);
+            for (current, start, count, boolean) in
+                izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
+            {
+                let start_ = usize::try_from(*start).expect("validated above");
                 let current_ = *current as f64;
                 for item in start_..end_ {
-                    if (matches[n] == 0) {
-                        n += 1;
-                        continue;
+                    if matches[n] != 0 {
+                        let slot = item - min_start;
+                        if let std::collections::hash_map::Entry::Vacant(entry) = totals.entry(slot)
+                        {
+                            touched.push(slot);
+                            entry.insert(1.);
+                        }
+                        if !*boolean && *count != 0 {
+                            *totals.get_mut(&slot).expect("inserted above") *= current_;
+                        }
                     }
-                    let pos = index[item];
-                    let slot = if let Some(slot) = slots.get(&pos) {
-                        *slot
-                    } else {
-                        let slot = totals.len();
-                        slots.insert(pos, slot);
-                        labels.push(pos);
-                        totals.push(1.0_f64);
-                        slot
-                    };
-                    if *boolean || (*count == 0) {
-                        n += 1;
-                        continue;
-                    }
-                    totals[slot] *= current_;
                     n += 1;
                 }
             }
-            Ok((
-                Array1::from_vec(labels).into_pyarray(py),
-                Array1::from_vec(totals).into_pyarray(py),
-            ))
+            let mut labels = Vec::with_capacity(touched.len());
+            let mut values = Vec::with_capacity(touched.len());
+            for slot in touched {
+                labels.push(index[min_start + slot]);
+                values.push(totals[&slot]);
+            }
+            Ok((labels.into_pyarray(py), values.into_pyarray(py)))
         }
     };
 }
@@ -364,7 +421,9 @@ mod tests {
             let arr = PyArray1::from_vec(py, vec![i64::MAX, 2]);
             let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
             let counts = PyArray1::from_vec(py, vec![1_i64, 1]);
-            let index = PyArray1::from_vec(py, vec![10_i64, 10]);
+            // pyjanitor supplies unique right-index labels; they need not be
+            // positional, so this also exercises the ordinal/label split.
+            let index = PyArray1::from_vec(py, vec![10_i64, 20]);
             let matches = PyArray1::from_vec(py, vec![1_i8, 0, 1]);
             let booleans = PyArray1::from_vec(py, vec![false, false]);
             let (_, values) = compute_prod_rev_start_match_int64(
@@ -377,7 +436,7 @@ mod tests {
                 booleans.readonly(),
             )
             .unwrap();
-            assert_eq!(values.readonly().as_slice().unwrap(), &[-2]);
+            assert_eq!(values.readonly().as_slice().unwrap(), &[i64::MAX, 2]);
         });
     }
 }

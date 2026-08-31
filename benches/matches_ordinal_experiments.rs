@@ -1,10 +1,18 @@
 //! Experiments for replacing label-keyed match aggregation with ordinal state.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use numpy::ndarray::Array1;
+use numpy::{PyArray1, PyArrayMethods};
+use pyo3::prelude::*;
 use std::hint::black_box;
 use std::time::Duration;
 
 mod support;
+use janitor_rs::bench_support::{
+    compute_max_rev_end_match_int64, compute_min_rev_end_match_int64,
+    compute_prod_rev_end_match_int64, compute_size_rev_end_matches,
+    compute_sum_rev_end_match_int64, max_rev_end_match_core,
+};
 use support::count_allocations;
 
 type Output = Vec<(i64, i64)>;
@@ -16,6 +24,28 @@ struct Fixture {
     index: Vec<i64>,
     matches: Vec<u8>,
     counts: Vec<i64>,
+}
+
+struct ProductionFixture {
+    arr: Array1<i64>,
+    ends: Array1<i64>,
+    index: Array1<i64>,
+    counts: Array1<i64>,
+    matches: Array1<i8>,
+    booleans: Array1<bool>,
+}
+
+impl ProductionFixture {
+    fn from_fixture(f: &Fixture) -> Self {
+        Self {
+            arr: Array1::from_vec(f.arr.clone()),
+            ends: Array1::from_vec(f.ends.iter().map(|&value| value as i64).collect()),
+            index: Array1::from_vec(f.index.clone()),
+            counts: Array1::from_vec(f.counts.clone()),
+            matches: Array1::from_vec(f.matches.iter().map(|&value| value as i8).collect()),
+            booleans: Array1::from_elem(f.arr.len(), false),
+        }
+    }
 }
 
 impl Fixture {
@@ -150,7 +180,92 @@ fn assert_equivalent(f: &Fixture) {
     assert_eq!(old, normalize(dense_ordinal(f)));
 }
 
+fn production_ordinal(f: &ProductionFixture) -> Output {
+    let (labels, rows) = max_rev_end_match_core(
+        f.arr.view(),
+        f.index.view(),
+        f.ends.view(),
+        f.counts.view(),
+        f.matches.view(),
+        f.booleans.view(),
+    )
+    .expect("benchmark fixture must satisfy the match-tape contract");
+    labels.into_iter().zip(rows).collect()
+}
+
+fn production_wrapper_end_matches(f: &Fixture, aggregation: &str) {
+    Python::attach(|py| {
+        let arr = PyArray1::from_vec(py, f.arr.clone());
+        let index = PyArray1::from_vec(py, f.index.clone());
+        let ends = PyArray1::from_vec(py, f.ends.iter().map(|&value| value as i64).collect());
+        let counts = PyArray1::from_vec(py, f.counts.clone());
+        let matches = PyArray1::from_vec(py, f.matches.iter().map(|&value| value as i8).collect());
+        let booleans = PyArray1::from_vec(py, vec![false; f.arr.len()]);
+        match aggregation {
+            "max" => {
+                let _ = compute_max_rev_end_match_int64(
+                    py,
+                    arr.readonly(),
+                    index.readonly(),
+                    ends.readonly(),
+                    counts.readonly(),
+                    matches.readonly(),
+                    booleans.readonly(),
+                )
+                .unwrap();
+            }
+            "min" => {
+                let _ = compute_min_rev_end_match_int64(
+                    py,
+                    arr.readonly(),
+                    index.readonly(),
+                    ends.readonly(),
+                    counts.readonly(),
+                    matches.readonly(),
+                    booleans.readonly(),
+                )
+                .unwrap();
+            }
+            "sum" => {
+                let _ = compute_sum_rev_end_match_int64(
+                    py,
+                    arr.readonly(),
+                    index.readonly(),
+                    ends.readonly(),
+                    counts.readonly(),
+                    matches.readonly(),
+                    booleans.readonly(),
+                )
+                .unwrap();
+            }
+            "prod" => {
+                let _ = compute_prod_rev_end_match_int64(
+                    py,
+                    arr.readonly(),
+                    index.readonly(),
+                    ends.readonly(),
+                    counts.readonly(),
+                    matches.readonly(),
+                    booleans.readonly(),
+                )
+                .unwrap();
+            }
+            "size" => {
+                let _ = compute_size_rev_end_matches(
+                    py,
+                    ends.readonly(),
+                    index.readonly(),
+                    matches.readonly(),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+    });
+}
+
 fn bench(c: &mut Criterion) {
+    Python::initialize();
     eprintln!("\\nmatches ordinal allocation report (bytes / allocs / peak-live):");
     for &(rows, domain, width, survivor_percent) in &[
         (100, 1_000, 1, 100),
@@ -188,7 +303,12 @@ fn bench(c: &mut Criterion) {
     ] {
         for &survivor_percent in &[1, 50, 100] {
             let fixture = Fixture::new(rows, domain, width, survivor_percent);
+            let production_fixture = ProductionFixture::from_fixture(&fixture);
             assert_equivalent(&fixture);
+            assert_eq!(
+                normalize(old_two_maps(&fixture)),
+                normalize(production_ordinal(&production_fixture))
+            );
             let label =
                 format!("rows={rows}/domain={domain}/width={width}/survivors={survivor_percent}%");
             group.bench_with_input(BenchmarkId::new("two_maps", &label), &fixture, |b, f| {
@@ -204,9 +324,24 @@ fn bench(c: &mut Criterion) {
                 &fixture,
                 |b, f| b.iter(|| black_box(dense_ordinal(black_box(f)))),
             );
+            group.bench_with_input(
+                BenchmarkId::new("production_ordinal", &label),
+                &production_fixture,
+                |b, f| b.iter(|| black_box(production_ordinal(black_box(f)))),
+            );
         }
     }
     group.finish();
+
+    let fixture = Fixture::new(1_000, 10_000, 1_000, 50);
+    let mut wrappers = c.benchmark_group("production_wrapper_end_matches");
+    wrappers.measurement_time(Duration::from_secs(2));
+    for aggregation in ["max", "min", "sum", "prod", "size"] {
+        wrappers.bench_function(aggregation, |b| {
+            b.iter(|| production_wrapper_end_matches(black_box(&fixture), aggregation))
+        });
+    }
+    wrappers.finish();
 }
 
 criterion_group!(benches, bench);

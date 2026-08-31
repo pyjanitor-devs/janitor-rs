@@ -112,32 +112,65 @@ pub fn compute_size_rev_end_matches<'py>(
         .filter_map(|e| checked_end(*e, index.len()))
         .sum();
     ensure_exact_tape_width(expected_matches_width, matches.len())?;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
-    let start_: usize = 0_usize;
-    let mut n: usize = 0;
+    let max_end = ends
+        .iter()
+        .filter_map(|e| checked_end(*e, index.len()))
+        .max()
+        .unwrap_or(0);
+    let dense = crate::aggs::should_use_dense_match_storage(index.len(), max_end);
+    let mut touched = Vec::with_capacity(max_end);
+    let mut n = 0_usize;
+    if dense {
+        let mut seen = vec![false; max_end];
+        let mut result = vec![0_i64; max_end];
+        for end in ends.iter() {
+            let Some(end_) = checked_end(*end, index.len()) else {
+                continue;
+            };
+            for item in 0..end_ {
+                if matches[n] != 0 {
+                    if !seen[item] {
+                        seen[item] = true;
+                        touched.push(item);
+                    }
+                    result[item] += 1;
+                }
+                n += 1;
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut values = Vec::with_capacity(touched.len());
+        for item in touched {
+            labels.push(index[item]);
+            values.push(result[item]);
+        }
+        return Ok((labels.into_pyarray(py), values.into_pyarray(py)));
+    }
+    let mut dictionary: HashMap<usize, i64> = HashMap::with_capacity(max_end);
     for end in ends.into_iter() {
         let Some(end_) = checked_end(*end, index.len()) else {
             continue;
         };
-        for item in start_..end_ {
+        for item in 0..end_ {
             if matches[n] == 0 {
                 n += 1;
                 continue;
             }
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
-            *total += 1;
+            if let std::collections::hash_map::Entry::Vacant(entry) = dictionary.entry(item) {
+                touched.push(item);
+                entry.insert(0);
+            }
+            *dictionary.get_mut(&item).expect("inserted above") += 1;
             n += 1;
         }
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut values = Vec::with_capacity(touched.len());
+    for item in touched {
+        labels.push(index[item]);
+        values.push(dictionary[&item]);
     }
-    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+    Ok((labels.into_pyarray(py), values.into_pyarray(py)))
 }
 
 #[pyfunction]
@@ -169,29 +202,67 @@ pub fn compute_size_rev_start_matches<'py>(
         .map(|s| end_.saturating_sub(*s as usize))
         .sum();
     ensure_exact_tape_width(expected_matches_width, matches.len())?;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
-    let mut n: usize = 0;
+    let min_start = starts
+        .iter()
+        .filter_map(|s| checked_index(*s, index.len()))
+        .min()
+        .unwrap_or(index.len());
+    let width = index.len().saturating_sub(min_start);
+    let dense = crate::aggs::should_use_dense_match_storage(index.len(), width);
+    let mut touched = Vec::with_capacity(width);
+    let mut n = 0_usize;
+    if dense {
+        let mut seen = vec![false; width];
+        let mut values = vec![0_i64; width];
+        for start in starts.iter() {
+            let Some(start_) = checked_index(*start, index.len() + 1) else {
+                continue;
+            };
+            for item in start_..index.len() {
+                if matches[n] != 0 {
+                    let slot = item - min_start;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        touched.push(slot);
+                    }
+                    values[slot] += 1;
+                }
+                n += 1;
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut result = Vec::with_capacity(touched.len());
+        for slot in touched {
+            labels.push(index[min_start + slot]);
+            result.push(values[slot]);
+        }
+        return Ok((labels.into_pyarray(py), result.into_pyarray(py)));
+    }
+    let mut dictionary: HashMap<usize, i64> = HashMap::with_capacity(width);
     for start in starts.into_iter() {
-        let start_ = *start as usize;
+        let Some(start_) = checked_index(*start, index.len() + 1) else {
+            continue;
+        };
         for item in start_..end_ {
             if matches[n] == 0 {
                 n += 1;
                 continue;
             }
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
-            *total += 1;
+            if let std::collections::hash_map::Entry::Vacant(entry) = dictionary.entry(item) {
+                touched.push(item);
+                entry.insert(0);
+            }
+            *dictionary.get_mut(&item).expect("inserted above") += 1;
             n += 1;
         }
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut result = Vec::with_capacity(touched.len());
+    for item in touched {
+        labels.push(index[item]);
+        result.push(dictionary[&item]);
     }
-    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+    Ok((labels.into_pyarray(py), result.into_pyarray(py)))
 }
 
 #[pyfunction]
@@ -225,33 +296,68 @@ pub fn compute_size_rev_start_end_matches<'py>(
         .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
         .sum();
     ensure_exact_tape_width(expected_matches_width, matches.len())?;
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
-    let mut n: usize = 0;
-    let zipped = starts.into_iter().zip(ends);
-    for (start, end) in zipped {
+    let mut min_start = index.len();
+    let mut max_end = 0_usize;
+    for (start, end) in starts.iter().zip(ends.iter()) {
+        if let Some((start_, end_)) = checked_range(*start, *end, index.len()) {
+            min_start = min_start.min(start_);
+            max_end = max_end.max(end_);
+        }
+    }
+    let width = max_end.saturating_sub(min_start);
+    let dense = crate::aggs::should_use_dense_match_storage(index.len(), width);
+    let mut touched = Vec::with_capacity(width);
+    let mut n = 0_usize;
+    if dense {
+        let mut seen = vec![false; width];
+        let mut values = vec![0_i64; width];
+        for (start, end) in starts.iter().zip(ends.iter()) {
+            let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
+                continue;
+            };
+            for item in start_..end_ {
+                if matches[n] != 0 {
+                    let slot = item - min_start;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        touched.push(slot);
+                    }
+                    values[slot] += 1;
+                }
+                n += 1;
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut result = Vec::with_capacity(touched.len());
+        for slot in touched {
+            labels.push(index[min_start + slot]);
+            result.push(values[slot]);
+        }
+        return Ok((labels.into_pyarray(py), result.into_pyarray(py)));
+    }
+    let mut dictionary: HashMap<usize, i64> = HashMap::with_capacity(width);
+    for (start, end) in starts.into_iter().zip(ends) {
         let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
             continue;
         };
         for item in start_..end_ {
-            if matches[n] == 0 {
-                n += 1;
-                continue;
+            if matches[n] != 0 {
+                if let std::collections::hash_map::Entry::Vacant(entry) = dictionary.entry(item) {
+                    touched.push(item);
+                    entry.insert(0);
+                }
+                *dictionary.get_mut(&item).expect("inserted above") += 1;
             }
-            let pos = index[item];
-            let total = dictionary.entry(pos).or_insert(0);
-            *total += 1;
             n += 1;
         }
     }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut result = Vec::with_capacity(touched.len());
+    for item in touched {
+        labels.push(index[item]);
+        result.push(dictionary[&item]);
     }
-    Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+    Ok((labels.into_pyarray(py), result.into_pyarray(py)))
 }
 
 /// Count covered right-row positions for each distinct right-row identity.
