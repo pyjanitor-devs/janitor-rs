@@ -70,3 +70,7 @@ harness = false
 [[bench]]
 name = "rev_starts_ends_experiments"
 harness = false
+
+[[bench]]
+name = "matches_ordinal_experiments"
+harness = false
