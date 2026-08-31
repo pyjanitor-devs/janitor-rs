@@ -1294,6 +1294,7 @@ mod adversarial_bounds_tests {
                     starts_values.len(),
                     ends_values.len()
                 );
+                let expected_core = "starts and ends must have equal lengths";
                 let starts = PyArray1::from_vec(py, starts_values);
                 let ends = PyArray1::from_vec(py, ends_values);
                 let arr = PyArray1::from_vec(py, vec![1_i64, 2]);
@@ -1321,7 +1322,7 @@ mod adversarial_bounds_tests {
                 )
                 .expect_err("reverse wrapper must reject unequal lengths");
                 assert!(error.is_instance_of::<PyValueError>(py));
-                assert_eq!(error.value(py).to_string(), expected);
+                assert_eq!(error.value(py).to_string(), expected_core);
 
                 let error = super::size_rev::computes::compute_size_rev_start_end(
                     py,
@@ -1331,7 +1332,7 @@ mod adversarial_bounds_tests {
                 )
                 .expect_err("reverse-size wrapper must reject unequal lengths");
                 assert!(error.is_instance_of::<PyValueError>(py));
-                assert_eq!(error.value(py).to_string(), expected);
+                assert_eq!(error.value(py).to_string(), expected_core);
             }
         });
     }

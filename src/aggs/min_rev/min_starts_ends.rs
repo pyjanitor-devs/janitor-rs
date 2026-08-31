@@ -2,9 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{
-    ensure_equal_lengths, materialize_labels, range_reduce, validate_start_end_inputs,
-};
+use crate::aggs::{materialize_labels, range_reduce, validate_start_end_inputs};
 
 /// Find the row containing the minimum value for each distinct right label.
 ///
@@ -85,9 +83,6 @@ macro_rules! compute {
             let ends = ends.as_array();
             let index = index.as_array();
             let booleans = booleans.as_array();
-            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let (indexers, result) = min_rev_start_end_core(arr, starts, ends, index, booleans)
                 .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))

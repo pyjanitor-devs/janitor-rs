@@ -302,7 +302,6 @@ pub fn compute_size_rev_start_end<'py>(
 ) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
-    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let result = size_rev_start_end_core(starts, ends, index)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;

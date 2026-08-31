@@ -3,8 +3,8 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    ensure_equal_lengths, materialize_labels, range_reduce, range_reduce_with_row_value,
-    validate_start_end_inputs, WrapAdd,
+    materialize_labels, range_reduce, range_reduce_with_row_value, validate_start_end_inputs,
+    WrapAdd,
 };
 
 /// Sum values into one compact state slot for each distinct right-hand label.
@@ -149,9 +149,6 @@ macro_rules! compute_ints {
             let ends = ends.as_array();
             let index = index.as_array();
             let booleans = booleans.as_array();
-            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let (indexers, result) =
                 sum_rev_start_end_int_core(arr, starts, ends, index, booleans, |value| {
                     value as $acc
@@ -194,9 +191,6 @@ macro_rules! compute_floats {
             let ends = ends.as_array();
             let index = index.as_array();
             let booleans = booleans.as_array();
-            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let (indexers, result) =
                 sum_rev_start_end_float_core(arr, starts, ends, index, booleans, |value| {
                     value as f64
