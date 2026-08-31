@@ -2,29 +2,9 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{ensure_equal_lengths, materialize_labels, range_reduce};
-
-fn validate_inputs<T>(
-    arr: ArrayView1<'_, T>,
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> Result<(), &'static str> {
-    if starts.len() != ends.len() {
-        return Err("starts and ends must have equal lengths");
-    }
-    if arr.len() != starts.len() {
-        return Err("arr, starts, and ends must have equal lengths");
-    }
-    if arr.len() != booleans.len() {
-        return Err("arr and booleans must have equal lengths");
-    }
-    if arr.is_empty() || index.is_empty() {
-        return Err("arr, starts, booleans, and index cannot be empty");
-    }
-    Ok(())
-}
+use crate::aggs::{
+    ensure_equal_lengths, materialize_labels, range_reduce, validate_start_end_inputs,
+};
 
 /// Find the row containing the minimum value for each distinct right label.
 ///
@@ -53,7 +33,13 @@ pub fn min_rev_start_end_core<T: PartialOrd + Copy>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, starts, ends, index, booleans)?;
+    validate_start_end_inputs(
+        arr.len(),
+        starts.len(),
+        ends.len(),
+        index.len(),
+        booleans.len(),
+    )?;
 
     // ELI5: a vector is faster than asking a dictionary for a drawer on every
     // visit. `Option` lets us leave the value uninitialized until a range

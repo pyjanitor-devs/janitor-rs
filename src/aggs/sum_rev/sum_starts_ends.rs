@@ -3,30 +3,9 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    ensure_equal_lengths, materialize_labels, range_reduce, range_reduce_with_row_value, WrapAdd,
+    ensure_equal_lengths, materialize_labels, range_reduce, range_reduce_with_row_value,
+    validate_start_end_inputs, WrapAdd,
 };
-
-fn validate_inputs<T>(
-    arr: ArrayView1<'_, T>,
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> Result<(), &'static str> {
-    if starts.len() != ends.len() {
-        return Err("starts and ends must have equal lengths");
-    }
-    if arr.len() != starts.len() {
-        return Err("arr, starts, and ends must have equal lengths");
-    }
-    if arr.len() != booleans.len() {
-        return Err("arr and booleans must have equal lengths");
-    }
-    if arr.is_empty() || index.is_empty() {
-        return Err("arr, starts, booleans, and index cannot be empty");
-    }
-    Ok(())
-}
 
 /// Sum values into one compact state slot for each distinct right-hand label.
 ///
@@ -66,7 +45,13 @@ where
     A: WrapAdd,
     F: FnMut(T) -> A,
 {
-    validate_inputs(arr, starts, ends, index, booleans)?;
+    validate_start_end_inputs(
+        arr.len(),
+        starts.len(),
+        ends.len(),
+        index.len(),
+        booleans.len(),
+    )?;
 
     // ELI5: because each right row is unique, its position in `index` is
     // already a perfect drawer number. Gaps in the identity values do not
@@ -94,7 +79,13 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    validate_inputs(arr, starts, ends, index, booleans)?;
+    validate_start_end_inputs(
+        arr.len(),
+        starts.len(),
+        ends.len(),
+        index.len(),
+        booleans.len(),
+    )?;
 
     // Integer reverse sums use `WrapAdd` because the project defines their
     // overflow behavior as modular wrapping. Floats do not have an

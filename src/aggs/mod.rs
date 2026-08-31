@@ -104,6 +104,58 @@ pub(crate) fn ensure_equal_lengths_core(
     }
 }
 
+/// Validate the shared inputs for a reverse explicit-range aggregation.
+///
+/// The four parallel arrays (`arr`, `starts`, `ends`, and `booleans`) describe
+/// one record per left row, while `index` describes the right-side positional
+/// domain. Keeping the checks here gives every min/max/sum/prod kernel the
+/// same ordering and error contract before it enters its hot range loop.
+///
+/// # Arguments
+///
+/// * `arr_len` - Number of left-side values.
+/// * `starts_len` - Number of inclusive range starts.
+/// * `ends_len` - Number of exclusive range ends.
+/// * `index_len` - Number of right-side positional labels.
+/// * `booleans_len` - Number of null-row flags.
+///
+/// # Errors
+///
+/// Returns an error when parallel lengths differ, or when `arr` or `index` is
+/// empty. Empty `starts`/`ends`/`booleans` arrays are rejected indirectly when
+/// they do not match the non-empty `arr` length.
+///
+/// ELI5: these arrays are five lists describing the same join. Before using
+/// them, make sure the lists line up and that there is a left row and a right
+/// shelf to work with.
+pub(crate) fn validate_start_end_inputs(
+    arr_len: usize,
+    starts_len: usize,
+    ends_len: usize,
+    index_len: usize,
+    booleans_len: usize,
+) -> Result<(), &'static str> {
+    ensure_equal_lengths_core(
+        starts_len,
+        ends_len,
+        "starts and ends must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr_len,
+        starts_len,
+        "arr, starts, and ends must have equal lengths",
+    )?;
+    ensure_equal_lengths_core(
+        arr_len,
+        booleans_len,
+        "arr and booleans must have equal lengths",
+    )?;
+    if arr_len == 0 || index_len == 0 {
+        return Err("arr, starts, booleans, and index cannot be empty");
+    }
+    Ok(())
+}
+
 // Shared domain contract for the plain reverse `*_rev_starts` and
 // `*_rev_ends` aggregation shapes (min/max/prod/sum/size).
 //
@@ -1170,6 +1222,23 @@ mod adversarial_bounds_tests {
         assert!(ensure_equal_lengths_core(0, 0, "mismatch").is_ok());
         assert!(ensure_equal_lengths_core(3, 3, "mismatch").is_ok());
         assert_eq!(ensure_equal_lengths_core(2, 3, "mismatch"), Err("mismatch"));
+    }
+
+    #[test]
+    fn explicit_range_validation_reuses_shared_core_contract() {
+        assert!(super::validate_start_end_inputs(2, 2, 2, 3, 2).is_ok());
+        assert_eq!(
+            super::validate_start_end_inputs(2, 1, 2, 3, 2),
+            Err("starts and ends must have equal lengths")
+        );
+        assert_eq!(
+            super::validate_start_end_inputs(0, 0, 0, 3, 0),
+            Err("arr, starts, booleans, and index cannot be empty")
+        );
+        assert_eq!(
+            super::validate_start_end_inputs(2, 2, 2, 0, 2),
+            Err("arr, starts, booleans, and index cannot be empty")
+        );
     }
 
     #[test]
