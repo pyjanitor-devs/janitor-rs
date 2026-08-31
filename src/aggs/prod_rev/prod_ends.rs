@@ -19,17 +19,9 @@ pub fn prod_rev_ends_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut convert: F,
-) -> Result<(Array1<i64>, Array1<A>), &'static str> {
-    ensure_equal_lengths_core(
-        arr.len(),
-        ends.len(),
-        "arr, ends, and booleans must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        booleans.len(),
-        "arr, ends, and booleans must have equal lengths",
-    )?;
+) -> Result<(Array1<i64>, Array1<A>), String> {
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
     // ELI5: a prefix row joins the running product just to the left of its
     // end. Combine rows at the same end into one product event, then sweep
@@ -55,17 +47,9 @@ pub fn prod_rev_ends_float_core<T: Copy, F: FnMut(T) -> f64>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut to_f64: F,
-) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
-    ensure_equal_lengths_core(
-        arr.len(),
-        ends.len(),
-        "arr, ends, and booleans must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        booleans.len(),
-        "arr, ends, and booleans must have equal lengths",
-    )?;
+) -> Result<(Array1<i64>, Array1<f64>), String> {
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
     // Keep floats on the direct nested loop. Unlike integer wrapping
     // multiplication, IEEE-754 multiplication is not safely regroupable:

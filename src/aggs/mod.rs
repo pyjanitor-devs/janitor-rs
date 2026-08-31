@@ -85,22 +85,26 @@ pub(crate) fn ensure_equal_lengths(
 ///
 /// # Arguments
 ///
+/// * `left_name` - Name of the first parallel input.
 /// * `left_len` - Length of the first parallel input.
+/// * `right_name` - Name of the second parallel input.
 /// * `right_len` - Length of the second parallel input.
-/// * `message` - Static error message to return when the lengths differ.
 ///
 /// # Errors
 ///
-/// Returns `message` when the two lengths differ.
+/// Returns an owned message naming both mismatched inputs and their lengths.
 pub(crate) fn ensure_equal_lengths_core(
+    left_name: &str,
     left_len: usize,
+    right_name: &str,
     right_len: usize,
-    message: &'static str,
-) -> Result<(), &'static str> {
+) -> Result<(), String> {
     if left_len == right_len {
         Ok(())
     } else {
-        Err(message)
+        Err(format!(
+            "{left_name} and {right_name} must have equal lengths; got {left_len} and {right_len}"
+        ))
     }
 }
 
@@ -842,11 +846,12 @@ pub(crate) type StartsEndsResult<'py, U> =
 ///
 /// The core arrays are consumed while their data is transferred into owned
 /// NumPy arrays associated with `py`.
-pub(crate) fn into_starts_ends_result<'py, U: Element>(
+pub(crate) fn into_starts_ends_result<'py, U: Element, E: std::fmt::Display>(
     py: Python<'py>,
-    core_result: Result<(Array1<i64>, Array1<U>), &'static str>,
+    core_result: Result<(Array1<i64>, Array1<U>), E>,
 ) -> StartsEndsResult<'py, U> {
-    let (indexers, result) = core_result.map_err(PyValueError::new_err)?;
+    let (indexers, result) =
+        core_result.map_err(|error| PyValueError::new_err(error.to_string()))?;
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
@@ -1039,10 +1044,19 @@ pub(crate) fn ensure_nonempty_matches(matches_len: usize) -> PyResult<()> {
     Ok(())
 }
 
+/// Rust-only generic empty-array check.
+pub(crate) fn ensure_nonempty_core(array_name: &str, array_len: usize) -> Result<(), String> {
+    if array_len == 0 {
+        Err(format!("{array_name} cannot be empty"))
+    } else {
+        Ok(())
+    }
+}
+
 /// Rust-only counterpart to [`ensure_nonempty_matches`].
-pub(crate) fn ensure_nonempty_matches_core(matches_len: usize) -> Result<(), &'static str> {
+pub(crate) fn ensure_nonempty_matches_core(matches_len: usize) -> Result<(), String> {
     if matches_len == 0 {
-        Err("matches cannot be empty")
+        ensure_nonempty_core("matches", matches_len)
     } else {
         Ok(())
     }
@@ -1169,7 +1183,7 @@ mod adversarial_bounds_tests {
     use super::min::min_starts_ends::min_start_end_core;
     use super::min::min_starts_ends_matches::min_start_end_match_core;
     use super::min::min_starts_matches::min_start_match_core;
-    use super::{ensure_equal_lengths, ensure_equal_lengths_core};
+    use super::{ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core};
     use super::{ensure_exact_tape_width, ensure_nonempty_matches, ensure_tape_width};
 
     #[test]
@@ -1198,9 +1212,21 @@ mod adversarial_bounds_tests {
 
     #[test]
     fn core_equal_length_validation_accepts_and_rejects() {
-        assert!(ensure_equal_lengths_core(0, 0, "mismatch").is_ok());
-        assert!(ensure_equal_lengths_core(3, 3, "mismatch").is_ok());
-        assert_eq!(ensure_equal_lengths_core(2, 3, "mismatch"), Err("mismatch"));
+        assert!(ensure_equal_lengths_core("arr", 0, "ends", 0).is_ok());
+        assert!(ensure_equal_lengths_core("arr", 3, "ends", 3).is_ok());
+        assert_eq!(
+            ensure_equal_lengths_core("arr", 2, "ends", 3),
+            Err("arr and ends must have equal lengths; got 2 and 3".to_owned())
+        );
+    }
+
+    #[test]
+    fn core_nonempty_validation_names_the_checked_array() {
+        assert!(ensure_nonempty_core("arr", 1).is_ok());
+        assert_eq!(
+            ensure_nonempty_core("matches", 0),
+            Err("matches cannot be empty".to_owned())
+        );
     }
 
     #[test]

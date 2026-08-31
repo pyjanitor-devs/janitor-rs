@@ -23,22 +23,14 @@ pub fn sum_rev_ends_int_core<T, A, F>(
     index: numpy::ndarray::ArrayView1<i64>,
     booleans: numpy::ndarray::ArrayView1<bool>,
     mut convert: F,
-) -> Result<(numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<A>), &'static str>
+) -> Result<(numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<A>), String>
 where
     T: Copy,
     A: WrapAdd,
     F: FnMut(T) -> A,
 {
-    ensure_equal_lengths_core(
-        arr.len(),
-        ends.len(),
-        "arr, ends, and booleans must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        booleans.len(),
-        "arr, ends, and booleans must have equal lengths",
-    )?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
 
     // ELI5: an end-bound row covers a prefix. Put its value at the last slot
@@ -66,21 +58,13 @@ pub fn sum_rev_ends_float_core<T, F>(
     index: numpy::ndarray::ArrayView1<i64>,
     booleans: numpy::ndarray::ArrayView1<bool>,
     mut to_f64: F,
-) -> Result<(numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<f64>), &'static str>
+) -> Result<(numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<f64>), String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    ensure_equal_lengths_core(
-        arr.len(),
-        ends.len(),
-        "arr, ends, and booleans must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        booleans.len(),
-        "arr, ends, and booleans must have equal lengths",
-    )?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
     // Keep the existing per-position Neumaier accumulation for floats for
     // the same row-order reason as the starts path.

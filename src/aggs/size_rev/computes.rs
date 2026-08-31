@@ -20,7 +20,7 @@ type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArra
 pub fn size_rev_ends_core(
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+) -> Result<(Array1<i64>, Array1<i64>), String> {
     let max_end = ends_domain(ends, index.len())?;
     // ELI5: a prefix row is active to the left of its end. Count how many
     // rows end at each boundary, then sweep from right to left and carry the
@@ -49,7 +49,7 @@ pub fn size_rev_ends_core(
 pub fn size_rev_starts_core(
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+) -> Result<(Array1<i64>, Array1<i64>), String> {
     let (min_start, width) = starts_domain(starts, index.len())?;
     // ELI5: a suffix row is active from its start onward. The shared reducer
     // counts rows at each start boundary, then carries the active-row count
@@ -383,14 +383,10 @@ pub fn size_rev_start_end_core(
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    ensure_equal_lengths_core(
-        starts.len(),
-        ends.len(),
-        "starts and ends must have equal lengths",
-    )?;
+) -> Result<(Array1<i64>, Array1<i64>), String> {
+    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
     if starts.is_empty() || index.is_empty() {
-        return Err("starts, ends, and index cannot be empty");
+        return Err("starts, ends, and index cannot be empty".to_owned());
     }
     let (touched, result) = range_reduce(starts, ends, index.len(), 0_i64, |_row, _item, count| {
         *count += 1

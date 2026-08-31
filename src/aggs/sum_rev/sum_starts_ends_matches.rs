@@ -21,32 +21,16 @@ fn sum_rev_start_end_match_int_core<T, A, F>(
     matches: ArrayView1<'_, i8>,
     booleans: ArrayView1<'_, bool>,
     mut convert: F,
-) -> Result<(Vec<i64>, Vec<A>), &'static str>
+) -> Result<(Vec<i64>, Vec<A>), String>
 where
     T: Copy,
     A: Copy + WrapAdd,
     F: FnMut(T) -> A,
 {
-    ensure_equal_lengths_core(
-        arr.len(),
-        starts.len(),
-        "arr and starts must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        ends.len(),
-        "arr and ends must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        counts.len(),
-        "arr and counts must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        booleans.len(),
-        "arr and booleans must have equal lengths",
-    )?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     ensure_nonempty_matches_core(matches.len())?;
     let mut expected = 0_usize;
     let mut min_start = index.len();
@@ -145,31 +129,15 @@ fn sum_rev_start_end_match_float_core<T, F>(
     matches: ArrayView1<'_, i8>,
     booleans: ArrayView1<'_, bool>,
     mut convert: F,
-) -> Result<(Vec<i64>, Vec<f64>), &'static str>
+) -> Result<(Vec<i64>, Vec<f64>), String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    ensure_equal_lengths_core(
-        arr.len(),
-        starts.len(),
-        "arr and starts must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        ends.len(),
-        "arr and ends must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        counts.len(),
-        "arr and counts must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        booleans.len(),
-        "arr and booleans must have equal lengths",
-    )?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     ensure_nonempty_matches_core(matches.len())?;
     let mut expected = 0_usize;
     let mut min_start = index.len();

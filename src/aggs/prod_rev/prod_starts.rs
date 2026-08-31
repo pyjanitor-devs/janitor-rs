@@ -19,17 +19,9 @@ pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut convert: F,
-) -> Result<(Array1<i64>, Array1<A>), &'static str> {
-    ensure_equal_lengths_core(
-        arr.len(),
-        starts.len(),
-        "arr, starts, and booleans must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        booleans.len(),
-        "arr, starts, and booleans must have equal lengths",
-    )?;
+) -> Result<(Array1<i64>, Array1<A>), String> {
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
     // ELI5: a suffix row joins the running product at its start bucket. The
     // shared reducer combines rows sharing a boundary, then carries one
@@ -50,17 +42,9 @@ pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut to_f64: F,
-) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
-    ensure_equal_lengths_core(
-        arr.len(),
-        starts.len(),
-        "arr, starts, and booleans must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        booleans.len(),
-        "arr, starts, and booleans must have equal lengths",
-    )?;
+) -> Result<(Array1<i64>, Array1<f64>), String> {
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
     // Keep floats on the direct nested loop. Unlike integer wrapping
     // multiplication, IEEE-754 multiplication is not safely regroupable:
