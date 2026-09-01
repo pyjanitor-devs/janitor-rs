@@ -30,7 +30,7 @@ fn validate_start_match_inputs_core<T>(
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("matches", matches.len())?;
 
-    let (min_start, width) = starts_domain(starts, index.len()).map_err(str::to_owned)?;
+    let (min_start, width) = starts_domain(starts, index.len())?;
     let expected_matches_width = starts.iter().try_fold(0_usize, |total, start| {
         let start =
             usize::try_from(*start).map_err(|_| "starts must be non-negative".to_owned())?;
