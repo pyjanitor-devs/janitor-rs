@@ -83,12 +83,14 @@ where
         for item in start_..index.len() {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                if let Entry::Vacant(entry) = totals.entry(slot) {
-                    touched.push(slot);
-                    entry.insert(A::ZERO);
-                }
+                let total = match totals.entry(slot) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        touched.push(slot);
+                        entry.insert(A::ZERO)
+                    }
+                };
                 if !*boolean && *count != 0 {
-                    let total = totals.get_mut(&slot).expect("inserted above");
                     *total = total.wrap_add(current_);
                 }
             }
@@ -184,12 +186,14 @@ where
         for item in start_..index.len() {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                if let Entry::Vacant(entry) = states.entry(slot) {
-                    touched.push(slot);
-                    entry.insert((0., 0.));
-                }
+                let state = match states.entry(slot) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        touched.push(slot);
+                        entry.insert((0., 0.))
+                    }
+                };
                 if !*boolean && *count != 0 {
-                    let state = states.get_mut(&slot).expect("inserted above");
                     let difference = current_ - state.1;
                     let increment = state.0 + difference;
                     state.1 = (increment - state.0) - difference;

@@ -84,15 +84,17 @@ pub fn min_rev_start_match_core<T: PartialOrd + Copy>(
                 continue;
             }
             let slot = item - min_start;
-            if let Entry::Vacant(entry) = states.entry(slot) {
-                touched.push(slot);
-                entry.insert((*current, -1));
-            }
+            let state = match states.entry(slot) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    touched.push(slot);
+                    entry.insert((*current, -1))
+                }
+            };
             tape += 1;
             if *boolean || *count == 0 {
                 continue;
             }
-            let state = states.get_mut(&slot).expect("inserted above");
             if state.1 == -1 || *current < state.0 {
                 *state = (*current, row as i64);
             }

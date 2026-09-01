@@ -80,15 +80,17 @@ pub fn min_rev_end_match_core<T: PartialOrd + Copy>(
                 tape += 1;
                 continue;
             }
-            if let Entry::Vacant(entry) = states.entry(item) {
-                touched.push(item);
-                entry.insert((*current, -1));
-            }
+            let state = match states.entry(item) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    touched.push(item);
+                    entry.insert((*current, -1))
+                }
+            };
             tape += 1;
             if *boolean || *count == 0 {
                 continue;
             }
-            let state = states.get_mut(&item).expect("inserted above");
             if state.1 == -1 || *current < state.0 {
                 *state = (*current, row as i64);
             }

@@ -98,12 +98,14 @@ where
         for item in s..e {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                if let Entry::Vacant(entry) = totals.entry(slot) {
-                    touched.push(slot);
-                    entry.insert(A::ONE);
-                }
+                let total = match totals.entry(slot) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        touched.push(slot);
+                        entry.insert(A::ONE)
+                    }
+                };
                 if !*boolean && *count != 0 {
-                    let total = totals.get_mut(&slot).expect("inserted above");
                     *total = total.wrap_mul(current_);
                 }
             }
@@ -276,12 +278,15 @@ macro_rules! compute_floats {
                 for item in s..e {
                     if matches[tape] != 0 {
                         let slot = item - min_start;
-                        if let Entry::Vacant(entry) = totals.entry(slot) {
-                            touched.push(slot);
-                            entry.insert(1.);
-                        }
+                        let total = match totals.entry(slot) {
+                            Entry::Occupied(entry) => entry.into_mut(),
+                            Entry::Vacant(entry) => {
+                                touched.push(slot);
+                                entry.insert(1.)
+                            }
+                        };
                         if !*boolean && *count != 0 {
-                            *totals.get_mut(&slot).expect("inserted above") *= current_;
+                            *total *= current_;
                         }
                     }
                     tape += 1;

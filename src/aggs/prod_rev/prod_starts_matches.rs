@@ -131,13 +131,15 @@ macro_rules! compute_ints {
                 let current_ = *current as $acc;
                 for item in start_..end_ {
                     if matches[n] != 0 {
-                        if let Entry::Vacant(entry) = totals.entry(item - min_start) {
-                            touched.push(item - min_start);
-                            entry.insert(1 as $acc);
-                        }
+                        let slot = item - min_start;
+                        let total = match totals.entry(slot) {
+                            Entry::Occupied(entry) => entry.into_mut(),
+                            Entry::Vacant(entry) => {
+                                touched.push(slot);
+                                entry.insert(1 as $acc)
+                            }
+                        };
                         if !*boolean && *count != 0 {
-                            let total =
-                                totals.get_mut(&(item - min_start)).expect("inserted above");
                             *total = total.wrapping_mul(current_);
                         }
                     }
@@ -264,12 +266,15 @@ macro_rules! compute_floats {
                 for item in start_..end_ {
                     if matches[n] != 0 {
                         let slot = item - min_start;
-                        if let Entry::Vacant(entry) = totals.entry(slot) {
-                            touched.push(slot);
-                            entry.insert(1.);
-                        }
+                        let total = match totals.entry(slot) {
+                            Entry::Occupied(entry) => entry.into_mut(),
+                            Entry::Vacant(entry) => {
+                                touched.push(slot);
+                                entry.insert(1.)
+                            }
+                        };
                         if !*boolean && *count != 0 {
-                            *totals.get_mut(&slot).expect("inserted above") *= current_;
+                            *total *= current_;
                         }
                     }
                     n += 1;
