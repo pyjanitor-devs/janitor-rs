@@ -5,8 +5,8 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
-    should_use_dense_match_storage, starts_domain, WrapMul,
+    checked_range, ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
+    should_use_dense_match_storage, WrapMul,
 };
 
 /// Aggregate products for suffix ranges selected by a survivor tape.
@@ -34,13 +34,16 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("matches", matches.len())?;
-    let (min_start, width) = starts_domain(starts, index.len())?;
-    let expected = starts.iter().try_fold(0_usize, |total, start| {
-        total
-            .checked_add(index.len() - *start as usize)
-            .ok_or_else(|| "matches tape width overflow".to_owned())
-    })?;
+    let mut expected = 0_usize;
+    let mut min_start = index.len();
+    for start in starts.iter() {
+        if let Some((start_, end_)) = checked_range(*start, index.len() as i64, index.len()) {
+            expected += end_ - start_;
+            min_start = min_start.min(start_);
+        }
+    }
     ensure_exact_tape_width_core(expected, matches.len())?;
+    let width = index.len().saturating_sub(min_start);
 
     let dense = should_use_dense_match_storage(index.len(), width);
     let mut touched = Vec::with_capacity(width);
@@ -120,13 +123,16 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("matches", matches.len())?;
-    let (min_start, width) = starts_domain(starts, index.len())?;
-    let expected = starts.iter().try_fold(0_usize, |total, start| {
-        total
-            .checked_add(index.len() - *start as usize)
-            .ok_or_else(|| "matches tape width overflow".to_owned())
-    })?;
+    let mut expected = 0_usize;
+    let mut min_start = index.len();
+    for start in starts.iter() {
+        if let Some((start_, end_)) = checked_range(*start, index.len() as i64, index.len()) {
+            expected += end_ - start_;
+            min_start = min_start.min(start_);
+        }
+    }
     ensure_exact_tape_width_core(expected, matches.len())?;
+    let width = index.len().saturating_sub(min_start);
 
     let dense = should_use_dense_match_storage(index.len(), width);
     let mut touched = Vec::with_capacity(width);
@@ -277,7 +283,6 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{compute_prod_rev_start_match_int64, compute_prod_rev_start_match_uint64};
-    use numpy::ndarray::array;
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::Python;
 
@@ -334,12 +339,6 @@ mod tests {
             )
             .is_err());
         });
-    }
-
-    #[test]
-    fn starts_domain_accepts_zero_width_suffix() {
-        let starts = array![3_i64];
-        assert_eq!(crate::aggs::starts_domain(starts.view(), 3), Ok((3, 0)));
     }
 
     #[test]
