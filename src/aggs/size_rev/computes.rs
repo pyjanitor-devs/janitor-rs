@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::aggs::{
     checked_end, checked_index, checked_range, ends_domain, ends_labels, ensure_equal_lengths,
-    ensure_equal_lengths_core, ensure_exact_tape_width, ensure_nonempty_matches,
+    ensure_equal_lengths_core, ensure_exact_tape_width, ensure_nonempty_core,
     into_starts_ends_result, materialize_labels, range_reduce, starts_domain, starts_labels,
     sweep_reduce,
 };
@@ -102,7 +102,8 @@ pub fn compute_size_rev_end_matches<'py>(
             "ends and index cannot be empty",
         ));
     }
-    ensure_nonempty_matches(matches.len())?;
+    ensure_nonempty_core("matches", matches.len())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
@@ -191,7 +192,8 @@ pub fn compute_size_rev_start_matches<'py>(
             "starts and index cannot be empty",
         ));
     }
-    ensure_nonempty_matches(matches.len())?;
+    ensure_nonempty_core("matches", matches.len())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let end_: usize = index.len();
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
@@ -285,7 +287,8 @@ pub fn compute_size_rev_start_end_matches<'py>(
             "starts, ends, and index cannot be empty",
         ));
     }
-    ensure_nonempty_matches(matches.len())?;
+    ensure_nonempty_core("matches", matches.len())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`

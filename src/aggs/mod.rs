@@ -1018,46 +1018,10 @@ pub(crate) fn ensure_tape_width(expected_width: usize, matches_len: usize) -> Py
     )))
 }
 
-/// Reject an empty flat `matches` tape.
-///
-/// ELI5: the tape must contain at least one flag before a reverse aggregation
-/// starts consuming it. The exact candidate-width check is performed
-/// separately by `ensure_exact_tape_width`.
-///
-/// # Arguments
-///
-/// * `matches_len` - Number of entries in the flat candidate tape.
-///
-/// # Errors
-///
-/// Returns a `ValueError` when the tape is empty.
-///
-/// # Returns
-///
-/// Returns `Ok(())` when the tape contains at least one entry.
-pub(crate) fn ensure_nonempty_matches(matches_len: usize) -> PyResult<()> {
-    // Keep this check separate from the width check: an all-zero-width batch
-    // is handled by pyjanitor, while a direct Rust caller must provide a real
-    // candidate tape. This makes the boundary contract explicit and cheap.
-    if matches_len == 0 {
-        return Err(PyValueError::new_err("matches cannot be empty"));
-    }
-    Ok(())
-}
-
 /// Rust-only generic empty-array check.
 pub(crate) fn ensure_nonempty_core(array_name: &str, array_len: usize) -> Result<(), String> {
     if array_len == 0 {
         Err(format!("{array_name} cannot be empty"))
-    } else {
-        Ok(())
-    }
-}
-
-/// Rust-only counterpart to [`ensure_nonempty_matches`].
-pub(crate) fn ensure_nonempty_matches_core(matches_len: usize) -> Result<(), String> {
-    if matches_len == 0 {
-        ensure_nonempty_core("matches", matches_len)
     } else {
         Ok(())
     }
@@ -1188,7 +1152,7 @@ mod adversarial_bounds_tests {
         ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core,
         should_use_dense_match_storage,
     };
-    use super::{ensure_exact_tape_width, ensure_nonempty_matches, ensure_tape_width};
+    use super::{ensure_exact_tape_width, ensure_tape_width};
 
     #[test]
     fn equal_length_validation_accepts_empty_and_non_empty_pairs() {
@@ -1268,12 +1232,6 @@ mod adversarial_bounds_tests {
         assert!(ensure_exact_tape_width(5, 5).is_ok());
         assert!(ensure_exact_tape_width(5, 4).is_err());
         assert!(ensure_exact_tape_width(5, 6).is_err());
-    }
-
-    #[test]
-    fn matches_validation_rejects_empty_tapes() {
-        assert!(ensure_nonempty_matches(1).is_ok());
-        assert!(ensure_nonempty_matches(0).is_err());
     }
 
     #[test]

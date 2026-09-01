@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::aggs::checked_range;
 use crate::aggs::{
-    ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_matches_core,
+    ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
     should_use_dense_match_storage, WrapMul,
 };
 
@@ -27,7 +27,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    ensure_nonempty_matches_core(matches.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut max_end = 0_usize;
     for end in ends.iter() {
@@ -117,7 +117,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    ensure_nonempty_matches_core(matches.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut max_end = 0_usize;
     for end in ends.iter() {

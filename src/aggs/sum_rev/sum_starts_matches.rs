@@ -5,8 +5,8 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    checked_index, ensure_equal_lengths_core, ensure_exact_tape_width_core,
-    ensure_nonempty_matches_core, should_use_dense_match_storage, WrapAdd,
+    checked_index, ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
+    should_use_dense_match_storage, WrapAdd,
 };
 
 fn sum_rev_start_match_int_core<T, A, F>(
@@ -26,7 +26,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    ensure_nonempty_matches_core(matches.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut min_start = index.len();
     for start in starts.iter() {
@@ -120,7 +120,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    ensure_nonempty_matches_core(matches.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut min_start = index.len();
     for start in starts.iter() {

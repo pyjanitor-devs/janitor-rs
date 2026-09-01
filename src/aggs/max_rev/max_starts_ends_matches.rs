@@ -4,8 +4,8 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    checked_range, ensure_equal_lengths_core, ensure_exact_tape_width_core,
-    ensure_nonempty_matches_core, should_use_dense_match_storage,
+    checked_range, ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
+    should_use_dense_match_storage,
 };
 use std::collections::HashMap;
 
@@ -22,7 +22,7 @@ pub fn max_rev_start_end_match_core<T: PartialOrd + Copy>(
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    ensure_nonempty_matches_core(matches.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
 
     let mut expected = 0_usize;
     let mut min_start = index.len();
