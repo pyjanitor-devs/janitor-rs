@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::aggs::{
     checked_end, checked_index, checked_range, ends_domain, ends_labels, ensure_equal_lengths,
-    ensure_equal_lengths_core, ensure_exact_tape_width, ensure_nonempty_core,
+    ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
     into_starts_ends_result, materialize_labels, range_reduce, starts_domain, starts_labels,
     sweep_reduce,
 };
@@ -112,7 +112,8 @@ pub fn compute_size_rev_end_matches<'py>(
         .iter()
         .filter_map(|e| checked_end(*e, index.len()))
         .sum();
-    ensure_exact_tape_width(expected_matches_width, matches.len())?;
+    ensure_exact_tape_width_core(expected_matches_width, matches.len())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let max_end = ends
         .iter()
         .filter_map(|e| checked_end(*e, index.len()))
@@ -203,7 +204,8 @@ pub fn compute_size_rev_start_matches<'py>(
         .iter()
         .map(|s| end_.saturating_sub(*s as usize))
         .sum();
-    ensure_exact_tape_width(expected_matches_width, matches.len())?;
+    ensure_exact_tape_width_core(expected_matches_width, matches.len())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let min_start = starts
         .iter()
         .filter_map(|s| checked_index(*s, index.len()))
@@ -298,7 +300,8 @@ pub fn compute_size_rev_start_end_matches<'py>(
         .zip(ends.iter())
         .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
         .sum();
-    ensure_exact_tape_width(expected_matches_width, matches.len())?;
+    ensure_exact_tape_width_core(expected_matches_width, matches.len())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let mut min_start = index.len();
     let mut max_end = 0_usize;
     for (start, end) in starts.iter().zip(ends.iter()) {

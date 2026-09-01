@@ -4,7 +4,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-use crate::aggs::{ensure_equal_lengths, ensure_exact_tape_width};
+use crate::aggs::{ensure_equal_lengths, ensure_exact_tape_width_core};
 
 fn expected_matches_width(starts: ArrayView1<'_, i64>, right_len: usize) -> PyResult<usize> {
     if starts.is_empty() {
@@ -78,7 +78,8 @@ macro_rules! compute_ints {
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
             let expected_matches_width = expected_matches_width(starts, end_)?;
-            ensure_exact_tape_width(expected_matches_width, matches.len())?;
+            ensure_exact_tape_width_core(expected_matches_width, matches.len())
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
             let min_start = starts
                 .iter()
                 .filter_map(|s| usize::try_from(*s).ok())
@@ -216,7 +217,8 @@ macro_rules! compute_floats {
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
             let expected_matches_width = expected_matches_width(starts, end_)?;
-            ensure_exact_tape_width(expected_matches_width, matches.len())?;
+            ensure_exact_tape_width_core(expected_matches_width, matches.len())
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
             let min_start = starts
                 .iter()
                 .filter_map(|s| usize::try_from(*s).ok())

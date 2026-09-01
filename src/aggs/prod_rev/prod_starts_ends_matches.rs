@@ -3,7 +3,7 @@ use numpy::ndarray::ArrayView1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths, ensure_exact_tape_width};
+use crate::aggs::{checked_range, ensure_equal_lengths};
 use std::collections::HashMap;
 
 use crate::aggs::{
@@ -219,7 +219,8 @@ macro_rules! compute_floats {
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             ensure_nonempty_core("matches", matches.len())
                 .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            ensure_exact_tape_width(expected, matches.len())?;
+            ensure_exact_tape_width_core(expected, matches.len())
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
             let width = max_end.saturating_sub(min_start);
             let dense = crate::aggs::should_use_dense_match_storage(index.len(), width);
             let mut touched = Vec::with_capacity(width);

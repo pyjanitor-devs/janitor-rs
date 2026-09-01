@@ -1035,37 +1035,16 @@ pub(crate) fn ensure_nonempty_core(array_name: &str, array_len: usize) -> Result
 /// `matches.len()`. The producer (pyjanitor) is responsible for ensuring that
 /// every `matches` value is either 0 or 1; this helper intentionally does not
 /// scan the tape to enforce that value-level contract.
-///
-/// # Arguments
-///
-/// * `expected_width` - Candidate positions implied by the row ranges.
-/// * `matches_len` - Number of entries in the flat candidate tape.
-///
-/// # Errors
-///
-/// Returns a `ValueError` when the two widths differ.
-///
-/// # Returns
-///
-/// Returns `Ok(())` when the tape length exactly matches `expected_width`.
-pub(crate) fn ensure_exact_tape_width(expected_width: usize, matches_len: usize) -> PyResult<()> {
-    if expected_width == matches_len {
-        return Ok(());
-    }
-    Err(PyValueError::new_err(format!(
-        "matches must have length {expected_width}; got {matches_len}"
-    )))
-}
-
-/// Rust-only counterpart to [`ensure_exact_tape_width`].
 pub(crate) fn ensure_exact_tape_width_core(
     expected_width: usize,
     matches_len: usize,
-) -> Result<(), &'static str> {
+) -> Result<(), String> {
     if expected_width == matches_len {
         Ok(())
     } else {
-        Err("matches length does not equal the expected tape width")
+        Err(format!(
+            "matches must have length {expected_width}; got {matches_len}"
+        ))
     }
 }
 
@@ -1134,6 +1113,7 @@ mod adversarial_bounds_tests {
     use pyo3::exceptions::PyValueError;
     use pyo3::Python;
 
+    use super::ensure_tape_width;
     use super::max::max_ends::max_end_core;
     use super::max::max_ends_matches::max_end_match_core;
     use super::max::max_positions::max_positions_core;
@@ -1152,7 +1132,6 @@ mod adversarial_bounds_tests {
         ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core,
         should_use_dense_match_storage,
     };
-    use super::{ensure_exact_tape_width, ensure_tape_width};
 
     #[test]
     fn equal_length_validation_accepts_empty_and_non_empty_pairs() {
@@ -1225,13 +1204,6 @@ mod adversarial_bounds_tests {
                 "matches must have length at least 5 to cover every candidate position; got 4"
             );
         });
-    }
-
-    #[test]
-    fn exact_tape_width_validation_rejects_short_and_long_tapes() {
-        assert!(ensure_exact_tape_width(5, 5).is_ok());
-        assert!(ensure_exact_tape_width(5, 4).is_err());
-        assert!(ensure_exact_tape_width(5, 6).is_err());
     }
 
     #[test]
