@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    checked_range, ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
+    checked_end, ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
     should_use_dense_match_storage,
 };
 
@@ -24,7 +24,7 @@ pub fn min_rev_end_match_core<T: PartialOrd + Copy>(
     let mut expected = 0_usize;
     let mut max_end = 0_usize;
     for end in ends.iter() {
-        if let Some((_, end_)) = checked_range(0, *end, index.len()) {
+        if let Some(end_) = checked_end(*end, index.len()) {
             expected += end_;
             max_end = max_end.max(end_);
         }
@@ -39,7 +39,7 @@ pub fn min_rev_end_match_core<T: PartialOrd + Copy>(
         for (row, (current, end, count, boolean)) in
             izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter()).enumerate()
         {
-            let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+            let Some(end_) = checked_end(*end, index.len()) else {
                 continue;
             };
             for item in 0..end_ {
@@ -72,7 +72,7 @@ pub fn min_rev_end_match_core<T: PartialOrd + Copy>(
     for (row, (current, end, count, boolean)) in
         izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter()).enumerate()
     {
-        let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+        let Some(end_) = checked_end(*end, index.len()) else {
             continue;
         };
         for item in 0..end_ {

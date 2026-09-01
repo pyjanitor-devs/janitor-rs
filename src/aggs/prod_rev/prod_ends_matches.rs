@@ -4,7 +4,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-use crate::aggs::checked_range;
+use crate::aggs::checked_end;
 use crate::aggs::{
     ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
     should_use_dense_match_storage, WrapMul,
@@ -31,7 +31,7 @@ where
     let mut expected = 0_usize;
     let mut max_end = 0_usize;
     for end in ends.iter() {
-        if let Some((_, end_)) = checked_range(0, *end, index.len()) {
+        if let Some(end_) = checked_end(*end, index.len()) {
             expected += end_;
             max_end = max_end.max(end_);
         }
@@ -46,7 +46,7 @@ where
         for (current, end, count, boolean) in
             izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter())
         {
-            let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+            let Some(end_) = checked_end(*end, index.len()) else {
                 continue;
             };
             let current_ = convert(*current);
@@ -75,7 +75,7 @@ where
     for (current, end, count, boolean) in
         izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter())
     {
-        let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+        let Some(end_) = checked_end(*end, index.len()) else {
             continue;
         };
         let current_ = convert(*current);
@@ -121,7 +121,7 @@ where
     let mut expected = 0_usize;
     let mut max_end = 0_usize;
     for end in ends.iter() {
-        if let Some((_, end_)) = checked_range(0, *end, index.len()) {
+        if let Some(end_) = checked_end(*end, index.len()) {
             expected += end_;
             max_end = max_end.max(end_);
         }
@@ -136,7 +136,7 @@ where
         for (current, end, count, boolean) in
             izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter())
         {
-            let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+            let Some(end_) = checked_end(*end, index.len()) else {
                 continue;
             };
             let current_ = convert(*current);
@@ -165,7 +165,7 @@ where
     for (current, end, count, boolean) in
         izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter())
     {
-        let Some((_, end_)) = checked_range(0, *end, index.len()) else {
+        let Some(end_) = checked_end(*end, index.len()) else {
             continue;
         };
         let current_ = convert(*current);
