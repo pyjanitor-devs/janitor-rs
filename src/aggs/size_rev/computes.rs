@@ -108,7 +108,7 @@ pub fn compute_size_rev_end_matches<'py>(
     let mut expected_matches_width = 0_usize;
     let mut max_end = 0_usize;
     for end in ends.iter() {
-        if let Some((_, end_)) = checked_range(0, *end, index.len()) {
+        if let Some(end_) = checked_end(*end, index.len()) {
             expected_matches_width += end_;
             max_end = max_end.max(end_);
         }
