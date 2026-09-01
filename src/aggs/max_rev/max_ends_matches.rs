@@ -77,8 +77,8 @@ pub fn max_rev_end_match_core<T: PartialOrd + Copy>(
         return Ok((indexers, result));
     }
 
-    let mut states: HashMap<usize, (T, i64)> = HashMap::with_capacity(max_end);
-    let mut touched = Vec::with_capacity(max_end);
+    let mut states: HashMap<usize, (T, i64)> = HashMap::new();
+    let mut touched = Vec::new();
     let mut tape = 0_usize;
     for (row, (current, end, count, boolean)) in
         izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter(),).enumerate()

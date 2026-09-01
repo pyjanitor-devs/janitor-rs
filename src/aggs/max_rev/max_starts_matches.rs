@@ -33,7 +33,11 @@ pub fn max_rev_start_match_core<T: PartialOrd + Copy>(
     ensure_exact_tape_width_core(expected, matches.len())?;
     let width = index.len().saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = Vec::with_capacity(width);
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
     let mut tape = 0_usize;
 
     if dense {
@@ -74,7 +78,7 @@ pub fn max_rev_start_match_core<T: PartialOrd + Copy>(
         return Ok((labels, result));
     }
 
-    let mut states: HashMap<usize, (T, i64)> = HashMap::with_capacity(width);
+    let mut states: HashMap<usize, (T, i64)> = HashMap::new();
     for (row, (current, start, count, boolean)) in
         izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter()).enumerate()
     {

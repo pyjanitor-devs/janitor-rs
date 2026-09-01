@@ -38,7 +38,11 @@ where
     ensure_exact_tape_width_core(expected, matches.len())?;
     let width = index.len().saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = Vec::with_capacity(width);
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
     let mut tape = 0_usize;
     if dense {
         let mut seen = vec![false; width];
@@ -72,7 +76,7 @@ where
         }
         return Ok((labels, values));
     }
-    let mut totals: HashMap<usize, A> = HashMap::with_capacity(width);
+    let mut totals: HashMap<usize, A> = HashMap::new();
     for (current, start, count, boolean) in
         izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
     {
@@ -131,7 +135,11 @@ where
     ensure_exact_tape_width_core(expected, matches.len())?;
     let width = index.len().saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = Vec::with_capacity(width);
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
     let mut tape = 0_usize;
     if dense {
         let mut seen = vec![false; width];
@@ -172,7 +180,7 @@ where
         }
         return Ok((labels, values));
     }
-    let mut states: HashMap<usize, (f64, f64)> = HashMap::with_capacity(width);
+    let mut states: HashMap<usize, (f64, f64)> = HashMap::new();
     for (current, start, count, boolean) in
         izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
     {

@@ -116,7 +116,11 @@ pub fn compute_size_rev_end_matches<'py>(
     ensure_exact_tape_width_core(expected_matches_width, matches.len())
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let dense = crate::aggs::should_use_dense_match_storage(index.len(), max_end);
-    let mut touched = Vec::with_capacity(max_end);
+    let mut touched = if dense {
+        Vec::with_capacity(max_end)
+    } else {
+        Vec::new()
+    };
     let mut n = 0_usize;
     if dense {
         let mut seen = vec![false; max_end];
@@ -144,7 +148,7 @@ pub fn compute_size_rev_end_matches<'py>(
         }
         return Ok((labels.into_pyarray(py), values.into_pyarray(py)));
     }
-    let mut dictionary: HashMap<usize, i64> = HashMap::with_capacity(max_end);
+    let mut dictionary: HashMap<usize, i64> = HashMap::new();
     for end in ends.into_iter() {
         let Some(end_) = checked_end(*end, index.len()) else {
             continue;
@@ -206,7 +210,11 @@ pub fn compute_size_rev_start_matches<'py>(
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let width = index.len().saturating_sub(min_start);
     let dense = crate::aggs::should_use_dense_match_storage(index.len(), width);
-    let mut touched = Vec::with_capacity(width);
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
     let mut n = 0_usize;
     if dense {
         let mut seen = vec![false; width];
@@ -235,7 +243,7 @@ pub fn compute_size_rev_start_matches<'py>(
         }
         return Ok((labels.into_pyarray(py), result.into_pyarray(py)));
     }
-    let mut dictionary: HashMap<usize, i64> = HashMap::with_capacity(width);
+    let mut dictionary: HashMap<usize, i64> = HashMap::new();
     for start in starts.into_iter() {
         let Some((start_, _)) = checked_range(*start, end_ as i64, index.len()) else {
             continue;
@@ -301,7 +309,11 @@ pub fn compute_size_rev_start_end_matches<'py>(
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let width = max_end.saturating_sub(min_start);
     let dense = crate::aggs::should_use_dense_match_storage(index.len(), width);
-    let mut touched = Vec::with_capacity(width);
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
     let mut n = 0_usize;
     if dense {
         let mut seen = vec![false; width];
@@ -330,7 +342,7 @@ pub fn compute_size_rev_start_end_matches<'py>(
         }
         return Ok((labels.into_pyarray(py), result.into_pyarray(py)));
     }
-    let mut dictionary: HashMap<usize, i64> = HashMap::with_capacity(width);
+    let mut dictionary: HashMap<usize, i64> = HashMap::new();
     for (start, end) in starts.into_iter().zip(ends) {
         let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
             continue;
