@@ -175,6 +175,11 @@ fn bench(c: &mut Criterion) {
         (100, 1_000, 64, 50),
         (1_000, 10_000, 8, 1),
         (1_000, 10_000, 1_000, 50),
+        // Sparse allocation stress: no survivors and just below the dense
+        // coverage threshold. These cases must not reserve the full span in
+        // the sparse path.
+        (100, 100_000, 49_000, 0),
+        (100, 100_000, 49_000, 49),
         // Many rows over a narrow prefix: sparse despite the large batch.
         (10_000, 100_000, 8, 100),
         (10_000, 100_000, 10_000, 50),
@@ -203,6 +208,8 @@ fn bench(c: &mut Criterion) {
         (100, 1_000, 64, 50),
         (1_000, 10_000, 8, 1),
         (1_000, 10_000, 1_000, 50),
+        (100, 100_000, 49_000, 0),
+        (100, 100_000, 49_000, 49),
         // Many rows over a narrow prefix: sparse despite the large batch.
         (10_000, 100_000, 8, 100),
         (10_000, 100_000, 10_000, 50),
