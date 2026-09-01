@@ -167,6 +167,8 @@ fn call_prepared<'py>(py: Python<'py>, f: &Fixture, aggregation: &str, prepared:
 fn bench(c: &mut Criterion) {
     Python::initialize();
     let mut group = c.benchmark_group("production_match_wrappers");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(200));
     group.measurement_time(Duration::from_millis(500));
     for &(rows, domain, width, survivors) in &[
         (100, 1_000, 1, 100),
@@ -193,6 +195,8 @@ fn bench(c: &mut Criterion) {
     group.finish();
 
     let mut prepared_group = c.benchmark_group("production_match_prebuilt_inputs");
+    prepared_group.sample_size(10);
+    prepared_group.warm_up_time(Duration::from_millis(200));
     prepared_group.measurement_time(Duration::from_millis(500));
     for &(rows, domain, width, survivors) in &[
         (100, 1_000, 1, 100),
