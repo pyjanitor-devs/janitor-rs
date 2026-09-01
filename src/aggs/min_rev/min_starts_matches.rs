@@ -2,7 +2,7 @@ use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 use crate::aggs::{
     checked_range, ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
@@ -84,7 +84,7 @@ pub fn min_rev_start_match_core<T: PartialOrd + Copy>(
                 continue;
             }
             let slot = item - min_start;
-            if let std::collections::hash_map::Entry::Vacant(entry) = states.entry(slot) {
+            if let Entry::Vacant(entry) = states.entry(slot) {
                 touched.push(slot);
                 entry.insert((*current, -1));
             }

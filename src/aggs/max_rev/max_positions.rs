@@ -4,7 +4,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{checked_index, checked_range, ensure_equal_lengths};
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 /// Find the maximum value for each label reached through `positions`.
 ///
@@ -42,8 +42,8 @@ pub fn max_positions_core<T: PartialOrd + Copy>(
             };
             let label = index[indexer_];
             let slot = match slots.entry(label) {
-                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
                     let slot = labels.len();
                     entry.insert(slot);
                     labels.push(label);

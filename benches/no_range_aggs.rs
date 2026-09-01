@@ -7,7 +7,7 @@
 //! difference for repeated and unique labels at a large input size.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::hint::black_box;
 
 struct Fixture {
@@ -54,8 +54,8 @@ fn compact_max(fixture: &Fixture) -> (Vec<i64>, Vec<i64>) {
     for (&left_index, &right_index) in fixture.left_index.iter().zip(&fixture.right_index) {
         let left = left_index as usize;
         let slot = match slots.entry(right_index) {
-            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
                 let slot = labels.len();
                 labels.push(right_index);
                 positions.push(-1);
@@ -101,8 +101,8 @@ fn compact_min(fixture: &Fixture) -> (Vec<i64>, Vec<i64>) {
     for (&left_index, &right_index) in fixture.left_index.iter().zip(&fixture.right_index) {
         let left = left_index as usize;
         let slot = match slots.entry(right_index) {
-            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
                 let slot = labels.len();
                 labels.push(right_index);
                 positions.push(-1);
@@ -141,8 +141,8 @@ fn compact_prod(fixture: &Fixture) -> (Vec<i64>, Vec<i64>) {
     for (&left_index, &right_index) in fixture.left_index.iter().zip(&fixture.right_index) {
         let left = left_index as usize;
         let slot = match slots.entry(right_index) {
-            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
                 let slot = labels.len();
                 labels.push(right_index);
                 products.push(1_i64);

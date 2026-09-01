@@ -7,7 +7,7 @@ use crate::aggs::{
     checked_range, ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
     should_use_dense_match_storage,
 };
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 pub fn max_rev_start_end_match_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
@@ -102,7 +102,7 @@ pub fn max_rev_start_end_match_core<T: PartialOrd + Copy>(
                 continue;
             }
             let slot = item - min_start;
-            if let std::collections::hash_map::Entry::Vacant(entry) = states.entry(slot) {
+            if let Entry::Vacant(entry) = states.entry(slot) {
                 touched.push(slot);
                 entry.insert((*current, -1));
             }

@@ -2,7 +2,7 @@ use itertools::izip;
 use numpy::ndarray::ArrayView1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 use crate::aggs::{ensure_equal_lengths, ensure_exact_tape_width_core};
 
@@ -131,9 +131,7 @@ macro_rules! compute_ints {
                 let current_ = *current as $acc;
                 for item in start_..end_ {
                     if matches[n] != 0 {
-                        if let std::collections::hash_map::Entry::Vacant(entry) =
-                            totals.entry(item - min_start)
-                        {
+                        if let Entry::Vacant(entry) = totals.entry(item - min_start) {
                             touched.push(item - min_start);
                             entry.insert(1 as $acc);
                         }
@@ -266,8 +264,7 @@ macro_rules! compute_floats {
                 for item in start_..end_ {
                     if matches[n] != 0 {
                         let slot = item - min_start;
-                        if let std::collections::hash_map::Entry::Vacant(entry) = totals.entry(slot)
-                        {
+                        if let Entry::Vacant(entry) = totals.entry(slot) {
                             touched.push(slot);
                             entry.insert(1.);
                         }

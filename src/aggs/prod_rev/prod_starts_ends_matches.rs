@@ -4,7 +4,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{checked_range, ensure_equal_lengths};
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 use crate::aggs::{
     ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
@@ -98,7 +98,7 @@ where
         for item in s..e {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                if let std::collections::hash_map::Entry::Vacant(entry) = totals.entry(slot) {
+                if let Entry::Vacant(entry) = totals.entry(slot) {
                     touched.push(slot);
                     entry.insert(A::ONE);
                 }
@@ -276,8 +276,7 @@ macro_rules! compute_floats {
                 for item in s..e {
                     if matches[tape] != 0 {
                         let slot = item - min_start;
-                        if let std::collections::hash_map::Entry::Vacant(entry) = totals.entry(slot)
-                        {
+                        if let Entry::Vacant(entry) = totals.entry(slot) {
                             touched.push(slot);
                             entry.insert(1.);
                         }
