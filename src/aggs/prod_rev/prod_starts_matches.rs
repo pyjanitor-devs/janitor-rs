@@ -4,26 +4,42 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-use crate::aggs::{ensure_equal_lengths, ensure_exact_tape_width_core};
+use crate::aggs::{
+    ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
+    should_use_dense_match_storage, starts_domain,
+};
 
-fn expected_matches_width(starts: ArrayView1<'_, i64>, right_len: usize) -> PyResult<usize> {
-    if starts.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "starts cannot be empty",
-        ));
-    }
-    starts.iter().try_fold(0usize, |total, start| {
-        let start = usize::try_from(*start)
-            .map_err(|_| pyo3::exceptions::PyValueError::new_err("starts must be non-negative"))?;
-        if start > right_len {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "starts must be less than index length",
-            ));
-        }
+/// Validate the complete start-match input contract and derive its compact domain.
+///
+/// ELI5: before walking the flat match tape, make sure every row-aligned array
+/// has the same number of rows, make sure each suffix starts inside `index`,
+/// and confirm that the tape contains exactly the candidates those suffixes
+/// describe. Returning the derived `(min_start, width)` keeps the Python
+/// wrappers thin and makes validation independent of PyO3.
+fn validate_start_match_inputs_core<T>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    counts: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    matches: ArrayView1<'_, i8>,
+    booleans: ArrayView1<'_, bool>,
+) -> Result<(usize, usize), String> {
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
+
+    let (min_start, width) = starts_domain(starts, index.len()).map_err(str::to_owned)?;
+    let expected_matches_width = starts.iter().try_fold(0_usize, |total, start| {
+        let start =
+            usize::try_from(*start).map_err(|_| "starts must be non-negative".to_owned())?;
         total
-            .checked_add(right_len - start)
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("matches tape width overflow"))
-    })
+            .checked_add(index.len() - start)
+            .ok_or_else(|| "matches tape width overflow".to_owned())
+    })?;
+    ensure_exact_tape_width_core(expected_matches_width, matches.len())?;
+    Ok((min_start, width))
 }
 
 macro_rules! compute_ints {
@@ -50,43 +66,15 @@ macro_rules! compute_ints {
         {
             let arr = arr.as_array();
             let starts = starts.as_array();
-            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let matches = matches.as_array();
             let counts = counts.as_array();
-            ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let index = index.as_array();
             let booleans = booleans.as_array();
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let end_: usize = index.len();
-            if arr.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "arr cannot be empty",
-                ));
-            }
-            if index.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "index cannot be empty",
-                ));
-            }
-            if matches.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "matches cannot be empty",
-                ));
-            }
-            // ELI5: `matches[n]` advances once per candidate position, summed
-            // across every row -- not comparable to any single array's length.
-            // Total that width up front and check it against `matches.len()`
-            // here, before the loop below ever indexes into the tape.
-            let expected_matches_width = expected_matches_width(starts, end_)?;
-            ensure_exact_tape_width_core(expected_matches_width, matches.len())
-                .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            let min_start = starts
-                .iter()
-                .filter_map(|s| usize::try_from(*s).ok())
-                .min()
-                .unwrap_or(end_);
-            let width = end_.saturating_sub(min_start);
-            let dense = crate::aggs::should_use_dense_match_storage(end_, width);
+            let (min_start, width) =
+                validate_start_match_inputs_core(arr, starts, counts, index, matches, booleans)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            let dense = should_use_dense_match_storage(end_, width);
             let mut touched = Vec::with_capacity(width);
             let mut n = 0_usize;
             if dense {
@@ -185,44 +173,16 @@ macro_rules! compute_floats {
         {
             let arr = arr.as_array();
             let starts = starts.as_array();
-            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let matches = matches.as_array();
             let counts = counts.as_array();
-            ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let index = index.as_array();
             let booleans = booleans.as_array();
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            let mut n: usize = 0;
             let end_: usize = index.len();
-            if arr.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "arr cannot be empty",
-                ));
-            }
-            if index.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "index cannot be empty",
-                ));
-            }
-            if matches.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "matches cannot be empty",
-                ));
-            }
-            // ELI5: `matches[n]` advances once per candidate position, summed
-            // across every row -- not comparable to any single array's length.
-            // Total that width up front and check it against `matches.len()`
-            // here, before the loop below ever indexes into the tape.
-            let expected_matches_width = expected_matches_width(starts, end_)?;
-            ensure_exact_tape_width_core(expected_matches_width, matches.len())
-                .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            let min_start = starts
-                .iter()
-                .filter_map(|s| usize::try_from(*s).ok())
-                .min()
-                .unwrap_or(end_);
-            let width = end_.saturating_sub(min_start);
-            let dense = crate::aggs::should_use_dense_match_storage(end_, width);
+            let (min_start, width) =
+                validate_start_match_inputs_core(arr, starts, counts, index, matches, booleans)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            let mut n: usize = 0;
+            let dense = should_use_dense_match_storage(end_, width);
             let mut touched = Vec::with_capacity(width);
             if dense {
                 let mut seen = vec![false; width];
@@ -309,10 +269,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        compute_prod_rev_start_match_int64, compute_prod_rev_start_match_uint64,
-        expected_matches_width,
-    };
+    use super::{compute_prod_rev_start_match_int64, compute_prod_rev_start_match_uint64};
+    use crate::aggs::starts_domain;
     use numpy::ndarray::array;
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::Python;
@@ -348,8 +306,8 @@ mod tests {
     }
 
     #[test]
-    fn computes_zero_width_start_at_index_length() {
-        assert_eq!(expected_matches_width(array![3_i64].view(), 3).unwrap(), 0);
+    fn starts_domain_accepts_zero_width_suffix() {
+        assert_eq!(starts_domain(array![3_i64].view(), 3).unwrap(), (3, 0));
     }
 
     #[test]
