@@ -2,7 +2,7 @@ use itertools::izip;
 use numpy::ndarray::ArrayView1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 
 use crate::aggs::{
     checked_index, ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
@@ -83,13 +83,10 @@ where
         for item in start_..index.len() {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                let total = match totals.entry(slot) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => {
-                        touched.push(slot);
-                        entry.insert(A::ZERO)
-                    }
-                };
+                let total = totals.entry(slot).or_insert_with(|| {
+                    touched.push(slot);
+                    A::ZERO
+                });
                 if !*boolean && *count != 0 {
                     *total = total.wrap_add(current_);
                 }
@@ -186,13 +183,10 @@ where
         for item in start_..index.len() {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                let state = match states.entry(slot) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => {
-                        touched.push(slot);
-                        entry.insert((0., 0.))
-                    }
-                };
+                let state = states.entry(slot).or_insert_with(|| {
+                    touched.push(slot);
+                    (0., 0.)
+                });
                 if !*boolean && *count != 0 {
                     let difference = current_ - state.1;
                     let increment = state.0 + difference;

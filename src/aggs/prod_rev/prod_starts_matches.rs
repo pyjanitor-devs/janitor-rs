@@ -2,7 +2,7 @@ use itertools::izip;
 use numpy::ndarray::ArrayView1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 
 use crate::aggs::{ensure_equal_lengths, ensure_exact_tape_width_core};
 
@@ -132,13 +132,10 @@ macro_rules! compute_ints {
                 for item in start_..end_ {
                     if matches[n] != 0 {
                         let slot = item - min_start;
-                        let total = match totals.entry(slot) {
-                            Entry::Occupied(entry) => entry.into_mut(),
-                            Entry::Vacant(entry) => {
-                                touched.push(slot);
-                                entry.insert(1 as $acc)
-                            }
-                        };
+                        let total = totals.entry(slot).or_insert_with(|| {
+                            touched.push(slot);
+                            1 as $acc
+                        });
                         if !*boolean && *count != 0 {
                             *total = total.wrapping_mul(current_);
                         }
@@ -266,13 +263,10 @@ macro_rules! compute_floats {
                 for item in start_..end_ {
                     if matches[n] != 0 {
                         let slot = item - min_start;
-                        let total = match totals.entry(slot) {
-                            Entry::Occupied(entry) => entry.into_mut(),
-                            Entry::Vacant(entry) => {
-                                touched.push(slot);
-                                entry.insert(1.)
-                            }
-                        };
+                        let total = totals.entry(slot).or_insert_with(|| {
+                            touched.push(slot);
+                            1.
+                        });
                         if !*boolean && *count != 0 {
                             *total *= current_;
                         }

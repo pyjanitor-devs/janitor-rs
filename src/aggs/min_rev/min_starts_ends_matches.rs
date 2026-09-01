@@ -7,7 +7,7 @@ use crate::aggs::{
     checked_range, ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
     should_use_dense_match_storage,
 };
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 
 pub fn min_rev_start_end_match_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
@@ -102,13 +102,10 @@ pub fn min_rev_start_end_match_core<T: PartialOrd + Copy>(
                 continue;
             }
             let slot = item - min_start;
-            let state = match states.entry(slot) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    touched.push(slot);
-                    entry.insert((*current, -1))
-                }
-            };
+            let state = states.entry(slot).or_insert_with(|| {
+                touched.push(slot);
+                (*current, -1)
+            });
             tape += 1;
             if *boolean || *count == 0 {
                 continue;

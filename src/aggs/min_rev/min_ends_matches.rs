@@ -2,7 +2,7 @@ use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 
 use crate::aggs::{
     checked_range, ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
@@ -80,13 +80,10 @@ pub fn min_rev_end_match_core<T: PartialOrd + Copy>(
                 tape += 1;
                 continue;
             }
-            let state = match states.entry(item) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    touched.push(item);
-                    entry.insert((*current, -1))
-                }
-            };
+            let state = states.entry(item).or_insert_with(|| {
+                touched.push(item);
+                (*current, -1)
+            });
             tape += 1;
             if *boolean || *count == 0 {
                 continue;
