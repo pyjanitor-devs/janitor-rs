@@ -6,52 +6,194 @@ use std::collections::HashMap;
 
 use crate::aggs::{
     ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
-    should_use_dense_match_storage, starts_domain,
+    should_use_dense_match_storage, starts_domain, WrapMul,
 };
 
-/// Validate the complete start-match input contract and derive its compact domain.
+/// Aggregate products for suffix ranges selected by a survivor tape.
 ///
-/// ELI5: before walking the flat match tape, make sure every row-aligned array
-/// has the same number of rows, make sure each suffix starts inside `index`,
-/// and confirm that the tape contains exactly the candidates those suffixes
-/// describe. Returning the derived `(min_start, width)` keeps the Python
-/// wrappers thin and makes validation independent of PyO3.
-fn validate_start_match_inputs_core<T>(
+/// ELI5: every row contributes to the right-side positions from `start` to
+/// the end of `index`. The flat `matches` tape removes candidates that failed
+/// later predicates. We keep state by positional ordinal and translate those
+/// ordinals through `index` only when emitting the result.
+fn prod_rev_start_match_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     counts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     matches: ArrayView1<'_, i8>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(usize, usize), String> {
+    mut convert: F,
+) -> Result<(Vec<i64>, Vec<A>), String>
+where
+    T: Copy,
+    A: Copy + WrapMul,
+    F: FnMut(T) -> A,
+{
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("matches", matches.len())?;
-
     let (min_start, width) = starts_domain(starts, index.len())?;
-    let expected_matches_width = starts.iter().try_fold(0_usize, |total, start| {
-        let start =
-            usize::try_from(*start).map_err(|_| "starts must be non-negative".to_owned())?;
+    let expected = starts.iter().try_fold(0_usize, |total, start| {
         total
-            .checked_add(index.len() - start)
+            .checked_add(index.len() - *start as usize)
             .ok_or_else(|| "matches tape width overflow".to_owned())
     })?;
-    ensure_exact_tape_width_core(expected_matches_width, matches.len())?;
-    Ok((min_start, width))
+    ensure_exact_tape_width_core(expected, matches.len())?;
+
+    let dense = should_use_dense_match_storage(index.len(), width);
+    let mut touched = Vec::with_capacity(width);
+    let mut tape = 0_usize;
+    if dense {
+        let mut seen = vec![false; width];
+        let mut totals = vec![A::ONE; width];
+        for (current, start, count, boolean) in
+            izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
+        {
+            let current = convert(*current);
+            for item in (*start as usize)..index.len() {
+                if matches[tape] != 0 {
+                    let slot = item - min_start;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        touched.push(slot);
+                    }
+                    if !*boolean && *count != 0 {
+                        totals[slot] = totals[slot].wrap_mul(current);
+                    }
+                }
+                tape += 1;
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut values = Vec::with_capacity(touched.len());
+        for slot in touched {
+            labels.push(index[min_start + slot]);
+            values.push(totals[slot]);
+        }
+        return Ok((labels, values));
+    }
+    let mut totals: HashMap<usize, A> = HashMap::with_capacity(width);
+    for (current, start, count, boolean) in
+        izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
+    {
+        let current = convert(*current);
+        for item in (*start as usize)..index.len() {
+            if matches[tape] != 0 {
+                let slot = item - min_start;
+                let total = totals.entry(slot).or_insert_with(|| {
+                    touched.push(slot);
+                    A::ONE
+                });
+                if !*boolean && *count != 0 {
+                    *total = total.wrap_mul(current);
+                }
+            }
+            tape += 1;
+        }
+    }
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut values = Vec::with_capacity(touched.len());
+    for slot in touched {
+        labels.push(index[min_start + slot]);
+        values.push(totals[&slot]);
+    }
+    Ok((labels, values))
+}
+
+fn prod_rev_start_match_float_core<T, F>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    counts: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    matches: ArrayView1<'_, i8>,
+    booleans: ArrayView1<'_, bool>,
+    mut convert: F,
+) -> Result<(Vec<i64>, Vec<f64>), String>
+where
+    T: Copy,
+    F: FnMut(T) -> f64,
+{
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
+    let (min_start, width) = starts_domain(starts, index.len())?;
+    let expected = starts.iter().try_fold(0_usize, |total, start| {
+        total
+            .checked_add(index.len() - *start as usize)
+            .ok_or_else(|| "matches tape width overflow".to_owned())
+    })?;
+    ensure_exact_tape_width_core(expected, matches.len())?;
+
+    let dense = should_use_dense_match_storage(index.len(), width);
+    let mut touched = Vec::with_capacity(width);
+    let mut tape = 0_usize;
+    if dense {
+        let mut seen = vec![false; width];
+        let mut totals = vec![1_f64; width];
+        for (current, start, count, boolean) in
+            izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
+        {
+            let current = convert(*current);
+            for item in (*start as usize)..index.len() {
+                if matches[tape] != 0 {
+                    let slot = item - min_start;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        touched.push(slot);
+                    }
+                    if !*boolean && *count != 0 {
+                        totals[slot] *= current;
+                    }
+                }
+                tape += 1;
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut values = Vec::with_capacity(touched.len());
+        for slot in touched {
+            labels.push(index[min_start + slot]);
+            values.push(totals[slot]);
+        }
+        return Ok((labels, values));
+    }
+    let mut totals: HashMap<usize, f64> = HashMap::with_capacity(width);
+    for (current, start, count, boolean) in
+        izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
+    {
+        let current = convert(*current);
+        for item in (*start as usize)..index.len() {
+            if matches[tape] != 0 {
+                let slot = item - min_start;
+                let total = totals.entry(slot).or_insert_with(|| {
+                    touched.push(slot);
+                    1.
+                });
+                if !*boolean && *count != 0 {
+                    *total *= current;
+                }
+            }
+            tape += 1;
+        }
+    }
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut values = Vec::with_capacity(touched.len());
+    for slot in touched {
+        labels.push(index[min_start + slot]);
+        values.push(totals[&slot]);
+    }
+    Ok((labels, values))
 }
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
-        /// `index`, `counts`, and `matches` are trusted outputs of the
-        /// conditional-join boundary and are expected to be non-negative.
-        /// `matches == 0` excludes a candidate; non-zero values are treated
-        /// as live without a second validation pass over the tape.
-        ///
-        /// The accumulator type `$acc` is `i64` for every dtype except
-        /// `uint64`, which uses `u64` so values `>= 2**63` don't get
-        /// sign-flipped by a forced `i64` cast (issue #90's bug class).
+        /// `matches` must contain exactly one entry for every candidate
+        /// position. pyjanitor supplies the tape and the aligned row arrays.
+        /// The `uint64` specialization uses a `u64` accumulator so values at
+        /// or above `i64::MAX` are not sign-flipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -61,89 +203,22 @@ macro_rules! compute_ints {
             index: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)>
-        // The macro will expand into the contents of this block.
-        {
-            let arr = arr.as_array();
-            let starts = starts.as_array();
-            let matches = matches.as_array();
-            let counts = counts.as_array();
-            let index = index.as_array();
-            let booleans = booleans.as_array();
-            let end_: usize = index.len();
-            let (min_start, width) =
-                validate_start_match_inputs_core(arr, starts, counts, index, matches, booleans)
-                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            let dense = should_use_dense_match_storage(end_, width);
-            let mut touched = Vec::with_capacity(width);
-            let mut n = 0_usize;
-            if dense {
-                let mut seen = vec![false; width];
-                let mut totals = vec![1 as $acc; width];
-                for (current, start, count, boolean) in
-                    izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
-                {
-                    let Some(start_) = usize::try_from(*start).ok().filter(|s| *s <= end_) else {
-                        continue;
-                    };
-                    let current_ = *current as $acc;
-                    for item in start_..end_ {
-                        if matches[n] != 0 {
-                            let slot = item - min_start;
-                            if !seen[slot] {
-                                seen[slot] = true;
-                                touched.push(slot);
-                            }
-                            if !*boolean && *count != 0 {
-                                totals[slot] = totals[slot].wrapping_mul(current_);
-                            }
-                        }
-                        n += 1;
-                    }
-                }
-                let mut labels = Vec::with_capacity(touched.len());
-                let mut values = Vec::with_capacity(touched.len());
-                for slot in touched {
-                    labels.push(index[min_start + slot]);
-                    values.push(totals[slot]);
-                }
-                return Ok((labels.into_pyarray(py), values.into_pyarray(py)));
-            }
-            let mut totals: HashMap<usize, $acc> = HashMap::with_capacity(width);
-            for (current, start, count, boolean) in
-                izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
-            {
-                let Some(start_) = usize::try_from(*start).ok().filter(|s| *s <= end_) else {
-                    continue;
-                };
-                let current_ = *current as $acc;
-                for item in start_..end_ {
-                    if matches[n] != 0 {
-                        let slot = item - min_start;
-                        let total = totals.entry(slot).or_insert_with(|| {
-                            touched.push(slot);
-                            1 as $acc
-                        });
-                        if !*boolean && *count != 0 {
-                            *total = total.wrapping_mul(current_);
-                        }
-                    }
-                    n += 1;
-                }
-            }
-            let mut labels = Vec::with_capacity(touched.len());
-            let mut values = Vec::with_capacity(touched.len());
-            for slot in touched {
-                labels.push(index[min_start + slot]);
-                values.push(totals[&slot]);
-            }
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)> {
+            let (labels, values) = prod_rev_start_match_int_core(
+                arr.as_array(),
+                starts.as_array(),
+                counts.as_array(),
+                index.as_array(),
+                matches.as_array(),
+                booleans.as_array(),
+                |value| value as $acc,
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok((labels.into_pyarray(py), values.into_pyarray(py)))
         }
     };
 }
 
-// `uint64` is the one dtype whose accumulator is `u64` instead of `i64` --
-// see the macro's doc comment. Every other dtype fits inside `i64` losslessly.
 compute_ints!(compute_prod_rev_start_match_int64, i64, i64);
 compute_ints!(compute_prod_rev_start_match_int32, i32, i64);
 compute_ints!(compute_prod_rev_start_match_int16, i16, i64);
@@ -155,10 +230,8 @@ compute_ints!(compute_prod_rev_start_match_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
-        /// `index`, `counts`, and `matches` are trusted outputs of the
-        /// conditional-join boundary and are expected to be non-negative.
-        /// `matches == 0` excludes a candidate; non-zero values are treated
-        /// as live without a second validation pass over the tape.
+        /// `matches` must contain exactly one entry for every candidate
+        /// position. pyjanitor supplies the tape and the aligned row arrays.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -168,78 +241,17 @@ macro_rules! compute_floats {
             index: PyReadonlyArray1<'py, i64>,
             matches: PyReadonlyArray1<'py, i8>,
             booleans: PyReadonlyArray1<'py, bool>,
-        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>
-        // The macro will expand into the contents of this block.
-        {
-            let arr = arr.as_array();
-            let starts = starts.as_array();
-            let matches = matches.as_array();
-            let counts = counts.as_array();
-            let index = index.as_array();
-            let booleans = booleans.as_array();
-            let end_: usize = index.len();
-            let (min_start, width) =
-                validate_start_match_inputs_core(arr, starts, counts, index, matches, booleans)
-                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            let mut n: usize = 0;
-            let dense = should_use_dense_match_storage(end_, width);
-            let mut touched = Vec::with_capacity(width);
-            if dense {
-                let mut seen = vec![false; width];
-                let mut totals = vec![1.0_f64; width];
-                for (current, start, count, boolean) in
-                    izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
-                {
-                    let start_ = usize::try_from(*start).expect("validated above");
-                    let current_ = *current as f64;
-                    for item in start_..end_ {
-                        if matches[n] != 0 {
-                            let slot = item - min_start;
-                            if !seen[slot] {
-                                seen[slot] = true;
-                                touched.push(slot);
-                            }
-                            if !*boolean && *count != 0 {
-                                totals[slot] *= current_;
-                            }
-                        }
-                        n += 1;
-                    }
-                }
-                let mut labels = Vec::with_capacity(touched.len());
-                let mut values = Vec::with_capacity(touched.len());
-                for slot in touched {
-                    labels.push(index[min_start + slot]);
-                    values.push(totals[slot]);
-                }
-                return Ok((labels.into_pyarray(py), values.into_pyarray(py)));
-            }
-            let mut totals: HashMap<usize, f64> = HashMap::with_capacity(width);
-            for (current, start, count, boolean) in
-                izip!(arr.iter(), starts.iter(), counts.iter(), booleans.iter())
-            {
-                let start_ = usize::try_from(*start).expect("validated above");
-                let current_ = *current as f64;
-                for item in start_..end_ {
-                    if matches[n] != 0 {
-                        let slot = item - min_start;
-                        let total = totals.entry(slot).or_insert_with(|| {
-                            touched.push(slot);
-                            1.
-                        });
-                        if !*boolean && *count != 0 {
-                            *total *= current_;
-                        }
-                    }
-                    n += 1;
-                }
-            }
-            let mut labels = Vec::with_capacity(touched.len());
-            let mut values = Vec::with_capacity(touched.len());
-            for slot in touched {
-                labels.push(index[min_start + slot]);
-                values.push(totals[&slot]);
-            }
+        ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)> {
+            let (labels, values) = prod_rev_start_match_float_core(
+                arr.as_array(),
+                starts.as_array(),
+                counts.as_array(),
+                index.as_array(),
+                matches.as_array(),
+                booleans.as_array(),
+                |value| value as f64,
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok((labels.into_pyarray(py), values.into_pyarray(py)))
         }
     };
@@ -248,11 +260,6 @@ macro_rules! compute_floats {
 compute_floats!(compute_prod_rev_start_match_f64, f64);
 compute_floats!(compute_prod_rev_start_match_f32, f32);
 
-/// Registers this file's dtype-specialized Python exports.
-///
-/// ELI5: this file owns a short guest list for just its own exported
-/// functions, instead of a central file trying to track every
-/// department's exports itself.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_prod_rev_start_match_uint64, m)?)?;
     m.add_function(wrap_pyfunction!(compute_prod_rev_start_match_uint32, m)?)?;
@@ -270,7 +277,6 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{compute_prod_rev_start_match_int64, compute_prod_rev_start_match_uint64};
-    use crate::aggs::starts_domain;
     use numpy::ndarray::array;
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::Python;
@@ -280,7 +286,6 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             if py.import("numpy").is_err() {
-                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
                 return;
             }
             let value = (i64::MAX as u64) + 5;
@@ -306,16 +311,10 @@ mod tests {
     }
 
     #[test]
-    fn starts_domain_accepts_zero_width_suffix() {
-        assert_eq!(starts_domain(array![3_i64].view(), 3).unwrap(), (3, 0));
-    }
-
-    #[test]
     fn rejects_extra_tape_entries() {
         Python::initialize();
         Python::attach(|py| {
             if py.import("numpy").is_err() {
-                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
                 return;
             }
             let arr = PyArray1::from_vec(py, vec![2_i64]);
@@ -338,11 +337,16 @@ mod tests {
     }
 
     #[test]
+    fn starts_domain_accepts_zero_width_suffix() {
+        let starts = array![3_i64];
+        assert_eq!(crate::aggs::starts_domain(starts.view(), 3), Ok((3, 0)));
+    }
+
+    #[test]
     fn integer_kernel_handles_duplicate_labels() {
         Python::initialize();
         Python::attach(|py| {
             if py.import("numpy").is_err() {
-                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
                 return;
             }
             let arr = PyArray1::from_vec(py, vec![2_i64, 3]);
@@ -371,14 +375,11 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             if py.import("numpy").is_err() {
-                eprintln!("skipping Python-wrapper test: NumPy is unavailable");
                 return;
             }
             let arr = PyArray1::from_vec(py, vec![i64::MAX, 2]);
             let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
             let counts = PyArray1::from_vec(py, vec![1_i64, 1]);
-            // pyjanitor supplies unique right-index labels; they need not be
-            // positional, so this also exercises the ordinal/label split.
             let index = PyArray1::from_vec(py, vec![10_i64, 20]);
             let matches = PyArray1::from_vec(py, vec![1_i8, 0, 1]);
             let booleans = PyArray1::from_vec(py, vec![false, false]);
