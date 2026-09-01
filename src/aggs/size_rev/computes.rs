@@ -97,28 +97,24 @@ pub fn compute_size_rev_end_matches<'py>(
     let ends = ends.as_array();
     let index = index.as_array();
     let matches = matches.as_array();
-    if ends.is_empty() || index.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "ends and index cannot be empty",
-        ));
-    }
+    ensure_nonempty_core("ends", ends.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
+    ensure_nonempty_core("index", index.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
     ensure_nonempty_core("matches", matches.len())
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize = ends
-        .iter()
-        .filter_map(|e| checked_end(*e, index.len()))
-        .sum();
+    let mut expected_matches_width = 0_usize;
+    let mut max_end = 0_usize;
+    for end in ends.iter() {
+        if let Some((_, end_)) = checked_range(0, *end, index.len()) {
+            expected_matches_width += end_;
+            max_end = max_end.max(end_);
+        }
+    }
     ensure_exact_tape_width_core(expected_matches_width, matches.len())
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    let max_end = ends
-        .iter()
-        .filter_map(|e| checked_end(*e, index.len()))
-        .max()
-        .unwrap_or(0);
     let dense = crate::aggs::should_use_dense_match_storage(index.len(), max_end);
     let mut touched = Vec::with_capacity(max_end);
     let mut n = 0_usize;
@@ -188,11 +184,9 @@ pub fn compute_size_rev_start_matches<'py>(
     let starts = starts.as_array();
     let index = index.as_array();
     let matches = matches.as_array();
-    if starts.is_empty() || index.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "starts and index cannot be empty",
-        ));
-    }
+    ensure_nonempty_core("starts", starts.len())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    ensure_nonempty_core("index", index.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
     ensure_nonempty_core("matches", matches.len())
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let end_: usize = index.len();
@@ -200,17 +194,16 @@ pub fn compute_size_rev_start_matches<'py>(
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize = starts
-        .iter()
-        .map(|s| end_.saturating_sub(*s as usize))
-        .sum();
+    let mut expected_matches_width = 0_usize;
+    let mut min_start = index.len();
+    for start in starts.iter() {
+        if let Some((start_, end_)) = checked_range(*start, end_ as i64, index.len()) {
+            expected_matches_width += end_ - start_;
+            min_start = min_start.min(start_);
+        }
+    }
     ensure_exact_tape_width_core(expected_matches_width, matches.len())
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    let min_start = starts
-        .iter()
-        .filter_map(|s| checked_index(*s, index.len()))
-        .min()
-        .unwrap_or(index.len());
     let width = index.len().saturating_sub(min_start);
     let dense = crate::aggs::should_use_dense_match_storage(index.len(), width);
     let mut touched = Vec::with_capacity(width);
@@ -284,32 +277,28 @@ pub fn compute_size_rev_start_end_matches<'py>(
     let ends = ends.as_array();
     let index = index.as_array();
     let matches = matches.as_array();
-    if starts.is_empty() || index.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "starts, ends, and index cannot be empty",
-        ));
-    }
+    ensure_nonempty_core("starts", starts.len())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    ensure_nonempty_core("ends", ends.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
+    ensure_nonempty_core("index", index.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
     ensure_nonempty_core("matches", matches.len())
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     // ELI5: `matches[n]` advances once per candidate position, summed
     // across every row -- not comparable to any single array's length.
     // Total that width up front and check it against `matches.len()`
     // here, before the loop below ever indexes into the tape.
-    let expected_matches_width: usize = starts
-        .iter()
-        .zip(ends.iter())
-        .filter_map(|(s, e)| checked_range(*s, *e, index.len()).map(|(s_, e_)| e_ - s_))
-        .sum();
-    ensure_exact_tape_width_core(expected_matches_width, matches.len())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let mut expected_matches_width = 0_usize;
     let mut min_start = index.len();
     let mut max_end = 0_usize;
     for (start, end) in starts.iter().zip(ends.iter()) {
         if let Some((start_, end_)) = checked_range(*start, *end, index.len()) {
+            expected_matches_width += end_ - start_;
             min_start = min_start.min(start_);
             max_end = max_end.max(end_);
         }
     }
+    ensure_exact_tape_width_core(expected_matches_width, matches.len())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let width = max_end.saturating_sub(min_start);
     let dense = crate::aggs::should_use_dense_match_storage(index.len(), width);
     let mut touched = Vec::with_capacity(width);
@@ -391,9 +380,9 @@ pub fn size_rev_start_end_core(
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), String> {
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
-    if starts.is_empty() || index.is_empty() {
-        return Err("starts, ends, and index cannot be empty".to_owned());
-    }
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_nonempty_core("index", index.len())?;
     let (touched, result) = range_reduce(starts, ends, index.len(), 0_i64, |_row, _item, count| {
         *count += 1
     });
@@ -492,11 +481,12 @@ pub fn compute_size_rev_positions<'py>(
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let positions = positions.as_array();
-    if starts.is_empty() || index.is_empty() || positions.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "starts, ends, index, and positions cannot be empty",
-        ));
-    }
+    ensure_nonempty_core("starts", starts.len())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    ensure_nonempty_core("ends", ends.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
+    ensure_nonempty_core("index", index.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
+    ensure_nonempty_core("positions", positions.len())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
