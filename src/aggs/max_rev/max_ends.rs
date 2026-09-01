@@ -15,17 +15,9 @@ pub fn max_rev_ends_core<T: PartialOrd + Copy>(
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    ensure_equal_lengths_core(
-        arr.len(),
-        ends.len(),
-        "arr, ends, and booleans must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        booleans.len(),
-        "arr, ends, and booleans must have equal lengths",
-    )?;
+) -> Result<(Array1<i64>, Array1<i64>), String> {
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
 
     if !should_sweep(arr.len(), max_end, std::mem::size_of::<T>()) {

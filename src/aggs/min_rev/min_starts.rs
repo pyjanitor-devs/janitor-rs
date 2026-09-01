@@ -17,17 +17,9 @@ pub fn min_rev_starts_core<T: PartialOrd + Copy>(
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    ensure_equal_lengths_core(
-        arr.len(),
-        starts.len(),
-        "arr, starts, and booleans must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        booleans.len(),
-        "arr, starts, and booleans must have equal lengths",
-    )?;
+) -> Result<(Array1<i64>, Array1<i64>), String> {
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
 
     if should_sweep(arr.len(), width, std::mem::size_of::<T>()) {

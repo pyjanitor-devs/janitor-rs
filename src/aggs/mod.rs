@@ -79,29 +79,60 @@ pub(crate) fn ensure_equal_lengths(
 /// rather than requiring the aggregation algorithm to know about Python.
 ///
 /// Unlike [`ensure_equal_lengths`], this helper does not construct a PyO3
-/// exception. Keeping the core-layer result as a static Rust error means the
+/// exception. Keeping the core-layer result as an owned Rust error means the
 /// algorithm remains directly testable without a Python interpreter; the
-/// surrounding PyO3 wrapper can convert the error at the boundary.
+/// surrounding PyO3 wrapper converts the error at the boundary.
 ///
 /// # Arguments
 ///
+/// * `left_name` - Name of the first parallel input.
 /// * `left_len` - Length of the first parallel input.
+/// * `right_name` - Name of the second parallel input.
 /// * `right_len` - Length of the second parallel input.
-/// * `message` - Static error message to return when the lengths differ.
 ///
 /// # Errors
 ///
-/// Returns `message` when the two lengths differ.
+/// Returns an owned message naming both mismatched inputs and their lengths.
 pub(crate) fn ensure_equal_lengths_core(
+    left_name: &str,
     left_len: usize,
+    right_name: &str,
     right_len: usize,
-    message: &'static str,
-) -> Result<(), &'static str> {
+) -> Result<(), String> {
     if left_len == right_len {
         Ok(())
     } else {
-        Err(message)
+        Err(format!(
+            "{left_name} and {right_name} must have equal lengths; got {left_len} and {right_len}"
+        ))
     }
+}
+
+/// Choose dense ordinal state only when the covered domain is large enough to
+/// justify allocating state for every possible right position.
+///
+/// ELI5: a dictionary is best when only a few shelves are visited; arrays are
+/// best when at least half the shelves are visited. This keeps a huge sparse
+/// domain from triggering a huge dense allocation. The caller still owns the
+/// aggregation loop, so this helper only centralizes the dispatch policy.
+///
+/// For example:
+///
+/// * `domain_len = 1_000_000`, `covered_len = 8`: use sparse storage because
+///   only eight positions can be touched in a million-position domain.
+/// * `domain_len = 10_000`, `covered_len = 4_999`: use sparse storage because
+///   coverage is below half the domain.
+/// * `domain_len = 10_000`, `covered_len = 5_000`: use dense storage because
+///   coverage is exactly half the domain.
+/// * `domain_len = 10_000`, `covered_len = 10_000`: use dense storage because
+///   the entire domain can be touched.
+///
+/// `covered_len` is a prefix bound, not a count of distinct positions. Thus,
+/// `covered_len = 5_000` can still mean that only a few positions are actually
+/// touched; using this inexpensive bound avoids building another set solely to
+/// make the dispatch decision.
+pub(crate) fn should_use_dense_match_storage(domain_len: usize, covered_len: usize) -> bool {
+    domain_len != 0 && covered_len.saturating_mul(2) >= domain_len
 }
 
 // Shared domain contract for the plain reverse `*_rev_starts` and
@@ -832,11 +863,12 @@ pub(crate) type StartsEndsResult<'py, U> =
 ///
 /// The core arrays are consumed while their data is transferred into owned
 /// NumPy arrays associated with `py`.
-pub(crate) fn into_starts_ends_result<'py, U: Element>(
+pub(crate) fn into_starts_ends_result<'py, U: Element, E: std::fmt::Display>(
     py: Python<'py>,
-    core_result: Result<(Array1<i64>, Array1<U>), &'static str>,
+    core_result: Result<(Array1<i64>, Array1<U>), E>,
 ) -> StartsEndsResult<'py, U> {
-    let (indexers, result) = core_result.map_err(PyValueError::new_err)?;
+    let (indexers, result) =
+        core_result.map_err(|error| PyValueError::new_err(error.to_string()))?;
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
@@ -1002,31 +1034,13 @@ pub(crate) fn ensure_tape_width(expected_width: usize, matches_len: usize) -> Py
     )))
 }
 
-/// Reject an empty flat `matches` tape.
-///
-/// ELI5: the tape must contain at least one flag before a reverse aggregation
-/// starts consuming it. The exact candidate-width check is performed
-/// separately by `ensure_exact_tape_width`.
-///
-/// # Arguments
-///
-/// * `matches_len` - Number of entries in the flat candidate tape.
-///
-/// # Errors
-///
-/// Returns a `ValueError` when the tape is empty.
-///
-/// # Returns
-///
-/// Returns `Ok(())` when the tape contains at least one entry.
-pub(crate) fn ensure_nonempty_matches(matches_len: usize) -> PyResult<()> {
-    // Keep this check separate from the width check: an all-zero-width batch
-    // is handled by pyjanitor, while a direct Rust caller must provide a real
-    // candidate tape. This makes the boundary contract explicit and cheap.
-    if matches_len == 0 {
-        return Err(PyValueError::new_err("matches cannot be empty"));
+/// Rust-only generic empty-array check.
+pub(crate) fn ensure_nonempty_core(array_name: &str, array_len: usize) -> Result<(), String> {
+    if array_len == 0 {
+        Err(format!("{array_name} cannot be empty"))
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 /// Reject a flat `matches` tape whose length differs from the candidate width.
@@ -1037,26 +1051,17 @@ pub(crate) fn ensure_nonempty_matches(matches_len: usize) -> PyResult<()> {
 /// `matches.len()`. The producer (pyjanitor) is responsible for ensuring that
 /// every `matches` value is either 0 or 1; this helper intentionally does not
 /// scan the tape to enforce that value-level contract.
-///
-/// # Arguments
-///
-/// * `expected_width` - Candidate positions implied by the row ranges.
-/// * `matches_len` - Number of entries in the flat candidate tape.
-///
-/// # Errors
-///
-/// Returns a `ValueError` when the two widths differ.
-///
-/// # Returns
-///
-/// Returns `Ok(())` when the tape length exactly matches `expected_width`.
-pub(crate) fn ensure_exact_tape_width(expected_width: usize, matches_len: usize) -> PyResult<()> {
+pub(crate) fn ensure_exact_tape_width_core(
+    expected_width: usize,
+    matches_len: usize,
+) -> Result<(), String> {
     if expected_width == matches_len {
-        return Ok(());
+        Ok(())
+    } else {
+        Err(format!(
+            "matches must have length {expected_width}; got {matches_len}"
+        ))
     }
-    Err(PyValueError::new_err(format!(
-        "matches must have length {expected_width}; got {matches_len}"
-    )))
 }
 
 /// Shared function-pointer shape for the `_positions` family's `#[cfg(test)]`
@@ -1124,6 +1129,7 @@ mod adversarial_bounds_tests {
     use pyo3::exceptions::PyValueError;
     use pyo3::Python;
 
+    use super::ensure_tape_width;
     use super::max::max_ends::max_end_core;
     use super::max::max_ends_matches::max_end_match_core;
     use super::max::max_positions::max_positions_core;
@@ -1138,8 +1144,10 @@ mod adversarial_bounds_tests {
     use super::min::min_starts_ends::min_start_end_core;
     use super::min::min_starts_ends_matches::min_start_end_match_core;
     use super::min::min_starts_matches::min_start_match_core;
-    use super::{ensure_equal_lengths, ensure_equal_lengths_core};
-    use super::{ensure_exact_tape_width, ensure_nonempty_matches, ensure_tape_width};
+    use super::{
+        ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core,
+        should_use_dense_match_storage,
+    };
 
     #[test]
     fn equal_length_validation_accepts_empty_and_non_empty_pairs() {
@@ -1167,9 +1175,30 @@ mod adversarial_bounds_tests {
 
     #[test]
     fn core_equal_length_validation_accepts_and_rejects() {
-        assert!(ensure_equal_lengths_core(0, 0, "mismatch").is_ok());
-        assert!(ensure_equal_lengths_core(3, 3, "mismatch").is_ok());
-        assert_eq!(ensure_equal_lengths_core(2, 3, "mismatch"), Err("mismatch"));
+        assert!(ensure_equal_lengths_core("arr", 0, "ends", 0).is_ok());
+        assert!(ensure_equal_lengths_core("arr", 3, "ends", 3).is_ok());
+        assert_eq!(
+            ensure_equal_lengths_core("arr", 2, "ends", 3),
+            Err("arr and ends must have equal lengths; got 2 and 3".to_owned())
+        );
+    }
+
+    #[test]
+    fn core_nonempty_validation_names_the_checked_array() {
+        assert!(ensure_nonempty_core("arr", 1).is_ok());
+        assert_eq!(
+            ensure_nonempty_core("matches", 0),
+            Err("matches cannot be empty".to_owned())
+        );
+    }
+
+    #[test]
+    fn match_storage_dispatch_keeps_sparse_domains_sparse() {
+        assert!(!should_use_dense_match_storage(1_000_000, 8));
+        assert!(!should_use_dense_match_storage(10_000, 4_999));
+        assert!(should_use_dense_match_storage(10_000, 5_000));
+        assert!(should_use_dense_match_storage(10_000, 10_000));
+        assert!(!should_use_dense_match_storage(0, 0));
     }
 
     #[test]
@@ -1191,19 +1220,6 @@ mod adversarial_bounds_tests {
                 "matches must have length at least 5 to cover every candidate position; got 4"
             );
         });
-    }
-
-    #[test]
-    fn exact_tape_width_validation_rejects_short_and_long_tapes() {
-        assert!(ensure_exact_tape_width(5, 5).is_ok());
-        assert!(ensure_exact_tape_width(5, 4).is_err());
-        assert!(ensure_exact_tape_width(5, 6).is_err());
-    }
-
-    #[test]
-    fn matches_validation_rejects_empty_tapes() {
-        assert!(ensure_nonempty_matches(1).is_ok());
-        assert!(ensure_nonempty_matches(0).is_err());
     }
 
     #[test]

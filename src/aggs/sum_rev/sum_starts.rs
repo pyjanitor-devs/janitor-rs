@@ -25,22 +25,14 @@ pub fn sum_rev_starts_int_core<T, A, F>(
     index: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut convert: F,
-) -> Result<(Array1<i64>, Array1<A>), &'static str>
+) -> Result<(Array1<i64>, Array1<A>), String>
 where
     T: Copy,
     A: WrapAdd,
     F: FnMut(T) -> A,
 {
-    ensure_equal_lengths_core(
-        arr.len(),
-        starts.len(),
-        "arr, starts, and booleans must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        booleans.len(),
-        "arr, starts, and booleans must have equal lengths",
-    )?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
 
     // ELI5: a suffix starts once and then stays active. The shared reducer puts
@@ -115,21 +107,13 @@ pub fn sum_rev_starts_float_core<T, F>(
     index: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_f64: F,
-) -> Result<(Array1<i64>, Array1<f64>), &'static str>
+) -> Result<(Array1<i64>, Array1<f64>), String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    ensure_equal_lengths_core(
-        arr.len(),
-        starts.len(),
-        "arr, starts, and booleans must have equal lengths",
-    )?;
-    ensure_equal_lengths_core(
-        arr.len(),
-        booleans.len(),
-        "arr, starts, and booleans must have equal lengths",
-    )?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
     // Keep the existing per-position Neumaier accumulation for floats. A
     // single running sweep would change the original row order at positions

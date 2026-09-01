@@ -1,12 +1,110 @@
 use itertools::izip;
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    checked_range, ensure_equal_lengths, ensure_exact_tape_width, ensure_nonempty_matches,
+    checked_end, ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
+    should_use_dense_match_storage,
 };
+
+pub fn min_rev_end_match_core<T: PartialOrd + Copy>(
+    arr: ArrayView1<'_, T>,
+    index: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    counts: ArrayView1<'_, i64>,
+    matches: ArrayView1<'_, i8>,
+    booleans: ArrayView1<'_, bool>,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
+    let mut expected = 0_usize;
+    let mut max_end = 0_usize;
+    for end in ends.iter() {
+        if let Some(end_) = checked_end(*end, index.len()) {
+            expected += end_;
+            max_end = max_end.max(end_);
+        }
+    }
+    ensure_exact_tape_width_core(expected, matches.len())?;
+    let dense = should_use_dense_match_storage(index.len(), max_end);
+    let mut touched = if dense {
+        Vec::with_capacity(max_end)
+    } else {
+        Vec::new()
+    };
+    let mut tape = 0_usize;
+    if dense {
+        let mut seen = vec![false; max_end];
+        let mut states = vec![(arr[0], -1_i64); max_end];
+        for (row, (current, end, count, boolean)) in
+            izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter()).enumerate()
+        {
+            let Some(end_) = checked_end(*end, index.len()) else {
+                continue;
+            };
+            for item in 0..end_ {
+                if matches[tape] == 0 {
+                    tape += 1;
+                    continue;
+                }
+                if !seen[item] {
+                    seen[item] = true;
+                    touched.push(item);
+                }
+                tape += 1;
+                if *boolean || *count == 0 {
+                    continue;
+                }
+                if states[item].1 == -1 || *current < states[item].0 {
+                    states[item] = (*current, row as i64);
+                }
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut result = Vec::with_capacity(touched.len());
+        for item in touched {
+            labels.push(index[item]);
+            result.push(states[item].1);
+        }
+        return Ok((labels, result));
+    }
+    let mut states: HashMap<usize, (T, i64)> = HashMap::new();
+    for (row, (current, end, count, boolean)) in
+        izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter()).enumerate()
+    {
+        let Some(end_) = checked_end(*end, index.len()) else {
+            continue;
+        };
+        for item in 0..end_ {
+            if matches[tape] == 0 {
+                tape += 1;
+                continue;
+            }
+            let state = states.entry(item).or_insert_with(|| {
+                touched.push(item);
+                (*current, -1)
+            });
+            tape += 1;
+            if *boolean || *count == 0 {
+                continue;
+            }
+            if state.1 == -1 || *current < state.0 {
+                *state = (*current, row as i64);
+            }
+        }
+    }
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut result = Vec::with_capacity(touched.len());
+    for item in touched {
+        labels.push(index[item]);
+        result.push(states[&item].1);
+    }
+    Ok((labels, result))
+}
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
@@ -32,75 +130,20 @@ macro_rules! compute {
             let arr = arr.as_array();
             let index = index.as_array();
             let ends = ends.as_array();
-            ensure_equal_lengths("arr", arr.len(), "ends", ends.len())?;
             let matches = matches.as_array();
-            ensure_nonempty_matches(matches.len())?;
             let counts = counts.as_array();
-            ensure_equal_lengths("arr", arr.len(), "counts", counts.len())?;
             let booleans = booleans.as_array();
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             // ELI5: `matches[n]` advances once per candidate position, summed
             // across every row -- not comparable to any single array's length.
             // Total that width up front and check it against `matches.len()`
             // here, before the loop below ever indexes into the tape.
-            let expected_matches_width: usize = ends
-                .iter()
-                .filter_map(|e| checked_range(0, *e, index.len()).map(|(_, e_)| e_))
-                .sum();
-            ensure_exact_tape_width(expected_matches_width, matches.len())?;
-            let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
-            let mut mapping: HashMap<i64, $type> = HashMap::with_capacity(index.len());
-            let mut n: usize = 0;
-            let zipped = izip!(
-                arr.into_iter(),
-                ends.into_iter(),
-                counts.into_iter(),
-                booleans.into_iter()
-            );
-            for (posn, (current, end, count, boolean)) in zipped.enumerate() {
-                // ELI5 (the guard): `end` indexes into `index`, not `arr`.
-                // Unlike the dual-bound `_starts_ends` shape, this single-
-                // bound producer (`src/compare/comp_ends.rs`) has no
-                // invalid-row concept of its own -- every `end` reaching
-                // here is already guaranteed `0 <= end <= index.len()`
-                // because `bin_search_lt_first`/`bin_search_gt_first` drop
-                // zero-width rows before `ends` is ever built. `end == 0`
-                // is valid and simply contributes no tape entries. This
-                // `checked_range` is defense in depth against that
-                // cross-module invariant breaking, not a condition the
-                // real pyjanitor call path can trigger; see issue #40 for
-                // the full trace and issue #41 for the tape-width check
-                // above, which is what actually guards `matches[n]`.
-                let Some((_, end_)) = checked_range(0, *end, index.len()) else {
-                    continue;
-                };
-                for item in 0..end_ {
-                    if (matches[n] == 0) {
-                        n += 1;
-                        continue;
-                    }
-                    let pos = index[item];
-                    let base = dictionary.entry(pos).or_insert(-1);
-                    let base_val = mapping.entry(pos).or_insert(*current);
-                    if *boolean || (*count == 0) {
-                        n += 1;
-                        continue;
-                    }
-                    if (*base == -1) || (*current < *base_val) {
-                        *base_val = *current;
-                        *base = posn as i64;
-                    }
-                    n += 1;
-                }
-            }
-            let length = dictionary.len();
-            let mut indexers = Array1::<i64>::zeros(length);
-            let mut result = Array1::<i64>::zeros(length);
-            for (pos, (key, val)) in dictionary.iter().enumerate() {
-                indexers[pos] = *key;
-                result[pos] = *val;
-            }
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+            let (indexers, result) =
+                min_rev_end_match_core(arr, index, ends, counts, matches, booleans)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((
+                Array1::from_vec(indexers).into_pyarray(py),
+                Array1::from_vec(result).into_pyarray(py),
+            ))
         }
     };
 }
