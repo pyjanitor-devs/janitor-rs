@@ -212,7 +212,7 @@ pub fn compute_size_rev_start_matches<'py>(
         let mut seen = vec![false; width];
         let mut values = vec![0_i64; width];
         for start in starts.iter() {
-            let Some(start_) = checked_index(*start, index.len() + 1) else {
+            let Some((start_, _)) = checked_range(*start, end_ as i64, index.len()) else {
                 continue;
             };
             for item in start_..index.len() {
@@ -237,7 +237,7 @@ pub fn compute_size_rev_start_matches<'py>(
     }
     let mut dictionary: HashMap<usize, i64> = HashMap::with_capacity(width);
     for start in starts.into_iter() {
-        let Some(start_) = checked_index(*start, index.len() + 1) else {
+        let Some((start_, _)) = checked_range(*start, end_ as i64, index.len()) else {
             continue;
         };
         for item in start_..end_ {
