@@ -115,6 +115,22 @@ pub(crate) fn ensure_equal_lengths_core(
 /// best when at least half the shelves are visited. This keeps a huge sparse
 /// domain from triggering a huge dense allocation. The caller still owns the
 /// aggregation loop, so this helper only centralizes the dispatch policy.
+///
+/// For example:
+///
+/// * `domain_len = 1_000_000`, `covered_len = 8`: use sparse storage because
+///   only eight positions can be touched in a million-position domain.
+/// * `domain_len = 10_000`, `covered_len = 4_999`: use sparse storage because
+///   coverage is below half the domain.
+/// * `domain_len = 10_000`, `covered_len = 5_000`: use dense storage because
+///   coverage is exactly half the domain.
+/// * `domain_len = 10_000`, `covered_len = 10_000`: use dense storage because
+///   the entire domain can be touched.
+///
+/// `covered_len` is a prefix bound, not a count of distinct positions. Thus,
+/// `covered_len = 5_000` can still mean that only a few positions are actually
+/// touched; using this inexpensive bound avoids building another set solely to
+/// make the dispatch decision.
 pub(crate) fn should_use_dense_match_storage(domain_len: usize, covered_len: usize) -> bool {
     domain_len != 0 && covered_len.saturating_mul(2) >= domain_len
 }
