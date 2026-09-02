@@ -14,6 +14,7 @@ mod left_le_right;
 #[doc(hidden)]
 pub mod bench_support {
     use numpy::ndarray::ArrayView1;
+    use pyo3::prelude::*;
 
     pub use crate::aggs::max_rev::max_ends::max_rev_ends_core;
     pub use crate::aggs::max_rev::max_ends_matches::compute_max_rev_end_match_int64;
@@ -128,6 +129,13 @@ pub mod bench_support {
             booleans,
             |value| value,
         )
+    }
+
+    /// Build the fully registered Python module for wrapper benchmarks.
+    pub fn registered_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
+        let module = PyModule::new(py, "janitor_rs_bench")?;
+        super::janitor_rs(&module)?;
+        Ok(module)
     }
 }
 
