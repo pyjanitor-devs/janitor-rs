@@ -62,7 +62,11 @@ where
     }
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = Vec::new();
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
 
     if dense {
         let mut seen = vec![false; width];
@@ -152,7 +156,11 @@ where
     }
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = Vec::new();
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
 
     if dense {
         let mut seen = vec![false; width];
