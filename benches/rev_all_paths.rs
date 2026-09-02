@@ -44,6 +44,7 @@ struct Scenario {
     name: &'static str,
     mixed_nulls: bool,
     dead_matches: bool,
+    mixed_matches: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -116,10 +117,31 @@ fn numeric_calls<T: Element>(
             .collect::<Vec<_>>(),
     );
     let counts = array(py, vec![width as i64; rows]);
-    let match_value = if scenario.dead_matches { 0_i8 } else { 1_i8 };
-    let matches = array(py, vec![match_value; rows.saturating_mul(width)]);
+    let matches = array(
+        py,
+        (0..rows.saturating_mul(width))
+            .map(|item| {
+                if scenario.dead_matches || (scenario.mixed_matches && item % 2 == 0) {
+                    0_i8
+                } else {
+                    1_i8
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
     let start_counts = array(py, vec![domain as i64; rows]);
-    let start_matches = array(py, vec![match_value; rows.saturating_mul(domain)]);
+    let start_matches = array(
+        py,
+        (0..rows.saturating_mul(domain))
+            .map(|item| {
+                if scenario.dead_matches || (scenario.mixed_matches && item % 2 == 0) {
+                    0_i8
+                } else {
+                    1_i8
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
 
     let mut calls = Vec::with_capacity(FAMILIES.len() * NUMERIC_PATHS.len());
     for family in FAMILIES {
@@ -338,21 +360,31 @@ fn bench(c: &mut Criterion) {
                     name: "baseline",
                     mixed_nulls: false,
                     dead_matches: false,
+                    mixed_matches: false,
                 },
                 Scenario {
                     name: "mixed_nulls",
                     mixed_nulls: true,
                     dead_matches: false,
+                    mixed_matches: false,
                 },
                 Scenario {
                     name: "dead_matches",
                     mixed_nulls: false,
                     dead_matches: true,
+                    mixed_matches: false,
+                },
+                Scenario {
+                    name: "mixed_matches",
+                    mixed_nulls: false,
+                    dead_matches: false,
+                    mixed_matches: true,
                 },
                 Scenario {
                     name: "mixed_nulls_dead_matches",
                     mixed_nulls: true,
                     dead_matches: true,
+                    mixed_matches: false,
                 },
             ] {
                 for suffix in DTYPES {
