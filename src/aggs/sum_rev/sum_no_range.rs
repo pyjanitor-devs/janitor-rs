@@ -1,4 +1,4 @@
-use crate::aggs::checked_index;
+use crate::aggs::{checked_index, ensure_equal_lengths_core, ensure_nonempty_core};
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
@@ -10,16 +10,17 @@ fn validate_inputs<T>(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(), &'static str> {
-    if arr.len() != booleans.len() {
-        return Err("arr and booleans must have equal lengths");
-    }
-    if left_index.len() != right_index.len() {
-        return Err("left_index and right_index must have equal lengths");
-    }
-    if arr.is_empty() || left_index.is_empty() || right_index.is_empty() {
-        return Err("arr, left_index, and right_index cannot be empty");
-    }
+) -> Result<(), String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("left_index", left_index.len())?;
+    ensure_nonempty_core("right_index", right_index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_equal_lengths_core(
+        "left_index",
+        left_index.len(),
+        "right_index",
+        right_index.len(),
+    )?;
     Ok(())
 }
 
@@ -33,13 +34,15 @@ pub fn sum_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut to_i64: F,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+) -> Result<(Array1<i64>, Array1<i64>), String> {
     validate_inputs(arr, left_index, right_index, booleans)?;
     // ELI5: reserve the lookup table for the full join, but let output state
     // grow only as distinct labels appear; duplicate-heavy inputs should not
     // preallocate one result slot per matched row.
-    let capacity = right_index.len();
-    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
+    // The pair count can be much larger than the number of distinct labels:
+    // one right row may match many left rows. Let the map grow with the
+    // labels actually observed instead of reserving for every match upfront.
+    let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut totals = Vec::new();
 
@@ -75,10 +78,9 @@ pub fn sum_rev_no_range_u64_core(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(Array1<i64>, Array1<u64>), &'static str> {
+) -> Result<(Array1<i64>, Array1<u64>), String> {
     validate_inputs(arr, left_index, right_index, booleans)?;
-    let capacity = right_index.len();
-    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
+    let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut totals = Vec::new();
 
@@ -113,10 +115,9 @@ pub fn sum_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut to_f64: F,
-) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
+) -> Result<(Array1<i64>, Array1<f64>), String> {
     validate_inputs(arr, left_index, right_index, booleans)?;
-    let capacity = right_index.len();
-    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
+    let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut values = Vec::new();
 

@@ -2,27 +2,9 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::checked_index;
+use crate::aggs::{checked_index, ensure_equal_lengths_core, ensure_nonempty_core};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-
-fn validate_inputs<T>(
-    arr: ArrayView1<'_, T>,
-    left_index: ArrayView1<'_, i64>,
-    right_index: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> Result<(), &'static str> {
-    if arr.len() != booleans.len() {
-        return Err("arr and booleans must have equal lengths");
-    }
-    if left_index.len() != right_index.len() {
-        return Err("left_index and right_index must have equal lengths");
-    }
-    if arr.is_empty() || left_index.is_empty() || right_index.is_empty() {
-        return Err("arr, left_index, and right_index cannot be empty");
-    }
-    Ok(())
-}
 
 /// Find the minimum contributing row position for each right-side label
 /// without range metadata. Null rows create labels but cannot win.
@@ -31,19 +13,30 @@ pub fn min_rev_no_range_core<T: Copy + PartialOrd>(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, left_index, right_index, booleans)?;
+) -> Result<(Array1<i64>, Array1<i64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("left_index", left_index.len())?;
+    ensure_nonempty_core("right_index", right_index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_equal_lengths_core(
+        "left_index",
+        left_index.len(),
+        "right_index",
+        right_index.len(),
+    )?;
     // ELI5: reserve the lookup table for the full join, but let output state
     // grow only as distinct labels appear; duplicate-heavy inputs should not
     // preallocate one result slot per matched row.
-    let mut slots = HashMap::<i64, usize>::with_capacity(right_index.len());
+    // A match pair is not necessarily a new label; repeated labels are the
+    // common many-to-one case. Grow only for labels that actually appear.
+    let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut positions = Vec::new();
     let mut values = Vec::new();
 
     for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
         let left = checked_index(*index_left, arr.len())
-            .ok_or("left_index must contain valid positions in arr")?;
+            .ok_or_else(|| "left_index must contain valid positions in arr".to_owned())?;
         let current = arr[left];
         let boolean = booleans[left];
         match slots.entry(*index_right) {

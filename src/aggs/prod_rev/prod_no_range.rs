@@ -2,27 +2,9 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::checked_index;
+use crate::aggs::{checked_index, ensure_equal_lengths_core, ensure_nonempty_core};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-
-fn validate_inputs<T>(
-    arr: ArrayView1<'_, T>,
-    left_index: ArrayView1<'_, i64>,
-    right_index: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> Result<(), &'static str> {
-    if arr.len() != booleans.len() {
-        return Err("arr and booleans must have equal lengths");
-    }
-    if left_index.len() != right_index.len() {
-        return Err("left_index and right_index must have equal lengths");
-    }
-    if arr.is_empty() || left_index.is_empty() || right_index.is_empty() {
-        return Err("arr, left_index, and right_index cannot be empty");
-    }
-    Ok(())
-}
 
 /// Multiply values grouped by right labels without range metadata.
 ///
@@ -38,12 +20,23 @@ pub fn prod_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut to_i64: F,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, left_index, right_index, booleans)?;
+) -> Result<(Array1<i64>, Array1<i64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("left_index", left_index.len())?;
+    ensure_nonempty_core("right_index", right_index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_equal_lengths_core(
+        "left_index",
+        left_index.len(),
+        "right_index",
+        right_index.len(),
+    )?;
     // ELI5: reserve the lookup table for the full join, but let output state
     // grow only as distinct labels appear; duplicate-heavy inputs should not
     // preallocate one result slot per matched row.
-    let mut slots = HashMap::<i64, usize>::with_capacity(right_index.len());
+    // Many matching pairs can belong to the same right-side label. Reserving
+    // from the pair count would allocate for duplicates that need no slot.
+    let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut products = Vec::new();
 
@@ -88,9 +81,18 @@ pub fn prod_rev_no_range_u64_core(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(Array1<i64>, Array1<u64>), &'static str> {
-    validate_inputs(arr, left_index, right_index, booleans)?;
-    let mut slots = HashMap::<i64, usize>::with_capacity(right_index.len());
+) -> Result<(Array1<i64>, Array1<u64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("left_index", left_index.len())?;
+    ensure_nonempty_core("right_index", right_index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_equal_lengths_core(
+        "left_index",
+        left_index.len(),
+        "right_index",
+        right_index.len(),
+    )?;
+    let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut products = Vec::new();
 
@@ -131,9 +133,18 @@ pub fn prod_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut to_f64: F,
-) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
-    validate_inputs(arr, left_index, right_index, booleans)?;
-    let mut slots = HashMap::<i64, usize>::with_capacity(right_index.len());
+) -> Result<(Array1<i64>, Array1<f64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("left_index", left_index.len())?;
+    ensure_nonempty_core("right_index", right_index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_equal_lengths_core(
+        "left_index",
+        left_index.len(),
+        "right_index",
+        right_index.len(),
+    )?;
+    let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut products = Vec::new();
 
