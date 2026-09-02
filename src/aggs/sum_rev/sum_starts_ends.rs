@@ -189,16 +189,16 @@ where
             };
             let current = *current;
             let boolean = *boolean;
+            if boolean {
+                continue;
+            }
+            let current = to_f64(current);
             for item in start..end {
                 let slot = item - min_start;
                 if !seen[slot] {
                     seen[slot] = true;
                     touched.push(slot);
                 }
-                if boolean {
-                    continue;
-                }
-                let current = to_f64(current);
                 let difference = current - slots[slot].1;
                 let increment = slots[slot].0 + difference;
                 slots[slot].1 = (increment - slots[slot].0) - difference;
@@ -226,16 +226,16 @@ where
         };
         let current = *current;
         let boolean = *boolean;
+        if boolean {
+            continue;
+        }
+        let current = to_f64(current);
         for item in start..end {
             let slot = item - min_start;
             let state = slots.entry(slot).or_insert_with(|| {
                 touched.push(slot);
                 (0.0, 0.0)
             });
-            if boolean {
-                continue;
-            }
-            let current = to_f64(current);
             let difference = current - state.1;
             let increment = state.0 + difference;
             state.1 = (increment - state.0) - difference;

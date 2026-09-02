@@ -203,15 +203,17 @@ where
             };
             let current = *current;
             let boolean = *boolean;
+            if boolean {
+                continue;
+            }
+            let current = to_f64(current);
             for item in start..end {
                 let slot = item - min_start;
                 if !seen[slot] {
                     seen[slot] = true;
                     touched.push(slot);
                 }
-                if !boolean {
-                    states[slot] *= to_f64(current);
-                }
+                states[slot] *= current;
             }
         }
         let mut labels = Vec::with_capacity(touched.len());
@@ -232,15 +234,17 @@ where
         };
         let current = *current;
         let boolean = *boolean;
+        if boolean {
+            continue;
+        }
+        let current = to_f64(current);
         for item in start..end {
             let slot = item - min_start;
             let product = states.entry(slot).or_insert_with(|| {
                 touched.push(slot);
                 1.0_f64
             });
-            if !boolean {
-                *product *= to_f64(current);
-            }
+            *product *= current;
         }
     }
     let mut labels = Vec::with_capacity(touched.len());
