@@ -68,6 +68,16 @@ pub fn min_positions_core<T: PartialOrd + Copy>(
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
+        /// Find the minimum contributing row position for each label reached
+        /// through the positional candidate tape.
+        ///
+        /// # Arguments
+        /// * `arr` - Left-side values; must not be empty.
+        /// * `starts` - Inclusive positional range starts.
+        /// * `ends` - Exclusive positional range ends.
+        /// * `index` - Right-side labels addressed by `positions`.
+        /// * `positions` - Positional candidate tape.
+        /// * `booleans` - Null mask; `True` rows are ignored.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

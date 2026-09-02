@@ -121,6 +121,86 @@ fn production_size(input: &Input<'_>) -> Vec<(i64, i64)> {
     sort_pairs(labels.into_iter().zip(counts).collect())
 }
 
+enum OldSizeStorage {
+    Sparse(HashMap<usize, i64>),
+    Dense { seen: Vec<bool>, counts: Vec<i64> },
+}
+
+fn old_checked_range(start: i64, end: i64, len: usize) -> Option<(usize, usize)> {
+    let start = usize::try_from(start).ok()?;
+    let end = usize::try_from(end).ok()?;
+    (end <= len && start < end).then_some((start, end))
+}
+
+/// The pre-refactor generic range reducer specialized to counting.
+fn old_size(input: &Input<'_>) -> Vec<(i64, i64)> {
+    let mut storage = OldSizeStorage::Sparse(HashMap::new());
+    let mut touched = Vec::new();
+    for row in 0..input.starts.len() {
+        let Some((start, end)) = old_checked_range(
+            input.starts_i64[row],
+            input.ends_i64[row],
+            input.index.len(),
+        ) else {
+            continue;
+        };
+        for item in start..end {
+            match &mut storage {
+                OldSizeStorage::Dense { seen, counts } => {
+                    if !seen[item] {
+                        seen[item] = true;
+                        touched.push(item);
+                    }
+                    counts[item] += 1;
+                }
+                OldSizeStorage::Sparse(counts) => {
+                    let count = counts.entry(item).or_insert_with(|| {
+                        touched.push(item);
+                        0
+                    });
+                    *count += 1;
+                    if counts.len().saturating_mul(2) >= input.index.len() {
+                        let old = std::mem::replace(
+                            &mut storage,
+                            OldSizeStorage::Dense {
+                                seen: Vec::new(),
+                                counts: Vec::new(),
+                            },
+                        );
+                        let OldSizeStorage::Sparse(counts) = old else {
+                            unreachable!("storage changed while promoting");
+                        };
+                        let mut seen = vec![false; input.index.len()];
+                        let mut dense_counts = vec![0_i64; input.index.len()];
+                        for (item, count) in counts {
+                            seen[item] = true;
+                            dense_counts[item] = count;
+                        }
+                        storage = OldSizeStorage::Dense {
+                            seen,
+                            counts: dense_counts,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    let mut result = Vec::with_capacity(touched.len());
+    match storage {
+        OldSizeStorage::Dense { counts, .. } => {
+            for item in touched {
+                result.push((input.index[item], counts[item]));
+            }
+        }
+        OldSizeStorage::Sparse(counts) => {
+            for item in touched {
+                result.push((input.index[item], counts[&item]));
+            }
+        }
+    }
+    sort_pairs(result)
+}
+
 fn hash_sum(input: &Input<'_>) -> Vec<(i64, i64)> {
     let mut map = HashMap::with_capacity(input.index.len());
     for row in 0..input.values.len() {
@@ -409,6 +489,11 @@ fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("reverse_starts_ends_experiments");
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(1));
+    // The contiguous singleton case exercises dense storage because the union
+    // of the ranges spans the whole domain. The scattered and repeated-extreme
+    // cases deliberately keep few live positions while presenting broad spans
+    // or large summed widths. The validation-heavy case has no aggregation
+    // work, isolating the repeated range checks.
     for (name, rows, right_len, width, duplicate) in [
         ("tiny_narrow_unique", 32, 32, 4, false),
         ("tiny_narrow_unique_reversed", 32, 32, 4, false),
@@ -431,18 +516,54 @@ fn bench(c: &mut Criterion) {
             8,
             true,
         ),
+        ("scattered_sparse_unique", 200, 1_000_000, 1, false),
+        (
+            "validation_heavy_zero_width",
+            1_000_000,
+            1_000_000,
+            1,
+            false,
+        ),
+        ("sparse_repeated_extremes", 1_000_000, 1_000_000, 1, false),
+        (
+            "super_large_singleton_unique",
+            1_000_000,
+            1_000_000,
+            1,
+            false,
+        ),
         ("super_large_narrow_unique", 1_000_000, 1_000_000, 8, false),
     ] {
         let values = (0..rows)
             .map(|row| (row % 7 + 1) as i64)
             .collect::<Vec<_>>();
-        let starts = (0..rows)
-            .map(|row| row % (right_len - width + 1))
-            .collect::<Vec<_>>();
-        let ends = starts
-            .iter()
-            .map(|&start| start + width)
-            .collect::<Vec<_>>();
+        let starts = if name == "validation_heavy_zero_width" {
+            vec![0; rows]
+        } else if name == "scattered_sparse_unique" {
+            (0..rows)
+                .map(|row| row * (right_len - 1) / (rows - 1))
+                .collect::<Vec<_>>()
+        } else if name == "sparse_repeated_extremes" {
+            (0..rows)
+                .map(|row| if row < rows / 2 { 0 } else { right_len - 1 })
+                .collect::<Vec<_>>()
+        } else if name == "super_large_singleton_unique" {
+            (0..rows)
+                .map(|row| row * (right_len - 1) / (rows - 1))
+                .collect::<Vec<_>>()
+        } else {
+            (0..rows)
+                .map(|row| row % (right_len - width + 1))
+                .collect::<Vec<_>>()
+        };
+        let ends = if name == "validation_heavy_zero_width" {
+            vec![0; rows]
+        } else {
+            starts
+                .iter()
+                .map(|&start| start + width)
+                .collect::<Vec<_>>()
+        };
         let starts_i64 = starts.iter().map(|&value| value as i64).collect::<Vec<_>>();
         let ends_i64 = ends.iter().map(|&value| value as i64).collect::<Vec<_>>();
         let booleans = vec![false; rows];
@@ -517,13 +638,14 @@ fn bench(c: &mut Criterion) {
         );
         if !duplicate {
             eprintln!(
-                "{name}: production allocations sum {:?}, prod {:?}, float_sum {:?}, float_prod {:?}, min {:?}, max {:?}, size {:?}",
+                "{name}: production allocations sum {:?}, prod {:?}, float_sum {:?}, float_prod {:?}, min {:?}, max {:?}, old_size {:?}, size {:?}",
                 allocations(|| production_sum(&input)),
                 allocations(|| production_product(&input)),
                 allocations(|| production_float_sum(&float_input)),
                 allocations(|| production_float_product(&float_input)),
                 allocations(|| production_min(&input)),
                 allocations(|| production_max(&input)),
+                allocations(|| old_size(&input)),
                 allocations(|| production_size(&input)),
             );
         }
@@ -551,6 +673,9 @@ fn bench(c: &mut Criterion) {
             });
             group.bench_function(format!("max/production/{name}"), |b| {
                 b.iter(|| production_max(black_box(&input)))
+            });
+            group.bench_function(format!("size/old/{name}"), |b| {
+                b.iter(|| old_size(black_box(&input)))
             });
             group.bench_function(format!("size/production/{name}"), |b| {
                 b.iter(|| production_size(black_box(&input)))

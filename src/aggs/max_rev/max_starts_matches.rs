@@ -9,6 +9,17 @@ use crate::aggs::{
     should_use_dense_match_storage,
 };
 
+/// Finds the row containing the maximum value for each right-side label that
+/// survives the reverse suffix-range match tape.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each suffix range.
+/// * `counts` - Number of matching candidates for each row.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `matches` - Flat per-candidate match mask; must have the exact tape width.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn max_rev_start_match_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -20,6 +31,8 @@ pub fn max_rev_start_match_core<T: PartialOrd + Copy>(
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("matches", matches.len())?;
 
     let mut expected = 0_usize;
@@ -122,6 +135,15 @@ macro_rules! compute {
         /// scan the tape to enforce that value-level contract. Normally
         /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
         /// full candidate-tape width.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each suffix range.
+        /// * `counts` - Number of matching candidates for each row.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `matches` - Flat per-candidate match mask.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -183,4 +205,52 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_max_rev_start_match_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_max_rev_start_match_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::max_rev_start_match_core;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn all_null_rows_emit_labels_without_winners() {
+        let got = max_rev_start_match_core(
+            array![3_i64, 5].view(),
+            array![0_i64, 1].view(),
+            array![2_i64, 1].view(),
+            array![10_i64, 20].view(),
+            array![1_i8, 1, 1].view(),
+            array![true, true].view(),
+        );
+
+        assert_eq!(got, Ok((vec![10, 20], vec![-1, -1])));
+    }
+
+    #[test]
+    fn zero_count_row_does_not_shift_the_following_tape_row() {
+        let got = max_rev_start_match_core(
+            array![2_i64, 3].view(),
+            array![0_i64, 1].view(),
+            array![0_i64, 1].view(),
+            array![10_i64, 20].view(),
+            array![0_i8, 0, 1].view(),
+            array![false, false].view(),
+        );
+
+        assert_eq!(got, Ok((vec![20], vec![1])));
+    }
+
+    #[test]
+    fn invalid_start_contributes_no_tape_entries() {
+        let got = max_rev_start_match_core(
+            array![2_i64, 3].view(),
+            array![-1_i64, 0].view(),
+            array![0_i64, 2].view(),
+            array![10_i64, 20].view(),
+            array![1_i8, 1].view(),
+            array![false, false].view(),
+        );
+
+        assert_eq!(got, Ok((vec![10, 20], vec![1, 1])));
+    }
 }

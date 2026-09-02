@@ -24,6 +24,8 @@ fn validate_inputs<T>(
     Ok(())
 }
 
+/// Find the maximum contributing row position for each right-side label
+/// without range metadata. Null rows create labels but cannot win.
 pub fn max_rev_no_range_core<T: Copy + PartialOrd>(
     arr: ArrayView1<'_, T>,
     left_index: ArrayView1<'_, i64>,
@@ -70,6 +72,17 @@ pub fn max_rev_no_range_core<T: Copy + PartialOrd>(
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
+        /// Find the maximum contributing row position for each right-side
+        /// label without range metadata.
+        ///
+        /// `arr`, `left_index`, and `right_index` must not be empty. Null
+        /// rows create labels but cannot win the maximum.
+        ///
+        /// # Arguments
+        /// * `arr` - Left-side values.
+        /// * `left_index` - Positions into `arr`.
+        /// * `right_index` - Output label for each joined row.
+        /// * `booleans` - Null mask; `True` rows are ignored.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

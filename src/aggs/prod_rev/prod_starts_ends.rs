@@ -1,32 +1,13 @@
+use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+use std::collections::HashMap;
 
 use crate::aggs::{
-    ensure_equal_lengths, materialize_labels, range_reduce, range_reduce_with_row_value, WrapMul,
+    checked_range, ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core,
+    should_use_dense_match_storage, WrapMul,
 };
-
-fn validate_inputs<T>(
-    arr: ArrayView1<'_, T>,
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> Result<(), &'static str> {
-    if starts.len() != ends.len() {
-        return Err("starts and ends must have equal lengths");
-    }
-    if arr.len() != starts.len() {
-        return Err("arr, starts, and ends must have equal lengths");
-    }
-    if arr.len() != booleans.len() {
-        return Err("arr and booleans must have equal lengths");
-    }
-    if arr.is_empty() || index.is_empty() {
-        return Err("arr, starts, booleans, and index cannot be empty");
-    }
-    Ok(())
-}
 
 /// Multiply values into one state slot per right-row ordinal.
 ///
@@ -36,9 +17,11 @@ fn validate_inputs<T>(
 /// `item`, the ordinal position in `index`, is the state slot; `index[item]`
 /// is the output label. `starts` and `ends` describe half-open ranges
 /// `[start, end)`. Invalid or zero-width ranges are skipped by `checked_range`,
-/// and empty input arrays are rejected.
+/// and `arr`/`index` must not be empty.
 ///
 /// # Preconditions
+///
+/// `arr` and `index` cannot be empty.
 ///
 /// `index` must contain unique labels in positional order. pyjanitor provides
 /// this by normalizing the right side to `range(len(right))`; direct callers
@@ -53,6 +36,14 @@ fn validate_inputs<T>(
 /// ELI5: every right-row position gets a numbered drawer containing its
 /// product. The printed row identity may be 42, 7, or 100; the drawer number
 /// is its position on the shelf, not the printed identity.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each interval.
+/// * `ends` - Exclusive ordinal end of each interval.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn prod_rev_start_end_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -60,23 +51,104 @@ pub fn prod_rev_start_end_int_core<T, A, F>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut convert: F,
-) -> Result<(Array1<i64>, Array1<A>), &'static str>
+) -> Result<(Vec<i64>, Vec<A>), String>
 where
     T: Copy,
     A: WrapMul,
     F: FnMut(T) -> A,
 {
-    validate_inputs(arr, starts, ends, index, booleans)?;
-    let (touched, products) =
-        range_reduce(starts, ends, index.len(), A::ONE, |row, _item, product| {
-            if !booleans[row] {
-                *product = product.wrap_mul(convert(arr[row]));
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+
+    let mut min_start = index.len();
+    let mut max_end = 0_usize;
+    let mut total_width = 0_usize;
+    for (start, end) in starts.iter().zip(ends.iter()) {
+        if let Some((start, end)) = checked_range(*start, *end, index.len()) {
+            min_start = min_start.min(start);
+            max_end = max_end.max(end);
+            total_width = total_width.saturating_add(end - start);
+        }
+    }
+    let width = max_end.saturating_sub(min_start);
+    let dense = should_use_dense_match_storage(index.len(), total_width);
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
+    if dense {
+        let mut seen = vec![false; width];
+        let mut states = vec![A::ONE; width];
+        for (current, (start, end), boolean) in
+            izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter())
+        {
+            let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+                continue;
+            };
+            let current = *current;
+            let boolean = *boolean;
+            for item in start..end {
+                let slot = item - min_start;
+                if !seen[slot] {
+                    seen[slot] = true;
+                    touched.push(slot);
+                }
+                if !boolean {
+                    states[slot] = states[slot].wrap_mul(convert(current));
+                }
             }
-        });
-    let labels = materialize_labels(&touched, index);
-    Ok((labels, Array1::from_vec(products)))
+        }
+        let mut result = Vec::with_capacity(touched.len());
+        let mut labels = Vec::with_capacity(touched.len());
+        for slot in touched {
+            result.push(states[slot]);
+            labels.push(index[min_start + slot]);
+        }
+        return Ok((labels, result));
+    }
+
+    let mut states: HashMap<usize, A> = HashMap::new();
+    for (current, (start, end), boolean) in
+        izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter())
+    {
+        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+            continue;
+        };
+        let current = *current;
+        let boolean = *boolean;
+        for item in start..end {
+            let slot = item - min_start;
+            let product = states.entry(slot).or_insert_with(|| {
+                touched.push(slot);
+                A::ONE
+            });
+            if !boolean {
+                *product = product.wrap_mul(convert(current));
+            }
+        }
+    }
+    let mut result = Vec::with_capacity(touched.len());
+    let mut labels = Vec::with_capacity(touched.len());
+    for slot in touched {
+        result.push(states[&slot]);
+        labels.push(index[min_start + slot]);
+    }
+    Ok((labels, result))
 }
 
+/// Multiply floating-point values into each compact interval slot.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each interval.
+/// * `ends` - Exclusive ordinal end of each interval.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn prod_rev_start_end_float_core<T, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -84,12 +156,16 @@ pub fn prod_rev_start_end_float_core<T, F>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut to_f64: F,
-) -> Result<(Array1<i64>, Array1<f64>), &'static str>
+) -> Result<(Vec<i64>, Vec<f64>), String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    validate_inputs(arr, starts, ends, index, booleans)?;
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     // Integer products use `WrapMul` because integer overflow is intentionally
     // modular in the reverse kernels. Floating-point multiplication follows
     // IEEE-754 instead: overflow yields signed infinity, and invalid cases
@@ -99,29 +175,97 @@ where
     //
     // ELI5: integer arithmetic goes around a fixed-size loop; float arithmetic
     // can leave the loop and say “infinity” or “not a number.”
-    // Prepare the conversion once per row, then reuse it for every item while
-    // retaining the shared reducer's sparse/dense ordinal storage.
-    let (touched, products) = range_reduce_with_row_value(
-        starts,
-        ends,
-        index.len(),
-        1.0_f64,
-        |row| (!booleans[row]).then(|| to_f64(arr[row])),
-        |_row, _item, current, product| {
-            if let Some(current) = *current {
+    let mut min_start = index.len();
+    let mut max_end = 0_usize;
+    let mut total_width = 0_usize;
+    for (start, end) in starts.iter().zip(ends.iter()) {
+        if let Some((start, end)) = checked_range(*start, *end, index.len()) {
+            min_start = min_start.min(start);
+            max_end = max_end.max(end);
+            total_width = total_width.saturating_add(end - start);
+        }
+    }
+    let width = max_end.saturating_sub(min_start);
+    let dense = should_use_dense_match_storage(index.len(), total_width);
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
+    if dense {
+        let mut seen = vec![false; width];
+        let mut states = vec![1.0_f64; width];
+        for (current, (start, end), boolean) in
+            izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter())
+        {
+            let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+                continue;
+            };
+            let current = *current;
+            let boolean = *boolean;
+            let current = if boolean { None } else { Some(to_f64(current)) };
+            for item in start..end {
+                let slot = item - min_start;
+                if !seen[slot] {
+                    seen[slot] = true;
+                    touched.push(slot);
+                }
+                if let Some(current) = current {
+                    states[slot] *= current;
+                }
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut result = Vec::with_capacity(touched.len());
+        for slot in touched {
+            labels.push(index[min_start + slot]);
+            result.push(states[slot]);
+        }
+        return Ok((labels, result));
+    }
+
+    let mut states: HashMap<usize, f64> = HashMap::new();
+    for (current, (start, end), boolean) in
+        izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter())
+    {
+        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+            continue;
+        };
+        let current = *current;
+        let boolean = *boolean;
+        let current = if boolean { None } else { Some(to_f64(current)) };
+        for item in start..end {
+            let slot = item - min_start;
+            let product = states.entry(slot).or_insert_with(|| {
+                touched.push(slot);
+                1.0_f64
+            });
+            if let Some(current) = current {
                 *product *= current;
             }
-        },
-    );
-    let labels = materialize_labels(&touched, index);
-    Ok((labels, Array1::from_vec(products)))
+        }
+    }
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut result = Vec::with_capacity(touched.len());
+    for slot in touched {
+        labels.push(index[min_start + slot]);
+        result.push(states[&slot]);
+    }
+    Ok((labels, result))
 }
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
-        /// `index` must be a unique positional domain. pyjanitor supplies a
-        /// normalized `range(len(right))`; direct callers must provide it.
-        /// This correctness precondition is unchecked to avoid an extra pass.
+        /// Finds products for each right-side label covered by reverse interval
+        /// ranges.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each interval.
+        /// * `ends` - Exclusive ordinal end of each interval.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -143,16 +287,26 @@ macro_rules! compute_ints {
                 value as $acc
             })
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            Ok((result.0.into_pyarray(py), result.1.into_pyarray(py)))
+            Ok((
+                Array1::from_vec(result.0).into_pyarray(py),
+                Array1::from_vec(result.1).into_pyarray(py),
+            ))
         }
     };
 }
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
-        /// `index` must be a unique positional domain. pyjanitor supplies a
-        /// normalized `range(len(right))`; direct callers must provide it.
-        /// This correctness precondition is unchecked to avoid an extra pass.
+        /// Finds floating-point products for each right-side label covered by
+        /// reverse interval ranges.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each interval.
+        /// * `ends` - Exclusive ordinal end of each interval.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -175,7 +329,10 @@ macro_rules! compute_floats {
                     value as f64
                 })
                 .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            Ok((result.0.into_pyarray(py), result.1.into_pyarray(py)))
+            Ok((
+                Array1::from_vec(result.0).into_pyarray(py),
+                Array1::from_vec(result.1).into_pyarray(py),
+            ))
         }
     };
 }
@@ -223,7 +380,7 @@ mod tests {
             array![false].view(),
             |v: u64| v,
         );
-        assert_eq!(got, Ok((array![10], array![value])));
+        assert_eq!(got, Ok((vec![10], vec![value])));
     }
 
     #[test]
@@ -236,7 +393,7 @@ mod tests {
             array![false, false, false].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![42, 7, 100], array![8, 6, 3])));
+        assert_eq!(got, Ok((vec![42, 7, 100], vec![8, 6, 3])));
     }
 
     #[test]
@@ -250,7 +407,7 @@ mod tests {
             |value| value,
         );
         // Ordinal slots are independent; duplicate labels are not merged.
-        assert_eq!(got, Ok((array![10, 20, 10], array![8, 6, 3])));
+        assert_eq!(got, Ok((vec![10, 20, 10], vec![8, 6, 3])));
     }
 
     #[test]
@@ -263,7 +420,7 @@ mod tests {
             array![true].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![10, 20], array![1, 1])));
+        assert_eq!(got, Ok((vec![10, 20], vec![1, 1])));
     }
 
     #[test]
@@ -276,7 +433,7 @@ mod tests {
             array![false, false, false].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![], array![])));
+        assert_eq!(got, Ok((vec![], vec![])));
     }
 
     #[test]
@@ -299,5 +456,56 @@ mod tests {
             |value: i64| value,
         )
         .is_err());
+        assert!(prod_rev_start_end_int_core(
+            array![1_i64].view(),
+            array![0_i64].view(),
+            array![1_i64].view(),
+            array![].view(),
+            array![false].view(),
+            |value: i64| value,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn float_null_row_still_emits_its_label_with_one() {
+        let got = prod_rev_start_end_float_core(
+            array![5.0_f64].view(),
+            array![0_i64].view(),
+            array![1_i64].view(),
+            array![10_i64].view(),
+            array![true].view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![10], vec![1.0]));
+    }
+
+    #[test]
+    fn float_null_rows_emit_disjoint_labels_with_one() {
+        let got = prod_rev_start_end_float_core(
+            array![5.0_f64, 7.0].view(),
+            array![0_i64, 2].view(),
+            array![1_i64, 3].view(),
+            array![10_i64, 20, 30].view(),
+            array![true, true].view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![10, 30], vec![1.0, 1.0]));
+    }
+
+    #[test]
+    fn float_mixed_rows_preserve_null_only_labels() {
+        let got = prod_rev_start_end_float_core(
+            array![2.0_f64, 5.0].view(),
+            array![0_i64, 1].view(),
+            array![1_i64, 2].view(),
+            array![10_i64, 20].view(),
+            array![false, true].view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![10, 20], vec![2.0, 1.0]));
     }
 }

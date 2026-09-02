@@ -14,6 +14,15 @@ use crate::aggs::{
 /// `index[item]` is the label returned to Python; `item` is the state key.
 /// Pyjanitor normalizes the right index to unique labels, but those labels are
 /// not required to equal their positions or form a contiguous integer range.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `ends` - Exclusive ordinal end of each prefix range.
+/// * `counts` - Number of matching candidates for each row.
+/// * `matches` - Flat per-candidate match mask; must have the exact tape width.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn max_rev_end_match_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     index: ArrayView1<'_, i64>,
@@ -25,6 +34,8 @@ pub fn max_rev_end_match_core<T: PartialOrd + Copy>(
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("matches", matches.len())?;
 
     let mut expected_matches_width = 0_usize;
@@ -123,6 +134,15 @@ macro_rules! compute {
         /// scan the tape to enforce that value-level contract. Normally
         /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
         /// full candidate-tape width.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `ends` - Exclusive ordinal end of each prefix range.
+        /// * `counts` - Number of matching candidates for each row.
+        /// * `matches` - Flat per-candidate match mask.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

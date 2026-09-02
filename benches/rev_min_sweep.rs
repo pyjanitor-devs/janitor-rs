@@ -13,7 +13,7 @@ fn old_starts(
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> (Array1<i64>, Array1<i64>) {
+) -> (Vec<i64>, Vec<i64>) {
     assert_eq!(arr.len(), starts.len());
     assert_eq!(arr.len(), booleans.len());
     assert!(!arr.is_empty() && !index.is_empty());
@@ -39,7 +39,7 @@ fn old_starts(
         }
     }
     let indexers = (min_start..index.len()).map(|item| index[item]).collect();
-    (indexers, Array1::from_vec(positions))
+    (indexers, positions)
 }
 
 fn old_ends(
@@ -47,7 +47,7 @@ fn old_ends(
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> (Array1<i64>, Array1<i64>) {
+) -> (Vec<i64>, Vec<i64>) {
     assert_eq!(arr.len(), ends.len());
     assert_eq!(arr.len(), booleans.len());
     assert!(!arr.is_empty() && !index.is_empty());
@@ -69,7 +69,7 @@ fn old_ends(
         }
     }
     let indexers = (0..max_end).map(|item| index[item]).collect();
-    (indexers, Array1::from_vec(positions))
+    (indexers, positions)
 }
 
 fn bench(c: &mut Criterion) {

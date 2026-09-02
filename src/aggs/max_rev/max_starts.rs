@@ -1,66 +1,81 @@
 use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
-use numpy::{PyArray1, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{
-    ensure_equal_lengths_core, into_starts_ends_result, should_sweep, starts_domain, starts_labels,
-    sweep_winner,
-};
+use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core, starts_domain};
 
 /// Groups reverse-maximum starts by compact candidate ordinal.
 /// ELI5: all suffixes share a contiguous union, so one slot per ordinal replaces the HashMaps.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each suffix range.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn max_rev_starts_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(Array1<i64>, Array1<i64>), String> {
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
 
-    if !should_sweep(arr.len(), width, std::mem::size_of::<T>()) {
-        let mut values = vec![arr[0]; width];
-        let mut positions = vec![-1_i64; width];
-        for (row, (current, start, boolean)) in
-            izip!(arr.iter(), starts.iter(), booleans.iter()).enumerate()
-        {
-            if *boolean {
-                continue;
-            }
-            // Example: with `min_start = 2` and `start = 5`, the compact
-            // output begins at offset `5 - 2 = 3`. Skipping three paired
-            // slots means this row updates positions 5 through the suffix
-            // end, while `positions` and `values` stay aligned.
-            for (position, value) in positions
-                .iter_mut()
-                .zip(values.iter_mut())
-                .skip(*start as usize - min_start)
-            {
-                if *position == -1 || *current > *value {
-                    *position = row as i64;
-                    *value = *current;
-                }
-            }
+    // ELI5: rows become eligible at their start boundary. Keep the best row
+    // for each boundary, then sweep those boundary winners across the suffixes
+    // once instead of revisiting every suffix position for every row.
+    let mut values = vec![arr[0]; width];
+    let mut positions = vec![-1_i64; width];
+    for (row, (current, start, boolean)) in
+        izip!(arr.iter(), starts.iter(), booleans.iter()).enumerate()
+    {
+        if *boolean || *start == index.len() as i64 {
+            continue;
         }
-        return Ok((starts_labels(min_start, index), Array1::from_vec(positions)));
+        let slot = *start as usize - min_start;
+        if positions[slot] == -1 || *current > values[slot] {
+            positions[slot] = row as i64;
+            values[slot] = *current;
+        }
     }
 
-    let positions = sweep_winner(
-        arr,
-        booleans,
-        width,
-        |row| starts[row] as usize - min_start,
-        |position| position,
-        0..width,
-        |current, winner| current > winner,
-    );
-    Ok((starts_labels(min_start, index), positions))
+    let mut winner = -1_i64;
+    let mut winner_value = arr[0];
+    for slot in 0..width {
+        if positions[slot] != -1
+            && (winner == -1
+                || values[slot] > winner_value
+                || (values[slot] == winner_value && positions[slot] < winner))
+        {
+            winner = positions[slot];
+            winner_value = values[slot];
+        }
+        positions[slot] = winner;
+    }
+    let labels = index.iter().skip(min_start).copied().collect();
+    Ok((labels, positions))
 }
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
+        /// Finds the row containing the maximum value for each right-side
+        /// label covered by the reverse suffix ranges.
+        ///
+        /// Null rows, identified by `booleans`, do not participate in the
+        /// maximum. The returned positions use `-1` when no non-null row
+        /// covers a label.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each suffix range.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -69,15 +84,17 @@ macro_rules! compute {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
-            into_starts_ends_result(
-                py,
-                max_rev_starts_core(
-                    arr.as_array(),
-                    starts.as_array(),
-                    index.as_array(),
-                    booleans.as_array(),
-                ),
+            let (labels, positions) = max_rev_starts_core(
+                arr.as_array(),
+                starts.as_array(),
+                index.as_array(),
+                booleans.as_array(),
             )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((
+                Array1::from_vec(labels).into_pyarray(py),
+                Array1::from_vec(positions).into_pyarray(py),
+            ))
         }
     };
 }
@@ -119,7 +136,7 @@ mod tests {
             array![50_i64, 10, 90].view(),
             array![false, false, false].view(),
         );
-        assert_eq!(got, Ok((array![50, 10, 90], array![1, 0, 0])));
+        assert_eq!(got, Ok((vec![50, 10, 90], vec![1, 0, 0])));
     }
     #[test]
     fn rejects_invalid_inputs() {
@@ -143,7 +160,7 @@ mod tests {
         booleans[99] = true;
         let got = max_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
         let (labels, positions) = got.unwrap();
-        assert_eq!(labels, index);
+        assert_eq!(labels, index.to_vec());
         assert!(positions.iter().all(|position| *position == 1));
     }
 
@@ -160,9 +177,10 @@ mod tests {
         booleans[2] = false;
         booleans[18] = false;
         let got = max_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
-        let expected =
-            Array1::from_iter((0..20).map(|position| if position == 19 { 2 } else { 18 }));
-        assert_eq!(got, Ok((Array1::from_iter(0..20_i64), expected)));
+        let expected: Vec<i64> = (0..20)
+            .map(|position| if position == 19 { 2 } else { 18 })
+            .collect();
+        assert_eq!(got, Ok((index.to_vec(), expected)));
     }
 
     #[test]
@@ -192,7 +210,7 @@ mod tests {
 
         let (labels, positions) =
             max_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view()).unwrap();
-        assert_eq!(labels, index);
-        assert_eq!(positions, Array1::from_vec(expected));
+        assert_eq!(labels, index.to_vec());
+        assert_eq!(positions, expected);
     }
 }

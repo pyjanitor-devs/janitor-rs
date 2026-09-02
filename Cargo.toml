@@ -78,3 +78,7 @@ harness = false
 [[bench]]
 name = "production_match_compare"
 harness = false
+
+[[bench]]
+name = "rev_all_paths"
+harness = false

@@ -13,7 +13,8 @@ mod left_le_right;
 /// hundreds of Python wrappers.
 #[doc(hidden)]
 pub mod bench_support {
-    use numpy::ndarray::{Array1, ArrayView1};
+    use numpy::ndarray::ArrayView1;
+    use pyo3::prelude::*;
 
     pub use crate::aggs::max_rev::max_ends::max_rev_ends_core;
     pub use crate::aggs::max_rev::max_ends_matches::compute_max_rev_end_match_int64;
@@ -68,7 +69,7 @@ pub mod bench_support {
         ends: ArrayView1<'_, i64>,
         index: ArrayView1<'_, i64>,
         booleans: ArrayView1<'_, bool>,
-    ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+    ) -> Result<(Vec<i64>, Vec<i64>), String> {
         crate::aggs::sum_rev::sum_starts_ends::sum_rev_start_end_int_core(
             arr,
             starts,
@@ -85,7 +86,7 @@ pub mod bench_support {
         ends: ArrayView1<'_, i64>,
         index: ArrayView1<'_, i64>,
         booleans: ArrayView1<'_, bool>,
-    ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
+    ) -> Result<(Vec<i64>, Vec<f64>), String> {
         crate::aggs::sum_rev::sum_starts_ends::sum_rev_start_end_float_core(
             arr,
             starts,
@@ -102,7 +103,7 @@ pub mod bench_support {
         ends: ArrayView1<'_, i64>,
         index: ArrayView1<'_, i64>,
         booleans: ArrayView1<'_, bool>,
-    ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+    ) -> Result<(Vec<i64>, Vec<i64>), String> {
         crate::aggs::prod_rev::prod_starts_ends::prod_rev_start_end_int_core(
             arr,
             starts,
@@ -119,7 +120,7 @@ pub mod bench_support {
         ends: ArrayView1<'_, i64>,
         index: ArrayView1<'_, i64>,
         booleans: ArrayView1<'_, bool>,
-    ) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
+    ) -> Result<(Vec<i64>, Vec<f64>), String> {
         crate::aggs::prod_rev::prod_starts_ends::prod_rev_start_end_float_core(
             arr,
             starts,
@@ -128,6 +129,13 @@ pub mod bench_support {
             booleans,
             |value| value,
         )
+    }
+
+    /// Build the fully registered Python module for wrapper benchmarks.
+    pub fn registered_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
+        let module = PyModule::new(py, "janitor_rs_bench")?;
+        super::janitor_rs(&module)?;
+        Ok(module)
     }
 }
 

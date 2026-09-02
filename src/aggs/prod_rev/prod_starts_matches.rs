@@ -15,6 +15,15 @@ use crate::aggs::{
 /// the end of `index`. The flat `matches` tape removes candidates that failed
 /// later predicates. We keep state by positional ordinal and translate those
 /// ordinals through `index` only when emitting the result.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each suffix range.
+/// * `counts` - Number of surviving candidates for each row.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `matches` - Flat match mask with the exact candidate-tape width.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 fn prod_rev_start_match_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -33,6 +42,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut min_start = index.len();
@@ -109,6 +119,16 @@ where
     Ok((labels, values))
 }
 
+/// Multiply floating-point values for labels surviving a reverse suffix tape.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each suffix range.
+/// * `counts` - Number of surviving candidates for each row.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `matches` - Flat match mask with the exact candidate-tape width.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 fn prod_rev_start_match_float_core<T, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -126,6 +146,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut min_start = index.len();
@@ -204,10 +225,16 @@ where
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
-        /// `matches` must contain exactly one entry for every candidate
-        /// position. pyjanitor supplies the tape and the aligned row arrays.
-        /// The `uint64` specialization uses a `u64` accumulator so values at
-        /// or above `i64::MAX` are not sign-flipped.
+        /// Finds products for labels surviving the reverse suffix match tape.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each suffix range.
+        /// * `counts` - Number of surviving candidates for each row.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `matches` - Flat match mask with the exact candidate-tape width.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -244,8 +271,17 @@ compute_ints!(compute_prod_rev_start_match_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
-        /// `matches` must contain exactly one entry for every candidate
-        /// position. pyjanitor supplies the tape and the aligned row arrays.
+        /// Finds floating-point products for labels surviving the reverse
+        /// suffix match tape.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each suffix range.
+        /// * `counts` - Number of surviving candidates for each row.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `matches` - Flat match mask with the exact candidate-tape width.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -290,7 +326,11 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_prod_rev_start_match_int64, compute_prod_rev_start_match_uint64};
+    use super::{
+        compute_prod_rev_start_match_int64, compute_prod_rev_start_match_uint64,
+        prod_rev_start_match_int_core,
+    };
+    use numpy::ndarray::array;
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::Python;
 
@@ -402,5 +442,50 @@ mod tests {
             .unwrap();
             assert_eq!(values.readonly().as_slice().unwrap(), &[i64::MAX, 2]);
         });
+    }
+
+    #[test]
+    fn all_null_rows_emit_labels_with_multiplicative_identity() {
+        let got = prod_rev_start_match_int_core(
+            array![2_i64, 3].view(),
+            array![0_i64, 1].view(),
+            array![2_i64, 1].view(),
+            array![10_i64, 20].view(),
+            array![1_i8, 1, 1].view(),
+            array![true, true].view(),
+            |value| value,
+        );
+
+        assert_eq!(got, Ok((vec![10, 20], vec![1, 1])));
+    }
+
+    #[test]
+    fn zero_count_row_does_not_shift_the_following_tape_row() {
+        let got = prod_rev_start_match_int_core(
+            array![2_i64, 3].view(),
+            array![0_i64, 1].view(),
+            array![0_i64, 1].view(),
+            array![10_i64, 20].view(),
+            array![0_i8, 0, 1].view(),
+            array![false, false].view(),
+            |value| value,
+        );
+
+        assert_eq!(got, Ok((vec![20], vec![3])));
+    }
+
+    #[test]
+    fn invalid_start_contributes_no_tape_entries() {
+        let got = prod_rev_start_match_int_core(
+            array![2_i64, 3].view(),
+            array![-1_i64, 0].view(),
+            array![0_i64, 2].view(),
+            array![10_i64, 20].view(),
+            array![1_i8, 1].view(),
+            array![false, false].view(),
+            |value| value,
+        );
+
+        assert_eq!(got, Ok((vec![10, 20], vec![3, 3])));
     }
 }

@@ -1,32 +1,13 @@
-use numpy::ndarray::{Array1, ArrayView1};
+use itertools::izip;
+use numpy::ndarray::ArrayView1;
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+use std::collections::HashMap;
 
 use crate::aggs::{
-    ensure_equal_lengths, materialize_labels, range_reduce, range_reduce_with_row_value, WrapAdd,
+    checked_range, ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core,
+    should_use_dense_match_storage, WrapAdd,
 };
-
-fn validate_inputs<T>(
-    arr: ArrayView1<'_, T>,
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> Result<(), &'static str> {
-    if starts.len() != ends.len() {
-        return Err("starts and ends must have equal lengths");
-    }
-    if arr.len() != starts.len() {
-        return Err("arr, starts, and ends must have equal lengths");
-    }
-    if arr.len() != booleans.len() {
-        return Err("arr and booleans must have equal lengths");
-    }
-    if arr.is_empty() || index.is_empty() {
-        return Err("arr, starts, booleans, and index cannot be empty");
-    }
-    Ok(())
-}
 
 /// Sum values into one compact state slot for each distinct right-hand label.
 ///
@@ -40,15 +21,18 @@ fn validate_inputs<T>(
 /// shelf position as the drawer number, even when the printed labels have
 /// gaps, then print the original label from that drawer.
 ///
-/// Empty `arr`/`index` inputs are rejected. Invalid or zero-width ranges are
-/// skipped by `checked_range`, and valid ranges are half-open `[start, end)`.
+/// Invalid or zero-width ranges are skipped by `checked_range`, and valid
+/// ranges are half-open `[start, end)`.
 ///
 /// # Preconditions
 ///
+/// `arr` and `index` cannot be empty.
+///
 /// `index` must contain unique labels in positional order. This is not checked
-/// here: pyjanitor supplies a normalized `range(len(right))` index, while a
-/// direct caller is responsible for this correctness precondition. Duplicate
-/// labels are unsupported and are accumulated independently by ordinal.
+/// here: pyjanitor supplies unique right-side labels, while a direct caller is
+/// responsible for this correctness precondition. The array position is the
+/// ordinal state slot; label values need not be positional. Duplicate labels
+/// are unsupported and are accumulated independently by ordinal.
 /// `A` is the accumulator type: every integer dtype instantiates this with
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
 /// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
@@ -60,26 +44,99 @@ pub fn sum_rev_start_end_int_core<T, A, F>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut convert: F,
-) -> Result<(Array1<i64>, Array1<A>), &'static str>
+) -> Result<(Vec<i64>, Vec<A>), String>
 where
     T: Copy,
     A: WrapAdd,
     F: FnMut(T) -> A,
 {
-    validate_inputs(arr, starts, ends, index, booleans)?;
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    let mut min_start = index.len();
+    let mut max_end = 0_usize;
+    let mut total_width = 0_usize;
+    for (start, end) in starts.iter().zip(ends.iter()) {
+        if let Some((start, end)) = checked_range(*start, *end, index.len()) {
+            min_start = min_start.min(start);
+            max_end = max_end.max(end);
+            total_width = total_width.saturating_add(end - start);
+        }
+    }
+    let width = max_end.saturating_sub(min_start);
+    // ELI5: if the ranges collectively represent enough positional work,
+    // direct array indexing is cheaper than dictionary lookups. This value is
+    // only a dispatch estimate; `width` remains the actual dense allocation.
+    let dense = should_use_dense_match_storage(index.len(), total_width);
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
 
-    // ELI5: because each right row is unique, its position in `index` is
-    // already a perfect drawer number. Gaps in the identity values do not
-    // matter: `[7, 3, 11]` still has drawers `0`, `1`, and `2`.
-    let (touched, totals) =
-        range_reduce(starts, ends, index.len(), A::ZERO, |row, _item, total| {
-            if !booleans[row] {
-                *total = total.wrap_add(convert(arr[row]));
+    if dense {
+        let mut seen = vec![false; width];
+        let mut totals = vec![A::ZERO; width];
+        for (current, (start, end), boolean) in
+            izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter())
+        {
+            let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+                continue;
+            };
+            let current = *current;
+            let boolean = *boolean;
+            for item in start..end {
+                // `min_start` is the smallest validated start, so every
+                // valid item is at least it. This subtraction therefore maps
+                // an absolute position into the compact array safely.
+                let slot = item - min_start;
+                if !seen[slot] {
+                    seen[slot] = true;
+                    touched.push(slot);
+                }
+                if !boolean {
+                    totals[slot] = totals[slot].wrap_add(convert(current));
+                }
             }
-        });
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut values = Vec::with_capacity(touched.len());
+        for slot in touched {
+            labels.push(index[min_start + slot]);
+            values.push(totals[slot]);
+        }
+        return Ok((labels, values));
+    }
 
-    let labels = materialize_labels(&touched, index);
-    Ok((labels, Array1::from_vec(totals)))
+    let mut totals: HashMap<usize, A> = HashMap::new();
+    for (current, (start, end), boolean) in
+        izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter())
+    {
+        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+            continue;
+        };
+        let current = *current;
+        let boolean = *boolean;
+        for item in start..end {
+            let slot = item - min_start;
+            let total = totals.entry(slot).or_insert_with(|| {
+                touched.push(slot);
+                A::ZERO
+            });
+            if !boolean {
+                *total = total.wrap_add(convert(current));
+            }
+        }
+    }
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut values = Vec::with_capacity(touched.len());
+    for slot in touched {
+        labels.push(index[min_start + slot]);
+        values.push(totals[&slot]);
+    }
+    Ok((labels, values))
 }
 
 pub fn sum_rev_start_end_float_core<T, F>(
@@ -89,13 +146,13 @@ pub fn sum_rev_start_end_float_core<T, F>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut to_f64: F,
-) -> Result<(Array1<i64>, Array1<f64>), &'static str>
+) -> Result<(Vec<i64>, Vec<f64>), String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    validate_inputs(arr, starts, ends, index, booleans)?;
-
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     // Integer reverse sums use `WrapAdd` because the project defines their
     // overflow behavior as modular wrapping. Floats do not have an
     // equivalent wrapping operation: IEEE-754 addition deliberately produces
@@ -106,42 +163,114 @@ where
     // ELI5: an integer odometer rolls back to zero after its last digit; a
     // float thermometer goes to infinity (or becomes NaN) instead. They need
     // different arithmetic rules.
-    // Prepare the conversion once per row, then reuse the prepared value for
-    // every item in that row. The shared reducer still chooses sparse or dense
-    // ordinal storage based on the positions actually touched.
-    let (touched, totals) = range_reduce_with_row_value(
-        starts,
-        ends,
-        index.len(),
-        (0.0_f64, 0.0_f64),
-        |row| (!booleans[row]).then(|| to_f64(arr[row])),
-        |_row, _item, current, (total, compensation)| {
-            let Some(current) = *current else {
-                return;
-            };
-            let difference = current - *compensation;
-            let increment = *total + difference;
-            *compensation = (increment - *total) - difference;
-            // ELI5: compensation remembers tiny rounding crumbs. If an
-            // infinity makes that crumb NaN, discard the crumb so the actual
-            // infinity remains the result, matching pandas' summation rules.
-            if !compensation.is_finite() {
-                *compensation = 0.0;
-            }
-            *total = increment;
-        },
-    );
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    let mut min_start = index.len();
+    let mut max_end = 0_usize;
+    let mut total_width = 0_usize;
+    for (start, end) in starts.iter().zip(ends.iter()) {
+        if let Some((start, end)) = checked_range(*start, *end, index.len()) {
+            min_start = min_start.min(start);
+            max_end = max_end.max(end);
+            total_width = total_width.saturating_add(end - start);
+        }
+    }
+    let width = max_end.saturating_sub(min_start);
+    let dense = should_use_dense_match_storage(index.len(), total_width);
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
 
-    let labels = materialize_labels(&touched, index);
-    let totals = totals.into_iter().map(|(total, _)| total).collect();
-    Ok((labels, Array1::from_vec(totals)))
+    if dense {
+        let mut seen = vec![false; width];
+        let mut slots = vec![(0.0_f64, 0.0_f64); width];
+        for (current, (start, end), boolean) in
+            izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter())
+        {
+            let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+                continue;
+            };
+            let current = *current;
+            let boolean = *boolean;
+            let current = if boolean { None } else { Some(to_f64(current)) };
+            for item in start..end {
+                let slot = item - min_start;
+                if !seen[slot] {
+                    seen[slot] = true;
+                    touched.push(slot);
+                }
+                if let Some(current) = current {
+                    let difference = current - slots[slot].1;
+                    let increment = slots[slot].0 + difference;
+                    slots[slot].1 = (increment - slots[slot].0) - difference;
+                    // ELI5: compensation tracks the tiny rounding remainder.
+                    // Once arithmetic produces infinity or NaN, that
+                    // remainder is no longer meaningful, so discard it and
+                    // continue with the ordinary running total.
+                    if !slots[slot].1.is_finite() {
+                        slots[slot].1 = 0.0;
+                    }
+                    slots[slot].0 = increment;
+                }
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut values = Vec::with_capacity(touched.len());
+        for slot in touched {
+            labels.push(index[min_start + slot]);
+            values.push(slots[slot].0);
+        }
+        return Ok((labels, values));
+    }
+
+    let mut slots: HashMap<usize, (f64, f64)> = HashMap::new();
+    for (current, (start, end), boolean) in
+        izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter())
+    {
+        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+            continue;
+        };
+        let current = *current;
+        let boolean = *boolean;
+        let current = if boolean { None } else { Some(to_f64(current)) };
+        for item in start..end {
+            // `min_start` is the smallest validated start, so this unsigned
+            // subtraction cannot underflow while translating to a slot.
+            let slot = item - min_start;
+            let state = slots.entry(slot).or_insert_with(|| {
+                touched.push(slot);
+                (0.0, 0.0)
+            });
+            if let Some(current) = current {
+                let difference = current - state.1;
+                let increment = state.0 + difference;
+                state.1 = (increment - state.0) - difference;
+                // ELI5: after overflow or an invalid float operation, the
+                // compensation remainder is no longer usable. Reset it so a
+                // stale NaN/ infinity does not poison later updates.
+                if !state.1.is_finite() {
+                    state.1 = 0.0;
+                }
+                state.0 = increment;
+            }
+        }
+    }
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut values = Vec::with_capacity(touched.len());
+    for slot in touched {
+        labels.push(index[min_start + slot]);
+        values.push(slots[&slot].0);
+    }
+    Ok((labels, values))
 }
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
-        /// `index` must be a unique positional domain. pyjanitor supplies a
-        /// normalized `range(len(right))`; direct callers must provide it.
-        /// This correctness precondition is unchecked to avoid an extra pass.
+        /// `index` must contain unique labels. Positions in the array are the
+        /// ordinal state slots; direct callers must preserve that contract.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -184,9 +313,8 @@ compute_ints!(compute_sum_rev_start_end_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
-        /// `index` must be a unique positional domain. pyjanitor supplies a
-        /// normalized `range(len(right))`; direct callers must provide it.
-        /// This correctness precondition is unchecked to avoid an extra pass.
+        /// `index` must contain unique labels. Positions in the array are the
+        /// ordinal state slots; direct callers must preserve that contract.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -305,7 +433,7 @@ mod tests {
             array![false].view(),
             |v: u64| v,
         );
-        assert_eq!(got, Ok((array![10], array![value])));
+        assert_eq!(got, Ok((vec![10], vec![value])));
     }
 
     #[test]
@@ -318,7 +446,7 @@ mod tests {
             array![false, false, false].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![42, 7, 100], array![4, 3, 2])));
+        assert_eq!(got, Ok((vec![42, 7, 100], vec![4, 3, 2])));
     }
 
     #[test]
@@ -334,7 +462,7 @@ mod tests {
             array![false, false, false].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![10, 20, 10], array![4, 3, 2])));
+        assert_eq!(got, Ok((vec![10, 20, 10], vec![4, 3, 2])));
     }
 
     #[test]
@@ -347,7 +475,7 @@ mod tests {
             array![true].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![10, 20], array![0, 0])));
+        assert_eq!(got, Ok((vec![10, 20], vec![0, 0])));
     }
 
     #[test]
@@ -360,7 +488,7 @@ mod tests {
             array![false, false, false].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![], array![])));
+        assert_eq!(got, Ok((vec![], vec![])));
     }
 
     #[test]
@@ -385,6 +513,15 @@ mod tests {
             |value: i64| value,
         )
         .is_err());
+        assert!(sum_rev_start_end_int_core(
+            array![1_i64].view(),
+            array![0_i64].view(),
+            array![1_i64].view(),
+            array![].view(),
+            booleans.view(),
+            |value: i64| value,
+        )
+        .is_err());
     }
 
     #[test]
@@ -398,7 +535,49 @@ mod tests {
             |value| value,
         )
         .unwrap();
-        assert_eq!(got.0, array![10]);
+        assert_eq!(got.0, vec![10]);
         assert!((got.1[0] - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn float_null_row_still_emits_its_label_with_zero() {
+        let got = sum_rev_start_end_float_core(
+            array![5.0_f64].view(),
+            array![0_i64].view(),
+            array![1_i64].view(),
+            array![10_i64].view(),
+            array![true].view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![10], vec![0.0]));
+    }
+
+    #[test]
+    fn float_null_rows_emit_disjoint_labels_with_zero() {
+        let got = sum_rev_start_end_float_core(
+            array![5.0_f64, 7.0].view(),
+            array![0_i64, 2].view(),
+            array![1_i64, 3].view(),
+            array![10_i64, 20, 30].view(),
+            array![true, true].view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![10, 30], vec![0.0, 0.0]));
+    }
+
+    #[test]
+    fn float_mixed_rows_preserve_null_only_labels() {
+        let got = sum_rev_start_end_float_core(
+            array![2.0_f64, 5.0].view(),
+            array![0_i64, 1].view(),
+            array![1_i64, 2].view(),
+            array![10_i64, 20].view(),
+            array![false, true].view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![10, 20], vec![2.0, 0.0]));
     }
 }

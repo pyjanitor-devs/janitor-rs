@@ -9,6 +9,18 @@ use crate::aggs::{
 };
 use std::collections::HashMap;
 
+/// Finds the row containing the maximum value for each right-side label that
+/// survives the reverse interval-range match tape.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each interval.
+/// * `ends` - Exclusive ordinal end of each interval.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `counts` - Number of matching candidates for each row.
+/// * `matches` - Flat per-candidate match mask; must have the exact tape width.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn max_rev_start_end_match_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -22,6 +34,8 @@ pub fn max_rev_start_end_match_core<T: PartialOrd + Copy>(
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("matches", matches.len())?;
 
     let mut expected = 0_usize;
@@ -137,6 +151,16 @@ macro_rules! compute {
         /// scan the tape to enforce that value-level contract. Normally
         /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
         /// full candidate-tape width.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each interval.
+        /// * `ends` - Exclusive ordinal end of each interval.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `counts` - Number of matching candidates for each row.
+        /// * `matches` - Flat per-candidate match mask.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[allow(clippy::too_many_arguments)]
         #[pyfunction]
         pub fn $fname<'py>(

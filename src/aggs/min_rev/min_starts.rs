@@ -1,72 +1,84 @@
 use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
-use numpy::{PyArray1, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{
-    ensure_equal_lengths_core, into_starts_ends_result, should_sweep, starts_domain, starts_labels,
-    sweep_winner,
-};
+use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core, starts_domain};
 
 /// Groups reverse-minimum starts by compact candidate ordinal.
 ///
 /// ELI5: every suffix touches a contiguous tail of `index`, so one slot per
 /// position in the union of those tails replaces both key/value HashMaps.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each suffix range.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn min_rev_starts_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(Array1<i64>, Array1<i64>), String> {
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
 
-    if should_sweep(arr.len(), width, std::mem::size_of::<T>()) {
-        // ELI5: a suffix row becomes eligible when the sweep reaches its
-        // start. Bucket each row at that boundary, then compare it with the
-        // current champion only once. Equal values are explicitly resolved by
-        // the smallest input row index in `sweep_winner`, matching the direct
-        // path regardless of bucket traversal order.
-        let positions = sweep_winner(
-            arr,
-            booleans,
-            width,
-            |row| starts[row] as usize - min_start,
-            |position| position,
-            0..width,
-            |current, winner| current < winner,
-        );
-        return Ok((starts_labels(min_start, index), positions));
-    }
-
+    // ELI5: rows become eligible at their start boundary. Keep the best row
+    // for each boundary, then sweep those boundary winners across the suffixes
+    // once instead of revisiting every suffix position for every row.
     let mut values = vec![arr[0]; width];
     let mut positions = vec![-1_i64; width];
-
-    for (row, (current, start, boolean)) in izip!(arr, starts, booleans).enumerate() {
-        if *boolean {
+    for (row, (current, start, boolean)) in
+        izip!(arr.iter(), starts.iter(), booleans.iter()).enumerate()
+    {
+        if *boolean || *start == index.len() as i64 {
             continue;
         }
-        // Example: with `min_start = 2` and `start = 5`, the compact offset
-        // is `5 - 2 = 3`. Skipping three paired slots leaves this row's
-        // suffix, positions 5 onward, for the minimum comparison.
-        for (position, value) in positions
-            .iter_mut()
-            .zip(values.iter_mut())
-            .skip(*start as usize - min_start)
-        {
-            if *position == -1 || *current < *value {
-                *position = row as i64;
-                *value = *current;
-            }
+        let slot = *start as usize - min_start;
+        if positions[slot] == -1 || *current < values[slot] {
+            positions[slot] = row as i64;
+            values[slot] = *current;
         }
     }
 
-    Ok((starts_labels(min_start, index), Array1::from_vec(positions)))
+    let mut winner = -1_i64;
+    let mut winner_value = arr[0];
+    for slot in 0..width {
+        if positions[slot] != -1
+            && (winner == -1
+                || values[slot] < winner_value
+                || (values[slot] == winner_value && positions[slot] < winner))
+        {
+            winner = positions[slot];
+            winner_value = values[slot];
+        }
+        positions[slot] = winner;
+    }
+
+    let labels = index.iter().skip(min_start).copied().collect();
+    Ok((labels, positions))
 }
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
+        /// Finds the row containing the minimum value for each right-side
+        /// label covered by the reverse suffix ranges.
+        ///
+        /// Null rows, identified by `booleans`, do not participate in the
+        /// minimum. The returned positions use `-1` when no non-null row
+        /// covers a label.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each suffix range.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -75,15 +87,17 @@ macro_rules! compute {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
-            into_starts_ends_result(
-                py,
-                min_rev_starts_core(
-                    arr.as_array(),
-                    starts.as_array(),
-                    index.as_array(),
-                    booleans.as_array(),
-                ),
+            let (labels, positions) = min_rev_starts_core(
+                arr.as_array(),
+                starts.as_array(),
+                index.as_array(),
+                booleans.as_array(),
             )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((
+                Array1::from_vec(labels).into_pyarray(py),
+                Array1::from_vec(positions).into_pyarray(py),
+            ))
         }
     };
 }
@@ -125,7 +139,7 @@ mod tests {
         let index = array![50_i64, 10, 90];
         let booleans = array![false, false, false];
         let got = min_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
-        assert_eq!(got, Ok((array![50, 10, 90], array![1, 1, 1])));
+        assert_eq!(got, Ok((vec![50, 10, 90], vec![1, 1, 1])));
     }
 
     #[test]
@@ -135,7 +149,7 @@ mod tests {
         let index = array![10_i64, 20, 30];
         let booleans = array![true, false, true];
         let got = min_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
-        assert_eq!(got, Ok((array![10, 20, 30], array![-1, 1, 1])));
+        assert_eq!(got, Ok((vec![10, 20, 30], vec![-1, 1, 1])));
     }
 
     #[test]
@@ -151,7 +165,7 @@ mod tests {
         let got = min_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
         let expected =
             Array1::from_iter((0..20).map(|position| if position == 19 { 2 } else { 18 }));
-        assert_eq!(got, Ok((Array1::from_iter(0..20_i64), expected)));
+        assert_eq!(got, Ok((Vec::from_iter(0..20_i64), expected.to_vec())));
     }
 
     #[test]
@@ -168,7 +182,7 @@ mod tests {
         let got = min_rev_starts_core(arr.view(), starts.view(), index.view(), booleans.view());
         let expected =
             Array1::from_iter((0..20).map(|position| if position == 19 { 2 } else { -1 }));
-        assert_eq!(got, Ok((Array1::from_iter(0..20_i64), expected)));
+        assert_eq!(got, Ok((Vec::from_iter(0..20_i64), expected.to_vec())));
     }
 
     #[test]
@@ -183,7 +197,7 @@ mod tests {
                 index.view(),
                 booleans.view()
             ),
-            Ok((array![], array![]))
+            Ok((vec![], vec![]))
         );
         assert!(min_rev_starts_core(
             arr.view(),
