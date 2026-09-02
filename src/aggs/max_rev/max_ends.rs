@@ -28,7 +28,8 @@ pub fn max_rev_ends_core<T: PartialOrd + Copy>(
     // ELI5: rows become inactive after their end boundary. Keep the best row
     // for each final covered slot, then sweep right-to-left once so each
     // boundary event affects all earlier prefix positions.
-    let mut events: Vec<Option<(T, i64)>> = std::iter::repeat_with(|| None).take(max_end).collect();
+    let mut values = vec![arr[0]; max_end];
+    let mut positions = vec![-1_i64; max_end];
     for (row, (current, end, boolean)) in
         izip!(arr.iter(), ends.iter(), booleans.iter()).enumerate()
     {
@@ -36,35 +37,24 @@ pub fn max_rev_ends_core<T: PartialOrd + Copy>(
             continue;
         }
         let slot = *end as usize - 1;
-        let event = &mut events[slot];
-        let replaces = match event {
-            None => true,
-            Some((value, event_row)) => {
-                *current > *value || (*current == *value && (row as i64) < *event_row)
-            }
-        };
-        if replaces {
-            *event = Some((*current, row as i64));
+        if positions[slot] == -1 || *current > values[slot] {
+            positions[slot] = row as i64;
+            values[slot] = *current;
         }
     }
 
-    let mut winner = None;
-    let mut positions = vec![-1_i64; max_end];
-    for (position, event) in positions.iter_mut().rev().zip(events.into_iter().rev()) {
-        if let Some((current, row)) = event {
-            let replaces = match winner.as_ref() {
-                None => true,
-                Some((value, winner_row)) => {
-                    current > *value || (current == *value && row < *winner_row)
-                }
-            };
-            if replaces {
-                winner = Some((current, row));
-            }
+    let mut winner = -1_i64;
+    let mut winner_value = arr[0];
+    for slot in (0..max_end).rev() {
+        if positions[slot] != -1
+            && (winner == -1
+                || values[slot] > winner_value
+                || (values[slot] == winner_value && positions[slot] < winner))
+        {
+            winner = positions[slot];
+            winner_value = values[slot];
         }
-        if let Some((_, row)) = winner {
-            *position = row;
-        }
+        positions[slot] = winner;
     }
     let labels = index.iter().take(max_end).copied().collect();
     Ok((labels, positions))
