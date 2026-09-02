@@ -15,6 +15,16 @@ use std::collections::{hash_map::Entry, HashMap};
 /// type: every integer dtype instantiates this with `A = i64`, except
 /// `uint64`, which instantiates it with `A = u64` so values `>= 2**63`
 /// don't get sign-flipped by a forced `i64` cast (see `WrapMul`).
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive start of each positional range.
+/// * `ends` - Exclusive end of each positional range.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `positions` - Positional candidate tape mapping to `index`.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
+/// * `capacity` - Initial output capacity hint.
 #[allow(clippy::too_many_arguments)]
 pub fn prod_positions_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
@@ -72,6 +82,17 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Multiply floating-point values for each label reached through `positions`.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive start of each positional range.
+/// * `ends` - Exclusive end of each positional range.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `positions` - Positional candidate tape mapping to `index`.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
+/// * `capacity` - Initial output capacity hint.
 pub fn prod_positions_float_core<T, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -125,6 +146,18 @@ where
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
+        /// Finds products for labels reached through the positional candidate
+        /// tape.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive start of each positional range.
+        /// * `ends` - Exclusive end of each positional range.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `positions` - Positional candidate tape mapping to `index`.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
+        /// * `capacity` - Initial output capacity hint.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -181,6 +214,18 @@ compute_ints!(compute_prod_rev_positions_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Finds products for labels reached through the positional candidate
+        /// tape.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive start of each positional range.
+        /// * `ends` - Exclusive end of each positional range.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `positions` - Positional candidate tape mapping to `index`.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
+        /// * `capacity` - Initial output capacity hint.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

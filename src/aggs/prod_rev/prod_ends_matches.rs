@@ -10,6 +10,16 @@ use crate::aggs::{
     should_use_dense_match_storage, WrapMul,
 };
 
+/// Aggregate products for prefix ranges selected by a survivor tape.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `ends` - Exclusive ordinal end of each prefix range.
+/// * `counts` - Number of surviving candidates for each row.
+/// * `matches` - Flat match mask with the exact candidate-tape width.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 fn prod_rev_end_match_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     index: ArrayView1<'_, i64>,
@@ -27,6 +37,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut max_end = 0_usize;
@@ -105,6 +116,16 @@ where
     Ok((labels, values))
 }
 
+/// Multiply floating-point values for labels surviving a reverse prefix tape.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `ends` - Exclusive ordinal end of each prefix range.
+/// * `counts` - Number of surviving candidates for each row.
+/// * `matches` - Flat match mask with the exact candidate-tape width.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 fn prod_rev_end_match_float_core<T, F>(
     arr: ArrayView1<'_, T>,
     index: ArrayView1<'_, i64>,
@@ -121,6 +142,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut max_end = 0_usize;
@@ -201,17 +223,16 @@ where
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
-        /// `matches` must be non-empty and must contain exactly one entry for
-        /// every candidate position. pyjanitor supplies the per-row counts
-        /// and binary mask from the same comparison stage. pyjanitor is
-        /// responsible for ensuring each mask value is 0 or 1; Rust does not
-        /// scan the tape to enforce that value-level contract. Normally
-        /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
-        /// full candidate-tape width.
+        /// Finds products for labels surviving the reverse prefix match tape.
         ///
-        /// The accumulator type `$acc` is `i64` for every dtype except
-        /// `uint64`, which uses `u64` so values `>= 2**63` don't get
-        /// sign-flipped by a forced `i64` cast (issue #90's bug class).
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `ends` - Exclusive ordinal end of each prefix range.
+        /// * `counts` - Number of surviving candidates for each row.
+        /// * `matches` - Flat match mask with the exact candidate-tape width.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -252,13 +273,17 @@ compute_ints!(compute_prod_rev_end_match_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
-        /// `matches` must be non-empty and must contain exactly one entry for
-        /// every candidate position. pyjanitor supplies the per-row counts
-        /// and binary mask from the same comparison stage. pyjanitor is
-        /// responsible for ensuring each mask value is 0 or 1; Rust does not
-        /// scan the tape to enforce that value-level contract. Normally
-        /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
-        /// full candidate-tape width.
+        /// Finds floating-point products for labels surviving the reverse
+        /// prefix match tape.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `ends` - Exclusive ordinal end of each prefix range.
+        /// * `counts` - Number of surviving candidates for each row.
+        /// * `matches` - Flat match mask with the exact candidate-tape width.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

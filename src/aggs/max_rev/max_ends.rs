@@ -1,65 +1,71 @@
 use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
-use numpy::{PyArray1, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{
-    ends_domain, ends_labels, ensure_equal_lengths_core, into_starts_ends_result, should_sweep,
-    sweep_winner,
-};
+use crate::aggs::{ends_domain, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// Groups reverse-maximum ends by compact candidate ordinal.
 /// ELI5: every prefix starts at zero, so the largest end is the exact slot count.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `ends` - Exclusive ordinal end of each prefix range.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn max_rev_ends_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(Array1<i64>, Array1<i64>), String> {
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
 
-    if !should_sweep(arr.len(), max_end, std::mem::size_of::<T>()) {
-        let mut values = vec![arr[0]; max_end];
-        let mut positions = vec![-1_i64; max_end];
-        for (row, (current, end, boolean)) in
-            izip!(arr.iter(), ends.iter(), booleans.iter()).enumerate()
+    let mut values = vec![arr[0]; max_end];
+    let mut positions = vec![-1_i64; max_end];
+    for (row, (current, end, boolean)) in
+        izip!(arr.iter(), ends.iter(), booleans.iter()).enumerate()
+    {
+        if *boolean {
+            continue;
+        }
+        // Example: `end = 3` means this prefix covers output slots 0, 1,
+        // and 2. `take(3)` visits exactly those three paired position and
+        // value slots, then stops before slot 3.
+        for (position, value) in positions
+            .iter_mut()
+            .zip(values.iter_mut())
+            .take(*end as usize)
         {
-            if *boolean {
-                continue;
-            }
-            // Example: `end = 3` means this prefix covers output slots 0, 1,
-            // and 2. `take(3)` visits exactly those three paired position and
-            // value slots, then stops before slot 3.
-            for (position, value) in positions
-                .iter_mut()
-                .zip(values.iter_mut())
-                .take(*end as usize)
-            {
-                if *position == -1 || *current > *value {
-                    *position = row as i64;
-                    *value = *current;
-                }
+            if *position == -1 || *current > *value {
+                *position = row as i64;
+                *value = *current;
             }
         }
-        return Ok((ends_labels(max_end, index), Array1::from_vec(positions)));
     }
-
-    let positions = sweep_winner(
-        arr,
-        booleans,
-        max_end,
-        |row| ends[row] as usize,
-        |position| position + 1,
-        (0..max_end).rev(),
-        |current, winner| current > winner,
-    );
-    Ok((ends_labels(max_end, index), positions))
+    let labels = index.iter().take(max_end).copied().collect();
+    Ok((labels, positions))
 }
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
+        /// Finds the row containing the maximum value for each right-side
+        /// label covered by the reverse prefix ranges.
+        ///
+        /// Null rows, identified by `booleans`, do not participate in the
+        /// maximum. The returned positions use `-1` when no non-null row
+        /// covers a label.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `ends` - Exclusive ordinal end of each prefix range.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -68,15 +74,17 @@ macro_rules! compute {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
-            into_starts_ends_result(
-                py,
-                max_rev_ends_core(
-                    arr.as_array(),
-                    ends.as_array(),
-                    index.as_array(),
-                    booleans.as_array(),
-                ),
+            let (labels, positions) = max_rev_ends_core(
+                arr.as_array(),
+                ends.as_array(),
+                index.as_array(),
+                booleans.as_array(),
             )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((
+                Array1::from_vec(labels).into_pyarray(py),
+                Array1::from_vec(positions).into_pyarray(py),
+            ))
         }
     };
 }
@@ -118,7 +126,7 @@ mod tests {
             array![50_i64, 10, 90].view(),
             array![false, false, false].view(),
         );
-        assert_eq!(got, Ok((array![50, 10, 90], array![0, 0, 1])));
+        assert_eq!(got, Ok((vec![50, 10, 90], vec![0, 0, 1])));
     }
     #[test]
     fn rejects_invalid_inputs() {
@@ -129,7 +137,7 @@ mod tests {
                 array![1_i64].view(),
                 array![false].view()
             ),
-            Ok((array![], array![]))
+            Ok((vec![], vec![]))
         );
         assert!(max_rev_ends_core(
             Array1::<i64>::zeros(0).view(),
@@ -167,7 +175,7 @@ mod tests {
         booleans[99] = true;
         let got = max_rev_ends_core(arr.view(), ends.view(), index.view(), booleans.view());
         let (labels, positions) = got.unwrap();
-        assert_eq!(labels, index);
+        assert_eq!(labels, index.to_vec());
         assert_eq!(positions[0], 1);
         assert_eq!(positions[499], 1);
         assert_eq!(positions[500], 0);
@@ -186,7 +194,7 @@ mod tests {
         booleans[2] = false;
         booleans[18] = false;
         let got = max_rev_ends_core(arr.view(), ends.view(), index.view(), booleans.view());
-        assert_eq!(got, Ok((index, Array1::from_elem(20, 2_i64))));
+        assert_eq!(got, Ok((index.to_vec(), vec![2_i64; 20])));
     }
 
     #[test]
@@ -215,7 +223,7 @@ mod tests {
 
         let (labels, positions) =
             max_rev_ends_core(arr.view(), ends.view(), index.view(), booleans.view()).unwrap();
-        assert_eq!(labels, Array1::from_iter(0..max_end as i64));
-        assert_eq!(positions, Array1::from_vec(expected));
+        assert_eq!(labels, (0..max_end as i64).collect::<Vec<_>>());
+        assert_eq!(positions, expected);
     }
 }

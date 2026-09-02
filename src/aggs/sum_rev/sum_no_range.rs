@@ -153,6 +153,14 @@ pub fn sum_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
+        /// Sum joined values by right-side label without range metadata.
+        /// Integer accumulation wraps on overflow; null rows are skipped.
+        ///
+        /// # Arguments
+        /// * `arr` - Left-side values; must not be empty.
+        /// * `left_index` - Positions into `arr`.
+        /// * `right_index` - Output label for each joined row.
+        /// * `booleans` - Null mask; `True` rows are ignored.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -176,6 +184,14 @@ macro_rules! compute_ints {
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Sum joined floating-point values by right-side label without range
+        /// metadata, using compensated accumulation.
+        ///
+        /// # Arguments
+        /// * `arr` - Left-side values; must not be empty.
+        /// * `left_index` - Positions into `arr`.
+        /// * `right_index` - Output label for each joined row.
+        /// * `booleans` - Null mask; `True` rows are ignored.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

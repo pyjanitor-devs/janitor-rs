@@ -24,6 +24,14 @@ fn validate_inputs<T>(
     Ok(())
 }
 
+/// Multiply values grouped by right labels without range metadata.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `left_index` - Positions into `arr`; must be valid.
+/// * `right_index` - Output label for each left position.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn prod_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     arr: ArrayView1<'_, T>,
     left_index: ArrayView1<'_, i64>,
@@ -68,6 +76,13 @@ pub fn prod_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
 /// This keeps the accumulator and the returned products in `u64`
 /// end-to-end so large unsigned products come back correct instead of
 /// sign-flipped.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side unsigned values to aggregate; must not be empty.
+/// * `left_index` - Positions into `arr`; must be valid.
+/// * `right_index` - Output label for each left position.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn prod_rev_no_range_u64_core(
     arr: ArrayView1<'_, u64>,
     left_index: ArrayView1<'_, i64>,
@@ -101,6 +116,15 @@ pub fn prod_rev_no_range_u64_core(
     Ok((Array1::from_vec(labels), Array1::from_vec(products)))
 }
 
+/// Multiply floating-point values grouped by right labels without range
+/// metadata.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `left_index` - Positions into `arr`; must be valid.
+/// * `right_index` - Output label for each left position.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn prod_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
     arr: ArrayView1<'_, T>,
     left_index: ArrayView1<'_, i64>,
@@ -137,6 +161,14 @@ pub fn prod_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
+        /// Groups products by right-side labels without range metadata.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `left_index` - Positions into `arr`; must be valid.
+        /// * `right_index` - Output label for each left position.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -165,6 +197,14 @@ macro_rules! compute_ints {
 /// the round trip to Python instead of wrapping to a negative `i64`.
 #[pyfunction]
 #[allow(clippy::type_complexity)]
+/// Groups `uint64` products by right-side labels without range metadata.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side unsigned values to aggregate; must not be empty.
+/// * `left_index` - Positions into `arr`; must be valid.
+/// * `right_index` - Output label for each left position.
+/// * `booleans` - Null mask for `arr`; `True` rows are skipped.
 pub fn compute_prod_rev_no_range_uint64<'py>(
     py: Python<'py>,
     arr: PyReadonlyArray1<'py, u64>,
@@ -191,6 +231,15 @@ compute_ints!(compute_prod_rev_no_range_uint8, u8);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Groups floating-point products by right-side labels without range
+        /// metadata.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `left_index` - Positions into `arr`; must be valid.
+        /// * `right_index` - Output label for each left position.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

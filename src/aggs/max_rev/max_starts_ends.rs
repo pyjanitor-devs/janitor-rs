@@ -1,30 +1,13 @@
+use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+use std::collections::HashMap;
 
-use crate::aggs::{ensure_equal_lengths, materialize_labels, range_reduce};
-
-fn validate_inputs<T>(
-    arr: ArrayView1<'_, T>,
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-    index: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> Result<(), &'static str> {
-    if starts.len() != ends.len() {
-        return Err("starts and ends must have equal lengths");
-    }
-    if arr.len() != starts.len() {
-        return Err("arr, starts, and ends must have equal lengths");
-    }
-    if arr.len() != booleans.len() {
-        return Err("arr and booleans must have equal lengths");
-    }
-    if arr.is_empty() || index.is_empty() {
-        return Err("arr, starts, booleans, and index cannot be empty");
-    }
-    Ok(())
-}
+use crate::aggs::{
+    checked_range, ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core,
+    should_use_dense_match_storage,
+};
 
 /// Find the row containing the maximum value for each distinct right label.
 ///
@@ -33,8 +16,7 @@ fn validate_inputs<T>(
 /// filtering, so labels can be reordered or gapped but are not duplicated.
 /// `item`, the ordinal position in `index`, is the state slot; `index[item]`
 /// is the output label. `starts` and `ends` describe half-open ranges
-/// `[start, end)`. Invalid or zero-width ranges are skipped by `checked_range`,
-/// and empty input arrays are rejected.
+/// `[start, end)`. Invalid or zero-width ranges are skipped by `checked_range`.
 ///
 /// # Preconditions
 ///
@@ -43,48 +25,130 @@ fn validate_inputs<T>(
 /// must provide it themselves. Duplicate labels are unsupported and are not
 /// merged by the positional accumulator.
 ///
+/// `arr`, `starts`, `ends`, `index`, `booleans` cannot be empty.
+///
 /// ELI5: each right-row position gets one numbered drawer. The number printed
 /// on the row may be 42, 7, or 100, but the drawer is still its position on
 /// the shelf. We remember the best left row in that drawer.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each interval.
+/// * `ends` - Exclusive ordinal end of each interval.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, starts, ends, index, booleans)?;
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
 
-    // ELI5: a vector is faster than asking a dictionary for a drawer on every
-    // visit. `Option` lets us leave the value uninitialized until a range
-    // first touches that ordinal position.
-    let (touched, states) = range_reduce(
-        starts,
-        ends,
-        index.len(),
-        (None, -1_i64),
-        |row, _item, (value, winner)| {
-            if booleans[row] {
-                return;
-            }
-            let current = arr[row];
-            if value.is_none() || current > value.unwrap() {
-                *value = Some(current);
-                *winner = row as i64;
-            }
-        },
-    );
+    let mut min_start = index.len();
+    let mut max_end = 0_usize;
+    for (&start, &end) in starts.iter().zip(ends.iter()) {
+        if let Some((start, end)) = checked_range(start, end, index.len()) {
+            min_start = min_start.min(start);
+            max_end = max_end.max(end);
+        }
+    }
+    let width = max_end.saturating_sub(min_start);
+    let dense = should_use_dense_match_storage(index.len(), width);
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
 
-    let labels = materialize_labels(&touched, index);
-    let rows = states.into_iter().map(|(_, row)| row).collect();
-    Ok((labels, Array1::from_vec(rows)))
+    if dense {
+        let mut seen = vec![false; width];
+        let mut states = vec![(arr[0], -1_i64); width];
+        for (row, (current, start, end, boolean)) in
+            izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter()).enumerate()
+        {
+            let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+                continue;
+            };
+            for item in start..end {
+                let slot = item - min_start;
+                if !seen[slot] {
+                    seen[slot] = true;
+                    touched.push(slot);
+                }
+                if *boolean {
+                    continue;
+                }
+                if states[slot].1 == -1 || *current > states[slot].0 {
+                    states[slot] = (*current, row as i64);
+                }
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut result = Vec::with_capacity(touched.len());
+        for slot in touched {
+            labels.push(index[min_start + slot]);
+            result.push(states[slot].1);
+        }
+        return Ok((labels, result));
+    }
+
+    let mut states: HashMap<usize, (T, i64)> = HashMap::new();
+    for (row, (current, start, end, boolean)) in
+        izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter()).enumerate()
+    {
+        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+            continue;
+        };
+        for item in start..end {
+            let slot = item - min_start;
+            let state = states.entry(slot).or_insert_with(|| {
+                touched.push(slot);
+                (*current, -1)
+            });
+
+            if *boolean {
+                continue;
+            }
+
+            if state.1 == -1 || *current > state.0 {
+                *state = (*current, row as i64);
+            }
+        }
+    }
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut result = Vec::with_capacity(touched.len());
+    for slot in touched {
+        labels.push(index[min_start + slot]);
+        result.push(states[&slot].1);
+    }
+    Ok((labels, result))
 }
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
-        /// `index` must be a unique positional domain. pyjanitor supplies a
-        /// normalized `range(len(right))`; direct callers must provide it.
-        /// This correctness precondition is unchecked to avoid an extra pass.
+        /// Finds the row containing the maximum value for each right-side
+        /// label covered by the reverse interval ranges.
+        ///
+        /// Null rows, identified by `booleans`, do not participate in the
+        /// maximum. The returned positions use `-1` when no non-null row
+        /// covers a label.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each interval.
+        /// * `ends` - Exclusive ordinal end of each interval.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
+        ///
+        /// `index` must contain unique labels. Positions in the array are
+        /// ordinal state slots; direct callers must preserve that contract.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -104,7 +168,10 @@ macro_rules! compute {
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
             let (indexers, result) = max_rev_start_end_core(arr, starts, ends, index, booleans)
                 .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
+            Ok((
+                Array1::from_vec(indexers).into_pyarray(py),
+                Array1::from_vec(result).into_pyarray(py),
+            ))
         }
     };
 }
@@ -153,7 +220,7 @@ mod tests {
             array![42_i64, 7, 100].view(),
             array![false, false, false].view(),
         );
-        assert_eq!(got, Ok((array![42, 7, 100], array![0, 0, 1])));
+        assert_eq!(got, Ok((vec![42, 7, 100], vec![0, 0, 1])));
     }
 
     #[test]
@@ -166,7 +233,7 @@ mod tests {
             array![false, false, false].view(),
         );
         // Ordinal slots are independent; duplicate labels are not merged.
-        assert_eq!(got, Ok((array![10, 20, 10], array![0, 0, 1])));
+        assert_eq!(got, Ok((vec![10, 20, 10], vec![0, 0, 1])));
     }
 
     #[test]
@@ -178,7 +245,7 @@ mod tests {
             array![10_i64, 20].view(),
             array![true].view(),
         );
-        assert_eq!(got, Ok((array![10, 20], array![-1, -1])));
+        assert_eq!(got, Ok((vec![10, 20], vec![-1, -1])));
     }
 
     #[test]
@@ -190,11 +257,11 @@ mod tests {
             array![10_i64, 20].view(),
             array![false, false, false].view(),
         );
-        assert_eq!(got, Ok((array![], array![])));
+        assert_eq!(got, Ok((vec![], vec![])));
     }
 
     #[test]
-    fn validation_rejects_shape_mismatches_and_empty_inputs() {
+    fn validation_rejects_shape_mismatches() {
         assert!(max_rev_start_end_core(
             array![1_i64].view(),
             array![0_i64].view(),

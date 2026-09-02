@@ -12,6 +12,11 @@ use crate::aggs::{
 };
 
 #[allow(clippy::too_many_arguments)]
+/// Aggregate integer sums for reverse intervals selected by a survivor tape.
+///
+/// `arr` must not be empty; `matches` must contain one entry per candidate
+/// position in the supplied interval tape. Null rows and rows with zero counts
+/// touch their matched labels but do not contribute to the sum.
 fn sum_rev_start_end_match_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -31,6 +36,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut min_start = index.len();
@@ -123,6 +129,12 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Aggregate floating-point sums for reverse intervals selected by a survivor
+/// tape.
+///
+/// `arr` must not be empty; `matches` must contain one entry per candidate
+/// position in the supplied interval tape. Null rows and rows with zero counts
+/// touch their matched labels but do not contribute to the sum.
 fn sum_rev_start_end_match_float_core<T, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -141,6 +153,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut min_start = index.len();

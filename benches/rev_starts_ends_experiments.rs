@@ -121,6 +121,86 @@ fn production_size(input: &Input<'_>) -> Vec<(i64, i64)> {
     sort_pairs(labels.into_iter().zip(counts).collect())
 }
 
+enum OldSizeStorage {
+    Sparse(HashMap<usize, i64>),
+    Dense { seen: Vec<bool>, counts: Vec<i64> },
+}
+
+fn old_checked_range(start: i64, end: i64, len: usize) -> Option<(usize, usize)> {
+    let start = usize::try_from(start).ok()?;
+    let end = usize::try_from(end).ok()?;
+    (end <= len && start < end).then_some((start, end))
+}
+
+/// The pre-refactor generic range reducer specialized to counting.
+fn old_size(input: &Input<'_>) -> Vec<(i64, i64)> {
+    let mut storage = OldSizeStorage::Sparse(HashMap::new());
+    let mut touched = Vec::new();
+    for row in 0..input.starts.len() {
+        let Some((start, end)) = old_checked_range(
+            input.starts_i64[row],
+            input.ends_i64[row],
+            input.index.len(),
+        ) else {
+            continue;
+        };
+        for item in start..end {
+            match &mut storage {
+                OldSizeStorage::Dense { seen, counts } => {
+                    if !seen[item] {
+                        seen[item] = true;
+                        touched.push(item);
+                    }
+                    counts[item] += 1;
+                }
+                OldSizeStorage::Sparse(counts) => {
+                    let count = counts.entry(item).or_insert_with(|| {
+                        touched.push(item);
+                        0
+                    });
+                    *count += 1;
+                    if counts.len().saturating_mul(2) >= input.index.len() {
+                        let old = std::mem::replace(
+                            &mut storage,
+                            OldSizeStorage::Dense {
+                                seen: Vec::new(),
+                                counts: Vec::new(),
+                            },
+                        );
+                        let OldSizeStorage::Sparse(counts) = old else {
+                            unreachable!("storage changed while promoting");
+                        };
+                        let mut seen = vec![false; input.index.len()];
+                        let mut dense_counts = vec![0_i64; input.index.len()];
+                        for (item, count) in counts {
+                            seen[item] = true;
+                            dense_counts[item] = count;
+                        }
+                        storage = OldSizeStorage::Dense {
+                            seen,
+                            counts: dense_counts,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    let mut result = Vec::with_capacity(touched.len());
+    match storage {
+        OldSizeStorage::Dense { counts, .. } => {
+            for item in touched {
+                result.push((input.index[item], counts[item]));
+            }
+        }
+        OldSizeStorage::Sparse(counts) => {
+            for item in touched {
+                result.push((input.index[item], counts[&item]));
+            }
+        }
+    }
+    sort_pairs(result)
+}
+
 fn hash_sum(input: &Input<'_>) -> Vec<(i64, i64)> {
     let mut map = HashMap::with_capacity(input.index.len());
     for row in 0..input.values.len() {
@@ -517,13 +597,14 @@ fn bench(c: &mut Criterion) {
         );
         if !duplicate {
             eprintln!(
-                "{name}: production allocations sum {:?}, prod {:?}, float_sum {:?}, float_prod {:?}, min {:?}, max {:?}, size {:?}",
+                "{name}: production allocations sum {:?}, prod {:?}, float_sum {:?}, float_prod {:?}, min {:?}, max {:?}, old_size {:?}, size {:?}",
                 allocations(|| production_sum(&input)),
                 allocations(|| production_product(&input)),
                 allocations(|| production_float_sum(&float_input)),
                 allocations(|| production_float_product(&float_input)),
                 allocations(|| production_min(&input)),
                 allocations(|| production_max(&input)),
+                allocations(|| old_size(&input)),
                 allocations(|| production_size(&input)),
             );
         }
@@ -551,6 +632,9 @@ fn bench(c: &mut Criterion) {
             });
             group.bench_function(format!("max/production/{name}"), |b| {
                 b.iter(|| production_max(black_box(&input)))
+            });
+            group.bench_function(format!("size/old/{name}"), |b| {
+                b.iter(|| old_size(black_box(&input)))
             });
             group.bench_function(format!("size/production/{name}"), |b| {
                 b.iter(|| production_size(black_box(&input)))

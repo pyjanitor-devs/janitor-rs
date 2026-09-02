@@ -1,17 +1,27 @@
 use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
-use numpy::{PyArray1, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{
-    ensure_equal_lengths_core, into_starts_ends_result, starts_domain, starts_labels, sweep_reduce,
-    WrapMul,
-};
+use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core, starts_domain, WrapMul};
 
+/// Multiply values into one state slot per right-row ordinal.
+///
 /// `A` is the accumulator type: every integer dtype instantiates this with
 /// `A = i64`, except `uint64`, which instantiates it with `A = u64` so
 /// values `>= 2**63` don't get sign-flipped by a forced `i64` cast (see
 /// `WrapMul`).
+///
+/// `starts` describes suffix ranges `[start, index.len())`. Invalid starts
+/// and empty `starts`/`index` inputs are rejected by `starts_domain`.
+/// Null rows leave each touched slot at the multiplicative identity, `1`.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each suffix range.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 #[allow(private_bounds)]
 pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     arr: ArrayView1<'_, T>,
@@ -19,30 +29,49 @@ pub fn prod_rev_starts_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut convert: F,
-) -> Result<(Array1<i64>, Array1<A>), String> {
+) -> Result<(Vec<i64>, Vec<A>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
-    // ELI5: a suffix row joins the running product at its start bucket. The
-    // shared reducer combines rows sharing a boundary, then carries one
-    // product forward. Wrapping multiplication is associative, so this
-    // removes repeated per-row work without changing integer overflow rules.
-    let events = izip!(arr, starts, booleans)
-        .filter(|(_, start, boolean)| !**boolean && **start < index.len() as i64)
-        .map(|(current, start, _)| (*start as usize - min_start, convert(*current)));
-    let result = sweep_reduce(width, A::ONE, events, 0..width, |left, right| {
-        left.wrap_mul(right)
-    })?;
-    Ok((starts_labels(min_start, index), result))
+    // ELI5: a suffix row joins the running product at its start bucket.
+    // Combine rows sharing a start into one product event, then sweep
+    // left-to-right so each event applies to that position and every later
+    // position. Wrapping multiplication is associative, so this preserves
+    // the integer result while avoiding a full suffix walk per row.
+    let mut values = vec![A::ONE; width];
+    for (current, start, boolean) in izip!(arr, starts, booleans) {
+        if *boolean || *start == index.len() as i64 {
+            continue;
+        }
+        let slot = *start as usize - min_start;
+        values[slot] = values[slot].wrap_mul(convert(*current));
+    }
+    let mut running = A::ONE;
+    for value in &mut values {
+        running = running.wrap_mul(*value);
+        *value = running;
+    }
+    let labels = index.iter().skip(min_start).copied().collect();
+    Ok((labels, values))
 }
 
+/// Multiply floating-point values into each compact suffix slot.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each suffix range.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut to_f64: F,
-) -> Result<(Array1<i64>, Array1<f64>), String> {
+) -> Result<(Vec<i64>, Vec<f64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
@@ -65,11 +94,23 @@ pub fn prod_rev_starts_float_core<T: Copy, F: FnMut(T) -> f64>(
             *value *= current;
         }
     }
-    Ok((starts_labels(min_start, index), Array1::from_vec(values)))
+    let labels = index.iter().skip(min_start).copied().collect();
+    Ok((labels, values))
 }
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
+        /// Finds the product for each right-side label covered by the reverse
+        /// suffix ranges.
+        ///
+        /// Null rows do not participate; untouched products remain `1`.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each suffix range.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -78,21 +119,34 @@ macro_rules! compute_ints {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)> {
-            into_starts_ends_result(
-                py,
-                prod_rev_starts_int_core(
-                    arr.as_array(),
-                    starts.as_array(),
-                    index.as_array(),
-                    booleans.as_array(),
-                    |value| value as $acc,
-                ),
+            let (labels, values) = prod_rev_starts_int_core(
+                arr.as_array(),
+                starts.as_array(),
+                index.as_array(),
+                booleans.as_array(),
+                |value| value as $acc,
             )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((
+                Array1::from_vec(labels).into_pyarray(py),
+                Array1::from_vec(values).into_pyarray(py),
+            ))
         }
     };
 }
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Finds the product for each right-side label covered by the reverse
+        /// suffix ranges.
+        ///
+        /// Null rows do not participate; untouched products remain `1.0`.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each suffix range.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -101,16 +155,18 @@ macro_rules! compute_floats {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)> {
-            into_starts_ends_result(
-                py,
-                prod_rev_starts_float_core(
-                    arr.as_array(),
-                    starts.as_array(),
-                    index.as_array(),
-                    booleans.as_array(),
-                    |value| value as f64,
-                ),
+            let (labels, values) = prod_rev_starts_float_core(
+                arr.as_array(),
+                starts.as_array(),
+                index.as_array(),
+                booleans.as_array(),
+                |value| value as f64,
             )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((
+                Array1::from_vec(labels).into_pyarray(py),
+                Array1::from_vec(values).into_pyarray(py),
+            ))
         }
     };
 }
@@ -160,7 +216,7 @@ mod tests {
             booleans.view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![20, 10, 90], array![2, 6, 6])));
+        assert_eq!(got, Ok((vec![20, 10, 90], vec![2, 6, 6])));
     }
 
     #[test]
@@ -172,7 +228,7 @@ mod tests {
             array![false, false].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![10], array![-2])));
+        assert_eq!(got, Ok((vec![10], vec![-2])));
 
         let got = prod_rev_starts_int_core(
             array![2_i64].view(),
@@ -181,7 +237,7 @@ mod tests {
             array![true].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![10], array![1])));
+        assert_eq!(got, Ok((vec![10], vec![1])));
     }
 
     #[test]
@@ -198,7 +254,7 @@ mod tests {
             booleans.view(),
             |value| value,
         );
-        assert_eq!(got.unwrap().1, Array1::from_elem(1000, 0_i64));
+        assert_eq!(got.unwrap().1, vec![0_i64; 1000]);
     }
 
     #[test]
@@ -211,7 +267,7 @@ mod tests {
             array![false].view(),
             |current| current,
         );
-        assert_eq!(got, Ok((array![10], array![value])));
+        assert_eq!(got, Ok((vec![10], vec![value])));
     }
 
     #[test]
@@ -223,7 +279,7 @@ mod tests {
             array![false, false].view(),
             |value| value as f64,
         );
-        assert_eq!(got, Ok((array![20, 10], array![2.5, 10.0])));
+        assert_eq!(got, Ok((vec![20, 10], vec![2.5, 10.0])));
 
         assert!(prod_rev_starts_int_core(
             array![1_i64].view(),

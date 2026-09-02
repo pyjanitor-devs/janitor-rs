@@ -15,6 +15,15 @@ use crate::aggs::{
 /// the end of `index`. The flat `matches` tape removes candidates that failed
 /// later predicates. We keep state by positional ordinal and translate those
 /// ordinals through `index` only when emitting the result.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each suffix range.
+/// * `counts` - Number of surviving candidates for each row.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `matches` - Flat match mask with the exact candidate-tape width.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 fn prod_rev_start_match_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -109,6 +118,16 @@ where
     Ok((labels, values))
 }
 
+/// Multiply floating-point values for labels surviving a reverse suffix tape.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `starts` - Inclusive ordinal start of each suffix range.
+/// * `counts` - Number of surviving candidates for each row.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `matches` - Flat match mask with the exact candidate-tape width.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 fn prod_rev_start_match_float_core<T, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -204,10 +223,16 @@ where
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
-        /// `matches` must contain exactly one entry for every candidate
-        /// position. pyjanitor supplies the tape and the aligned row arrays.
-        /// The `uint64` specialization uses a `u64` accumulator so values at
-        /// or above `i64::MAX` are not sign-flipped.
+        /// Finds products for labels surviving the reverse suffix match tape.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each suffix range.
+        /// * `counts` - Number of surviving candidates for each row.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `matches` - Flat match mask with the exact candidate-tape width.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -244,8 +269,17 @@ compute_ints!(compute_prod_rev_start_match_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
-        /// `matches` must contain exactly one entry for every candidate
-        /// position. pyjanitor supplies the tape and the aligned row arrays.
+        /// Finds floating-point products for labels surviving the reverse
+        /// suffix match tape.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `starts` - Inclusive ordinal start of each suffix range.
+        /// * `counts` - Number of surviving candidates for each row.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `matches` - Flat match mask with the exact candidate-tape width.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

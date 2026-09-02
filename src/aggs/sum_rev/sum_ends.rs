@@ -1,10 +1,9 @@
 use itertools::izip;
-use numpy::{PyArray1, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{
-    ends_domain, ends_labels, ensure_equal_lengths, ensure_equal_lengths_core,
-    into_starts_ends_result, sweep_reduce, WrapAdd,
+    ends_domain, ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core, WrapAdd,
 };
 
 /// Accumulate reverse-sum `ends` rows in compact candidate-ordinal slots.
@@ -23,12 +22,13 @@ pub fn sum_rev_ends_int_core<T, A, F>(
     index: numpy::ndarray::ArrayView1<i64>,
     booleans: numpy::ndarray::ArrayView1<bool>,
     mut convert: F,
-) -> Result<(numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<A>), String>
+) -> Result<(Vec<i64>, Vec<A>), String>
 where
     T: Copy,
     A: WrapAdd,
     F: FnMut(T) -> A,
 {
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
@@ -39,17 +39,19 @@ where
     // boundary preserves results. Using `end - 1` means each event can be
     // replaced by its final value after it is read; `end == 0` is an empty
     // prefix and has no event.
-    let events = izip!(arr, ends, booleans)
-        .filter(|(_, end, boolean)| !**boolean && **end > 0)
-        .map(|(current, end, _)| (*end as usize - 1, convert(*current)));
-    let values = sweep_reduce(
-        max_end,
-        A::ZERO,
-        events,
-        (0..max_end).rev(),
-        |left, right| left.wrap_add(right),
-    )?;
-    Ok((ends_labels(max_end, index), values))
+    let mut values = vec![A::ZERO; max_end];
+    for (current, end, boolean) in izip!(arr, ends, booleans) {
+        if !*boolean && *end > 0 {
+            values[*end as usize - 1] = values[*end as usize - 1].wrap_add(convert(*current));
+        }
+    }
+    let mut running = A::ZERO;
+    for value in values.iter_mut().rev() {
+        running = running.wrap_add(*value);
+        *value = running;
+    }
+    let labels = index.iter().take(max_end).copied().collect();
+    Ok((labels, values))
 }
 
 pub fn sum_rev_ends_float_core<T, F>(
@@ -58,11 +60,12 @@ pub fn sum_rev_ends_float_core<T, F>(
     index: numpy::ndarray::ArrayView1<i64>,
     booleans: numpy::ndarray::ArrayView1<bool>,
     mut to_f64: F,
-) -> Result<(numpy::ndarray::Array1<i64>, numpy::ndarray::Array1<f64>), String>
+) -> Result<(Vec<i64>, Vec<f64>), String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
@@ -87,11 +90,20 @@ where
         }
     }
     let result = slots.into_iter().map(|(total, _)| total).collect();
-    Ok((ends_labels(max_end, index), result))
+    let labels = index.iter().take(max_end).copied().collect();
+    Ok((labels, result))
 }
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
+        /// Sum values for each right-side label covered by reverse prefix
+        /// ranges. Integer accumulation wraps on overflow.
+        ///
+        /// # Arguments
+        /// * `arr` - Left-side values; must not be empty.
+        /// * `ends` - Exclusive prefix ends.
+        /// * `index` - Right-side labels in ordinal order.
+        /// * `booleans` - Null mask; `True` rows are ignored.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -108,10 +120,10 @@ macro_rules! compute_ints {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            into_starts_ends_result(
-                py,
-                sum_rev_ends_int_core(arr, ends, index, booleans, |value| value as $acc),
-            )
+            let (labels, values) =
+                sum_rev_ends_int_core(arr, ends, index, booleans, |value| value as $acc)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((labels.into_pyarray(py), values.into_pyarray(py)))
         }
     };
 }
@@ -129,6 +141,14 @@ compute_ints!(compute_sum_rev_end_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Sum floating-point values for each right-side label covered by
+        /// reverse prefix ranges using compensated accumulation.
+        ///
+        /// # Arguments
+        /// * `arr` - Left-side values; must not be empty.
+        /// * `ends` - Exclusive prefix ends.
+        /// * `index` - Right-side labels in ordinal order.
+        /// * `booleans` - Null mask; `True` rows are ignored.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -145,10 +165,10 @@ macro_rules! compute_floats {
             let index = index.as_array();
             let booleans = booleans.as_array();
             ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            into_starts_ends_result(
-                py,
-                sum_rev_ends_float_core(arr, ends, index, booleans, |value| value as f64),
-            )
+            let (labels, values) =
+                sum_rev_ends_float_core(arr, ends, index, booleans, |value| value as f64)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((labels.into_pyarray(py), values.into_pyarray(py)))
         }
     };
 }
@@ -196,8 +216,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(indexers, array![10, 30]);
-        assert_eq!(result, array![5, 5]);
+        assert_eq!(indexers, vec![10, 30]);
+        assert_eq!(result, vec![5, 5]);
     }
 
     #[test]
@@ -211,8 +231,8 @@ mod tests {
             |v: u64| v,
         )
         .unwrap();
-        assert_eq!(indexers, array![20]);
-        assert_eq!(result, array![value]);
+        assert_eq!(indexers, vec![20]);
+        assert_eq!(result, vec![value]);
     }
 
     #[test]
@@ -278,8 +298,8 @@ mod tests {
 
         // The end=0 row covers nothing; end=1 covers only slot 0; end=3
         // covers all three slots. The labels remain in right-index order.
-        assert_eq!(indexers, array![10, 30, 20]);
-        assert_eq!(result, array![18, 11, 11]);
+        assert_eq!(indexers, vec![10, 30, 20]);
+        assert_eq!(result, vec![18, 11, 11]);
     }
 
     #[test]
@@ -298,8 +318,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(indexers, array![20, 10]);
-        assert_eq!(result, array![0.0, 0.0]);
+        assert_eq!(indexers, vec![20, 10]);
+        assert_eq!(result, vec![0.0, 0.0]);
     }
 
     #[test]
@@ -357,7 +377,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(indexers, array![20, 10]);
-        assert_eq!(result, array![3.75, 1.5]);
+        assert_eq!(indexers, vec![20, 10]);
+        assert_eq!(result, vec![3.75, 1.5]);
     }
 }

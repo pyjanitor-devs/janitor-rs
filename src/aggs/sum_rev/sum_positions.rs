@@ -146,6 +146,16 @@ where
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
+        /// Sum values for labels reached through the positional candidate
+        /// tape. Integer accumulation wraps on overflow.
+        ///
+        /// # Arguments
+        /// * `arr` - Left-side values; must not be empty.
+        /// * `starts` - Inclusive positional range starts.
+        /// * `ends` - Exclusive positional range ends.
+        /// * `index` - Right-side labels addressed by `positions`.
+        /// * `positions` - Positional candidate tape.
+        /// * `booleans` - Null mask; `True` rows are ignored.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -202,6 +212,16 @@ compute_ints!(compute_sum_rev_positions_uint8, u8, i64);
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Sum floating-point values for labels reached through the positional
+        /// candidate tape using compensated accumulation.
+        ///
+        /// # Arguments
+        /// * `arr` - Left-side values; must not be empty.
+        /// * `starts` - Inclusive positional range starts.
+        /// * `ends` - Exclusive positional range ends.
+        /// * `index` - Right-side labels addressed by `positions`.
+        /// * `positions` - Positional candidate tape.
+        /// * `booleans` - Null mask; `True` rows are ignored.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

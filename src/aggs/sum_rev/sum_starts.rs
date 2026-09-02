@@ -1,12 +1,9 @@
 use itertools::izip;
-use numpy::ndarray::{Array1, ArrayView1};
-use numpy::{PyArray1, PyReadonlyArray1};
+use numpy::ndarray::ArrayView1;
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{
-    ensure_equal_lengths, ensure_equal_lengths_core, into_starts_ends_result, starts_domain,
-    starts_labels, sweep_reduce, WrapAdd,
-};
+use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core, starts_domain, WrapAdd};
 
 /// Accumulate reverse-sum `starts` rows in slots for the touched candidate
 /// suffix, then emit the original right labels from `index`.
@@ -25,12 +22,13 @@ pub fn sum_rev_starts_int_core<T, A, F>(
     index: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut convert: F,
-) -> Result<(Array1<i64>, Array1<A>), String>
+) -> Result<(Vec<i64>, Vec<A>), String>
 where
     T: Copy,
     A: WrapAdd,
     F: FnMut(T) -> A,
 {
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
@@ -39,17 +37,32 @@ where
     // each row's value into its start bucket and carries one running sum
     // forward, so a wide suffix is not rescanned for every row. Integer
     // wrapping addition is associative, so this regrouping preserves results.
-    let events = izip!(arr, starts, booleans)
-        .filter(|(_, start, boolean)| !**boolean && **start < index.len() as i64)
-        .map(|(current, start, _)| (*start as usize - min_start, convert(*current)));
-    let result = sweep_reduce(width, A::ZERO, events, 0..width, |left, right| {
-        left.wrap_add(right)
-    })?;
-    Ok((starts_labels(min_start, index), result))
+    let mut result = vec![A::ZERO; width];
+    for (current, start, boolean) in izip!(arr, starts, booleans) {
+        if !*boolean && *start < index.len() as i64 {
+            let slot = *start as usize - min_start;
+            result[slot] = result[slot].wrap_add(convert(*current));
+        }
+    }
+    let mut running = A::ZERO;
+    for value in &mut result {
+        running = running.wrap_add(*value);
+        *value = running;
+    }
+    let labels = index.iter().skip(min_start).copied().collect();
+    Ok((labels, result))
 }
 
 macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
+        /// Sum values for each right-side label covered by reverse suffix
+        /// ranges. Integer accumulation wraps on overflow.
+        ///
+        /// # Arguments
+        /// * `arr` - Left-side values; must not be empty.
+        /// * `starts` - Inclusive suffix starts.
+        /// * `index` - Right-side labels in ordinal order.
+        /// * `booleans` - Null mask; `True` rows are ignored.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -60,28 +73,15 @@ macro_rules! compute_ints {
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<$acc>>)>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "starts",
-                starts.as_array().len(),
-            )?;
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
-            into_starts_ends_result(
-                py,
-                sum_rev_starts_int_core(
-                    arr.as_array(),
-                    starts.as_array(),
-                    index.as_array(),
-                    booleans.as_array(),
-                    |value| value as $acc,
-                ),
+            let (labels, values) = sum_rev_starts_int_core(
+                arr.as_array(),
+                starts.as_array(),
+                index.as_array(),
+                booleans.as_array(),
+                |value| value as $acc,
             )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((labels.into_pyarray(py), values.into_pyarray(py)))
         }
     };
 }
@@ -107,11 +107,12 @@ pub fn sum_rev_starts_float_core<T, F>(
     index: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_f64: F,
-) -> Result<(Array1<i64>, Array1<f64>), String>
+) -> Result<(Vec<i64>, Vec<f64>), String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
@@ -143,11 +144,20 @@ where
         }
     }
     let result = slots.into_iter().map(|(total, _)| total).collect();
-    Ok((starts_labels(min_start, index), result))
+    let labels = index.iter().skip(min_start).copied().collect();
+    Ok((labels, result))
 }
 
 macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Sum floating-point values for each right-side label covered by
+        /// reverse suffix ranges using compensated accumulation.
+        ///
+        /// # Arguments
+        /// * `arr` - Left-side values; must not be empty.
+        /// * `starts` - Inclusive suffix starts.
+        /// * `index` - Right-side labels in ordinal order.
+        /// * `booleans` - Null mask; `True` rows are ignored.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -158,28 +168,15 @@ macro_rules! compute_floats {
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "starts",
-                starts.as_array().len(),
-            )?;
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
-            into_starts_ends_result(
-                py,
-                sum_rev_starts_float_core(
-                    arr.as_array(),
-                    starts.as_array(),
-                    index.as_array(),
-                    booleans.as_array(),
-                    |value| value as f64,
-                ),
+            let (labels, values) = sum_rev_starts_float_core(
+                arr.as_array(),
+                starts.as_array(),
+                index.as_array(),
+                booleans.as_array(),
+                |value| value as f64,
             )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((labels.into_pyarray(py), values.into_pyarray(py)))
         }
     };
 }
@@ -229,8 +226,8 @@ mod tests {
         .unwrap();
         // row0 (start=1) touches index[1..3] = {0, 1}; row1 (start=0)
         // touches index[0..3] = {2, 0, 1}.
-        assert_eq!(indexers, array![2, 0, 1]);
-        assert_eq!(result, array![6, 11, 11]);
+        assert_eq!(indexers, vec![2, 0, 1]);
+        assert_eq!(result, vec![6, 11, 11]);
     }
 
     #[test]
@@ -254,8 +251,8 @@ mod tests {
             |value| value,
         )
         .unwrap();
-        assert_eq!(indexers, array![7, 6]);
-        assert_eq!(result, array![10, 10]);
+        assert_eq!(indexers, vec![7, 6]);
+        assert_eq!(result, vec![10, 10]);
     }
 
     #[test]
@@ -276,8 +273,8 @@ mod tests {
             |value| value,
         )
         .unwrap();
-        assert_eq!(indexers, array![0]);
-        assert_eq!(result, array![0]);
+        assert_eq!(indexers, vec![0]);
+        assert_eq!(result, vec![0]);
     }
 
     #[test]
@@ -297,7 +294,7 @@ mod tests {
             |value| value,
         )
         .unwrap();
-        assert_eq!(indexers, array![0]);
+        assert_eq!(indexers, vec![0]);
         assert!((result[0] - 0.6).abs() < 1e-9);
     }
 
@@ -312,8 +309,8 @@ mod tests {
             |v: u64| v,
         )
         .unwrap();
-        assert_eq!(indexers, array![20]);
-        assert_eq!(result, array![value]);
+        assert_eq!(indexers, vec![20]);
+        assert_eq!(result, vec![value]);
     }
 
     #[test]
@@ -327,8 +324,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(indexers, array![0]);
-        assert_eq!(result, array![i64::MIN]);
+        assert_eq!(indexers, vec![0]);
+        assert_eq!(result, vec![i64::MIN]);
     }
 
     #[test]

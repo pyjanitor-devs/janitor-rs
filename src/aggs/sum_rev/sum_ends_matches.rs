@@ -9,6 +9,11 @@ use crate::aggs::{
     should_use_dense_match_storage, WrapAdd,
 };
 
+/// Aggregate integer sums for reverse prefixes selected by a survivor tape.
+///
+/// `arr` must not be empty; `matches` must contain one entry per candidate
+/// position in the supplied prefix tape. Null rows and rows with zero counts
+/// touch their matched labels but do not contribute to the sum.
 fn sum_rev_end_match_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
     index: ArrayView1<'_, i64>,
@@ -26,6 +31,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut max_end = 0_usize;
@@ -104,6 +110,12 @@ where
     Ok((labels, values))
 }
 
+/// Aggregate floating-point sums for reverse prefixes selected by a survivor
+/// tape.
+///
+/// `arr` must not be empty; `matches` must contain one entry per candidate
+/// position in the supplied prefix tape. Null rows and rows with zero counts
+/// touch their matched labels but do not contribute to the sum.
 fn sum_rev_end_match_float_core<T, F>(
     arr: ArrayView1<'_, T>,
     index: ArrayView1<'_, i64>,
@@ -120,6 +132,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut max_end = 0_usize;

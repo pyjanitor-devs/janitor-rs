@@ -1,45 +1,31 @@
 use itertools::izip;
 use numpy::ndarray::{Array1, ArrayView1};
-use numpy::{PyArray1, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{
-    ends_domain, ends_labels, ensure_equal_lengths_core, into_starts_ends_result, should_sweep,
-    sweep_winner,
-};
+use crate::aggs::{ends_domain, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// Groups reverse-minimum ends by compact candidate ordinal.
 ///
 /// ELI5: every prefix touches the same contiguous range beginning at zero,
 /// so the largest end tells us exactly how many accumulator slots are needed.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values to aggregate; must not be empty.
+/// * `ends` - Exclusive ordinal end of each prefix range.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `booleans` - Null mask for `arr`; `true` rows are skipped.
 pub fn min_rev_ends_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(Array1<i64>, Array1<i64>), String> {
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
-
-    if should_sweep(arr.len(), max_end, std::mem::size_of::<T>()) {
-        // ELI5: a prefix row is eligible while the sweep is left of its end.
-        // Bucket each row at its end, activate it once while sweeping from
-        // right to left, and retain the current minimum. Equal values are
-        // explicitly resolved by the smallest input row index in
-        // `sweep_winner`,
-        // matching the direct path regardless of bucket traversal order.
-        let positions = sweep_winner(
-            arr,
-            booleans,
-            max_end,
-            |row| ends[row] as usize,
-            |position| position + 1,
-            (0..max_end).rev(),
-            |current, winner| current < winner,
-        );
-        return Ok((ends_labels(max_end, index), positions));
-    }
 
     let mut values = vec![arr[0]; max_end];
     let mut positions = vec![-1_i64; max_end];
@@ -62,11 +48,25 @@ pub fn min_rev_ends_core<T: PartialOrd + Copy>(
         }
     }
 
-    Ok((ends_labels(max_end, index), Array1::from_vec(positions)))
+    let labels = index.iter().take(max_end).copied().collect();
+    Ok((labels, positions))
 }
 
 macro_rules! compute {
     ($fname:ident, $type:ty) => {
+        /// Finds the row containing the minimum value for each right-side
+        /// label covered by the reverse prefix ranges.
+        ///
+        /// Null rows, identified by `booleans`, do not participate in the
+        /// minimum. The returned positions use `-1` when no non-null row
+        /// covers a label.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Left-side values to aggregate; must not be empty.
+        /// * `ends` - Exclusive ordinal end of each prefix range.
+        /// * `index` - Right-side labels in ordinal position order.
+        /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -75,15 +75,17 @@ macro_rules! compute {
             index: PyReadonlyArray1<'py, i64>,
             booleans: PyReadonlyArray1<'py, bool>,
         ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
-            into_starts_ends_result(
-                py,
-                min_rev_ends_core(
-                    arr.as_array(),
-                    ends.as_array(),
-                    index.as_array(),
-                    booleans.as_array(),
-                ),
+            let (labels, positions) = min_rev_ends_core(
+                arr.as_array(),
+                ends.as_array(),
+                index.as_array(),
+                booleans.as_array(),
             )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok((
+                Array1::from_vec(labels).into_pyarray(py),
+                Array1::from_vec(positions).into_pyarray(py),
+            ))
         }
     };
 }
@@ -125,7 +127,7 @@ mod tests {
         let index = array![50_i64, 10, 90];
         let booleans = array![false, false, false];
         let got = min_rev_ends_core(arr.view(), ends.view(), index.view(), booleans.view());
-        assert_eq!(got, Ok((array![50, 10, 90], array![1, 1, 1])));
+        assert_eq!(got, Ok((vec![50, 10, 90], vec![1, 1, 1])));
     }
 
     #[test]
@@ -135,7 +137,7 @@ mod tests {
         let index = array![10_i64, 20, 30];
         let booleans = array![true, false, true];
         let got = min_rev_ends_core(arr.view(), ends.view(), index.view(), booleans.view());
-        assert_eq!(got, Ok((array![10, 20, 30], array![1, 1, -1])));
+        assert_eq!(got, Ok((vec![10, 20, 30], vec![1, 1, -1])));
     }
 
     #[test]
@@ -150,7 +152,7 @@ mod tests {
         let booleans = Array1::from_elem(20, false);
         let got = min_rev_ends_core(arr.view(), ends.view(), index.view(), booleans.view());
         let expected = Array1::from_elem(20, 2_i64);
-        assert_eq!(got, Ok((index, expected)));
+        assert_eq!(got, Ok((index.to_vec(), expected.to_vec())));
     }
 
     #[test]
@@ -165,7 +167,7 @@ mod tests {
         let mut booleans = Array1::from_elem(20, true);
         booleans[2] = false;
         let got = min_rev_ends_core(arr.view(), ends.view(), index.view(), booleans.view());
-        assert_eq!(got, Ok((index, Array1::from_elem(20, 2_i64))));
+        assert_eq!(got, Ok((index.to_vec(), vec![2_i64; 20])));
     }
 
     #[test]
@@ -180,7 +182,7 @@ mod tests {
                 index.view(),
                 booleans.view()
             ),
-            Ok((array![], array![]))
+            Ok((vec![], vec![]))
         );
         assert!(min_rev_ends_core(
             arr.view(),

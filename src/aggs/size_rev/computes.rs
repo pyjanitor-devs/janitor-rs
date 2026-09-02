@@ -1,15 +1,21 @@
+//! Reverse size aggregations.
+//!
+//! These kernels count how many rows or surviving match-tape candidates cover
+//! each right-side position. State is addressed by ordinal position; `index`
+//! supplies the original labels emitted in the result.
+
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::aggs::{
-    checked_end, checked_index, checked_range, ends_domain, ends_labels, ensure_equal_lengths,
+    checked_end, checked_index, checked_range, ends_domain, ensure_equal_lengths,
     ensure_equal_lengths_core, ensure_exact_tape_width_core, ensure_nonempty_core,
-    into_starts_ends_result, materialize_labels, range_reduce, starts_domain, starts_labels,
-    sweep_reduce,
+    should_use_dense_match_storage, starts_domain,
 };
 
+/// Common Python-facing result: output labels followed by integer counts.
 type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)>;
 
 /// Count how many reverse-end rows cover each compact prefix position.
@@ -17,10 +23,20 @@ type SizeRevResult<'py> = PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArra
 /// ELI5: each `end` says “this row covers everything before here.” Instead of
 /// walking that whole prefix for every row, the implementation activates rows
 /// once during a right-to-left sweep and carries the running count.
+///
+/// # Arguments
+///
+/// * `ends` - Exclusive prefix end for each row. Invalid or zero ends do not
+///   contribute to the result.
+/// * `index` - Right-side labels in ordinal position order.
+///
+/// # Returns
+///
+/// The emitted labels and one count per compact prefix position.
 pub fn size_rev_ends_core(
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
-) -> Result<(Array1<i64>, Array1<i64>), String> {
+) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     let max_end = ends_domain(ends, index.len())?;
     // ELI5: a prefix row is active to the left of its end. Count how many
     // rows end at each boundary, then sweep from right to left and carry the
@@ -28,17 +44,19 @@ pub fn size_rev_ends_core(
     // naturally has no activation bucket visited by the output loop. Counts
     // are enough here, so memory depends on the compact output width—not the
     // number of rows in the batch.
-    // Events are streamed directly from `ends`; `sweep_reduce` stores both the
-    // boundary totals and the final running counts in one width-sized bucket
-    // vector. `end == 0` is an empty prefix and has no event to record.
-    let events = ends
-        .iter()
-        .filter(|end| **end > 0)
-        .map(|end| (*end as usize - 1, 1_i64));
-    let result = sweep_reduce(max_end, 0_i64, events, (0..max_end).rev(), |left, right| {
-        left + right
-    })?;
-    Ok((ends_labels(max_end, index), result))
+    let mut result = vec![0_i64; max_end];
+    for end in ends {
+        if *end > 0 {
+            result[*end as usize - 1] += 1;
+        }
+    }
+    let mut running = 0_i64;
+    for value in result.iter_mut().rev() {
+        running += *value;
+        *value = running;
+    }
+    let labels = Array1::from_iter(index.iter().take(max_end).copied());
+    Ok((labels, Array1::from_vec(result)))
 }
 
 /// Count how many reverse-start rows cover each compact suffix position.
@@ -46,65 +64,101 @@ pub fn size_rev_ends_core(
 /// ELI5: each `start` says “this row covers everything from here onward.” The
 /// implementation groups starts by boundary and sweeps those boundaries once,
 /// so wide suffixes do not cause repeated work.
+///
+/// # Arguments
+///
+/// * `starts` - Inclusive suffix start for each row. Invalid starts and the
+///   one-past-end sentinel do not contribute to the result.
+/// * `index` - Right-side labels in ordinal position order.
+///
+/// # Returns
+///
+/// The emitted labels and one count per compact suffix position.
 pub fn size_rev_starts_core(
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
-) -> Result<(Array1<i64>, Array1<i64>), String> {
+) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
     let (min_start, width) = starts_domain(starts, index.len())?;
     // ELI5: a suffix row is active from its start onward. The shared reducer
     // counts rows at each start boundary, then carries the active-row count
     // forward. The valid `start == index.len()` bucket has no emitted slot and
     // is naturally outside the compact output domain.
-    let events = starts
-        .iter()
-        .filter(|start| **start < index.len() as i64)
-        .map(|start| (*start as usize - min_start, 1_i64));
-    let result = sweep_reduce(width, 0_i64, events, 0..width, |left, right| left + right)?;
-    Ok((starts_labels(min_start, index), result))
+    let mut result = vec![0_i64; width];
+    for start in starts {
+        if *start < index.len() as i64 {
+            result[*start as usize - min_start] += 1;
+        }
+    }
+    let mut running = 0_i64;
+    for value in &mut result {
+        running += *value;
+        *value = running;
+    }
+    let labels = Array1::from_iter(index.iter().skip(min_start).copied());
+    Ok((labels, Array1::from_vec(result)))
 }
 
+/// Count rows covered by each compact right-side position for reverse prefix
+/// ranges. Empty prefixes contribute no counts; `index` labels are emitted in
+/// positional order.
+///
+/// # Arguments
+///
+/// * `ends` - Exclusive prefix end for each row.
+/// * `index` - Right-side labels in ordinal position order.
 #[pyfunction]
 pub fn compute_size_rev_end<'py>(
     py: Python<'py>,
     ends: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
 ) -> SizeRevResult<'py> {
-    into_starts_ends_result(py, size_rev_ends_core(ends.as_array(), index.as_array()))
+    let (labels, counts) = size_rev_ends_core(ends.as_array(), index.as_array())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok((labels.into_pyarray(py), counts.into_pyarray(py)))
 }
 
+/// Count rows covered by each compact right-side position for reverse suffix
+/// ranges. Empty suffixes are omitted from the compact output.
+///
+/// # Arguments
+///
+/// * `starts` - Inclusive suffix start for each row.
+/// * `index` - Right-side labels in ordinal position order.
 #[pyfunction]
 pub fn compute_size_rev_start<'py>(
     py: Python<'py>,
     starts: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
 ) -> SizeRevResult<'py> {
-    into_starts_ends_result(
-        py,
-        size_rev_starts_core(starts.as_array(), index.as_array()),
-    )
+    let (labels, counts) = size_rev_starts_core(starts.as_array(), index.as_array())
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok((labels.into_pyarray(py), counts.into_pyarray(py)))
 }
 
-#[pyfunction]
+/// Count surviving candidates for each right-side position in reverse prefix
+/// ranges using a flat match tape.
+///
 /// `matches` must be non-empty and contain exactly one entry per candidate
-/// position. `counts_array.sum()` normally equals `matches.sum()`; the tape
-/// width is `matches.len()`.
-pub fn compute_size_rev_end_matches<'py>(
-    py: Python<'py>,
-    ends: PyReadonlyArray1<'py, i64>,
-    index: PyReadonlyArray1<'py, i64>,
-    matches: PyReadonlyArray1<'py, i8>,
-) -> SizeRevResult<'py> {
-    let ends = ends.as_array();
-    let index = index.as_array();
-    let matches = matches.as_array();
-    ensure_nonempty_core("ends", ends.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
-    ensure_nonempty_core("index", index.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
-    ensure_nonempty_core("matches", matches.len())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    // ELI5: `matches[n]` advances once per candidate position, summed
-    // across every row -- not comparable to any single array's length.
-    // Total that width up front and check it against `matches.len()`
-    // here, before the loop below ever indexes into the tape.
+/// position in the valid ranges. Its length is the flattened tape width.
+///
+/// # Arguments
+///
+/// * `ends` - Exclusive prefix end for each row.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `matches` - Flat per-candidate match mask.
+///
+/// # Returns
+///
+/// The labels with at least one surviving candidate and their counts.
+pub fn size_rev_end_match_core(
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    matches: ArrayView1<'_, i8>,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
+
     let mut expected_matches_width = 0_usize;
     let mut max_end = 0_usize;
     for end in ends.iter() {
@@ -113,188 +167,210 @@ pub fn compute_size_rev_end_matches<'py>(
             max_end = max_end.max(end_);
         }
     }
-    ensure_exact_tape_width_core(expected_matches_width, matches.len())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    let dense = crate::aggs::should_use_dense_match_storage(index.len(), max_end);
+    ensure_exact_tape_width_core(expected_matches_width, matches.len())?;
+
+    let dense = should_use_dense_match_storage(index.len(), max_end);
     let mut touched = if dense {
         Vec::with_capacity(max_end)
     } else {
         Vec::new()
     };
-    let mut n = 0_usize;
+    let mut tape = 0_usize;
+
     if dense {
         let mut seen = vec![false; max_end];
-        let mut result = vec![0_i64; max_end];
+        let mut counts = vec![0_i64; max_end];
         for end in ends.iter() {
             let Some(end_) = checked_end(*end, index.len()) else {
                 continue;
             };
             for item in 0..end_ {
-                if matches[n] != 0 {
+                if matches[tape] != 0 {
                     if !seen[item] {
                         seen[item] = true;
                         touched.push(item);
                     }
-                    result[item] += 1;
+                    counts[item] += 1;
                 }
-                n += 1;
+                tape += 1;
             }
         }
         let mut labels = Vec::with_capacity(touched.len());
         let mut values = Vec::with_capacity(touched.len());
         for item in touched {
             labels.push(index[item]);
-            values.push(result[item]);
+            values.push(counts[item]);
         }
-        return Ok((labels.into_pyarray(py), values.into_pyarray(py)));
+        return Ok((labels, values));
     }
-    let mut dictionary: HashMap<usize, i64> = HashMap::new();
-    for end in ends.into_iter() {
+
+    let mut counts = HashMap::<usize, i64>::new();
+    for end in ends.iter() {
         let Some(end_) = checked_end(*end, index.len()) else {
             continue;
         };
         for item in 0..end_ {
-            if matches[n] == 0 {
-                n += 1;
-                continue;
+            if matches[tape] != 0 {
+                let count = counts.entry(item).or_insert_with(|| {
+                    touched.push(item);
+                    0
+                });
+                *count += 1;
             }
-            let value = dictionary.entry(item).or_insert_with(|| {
-                touched.push(item);
-                0
-            });
-            *value += 1;
-            n += 1;
+            tape += 1;
         }
     }
     let mut labels = Vec::with_capacity(touched.len());
     let mut values = Vec::with_capacity(touched.len());
     for item in touched {
         labels.push(index[item]);
-        values.push(dictionary[&item]);
+        values.push(counts[&item]);
     }
-    Ok((labels.into_pyarray(py), values.into_pyarray(py)))
+    Ok((labels, values))
 }
 
+/// # Returns
+///
+/// The labels with at least one surviving candidate and their counts.
 #[pyfunction]
+pub fn compute_size_rev_end_matches<'py>(
+    py: Python<'py>,
+    ends: PyReadonlyArray1<'py, i64>,
+    index: PyReadonlyArray1<'py, i64>,
+    matches: PyReadonlyArray1<'py, i8>,
+) -> SizeRevResult<'py> {
+    let (labels, counts) =
+        size_rev_end_match_core(ends.as_array(), index.as_array(), matches.as_array())
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok((labels.into_pyarray(py), counts.into_pyarray(py)))
+}
+
+/// Count surviving candidates for each right-side position in reverse suffix
+/// ranges using a flat match tape.
+///
 /// `matches` must be non-empty and contain exactly one entry per candidate
-/// position. `counts_array.sum()` normally equals `matches.sum()`; the tape
-/// width is `matches.len()`.
+/// position in the valid ranges. Its length is the flattened tape width.
+pub fn size_rev_start_match_core(
+    starts: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    matches: ArrayView1<'_, i8>,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
+
+    let mut expected_matches_width = 0_usize;
+    let mut min_start = index.len();
+    for start in starts.iter() {
+        if let Some((start_, end_)) = checked_range(*start, index.len() as i64, index.len()) {
+            expected_matches_width += end_ - start_;
+            min_start = min_start.min(start_);
+        }
+    }
+    ensure_exact_tape_width_core(expected_matches_width, matches.len())?;
+
+    let width = index.len().saturating_sub(min_start);
+    let dense = should_use_dense_match_storage(index.len(), width);
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
+    let mut tape = 0_usize;
+
+    if dense {
+        let mut seen = vec![false; width];
+        let mut counts = vec![0_i64; width];
+        for start in starts.iter() {
+            let Some((start_, end_)) = checked_range(*start, index.len() as i64, index.len())
+            else {
+                continue;
+            };
+            for item in start_..end_ {
+                if matches[tape] != 0 {
+                    let slot = item - min_start;
+                    if !seen[slot] {
+                        seen[slot] = true;
+                        touched.push(slot);
+                    }
+                    counts[slot] += 1;
+                }
+                tape += 1;
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut values = Vec::with_capacity(touched.len());
+        for slot in touched {
+            labels.push(index[min_start + slot]);
+            values.push(counts[slot]);
+        }
+        return Ok((labels, values));
+    }
+
+    let mut counts = HashMap::<usize, i64>::new();
+    for start in starts.iter() {
+        let Some((start_, end_)) = checked_range(*start, index.len() as i64, index.len()) else {
+            continue;
+        };
+        for item in start_..end_ {
+            if matches[tape] != 0 {
+                let slot = item - min_start;
+                let count = counts.entry(slot).or_insert_with(|| {
+                    touched.push(slot);
+                    0
+                });
+                *count += 1;
+            }
+            tape += 1;
+        }
+    }
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut values = Vec::with_capacity(touched.len());
+    for slot in touched {
+        labels.push(index[min_start + slot]);
+        values.push(counts[&slot]);
+    }
+    Ok((labels, values))
+}
+
+/// Count surviving candidates for each right-side position in reverse suffix
+/// ranges using a flat match tape.
+///
+/// # Arguments
+///
+/// * `starts` - Inclusive suffix start for each row.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `matches` - Flat per-candidate match mask with the exact tape width.
+///
+/// # Returns
+///
+/// The labels with at least one surviving candidate and their counts.
+#[pyfunction]
 pub fn compute_size_rev_start_matches<'py>(
     py: Python<'py>,
     starts: PyReadonlyArray1<'py, i64>,
     index: PyReadonlyArray1<'py, i64>,
     matches: PyReadonlyArray1<'py, i8>,
 ) -> SizeRevResult<'py> {
-    let starts = starts.as_array();
-    let index = index.as_array();
-    let matches = matches.as_array();
-    ensure_nonempty_core("starts", starts.len())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    ensure_nonempty_core("index", index.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
-    ensure_nonempty_core("matches", matches.len())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    let end_: usize = index.len();
-    // ELI5: `matches[n]` advances once per candidate position, summed
-    // across every row -- not comparable to any single array's length.
-    // Total that width up front and check it against `matches.len()`
-    // here, before the loop below ever indexes into the tape.
-    let mut expected_matches_width = 0_usize;
-    let mut min_start = index.len();
-    for start in starts.iter() {
-        if let Some((start_, end_)) = checked_range(*start, end_ as i64, index.len()) {
-            expected_matches_width += end_ - start_;
-            min_start = min_start.min(start_);
-        }
-    }
-    ensure_exact_tape_width_core(expected_matches_width, matches.len())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    let width = index.len().saturating_sub(min_start);
-    let dense = crate::aggs::should_use_dense_match_storage(index.len(), width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
-    let mut n = 0_usize;
-    if dense {
-        let mut seen = vec![false; width];
-        let mut values = vec![0_i64; width];
-        for start in starts.iter() {
-            let Some((start_, _)) = checked_range(*start, end_ as i64, index.len()) else {
-                continue;
-            };
-            for item in start_..index.len() {
-                if matches[n] != 0 {
-                    let slot = item - min_start;
-                    if !seen[slot] {
-                        seen[slot] = true;
-                        touched.push(slot);
-                    }
-                    values[slot] += 1;
-                }
-                n += 1;
-            }
-        }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut result = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            result.push(values[slot]);
-        }
-        return Ok((labels.into_pyarray(py), result.into_pyarray(py)));
-    }
-    let mut dictionary: HashMap<usize, i64> = HashMap::new();
-    for start in starts.into_iter() {
-        let Some((start_, _)) = checked_range(*start, end_ as i64, index.len()) else {
-            continue;
-        };
-        for item in start_..end_ {
-            if matches[n] == 0 {
-                n += 1;
-                continue;
-            }
-            let value = dictionary.entry(item).or_insert_with(|| {
-                touched.push(item);
-                0
-            });
-            *value += 1;
-            n += 1;
-        }
-    }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut result = Vec::with_capacity(touched.len());
-    for item in touched {
-        labels.push(index[item]);
-        result.push(dictionary[&item]);
-    }
-    Ok((labels.into_pyarray(py), result.into_pyarray(py)))
+    let (labels, counts) =
+        size_rev_start_match_core(starts.as_array(), index.as_array(), matches.as_array())
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok((labels.into_pyarray(py), counts.into_pyarray(py)))
 }
 
-#[pyfunction]
-/// `matches` must be non-empty and contain exactly one entry per candidate
-/// position. `counts_array.sum()` normally equals `matches.sum()`; the tape
-/// width is `matches.len()`.
-pub fn compute_size_rev_start_end_matches<'py>(
-    py: Python<'py>,
-    starts: PyReadonlyArray1<'py, i64>,
-    ends: PyReadonlyArray1<'py, i64>,
-    index: PyReadonlyArray1<'py, i64>,
-    matches: PyReadonlyArray1<'py, i8>,
-) -> SizeRevResult<'py> {
-    let starts = starts.as_array();
-    let ends = ends.as_array();
-    let index = index.as_array();
-    let matches = matches.as_array();
-    ensure_nonempty_core("starts", starts.len())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    ensure_nonempty_core("ends", ends.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
-    ensure_nonempty_core("index", index.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
-    ensure_nonempty_core("matches", matches.len())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    // ELI5: `matches[n]` advances once per candidate position, summed
-    // across every row -- not comparable to any single array's length.
-    // Total that width up front and check it against `matches.len()`
-    // here, before the loop below ever indexes into the tape.
+/// Count surviving candidates for each right-side position in reverse
+/// interval ranges using a flat match tape.
+pub fn size_rev_start_end_match_core(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    matches: ArrayView1<'_, i8>,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
+
     let mut expected_matches_width = 0_usize;
     let mut min_start = index.len();
     let mut max_end = 0_usize;
@@ -305,66 +381,100 @@ pub fn compute_size_rev_start_end_matches<'py>(
             max_end = max_end.max(end_);
         }
     }
-    ensure_exact_tape_width_core(expected_matches_width, matches.len())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    ensure_exact_tape_width_core(expected_matches_width, matches.len())?;
+
     let width = max_end.saturating_sub(min_start);
-    let dense = crate::aggs::should_use_dense_match_storage(index.len(), width);
+    let dense = should_use_dense_match_storage(index.len(), width);
     let mut touched = if dense {
         Vec::with_capacity(width)
     } else {
         Vec::new()
     };
-    let mut n = 0_usize;
+    let mut tape = 0_usize;
+
     if dense {
         let mut seen = vec![false; width];
-        let mut values = vec![0_i64; width];
+        let mut counts = vec![0_i64; width];
         for (start, end) in starts.iter().zip(ends.iter()) {
             let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
                 continue;
             };
             for item in start_..end_ {
-                if matches[n] != 0 {
+                if matches[tape] != 0 {
                     let slot = item - min_start;
                     if !seen[slot] {
                         seen[slot] = true;
                         touched.push(slot);
                     }
-                    values[slot] += 1;
+                    counts[slot] += 1;
                 }
-                n += 1;
+                tape += 1;
             }
         }
         let mut labels = Vec::with_capacity(touched.len());
-        let mut result = Vec::with_capacity(touched.len());
+        let mut values = Vec::with_capacity(touched.len());
         for slot in touched {
             labels.push(index[min_start + slot]);
-            result.push(values[slot]);
+            values.push(counts[slot]);
         }
-        return Ok((labels.into_pyarray(py), result.into_pyarray(py)));
+        return Ok((labels, values));
     }
-    let mut dictionary: HashMap<usize, i64> = HashMap::new();
-    for (start, end) in starts.into_iter().zip(ends) {
+
+    let mut counts = HashMap::<usize, i64>::new();
+    for (start, end) in starts.iter().zip(ends.iter()) {
         let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
             continue;
         };
         for item in start_..end_ {
-            if matches[n] != 0 {
-                let value = dictionary.entry(item).or_insert_with(|| {
-                    touched.push(item);
+            if matches[tape] != 0 {
+                let slot = item - min_start;
+                let count = counts.entry(slot).or_insert_with(|| {
+                    touched.push(slot);
                     0
                 });
-                *value += 1;
+                *count += 1;
             }
-            n += 1;
+            tape += 1;
         }
     }
     let mut labels = Vec::with_capacity(touched.len());
-    let mut result = Vec::with_capacity(touched.len());
-    for item in touched {
-        labels.push(index[item]);
-        result.push(dictionary[&item]);
+    let mut values = Vec::with_capacity(touched.len());
+    for slot in touched {
+        labels.push(index[min_start + slot]);
+        values.push(counts[&slot]);
     }
-    Ok((labels.into_pyarray(py), result.into_pyarray(py)))
+    Ok((labels, values))
+}
+
+/// `matches` must be non-empty and contain exactly one entry per candidate
+/// position in the valid ranges. Its length is the flattened tape width.
+///
+/// # Arguments
+///
+/// * `starts` - Inclusive interval start for each row.
+/// * `ends` - Exclusive interval end for each row.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `matches` - Flat per-candidate match mask.
+///
+/// # Returns
+///
+/// The labels with at least one surviving candidate and their counts.
+#[pyfunction]
+pub fn compute_size_rev_start_end_matches<'py>(
+    py: Python<'py>,
+    starts: PyReadonlyArray1<'py, i64>,
+    ends: PyReadonlyArray1<'py, i64>,
+    index: PyReadonlyArray1<'py, i64>,
+    matches: PyReadonlyArray1<'py, i8>,
+) -> SizeRevResult<'py> {
+    let (labels, counts) = size_rev_start_end_match_core(
+        starts.as_array(),
+        ends.as_array(),
+        index.as_array(),
+        matches.as_array(),
+    )
+    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok((labels.into_pyarray(py), counts.into_pyarray(py)))
 }
 
 /// Count covered right-row positions for each distinct right-row identity.
@@ -384,24 +494,102 @@ pub fn compute_size_rev_start_end_matches<'py>(
 /// must provide it themselves. Duplicate labels are unsupported and are not
 /// merged by the positional accumulator.
 ///
+/// # Arguments
+///
+/// * `starts` - Inclusive start of each half-open interval.
+/// * `ends` - Exclusive end of each half-open interval.
+/// * `index` - Right-side labels in ordinal position order.
+///
+/// # Returns
+///
+/// The touched labels and the number of covering intervals for each label.
+///
 /// ELI5: each right-row position gets a drawer. Every range adds one to each
 /// covered drawer, then we print the row identity stored in `index[item]`.
 pub fn size_rev_start_end_core(
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
-) -> Result<(Array1<i64>, Array1<i64>), String> {
+) -> Result<(Vec<i64>, Vec<i64>), String> {
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
     ensure_nonempty_core("starts", starts.len())?;
-    ensure_nonempty_core("ends", ends.len())?;
     ensure_nonempty_core("index", index.len())?;
-    let (touched, result) = range_reduce(starts, ends, index.len(), 0_i64, |_row, _item, count| {
-        *count += 1
-    });
-    let indexers = materialize_labels(&touched, index);
-    Ok((indexers, result.into_iter().collect()))
+
+    let mut min_start = index.len();
+    let mut max_end = 0_usize;
+    for (&start, &end) in starts.iter().zip(ends.iter()) {
+        if let Some((start, end)) = checked_range(start, end, index.len()) {
+            min_start = min_start.min(start);
+            max_end = max_end.max(end);
+        }
+    }
+    let width = max_end.saturating_sub(min_start);
+    let dense = should_use_dense_match_storage(index.len(), width);
+    let mut touched = if dense {
+        Vec::with_capacity(width)
+    } else {
+        Vec::new()
+    };
+
+    if dense {
+        let mut seen = vec![false; width];
+        let mut counts = vec![0_i64; width];
+        for (&start, &end) in starts.iter().zip(ends.iter()) {
+            let Some((start, end)) = checked_range(start, end, index.len()) else {
+                continue;
+            };
+            for item in start..end {
+                let slot = item - min_start;
+                if !seen[slot] {
+                    seen[slot] = true;
+                    touched.push(slot);
+                }
+                counts[slot] += 1;
+            }
+        }
+        let mut labels = Vec::with_capacity(touched.len());
+        let mut result = Vec::with_capacity(touched.len());
+        for slot in touched {
+            labels.push(index[min_start + slot]);
+            result.push(counts[slot]);
+        }
+        return Ok((labels, result));
+    }
+
+    let mut counts = HashMap::<usize, i64>::new();
+    for (&start, &end) in starts.iter().zip(ends.iter()) {
+        let Some((start, end)) = checked_range(start, end, index.len()) else {
+            continue;
+        };
+        for item in start..end {
+            let count = counts.entry(item).or_insert_with(|| {
+                touched.push(item);
+                0
+            });
+            *count += 1;
+        }
+    }
+    let mut labels = Vec::with_capacity(touched.len());
+    let mut result = Vec::with_capacity(touched.len());
+    for item in touched {
+        labels.push(index[item]);
+        result.push(counts[&item]);
+    }
+    Ok((labels, result))
 }
 
+/// Count rows covered by each compact right-side position for reverse interval
+/// ranges. Ranges use half-open `[start, end)` semantics.
+///
+/// # Arguments
+///
+/// * `starts` - Inclusive interval start for each row.
+/// * `ends` - Exclusive interval end for each row.
+/// * `index` - Right-side labels in ordinal position order.
+///
+/// # Returns
+///
+/// The emitted labels and one count per touched interval position.
 #[pyfunction]
 pub fn compute_size_rev_start_end<'py>(
     py: Python<'py>,
@@ -413,9 +601,9 @@ pub fn compute_size_rev_start_end<'py>(
     let ends = ends.as_array();
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
-    let result = size_rev_start_end_core(starts, ends, index)
+    let (labels, counts) = size_rev_start_end_core(starts, ends, index)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    Ok((result.0.into_pyarray(py), result.1.into_pyarray(py)))
+    Ok((labels.into_pyarray(py), counts.into_pyarray(py)))
 }
 
 #[cfg(test)]
@@ -456,6 +644,48 @@ mod tests {
     }
 
     #[test]
+    fn dense_match_path_preserves_gapped_label_order() {
+        Python::initialize();
+        Python::attach(|py| {
+            let ends = PyArray1::from_vec(py, vec![3_i64]);
+            let index = PyArray1::from_vec(py, vec![50_i64, 10, 90]);
+            let matches = PyArray1::from_vec(py, vec![1_i8, 0, 1]);
+            let (labels, counts) = compute_size_rev_end_matches(
+                py,
+                ends.readonly(),
+                index.readonly(),
+                matches.readonly(),
+            )
+            .unwrap();
+            assert_eq!(labels.readonly().as_array(), array![50, 90].view());
+            assert_eq!(counts.readonly().as_array(), array![1, 1].view());
+
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let (labels, counts) = compute_size_rev_start_matches(
+                py,
+                starts.readonly(),
+                index.readonly(),
+                matches.readonly(),
+            )
+            .unwrap();
+            assert_eq!(labels.readonly().as_array(), array![50, 90].view());
+            assert_eq!(counts.readonly().as_array(), array![1, 1].view());
+
+            let ends = PyArray1::from_vec(py, vec![3_i64]);
+            let (labels, counts) = compute_size_rev_start_end_matches(
+                py,
+                starts.readonly(),
+                ends.readonly(),
+                index.readonly(),
+                matches.readonly(),
+            )
+            .unwrap();
+            assert_eq!(labels.readonly().as_array(), array![50, 90].view());
+            assert_eq!(counts.readonly().as_array(), array![1, 1].view());
+        });
+    }
+
+    #[test]
     fn rejects_empty_and_invalid_boundaries() {
         let index = array![10_i64];
         assert_eq!(
@@ -480,6 +710,19 @@ mod tests {
     }
 }
 
+/// Count rows covered by each label reached through the positional candidate
+/// tape.
+///
+/// # Arguments
+///
+/// * `starts` - Inclusive positional range starts.
+/// * `ends` - Exclusive positional range ends.
+/// * `index` - Right-side labels addressed by `positions`.
+/// * `positions` - Positional candidate tape.
+///
+/// # Returns
+///
+/// The labels reached through `positions` and their coverage counts.
 #[pyfunction]
 pub fn compute_size_rev_positions<'py>(
     py: Python<'py>,
@@ -493,12 +736,11 @@ pub fn compute_size_rev_positions<'py>(
     ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let positions = positions.as_array();
-    ensure_nonempty_core("starts", starts.len())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    ensure_nonempty_core("ends", ends.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
-    ensure_nonempty_core("index", index.len()).map_err(pyo3::exceptions::PyValueError::new_err)?;
-    ensure_nonempty_core("positions", positions.len())
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    if starts.is_empty() || index.is_empty() || positions.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "starts, ends, index, and positions cannot be empty",
+        ));
+    }
     let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
     let zipped = starts.into_iter().zip(ends);
     for (start, end) in zipped {
