@@ -66,6 +66,9 @@ where
         }
     }
     let width = max_end.saturating_sub(min_start);
+    // ELI5: if the ranges collectively represent enough positional work,
+    // direct array indexing is cheaper than dictionary lookups. This value is
+    // only a dispatch estimate; `width` remains the actual dense allocation.
     let dense = should_use_dense_match_storage(index.len(), total_width);
     let mut touched = if dense {
         Vec::with_capacity(width)
@@ -85,6 +88,9 @@ where
             let current = *current;
             let boolean = *boolean;
             for item in start..end {
+                // `min_start` is the smallest validated start, so every
+                // valid item is at least it. This subtraction therefore maps
+                // an absolute position into the compact array safely.
                 let slot = item - min_start;
                 if !seen[slot] {
                     seen[slot] = true;
@@ -200,6 +206,10 @@ where
                     let difference = current - slots[slot].1;
                     let increment = slots[slot].0 + difference;
                     slots[slot].1 = (increment - slots[slot].0) - difference;
+                    // ELI5: compensation tracks the tiny rounding remainder.
+                    // Once arithmetic produces infinity or NaN, that
+                    // remainder is no longer meaningful, so discard it and
+                    // continue with the ordinary running total.
                     if !slots[slot].1.is_finite() {
                         slots[slot].1 = 0.0;
                     }
@@ -227,6 +237,8 @@ where
         let boolean = *boolean;
         let current = if boolean { None } else { Some(to_f64(current)) };
         for item in start..end {
+            // `min_start` is the smallest validated start, so this unsigned
+            // subtraction cannot underflow while translating to a slot.
             let slot = item - min_start;
             let state = slots.entry(slot).or_insert_with(|| {
                 touched.push(slot);
@@ -236,6 +248,9 @@ where
                 let difference = current - state.1;
                 let increment = state.0 + difference;
                 state.1 = (increment - state.0) - difference;
+                // ELI5: after overflow or an invalid float operation, the
+                // compensation remainder is no longer usable. Reset it so a
+                // stale NaN/ infinity does not poison later updates.
                 if !state.1.is_finite() {
                     state.1 = 0.0;
                 }

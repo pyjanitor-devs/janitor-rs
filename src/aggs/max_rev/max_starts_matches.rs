@@ -206,3 +206,51 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_max_rev_start_match_f64, m)?)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::max_rev_start_match_core;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn all_null_rows_emit_labels_without_winners() {
+        let got = max_rev_start_match_core(
+            array![3_i64, 5].view(),
+            array![0_i64, 1].view(),
+            array![2_i64, 1].view(),
+            array![10_i64, 20].view(),
+            array![1_i8, 1, 1].view(),
+            array![true, true].view(),
+        );
+
+        assert_eq!(got, Ok((vec![10, 20], vec![-1, -1])));
+    }
+
+    #[test]
+    fn zero_count_row_does_not_shift_the_following_tape_row() {
+        let got = max_rev_start_match_core(
+            array![2_i64, 3].view(),
+            array![0_i64, 1].view(),
+            array![0_i64, 1].view(),
+            array![10_i64, 20].view(),
+            array![0_i8, 0, 1].view(),
+            array![false, false].view(),
+        );
+
+        assert_eq!(got, Ok((vec![20], vec![1])));
+    }
+
+    #[test]
+    fn invalid_start_contributes_no_tape_entries() {
+        let got = max_rev_start_match_core(
+            array![2_i64, 3].view(),
+            array![-1_i64, 0].view(),
+            array![0_i64, 2].view(),
+            array![10_i64, 20].view(),
+            array![1_i8, 1].view(),
+            array![false, false].view(),
+        );
+
+        assert_eq!(got, Ok((vec![10, 20], vec![1, 1])));
+    }
+}

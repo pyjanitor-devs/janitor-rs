@@ -62,6 +62,10 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
         }
     }
     let width = max_end.saturating_sub(min_start);
+    // ELI5: when the requested ranges cover enough of the right-hand domain,
+    // a numbered row of drawers is cheaper than repeatedly looking positions
+    // up in a dictionary. `total_width` is the estimated amount of work; it
+    // is intentionally only a dispatch hint, not the allocated width.
     let dense = should_use_dense_match_storage(index.len(), total_width);
     let mut touched = if dense {
         Vec::with_capacity(width)
@@ -81,6 +85,10 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
             let current = *current;
             let boolean = *boolean;
             for item in start..end {
+                // `checked_range` guarantees `item >= start`, and the
+                // pre-pass guarantees `min_start <= start`. Therefore this
+                // unsigned subtraction cannot underflow: it translates an
+                // absolute right-row position into the compact domain.
                 let slot = item - min_start;
                 if !seen[slot] {
                     seen[slot] = true;
@@ -113,6 +121,9 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
         let current = *current;
         let boolean = *boolean;
         for item in start..end {
+            // `min_start` is the smallest validated start, so every valid
+            // item is at least `min_start`; subtraction is a safe compact-slot
+            // translation rather than an unchecked signed-boundary operation.
             let slot = item - min_start;
             let state = states.entry(slot).or_insert_with(|| {
                 touched.push(slot);

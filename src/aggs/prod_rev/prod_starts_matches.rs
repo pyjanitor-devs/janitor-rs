@@ -326,7 +326,11 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_prod_rev_start_match_int64, compute_prod_rev_start_match_uint64};
+    use super::{
+        compute_prod_rev_start_match_int64, compute_prod_rev_start_match_uint64,
+        prod_rev_start_match_int_core,
+    };
+    use numpy::ndarray::array;
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::Python;
 
@@ -438,5 +442,50 @@ mod tests {
             .unwrap();
             assert_eq!(values.readonly().as_slice().unwrap(), &[i64::MAX, 2]);
         });
+    }
+
+    #[test]
+    fn all_null_rows_emit_labels_with_multiplicative_identity() {
+        let got = prod_rev_start_match_int_core(
+            array![2_i64, 3].view(),
+            array![0_i64, 1].view(),
+            array![2_i64, 1].view(),
+            array![10_i64, 20].view(),
+            array![1_i8, 1, 1].view(),
+            array![true, true].view(),
+            |value| value,
+        );
+
+        assert_eq!(got, Ok((vec![10, 20], vec![1, 1])));
+    }
+
+    #[test]
+    fn zero_count_row_does_not_shift_the_following_tape_row() {
+        let got = prod_rev_start_match_int_core(
+            array![2_i64, 3].view(),
+            array![0_i64, 1].view(),
+            array![0_i64, 1].view(),
+            array![10_i64, 20].view(),
+            array![0_i8, 0, 1].view(),
+            array![false, false].view(),
+            |value| value,
+        );
+
+        assert_eq!(got, Ok((vec![20], vec![3])));
+    }
+
+    #[test]
+    fn invalid_start_contributes_no_tape_entries() {
+        let got = prod_rev_start_match_int_core(
+            array![2_i64, 3].view(),
+            array![-1_i64, 0].view(),
+            array![0_i64, 2].view(),
+            array![10_i64, 20].view(),
+            array![1_i8, 1].view(),
+            array![false, false].view(),
+            |value| value,
+        );
+
+        assert_eq!(got, Ok((vec![10, 20], vec![3, 3])));
     }
 }
