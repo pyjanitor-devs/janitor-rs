@@ -189,7 +189,7 @@ where
             };
             let current = *current;
             let boolean = *boolean;
-            let current = (!boolean).then(|| to_f64(current));
+            let current = if boolean { None } else { Some(to_f64(current)) };
             for item in start..end {
                 let slot = item - min_start;
                 if !seen[slot] {
@@ -225,7 +225,7 @@ where
         };
         let current = *current;
         let boolean = *boolean;
-        let current = (!boolean).then(|| to_f64(current));
+        let current = if boolean { None } else { Some(to_f64(current)) };
         for item in start..end {
             let slot = item - min_start;
             let state = slots.entry(slot).or_insert_with(|| {
