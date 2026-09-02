@@ -511,6 +511,13 @@ fn bench(c: &mut Criterion) {
             8,
             true,
         ),
+        (
+            "super_large_singleton_unique",
+            1_000_000,
+            1_000_000,
+            1,
+            false,
+        ),
         ("super_large_narrow_unique", 1_000_000, 1_000_000, 8, false),
     ] {
         let values = (0..rows)
