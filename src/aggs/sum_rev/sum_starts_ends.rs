@@ -238,7 +238,6 @@ macro_rules! compute_ints {
     ($fname:ident, $type:ty, $acc:ty) => {
         /// `index` must contain unique labels. Positions in the array are the
         /// ordinal state slots; direct callers must preserve that contract.
-        /// This correctness precondition is unchecked to avoid an extra pass.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -283,7 +282,6 @@ macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
         /// `index` must contain unique labels. Positions in the array are the
         /// ordinal state slots; direct callers must preserve that contract.
-        /// This correctness precondition is unchecked to avoid an extra pass.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
