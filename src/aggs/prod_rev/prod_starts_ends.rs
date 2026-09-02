@@ -203,17 +203,16 @@ where
             };
             let current = *current;
             let boolean = *boolean;
-            if boolean {
-                continue;
-            }
-            let current = to_f64(current);
+            let current = (!boolean).then(|| to_f64(current));
             for item in start..end {
                 let slot = item - min_start;
                 if !seen[slot] {
                     seen[slot] = true;
                     touched.push(slot);
                 }
-                states[slot] *= current;
+                if let Some(current) = current {
+                    states[slot] *= current;
+                }
             }
         }
         let mut labels = Vec::with_capacity(touched.len());
@@ -234,17 +233,16 @@ where
         };
         let current = *current;
         let boolean = *boolean;
-        if boolean {
-            continue;
-        }
-        let current = to_f64(current);
+        let current = (!boolean).then(|| to_f64(current));
         for item in start..end {
             let slot = item - min_start;
             let product = states.entry(slot).or_insert_with(|| {
                 touched.push(slot);
                 1.0_f64
             });
-            *product *= current;
+            if let Some(current) = current {
+                *product *= current;
+            }
         }
     }
     let mut labels = Vec::with_capacity(touched.len());
@@ -467,5 +465,47 @@ mod tests {
             |value: i64| value,
         )
         .is_err());
+    }
+
+    #[test]
+    fn float_null_row_still_emits_its_label_with_one() {
+        let got = prod_rev_start_end_float_core(
+            array![5.0_f64].view(),
+            array![0_i64].view(),
+            array![1_i64].view(),
+            array![10_i64].view(),
+            array![true].view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![10], vec![1.0]));
+    }
+
+    #[test]
+    fn float_null_rows_emit_disjoint_labels_with_one() {
+        let got = prod_rev_start_end_float_core(
+            array![5.0_f64, 7.0].view(),
+            array![0_i64, 2].view(),
+            array![1_i64, 3].view(),
+            array![10_i64, 20, 30].view(),
+            array![true, true].view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![10, 30], vec![1.0, 1.0]));
+    }
+
+    #[test]
+    fn float_mixed_rows_preserve_null_only_labels() {
+        let got = prod_rev_start_end_float_core(
+            array![2.0_f64, 5.0].view(),
+            array![0_i64, 1].view(),
+            array![1_i64, 2].view(),
+            array![10_i64, 20].view(),
+            array![false, true].view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![10, 20], vec![2.0, 1.0]));
     }
 }

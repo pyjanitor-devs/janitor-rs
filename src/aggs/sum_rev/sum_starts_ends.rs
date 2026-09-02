@@ -189,23 +189,22 @@ where
             };
             let current = *current;
             let boolean = *boolean;
-            if boolean {
-                continue;
-            }
-            let current = to_f64(current);
+            let current = (!boolean).then(|| to_f64(current));
             for item in start..end {
                 let slot = item - min_start;
                 if !seen[slot] {
                     seen[slot] = true;
                     touched.push(slot);
                 }
-                let difference = current - slots[slot].1;
-                let increment = slots[slot].0 + difference;
-                slots[slot].1 = (increment - slots[slot].0) - difference;
-                if !slots[slot].1.is_finite() {
-                    slots[slot].1 = 0.0;
+                if let Some(current) = current {
+                    let difference = current - slots[slot].1;
+                    let increment = slots[slot].0 + difference;
+                    slots[slot].1 = (increment - slots[slot].0) - difference;
+                    if !slots[slot].1.is_finite() {
+                        slots[slot].1 = 0.0;
+                    }
+                    slots[slot].0 = increment;
                 }
-                slots[slot].0 = increment;
             }
         }
         let mut labels = Vec::with_capacity(touched.len());
@@ -226,23 +225,22 @@ where
         };
         let current = *current;
         let boolean = *boolean;
-        if boolean {
-            continue;
-        }
-        let current = to_f64(current);
+        let current = (!boolean).then(|| to_f64(current));
         for item in start..end {
             let slot = item - min_start;
             let state = slots.entry(slot).or_insert_with(|| {
                 touched.push(slot);
                 (0.0, 0.0)
             });
-            let difference = current - state.1;
-            let increment = state.0 + difference;
-            state.1 = (increment - state.0) - difference;
-            if !state.1.is_finite() {
-                state.1 = 0.0;
+            if let Some(current) = current {
+                let difference = current - state.1;
+                let increment = state.0 + difference;
+                state.1 = (increment - state.0) - difference;
+                if !state.1.is_finite() {
+                    state.1 = 0.0;
+                }
+                state.0 = increment;
             }
-            state.0 = increment;
         }
     }
     let mut labels = Vec::with_capacity(touched.len());
@@ -524,5 +522,47 @@ mod tests {
         .unwrap();
         assert_eq!(got.0, vec![10]);
         assert!((got.1[0] - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn float_null_row_still_emits_its_label_with_zero() {
+        let got = sum_rev_start_end_float_core(
+            array![5.0_f64].view(),
+            array![0_i64].view(),
+            array![1_i64].view(),
+            array![10_i64].view(),
+            array![true].view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![10], vec![0.0]));
+    }
+
+    #[test]
+    fn float_null_rows_emit_disjoint_labels_with_zero() {
+        let got = sum_rev_start_end_float_core(
+            array![5.0_f64, 7.0].view(),
+            array![0_i64, 2].view(),
+            array![1_i64, 3].view(),
+            array![10_i64, 20, 30].view(),
+            array![true, true].view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![10, 30], vec![0.0, 0.0]));
+    }
+
+    #[test]
+    fn float_mixed_rows_preserve_null_only_labels() {
+        let got = sum_rev_start_end_float_core(
+            array![2.0_f64, 5.0].view(),
+            array![0_i64, 1].view(),
+            array![1_i64, 2].view(),
+            array![10_i64, 20].view(),
+            array![false, true].view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![10, 20], vec![2.0, 0.0]));
     }
 }
