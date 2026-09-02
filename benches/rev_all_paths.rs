@@ -1,8 +1,8 @@
-//! Coverage benchmark for every reverse Python-facing aggregation path.
+//! Coverage benchmark for every listed reverse Python-facing aggregation path.
 //!
-//! Each numeric dtype is measured across range, positional, no-range, and
-//! match-tape paths. Shapes cover small/wide, small/narrow, large/wide, and
-//! large/narrow inputs. Inputs are prepared once per benchmark so timings
+//! Each listed numeric dtype is measured across range, positional, no-range,
+//! and match-tape paths. Shapes cover small/wide, small/narrow, large/wide,
+//! and large/narrow inputs. Inputs are prepared once per benchmark so timings
 //! describe the aggregation path rather than NumPy-array construction.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
