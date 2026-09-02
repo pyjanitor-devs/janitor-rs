@@ -127,8 +127,16 @@ pub(crate) fn ensure_equal_lengths_core(
 ///
 /// `covered_len` is a prefix bound, not a count of distinct positions. Thus,
 /// `covered_len = 5_000` can still mean that only a few positions are actually
-/// touched; using this inexpensive bound avoids building another set solely to
-/// make the dispatch decision.
+/// touched. This can happen when many input rows have unique `right_index`
+/// labels but repeat the same positional range. We intentionally use this
+/// inexpensive bound instead of building another set solely to make the
+/// dispatch decision; a future adaptive HashMap-to-dense accumulator could
+/// make promotion depend on the actual number of distinct touched positions.
+///
+/// ELI5: one million uniquely labelled requests can still point at just two
+/// shelves. Summing their requested shelf widths may make the room look full
+/// even though only two shelves are occupied, so this remains a documented
+/// memory/performance tradeoff rather than a correctness guarantee.
 pub(crate) fn should_use_dense_match_storage(domain_len: usize, covered_len: usize) -> bool {
     domain_len != 0 && covered_len.saturating_mul(2) >= domain_len
 }
