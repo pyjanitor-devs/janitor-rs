@@ -37,6 +37,7 @@ pub fn size_rev_ends_core(
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+    ensure_nonempty_core("index", index.len()).map_err(|_| "index cannot be empty")?;
     let max_end = ends_domain(ends, index.len())?;
     // ELI5: a prefix row is active to the left of its end. Count how many
     // rows end at each boundary, then sweep from right to left and carry the
@@ -78,6 +79,7 @@ pub fn size_rev_starts_core(
     starts: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
+    ensure_nonempty_core("index", index.len()).map_err(|_| "index cannot be empty")?;
     let (min_start, width) = starts_domain(starts, index.len())?;
     // ELI5: a suffix row is active from its start onward. The shared reducer
     // counts rows at each start boundary, then carries the active-row count

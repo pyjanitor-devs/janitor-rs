@@ -27,6 +27,7 @@ pub fn prod_rev_ends_int_core<T: Copy, A: WrapMul, F: FnMut(T) -> A>(
     mut convert: F,
 ) -> Result<(Vec<i64>, Vec<A>), String> {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
@@ -66,6 +67,7 @@ pub fn prod_rev_ends_float_core<T: Copy, F: FnMut(T) -> f64>(
     mut to_f64: F,
 ) -> Result<(Vec<i64>, Vec<f64>), String> {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;

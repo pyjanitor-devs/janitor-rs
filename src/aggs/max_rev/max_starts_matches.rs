@@ -32,6 +32,7 @@ pub fn max_rev_start_match_core<T: PartialOrd + Copy>(
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("matches", matches.len())?;
 
     let mut expected = 0_usize;
