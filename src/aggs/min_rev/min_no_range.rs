@@ -24,11 +24,9 @@ pub fn min_rev_no_range_core<T: Copy + PartialOrd>(
         "right_index",
         right_index.len(),
     )?;
-    // ELI5: reserve the lookup table for the full join, but let output state
-    // grow only as distinct labels appear; duplicate-heavy inputs should not
-    // preallocate one result slot per matched row.
-    // A match pair is not necessarily a new label; repeated labels are the
-    // common many-to-one case. Grow only for labels that actually appear.
+    // ELI5: a match pair is not necessarily a new label; repeated labels are
+    // the common many-to-one case. Let the map grow only for labels actually
+    // observed instead of reserving for every pair up front.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut positions = Vec::new();

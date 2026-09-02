@@ -36,12 +36,9 @@ pub fn sum_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     mut to_i64: F,
 ) -> Result<(Array1<i64>, Array1<i64>), String> {
     validate_inputs(arr, left_index, right_index, booleans)?;
-    // ELI5: reserve the lookup table for the full join, but let output state
-    // grow only as distinct labels appear; duplicate-heavy inputs should not
-    // preallocate one result slot per matched row.
-    // The pair count can be much larger than the number of distinct labels:
-    // one right row may match many left rows. Let the map grow with the
-    // labels actually observed instead of reserving for every match upfront.
+    // ELI5: the pair count can be much larger than the number of distinct
+    // labels because one right row may match many left rows. Let the map grow
+    // with labels actually observed instead of reserving for every pair.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut totals = Vec::new();

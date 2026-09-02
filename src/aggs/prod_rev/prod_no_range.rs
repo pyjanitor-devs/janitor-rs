@@ -31,11 +31,9 @@ pub fn prod_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
         "right_index",
         right_index.len(),
     )?;
-    // ELI5: reserve the lookup table for the full join, but let output state
-    // grow only as distinct labels appear; duplicate-heavy inputs should not
-    // preallocate one result slot per matched row.
-    // Many matching pairs can belong to the same right-side label. Reserving
-    // from the pair count would allocate for duplicates that need no slot.
+    // ELI5: many matching pairs can belong to the same right-side label.
+    // Let the map grow only for labels actually observed instead of reserving
+    // for duplicate pairs up front.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut products = Vec::new();
