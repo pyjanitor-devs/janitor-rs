@@ -25,27 +25,45 @@ pub fn max_rev_starts_core<T: PartialOrd + Copy>(
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let (min_start, width) = starts_domain(starts, index.len())?;
 
-    let mut values = vec![arr[0]; width];
-    let mut positions = vec![-1_i64; width];
+    // ELI5: rows become eligible at their start boundary. Keep the best row
+    // for each boundary, then sweep those boundary winners across the suffixes
+    // once instead of revisiting every suffix position for every row.
+    let mut events: Vec<Option<(T, i64)>> = std::iter::repeat_with(|| None).take(width).collect();
     for (row, (current, start, boolean)) in
         izip!(arr.iter(), starts.iter(), booleans.iter()).enumerate()
     {
-        if *boolean {
+        if *boolean || *start == index.len() as i64 {
             continue;
         }
-        // Example: with `min_start = 2` and `start = 5`, the compact
-        // output begins at offset `5 - 2 = 3`. Skipping three paired
-        // slots means this row updates positions 5 through the suffix
-        // end, while `positions` and `values` stay aligned.
-        for (position, value) in positions
-            .iter_mut()
-            .zip(values.iter_mut())
-            .skip(*start as usize - min_start)
-        {
-            if *position == -1 || *current > *value {
-                *position = row as i64;
-                *value = *current;
+        let slot = *start as usize - min_start;
+        let event = &mut events[slot];
+        let replaces = match event {
+            None => true,
+            Some((value, event_row)) => {
+                *current > *value || (*current == *value && (row as i64) < *event_row)
             }
+        };
+        if replaces {
+            *event = Some((*current, row as i64));
+        }
+    }
+
+    let mut winner = None;
+    let mut positions = vec![-1_i64; width];
+    for (position, event) in positions.iter_mut().zip(events) {
+        if let Some((current, row)) = event {
+            let replaces = match winner.as_ref() {
+                None => true,
+                Some((value, winner_row)) => {
+                    current > *value || (current == *value && row < *winner_row)
+                }
+            };
+            if replaces {
+                winner = Some((current, row));
+            }
+        }
+        if let Some((_, row)) = winner {
+            *position = row;
         }
     }
     let labels = index.iter().skip(min_start).copied().collect();

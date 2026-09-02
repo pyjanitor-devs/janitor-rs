@@ -26,6 +26,8 @@ use crate::aggs::{
 ///
 /// # Preconditions
 ///
+/// `arr` and `index` cannot be empty.
+///
 /// `index` must contain unique labels in positional order. This is not checked
 /// here: pyjanitor supplies unique right-side labels, while a direct caller is
 /// responsible for this correctness precondition. The array position is the
@@ -49,6 +51,7 @@ where
     F: FnMut(T) -> A,
 {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
@@ -133,6 +136,7 @@ where
     F: FnMut(T) -> f64,
 {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     // Integer reverse sums use `WrapAdd` because the project defines their
     // overflow behavior as modular wrapping. Floats do not have an
     // equivalent wrapping operation: IEEE-754 addition deliberately produces
@@ -475,6 +479,15 @@ mod tests {
             array![].view(),
             index.view(),
             array![].view(),
+            |value: i64| value,
+        )
+        .is_err());
+        assert!(sum_rev_start_end_int_core(
+            array![1_i64].view(),
+            array![0_i64].view(),
+            array![1_i64].view(),
+            array![].view(),
+            booleans.view(),
             |value: i64| value,
         )
         .is_err());

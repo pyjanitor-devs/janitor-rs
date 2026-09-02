@@ -27,24 +27,45 @@ pub fn min_rev_ends_core<T: PartialOrd + Copy>(
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let max_end = ends_domain(ends, index.len())?;
 
-    let mut values = vec![arr[0]; max_end];
-    let mut positions = vec![-1_i64; max_end];
-
-    for (row, (current, end, boolean)) in izip!(arr, ends, booleans).enumerate() {
-        if *boolean {
+    // ELI5: rows become inactive after their end boundary. Keep the best row
+    // for each final covered slot, then sweep right-to-left once so each
+    // boundary event affects all earlier prefix positions.
+    let mut events: Vec<Option<(T, i64)>> = std::iter::repeat_with(|| None).take(max_end).collect();
+    for (row, (current, end, boolean)) in
+        izip!(arr.iter(), ends.iter(), booleans.iter()).enumerate()
+    {
+        if *boolean || *end == 0 {
             continue;
         }
-        // Example: `end = 3` covers slots 0, 1, and 2. `take(3)` visits those
-        // paired slots only, so the row cannot affect position 3 or later.
-        for (position, value) in positions
-            .iter_mut()
-            .zip(values.iter_mut())
-            .take(*end as usize)
-        {
-            if *position == -1 || *current < *value {
-                *position = row as i64;
-                *value = *current;
+        let slot = *end as usize - 1;
+        let event = &mut events[slot];
+        let replaces = match event {
+            None => true,
+            Some((value, event_row)) => {
+                *current < *value || (*current == *value && (row as i64) < *event_row)
             }
+        };
+        if replaces {
+            *event = Some((*current, row as i64));
+        }
+    }
+
+    let mut winner = None;
+    let mut positions = vec![-1_i64; max_end];
+    for (position, event) in positions.iter_mut().rev().zip(events.into_iter().rev()) {
+        if let Some((current, row)) = event {
+            let replaces = match winner.as_ref() {
+                None => true,
+                Some((value, winner_row)) => {
+                    current < *value || (current == *value && row < *winner_row)
+                }
+            };
+            if replaces {
+                winner = Some((current, row));
+            }
+        }
+        if let Some((_, row)) = winner {
+            *position = row;
         }
     }
 

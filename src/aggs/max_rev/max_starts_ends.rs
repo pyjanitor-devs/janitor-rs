@@ -46,6 +46,7 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Vec<i64>, Vec<i64>), String> {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
@@ -276,6 +277,14 @@ mod tests {
             array![].view(),
             array![10_i64].view(),
             array![].view(),
+        )
+        .is_err());
+        assert!(max_rev_start_end_core(
+            array![1_i64].view(),
+            array![0_i64].view(),
+            array![1_i64].view(),
+            array![].view(),
+            array![false].view(),
         )
         .is_err());
     }

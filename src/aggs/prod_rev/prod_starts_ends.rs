@@ -17,9 +17,11 @@ use crate::aggs::{
 /// `item`, the ordinal position in `index`, is the state slot; `index[item]`
 /// is the output label. `starts` and `ends` describe half-open ranges
 /// `[start, end)`. Invalid or zero-width ranges are skipped by `checked_range`,
-/// and empty input arrays are allowed when there are no valid ranges.
+/// and `arr`/`index` must not be empty.
 ///
 /// # Preconditions
+///
+/// `arr` and `index` cannot be empty.
 ///
 /// `index` must contain unique labels in positional order. pyjanitor provides
 /// this by normalizing the right side to `range(len(right))`; direct callers
@@ -56,6 +58,7 @@ where
     F: FnMut(T) -> A,
 {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
@@ -153,6 +156,7 @@ where
     F: FnMut(T) -> f64,
 {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
@@ -435,6 +439,15 @@ mod tests {
             array![].view(),
             array![10_i64].view(),
             array![].view(),
+            |value: i64| value,
+        )
+        .is_err());
+        assert!(prod_rev_start_end_int_core(
+            array![1_i64].view(),
+            array![0_i64].view(),
+            array![1_i64].view(),
+            array![].view(),
+            array![false].view(),
             |value: i64| value,
         )
         .is_err());
