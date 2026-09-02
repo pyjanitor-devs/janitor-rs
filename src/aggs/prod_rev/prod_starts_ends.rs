@@ -65,14 +65,20 @@ where
 
     let mut min_start = index.len();
     let mut max_end = 0_usize;
-    for (&start, &end) in starts.iter().zip(ends.iter()) {
-        if let Some((start, end)) = checked_range(start, end, index.len()) {
+    let mut total_width = 0_usize;
+    let mut valid_ranges = Vec::new();
+    for (row, (current, (start, end), boolean)) in
+        izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter()).enumerate()
+    {
+        if let Some((start, end)) = checked_range(*start, *end, index.len()) {
             min_start = min_start.min(start);
             max_end = max_end.max(end);
+            total_width = total_width.saturating_add(end - start);
+            valid_ranges.push((row, *current, *boolean, start, end));
         }
     }
     let width = max_end.saturating_sub(min_start);
-    let dense = should_use_dense_match_storage(index.len(), width);
+    let dense = should_use_dense_match_storage(index.len(), total_width);
     let mut touched = if dense {
         Vec::with_capacity(width)
     } else {
@@ -81,20 +87,15 @@ where
     if dense {
         let mut seen = vec![false; width];
         let mut states = vec![A::ONE; width];
-        for (current, start, end, boolean) in
-            izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter())
-        {
-            let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-                continue;
-            };
+        for (_row, current, boolean, start, end) in valid_ranges.iter().copied() {
             for item in start..end {
                 let slot = item - min_start;
                 if !seen[slot] {
                     seen[slot] = true;
                     touched.push(slot);
                 }
-                if !*boolean {
-                    states[slot] = states[slot].wrap_mul(convert(*current));
+                if !boolean {
+                    states[slot] = states[slot].wrap_mul(convert(current));
                 }
             }
         }
@@ -108,20 +109,15 @@ where
     }
 
     let mut states: HashMap<usize, A> = HashMap::new();
-    for (current, start, end, boolean) in
-        izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter())
-    {
-        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
+    for (_row, current, boolean, start, end) in valid_ranges.iter().copied() {
         for item in start..end {
             let slot = item - min_start;
             let product = states.entry(slot).or_insert_with(|| {
                 touched.push(slot);
                 A::ONE
             });
-            if !*boolean {
-                *product = product.wrap_mul(convert(*current));
+            if !boolean {
+                *product = product.wrap_mul(convert(current));
             }
         }
     }
@@ -171,14 +167,20 @@ where
     // can leave the loop and say “infinity” or “not a number.”
     let mut min_start = index.len();
     let mut max_end = 0_usize;
-    for (&start, &end) in starts.iter().zip(ends.iter()) {
-        if let Some((start, end)) = checked_range(start, end, index.len()) {
+    let mut total_width = 0_usize;
+    let mut valid_ranges = Vec::new();
+    for (row, (current, (start, end), boolean)) in
+        izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter()).enumerate()
+    {
+        if let Some((start, end)) = checked_range(*start, *end, index.len()) {
             min_start = min_start.min(start);
             max_end = max_end.max(end);
+            total_width = total_width.saturating_add(end - start);
+            valid_ranges.push((row, *current, *boolean, start, end));
         }
     }
     let width = max_end.saturating_sub(min_start);
-    let dense = should_use_dense_match_storage(index.len(), width);
+    let dense = should_use_dense_match_storage(index.len(), total_width);
     let mut touched = if dense {
         Vec::with_capacity(width)
     } else {
@@ -187,20 +189,15 @@ where
     if dense {
         let mut seen = vec![false; width];
         let mut states = vec![1.0_f64; width];
-        for (current, start, end, boolean) in
-            izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter())
-        {
-            let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-                continue;
-            };
+        for (_row, current, boolean, start, end) in valid_ranges.iter().copied() {
             for item in start..end {
                 let slot = item - min_start;
                 if !seen[slot] {
                     seen[slot] = true;
                     touched.push(slot);
                 }
-                if !*boolean {
-                    states[slot] *= to_f64(*current);
+                if !boolean {
+                    states[slot] *= to_f64(current);
                 }
             }
         }
@@ -214,20 +211,15 @@ where
     }
 
     let mut states: HashMap<usize, f64> = HashMap::new();
-    for (current, start, end, boolean) in
-        izip!(arr.iter(), starts.iter(), ends.iter(), booleans.iter())
-    {
-        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
-            continue;
-        };
+    for (_row, current, boolean, start, end) in valid_ranges.iter().copied() {
         for item in start..end {
             let slot = item - min_start;
             let product = states.entry(slot).or_insert_with(|| {
                 touched.push(slot);
                 1.0_f64
             });
-            if !*boolean {
-                *product *= to_f64(*current);
+            if !boolean {
+                *product *= to_f64(current);
             }
         }
     }
