@@ -54,15 +54,11 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
     let mut min_start = index.len();
     let mut max_end = 0_usize;
     let mut total_width = 0_usize;
-    let mut valid_ranges = Vec::new();
-    for (row, (current, (start, end), boolean)) in
-        izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter()).enumerate()
-    {
+    for (start, end) in starts.iter().zip(ends.iter()) {
         if let Some((start, end)) = checked_range(*start, *end, index.len()) {
             min_start = min_start.min(start);
             max_end = max_end.max(end);
             total_width = total_width.saturating_add(end - start);
-            valid_ranges.push((row, *current, *boolean, start, end));
         }
     }
     let width = max_end.saturating_sub(min_start);
@@ -76,7 +72,14 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
     if dense {
         let mut seen = vec![false; width];
         let mut states = vec![(arr[0], -1_i64); width];
-        for (row, current, boolean, start, end) in valid_ranges.iter().copied() {
+        for (row, (current, (start, end), boolean)) in
+            izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter()).enumerate()
+        {
+            let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+                continue;
+            };
+            let current = *current;
+            let boolean = *boolean;
             for item in start..end {
                 let slot = item - min_start;
                 if !seen[slot] {
@@ -101,7 +104,14 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
     }
 
     let mut states: HashMap<usize, (T, i64)> = HashMap::new();
-    for (row, current, boolean, start, end) in valid_ranges.iter().copied() {
+    for (row, (current, (start, end), boolean)) in
+        izip!(arr.iter(), starts.iter().zip(ends.iter()), booleans.iter()).enumerate()
+    {
+        let Some((start, end)) = checked_range(*start, *end, index.len()) else {
+            continue;
+        };
+        let current = *current;
+        let boolean = *boolean;
         for item in start..end {
             let slot = item - min_start;
             let state = states.entry(slot).or_insert_with(|| {

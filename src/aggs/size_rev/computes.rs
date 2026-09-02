@@ -520,13 +520,11 @@ pub fn size_rev_start_end_core(
     let mut min_start = index.len();
     let mut max_end = 0_usize;
     let mut total_width = 0_usize;
-    let mut valid_ranges = Vec::new();
     for (&start, &end) in starts.iter().zip(ends.iter()) {
         if let Some((start, end)) = checked_range(start, end, index.len()) {
             min_start = min_start.min(start);
             max_end = max_end.max(end);
             total_width = total_width.saturating_add(end - start);
-            valid_ranges.push((start, end));
         }
     }
     let width = max_end.saturating_sub(min_start);
@@ -540,7 +538,10 @@ pub fn size_rev_start_end_core(
     if dense {
         let mut seen = vec![false; width];
         let mut counts = vec![0_i64; width];
-        for (start, end) in valid_ranges.iter().copied() {
+        for (&start, &end) in starts.iter().zip(ends.iter()) {
+            let Some((start, end)) = checked_range(start, end, index.len()) else {
+                continue;
+            };
             for item in start..end {
                 let slot = item - min_start;
                 if !seen[slot] {
@@ -560,7 +561,10 @@ pub fn size_rev_start_end_core(
     }
 
     let mut counts = HashMap::<usize, i64>::new();
-    for (start, end) in valid_ranges.iter().copied() {
+    for (&start, &end) in starts.iter().zip(ends.iter()) {
+        let Some((start, end)) = checked_range(start, end, index.len()) else {
+            continue;
+        };
         for item in start..end {
             let count = counts.entry(item).or_insert_with(|| {
                 touched.push(item);

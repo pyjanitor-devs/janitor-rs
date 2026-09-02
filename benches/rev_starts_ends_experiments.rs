@@ -490,10 +490,10 @@ fn bench(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(1));
     // The contiguous singleton case exercises dense storage because the union
-    // of the ranges spans the whole domain. The scattered case deliberately
-    // keeps only 200 one-position ranges far apart, exposing span-based dense
-    // classification and its allocation cost. The validation-heavy case has
-    // no aggregation work, isolating the repeated range checks.
+    // of the ranges spans the whole domain. The scattered and repeated-extreme
+    // cases deliberately keep few live positions while presenting broad spans
+    // or large summed widths. The validation-heavy case has no aggregation
+    // work, isolating the repeated range checks.
     for (name, rows, right_len, width, duplicate) in [
         ("tiny_narrow_unique", 32, 32, 4, false),
         ("tiny_narrow_unique_reversed", 32, 32, 4, false),
@@ -524,6 +524,7 @@ fn bench(c: &mut Criterion) {
             1,
             false,
         ),
+        ("sparse_repeated_extremes", 1_000_000, 1_000_000, 1, false),
         (
             "super_large_singleton_unique",
             1_000_000,
@@ -539,6 +540,14 @@ fn bench(c: &mut Criterion) {
         let starts = if name == "validation_heavy_zero_width" {
             vec![0; rows]
         } else if name == "scattered_sparse_unique" {
+            (0..rows)
+                .map(|row| row * (right_len - 1) / (rows - 1))
+                .collect::<Vec<_>>()
+        } else if name == "sparse_repeated_extremes" {
+            (0..rows)
+                .map(|row| if row < rows / 2 { 0 } else { right_len - 1 })
+                .collect::<Vec<_>>()
+        } else if name == "super_large_singleton_unique" {
             (0..rows)
                 .map(|row| row * (right_len - 1) / (rows - 1))
                 .collect::<Vec<_>>()
