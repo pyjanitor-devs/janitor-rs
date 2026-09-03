@@ -35,6 +35,8 @@ pub fn prod_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     )?;
     // ELI5: grow one lookup table only for labels actually observed. The
     // compact layout still avoids the second map used by the old reducer.
+    // Intentionally start empty: right_index is a match stream and repeated
+    // labels can make pair count much larger than distinct label count.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut products = Vec::new();
@@ -91,6 +93,7 @@ pub fn prod_rev_no_range_u64_core(
         "right_index",
         right_index.len(),
     )?;
+    // Use the same on-demand allocation policy for the u64 product path.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut products = Vec::new();
@@ -143,6 +146,7 @@ pub fn prod_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
         "right_index",
         right_index.len(),
     )?;
+    // Use the same on-demand allocation policy for the float product path.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut products = Vec::new();
