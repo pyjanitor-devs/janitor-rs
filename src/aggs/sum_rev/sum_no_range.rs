@@ -32,6 +32,8 @@ pub fn sum_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     // compact layout still avoids the second map used by the old reducer.
     // Intentionally start empty: right_index is a match stream and repeated
     // labels can make pair count much larger than distinct label count.
+    // This saves memory for repeated labels, at the cost of rehashing when
+    // nearly every match has a unique label.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut totals = Vec::new();
@@ -79,7 +81,8 @@ pub fn sum_rev_no_range_u64_core(
         "right_index",
         right_index.len(),
     )?;
-    // Use the same on-demand allocation policy for the u64 sum path.
+    // Use the same on-demand allocation policy for the u64 sum path. It saves
+    // memory for repeated labels but may rehash for unique labels.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut totals = Vec::new();
@@ -126,7 +129,8 @@ pub fn sum_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
         "right_index",
         right_index.len(),
     )?;
-    // Use the same on-demand allocation policy for the float sum path.
+    // Use the same on-demand allocation policy for the float sum path. It
+    // saves memory for repeated labels but may rehash for unique labels.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut values = Vec::new();

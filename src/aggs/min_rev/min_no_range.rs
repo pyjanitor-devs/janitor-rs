@@ -28,6 +28,8 @@ pub fn min_rev_no_range_core<T: Copy + PartialOrd>(
     )?;
     // ELI5: grow one lookup table only for labels actually observed. The
     // compact layout still avoids the second map used by the old reducer.
+    // This saves memory for repeated labels, at the cost of rehashing when
+    // nearly every match has a unique label.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut positions = Vec::new();
