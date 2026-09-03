@@ -945,3 +945,16 @@ framework, which is installed inside Xcode but is not always discoverable by
 `DYLD_FRAMEWORK_PATH=/Applications/Xcode.app/Contents/Developer/Library/Frameworks`
 prepended to the command. This is a local loader workaround; do not encode the
 machine-specific path in Cargo or production code.
+
+### [2026-09-03] Preserve Shared Core Validation Helpers
+
+**Context**: Reviewing no-range aggregation validation while addressing
+compatibility findings.
+**Learning**: The shared `ensure_nonempty_core` and
+`ensure_equal_lengths_core` helpers are intentional and should remain the
+canonical core-layer validation approach, even when their check ordering is
+different from older local validators.
+**Recommendation**: Preserve the helper-based validation unless the API
+explicitly requires legacy error precedence; document and test any intentional
+ordering difference rather than replacing the helpers with duplicated local
+checks.

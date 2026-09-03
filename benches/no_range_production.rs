@@ -28,7 +28,7 @@ fn array<T: numpy::Element>(py: Python<'_>, values: Vec<T>) -> Py<PyAny> {
 fn fixture(py: Python<'_>, pairs: usize, labels: usize) -> Fixture {
     Fixture {
         arr: array(py, (0..pairs).map(|value| (value % 97) as i64).collect()),
-        left_index: array(py, (0..pairs).map(|value| (value % pairs) as i64).collect()),
+        left_index: array(py, (0..pairs).map(|value| value as i64).collect()),
         right_index: array(
             py,
             (0..pairs).map(|value| (value % labels) as i64).collect(),

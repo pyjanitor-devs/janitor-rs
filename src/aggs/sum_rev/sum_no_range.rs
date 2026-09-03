@@ -5,25 +5,6 @@ use pyo3::prelude::*;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
-fn validate_inputs<T>(
-    arr: ArrayView1<'_, T>,
-    left_index: ArrayView1<'_, i64>,
-    right_index: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> Result<(), String> {
-    ensure_nonempty_core("arr", arr.len())?;
-    ensure_nonempty_core("left_index", left_index.len())?;
-    ensure_nonempty_core("right_index", right_index.len())?;
-    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    ensure_equal_lengths_core(
-        "left_index",
-        left_index.len(),
-        "right_index",
-        right_index.len(),
-    )?;
-    Ok(())
-}
-
 /// Sums no-range rows with arbitrary right labels using compact label slots.
 ///
 /// ELI5: the map stores one total per arbitrary label, while the label vector
@@ -35,10 +16,20 @@ pub fn sum_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     booleans: ArrayView1<'_, bool>,
     mut to_i64: F,
 ) -> Result<(Array1<i64>, Array1<i64>), String> {
-    validate_inputs(arr, left_index, right_index, booleans)?;
-    // ELI5: the pair count can be much larger than the number of distinct
-    // labels because one right row may match many left rows. Let the map grow
-    // with labels actually observed instead of reserving for every pair.
+    // Empty inputs are rejected before shape mismatches intentionally. This
+    // is the compatibility contract for the shared core validation helpers.
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("left_index", left_index.len())?;
+    ensure_nonempty_core("right_index", right_index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_equal_lengths_core(
+        "left_index",
+        left_index.len(),
+        "right_index",
+        right_index.len(),
+    )?;
+    // ELI5: grow one lookup table only for labels actually observed. The
+    // compact layout still avoids the second map used by the old reducer.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut totals = Vec::new();
@@ -76,7 +67,16 @@ pub fn sum_rev_no_range_u64_core(
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<u64>), String> {
-    validate_inputs(arr, left_index, right_index, booleans)?;
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("left_index", left_index.len())?;
+    ensure_nonempty_core("right_index", right_index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_equal_lengths_core(
+        "left_index",
+        left_index.len(),
+        "right_index",
+        right_index.len(),
+    )?;
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut totals = Vec::new();
@@ -113,7 +113,16 @@ pub fn sum_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
     booleans: ArrayView1<'_, bool>,
     mut to_f64: F,
 ) -> Result<(Array1<i64>, Array1<f64>), String> {
-    validate_inputs(arr, left_index, right_index, booleans)?;
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("left_index", left_index.len())?;
+    ensure_nonempty_core("right_index", right_index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_equal_lengths_core(
+        "left_index",
+        left_index.len(),
+        "right_index",
+        right_index.len(),
+    )?;
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut values = Vec::new();
@@ -329,6 +338,19 @@ mod tests {
             |value| value,
         )
         .is_err());
+    }
+
+    #[test]
+    fn empty_input_error_precedes_shape_mismatch() {
+        let error = sum_rev_no_range_int_core(
+            Array1::<i64>::zeros(0).view(),
+            array![].view(),
+            array![20_i64].view(),
+            array![false].view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub fn prod_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     booleans: ArrayView1<'_, bool>,
     mut to_i64: F,
 ) -> Result<(Array1<i64>, Array1<i64>), String> {
+    // Empty inputs are rejected before shape mismatches intentionally. This
+    // is the compatibility contract for the shared core validation helpers.
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("left_index", left_index.len())?;
     ensure_nonempty_core("right_index", right_index.len())?;
@@ -31,9 +33,8 @@ pub fn prod_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
         "right_index",
         right_index.len(),
     )?;
-    // ELI5: many matching pairs can belong to the same right-side label.
-    // Let the map grow only for labels actually observed instead of reserving
-    // for duplicate pairs up front.
+    // ELI5: grow one lookup table only for labels actually observed. The
+    // compact layout still avoids the second map used by the old reducer.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut products = Vec::new();
@@ -310,6 +311,19 @@ mod tests {
             |value| value,
         );
         assert_eq!(got, Ok((array![20, 40], array![35, 4])));
+    }
+
+    #[test]
+    fn empty_input_error_precedes_shape_mismatch() {
+        let error = prod_rev_no_range_int_core(
+            Array1::<i64>::zeros(0).view(),
+            array![].view(),
+            array![20_i64].view(),
+            array![false].view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
     }
 
     #[test]

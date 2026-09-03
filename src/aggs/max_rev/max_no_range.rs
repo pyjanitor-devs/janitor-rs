@@ -14,6 +14,8 @@ pub fn max_rev_no_range_core<T: Copy + PartialOrd>(
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Array1<i64>, Array1<i64>), String> {
+    // Empty inputs are rejected before shape mismatches intentionally. This
+    // is the compatibility contract for the shared core validation helpers.
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("left_index", left_index.len())?;
     ensure_nonempty_core("right_index", right_index.len())?;
@@ -24,9 +26,8 @@ pub fn max_rev_no_range_core<T: Copy + PartialOrd>(
         "right_index",
         right_index.len(),
     )?;
-    // ELI5: a match pair is not necessarily a new label; repeated labels are
-    // the common many-to-one case. Let the map grow only for labels actually
-    // observed instead of reserving for every pair up front.
+    // ELI5: grow one lookup table only for labels actually observed. The
+    // compact layout still avoids the second map used by the old reducer.
     let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut positions = Vec::new();
@@ -209,5 +210,17 @@ mod tests {
             array![false].view(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn empty_input_error_precedes_shape_mismatch() {
+        let error = max_rev_no_range_core(
+            Array1::<i64>::zeros(0).view(),
+            array![].view(),
+            array![20_i64].view(),
+            array![false].view(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
     }
 }
