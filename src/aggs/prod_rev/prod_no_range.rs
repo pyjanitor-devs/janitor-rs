@@ -335,6 +335,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_input_error_precedes_shape_mismatch_for_u64_and_float_cores() {
+        let error = prod_rev_no_range_u64_core(
+            Array1::<u64>::zeros(0).view(),
+            array![].view(),
+            array![20_i64].view(),
+            array![false].view(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+
+        let error = prod_rev_no_range_float_core(
+            Array1::<f64>::zeros(0).view(),
+            array![].view(),
+            array![20_i64].view(),
+            array![false].view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+    }
+
+    #[test]
     fn u64_core_preserves_values_at_and_above_i64_max() {
         let value = (i64::MAX as u64) + 5;
         let got = prod_rev_no_range_u64_core(

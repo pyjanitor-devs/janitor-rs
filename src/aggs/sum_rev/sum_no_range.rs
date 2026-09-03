@@ -362,6 +362,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_input_error_precedes_shape_mismatch_for_u64_and_float_cores() {
+        let error = sum_rev_no_range_u64_core(
+            Array1::<u64>::zeros(0).view(),
+            array![].view(),
+            array![20_i64].view(),
+            array![false].view(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+
+        let error = sum_rev_no_range_float_core(
+            Array1::<f64>::zeros(0).view(),
+            array![].view(),
+            array![20_i64].view(),
+            array![false].view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+    }
+
+    #[test]
     fn rejects_invalid_left_positions_before_aggregation() {
         assert!(sum_rev_no_range_int_core(
             array![1_i64].view(),

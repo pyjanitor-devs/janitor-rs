@@ -37,7 +37,7 @@ pub fn min_rev_no_range_core<T: Copy + PartialOrd>(
 
     for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
         let left = checked_index(*index_left, arr.len())
-            .ok_or_else(|| "left_index must contain valid positions in arr".to_owned())?;
+            .ok_or("left_index must contain valid positions in arr")?;
         let current = arr[left];
         let boolean = booleans[left];
         match slots.entry(*index_right) {
