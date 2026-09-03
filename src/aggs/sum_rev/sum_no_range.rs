@@ -1,27 +1,9 @@
-use crate::aggs::checked_index;
+use crate::aggs::{checked_index, ensure_equal_lengths_core, ensure_nonempty_core};
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-
-fn validate_inputs<T>(
-    arr: ArrayView1<'_, T>,
-    left_index: ArrayView1<'_, i64>,
-    right_index: ArrayView1<'_, i64>,
-    booleans: ArrayView1<'_, bool>,
-) -> Result<(), &'static str> {
-    if arr.len() != booleans.len() {
-        return Err("arr and booleans must have equal lengths");
-    }
-    if left_index.len() != right_index.len() {
-        return Err("left_index and right_index must have equal lengths");
-    }
-    if arr.is_empty() || left_index.is_empty() || right_index.is_empty() {
-        return Err("arr, left_index, and right_index cannot be empty");
-    }
-    Ok(())
-}
 
 /// Sums no-range rows with arbitrary right labels using compact label slots.
 ///
@@ -33,13 +15,26 @@ pub fn sum_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut to_i64: F,
-) -> Result<(Array1<i64>, Array1<i64>), &'static str> {
-    validate_inputs(arr, left_index, right_index, booleans)?;
-    // ELI5: reserve the lookup table for the full join, but let output state
-    // grow only as distinct labels appear; duplicate-heavy inputs should not
-    // preallocate one result slot per matched row.
-    let capacity = right_index.len();
-    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
+) -> Result<(Array1<i64>, Array1<i64>), String> {
+    // Empty inputs are rejected before shape mismatches intentionally. This
+    // is the compatibility contract for the shared core validation helpers.
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("left_index", left_index.len())?;
+    ensure_nonempty_core("right_index", right_index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_equal_lengths_core(
+        "left_index",
+        left_index.len(),
+        "right_index",
+        right_index.len(),
+    )?;
+    // ELI5: grow one lookup table only for labels actually observed. The
+    // compact layout still avoids the second map used by the old reducer.
+    // Intentionally start empty: right_index is a match stream and repeated
+    // labels can make pair count much larger than distinct label count.
+    // This saves memory for repeated labels, at the cost of rehashing when
+    // nearly every match has a unique label.
+    let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut totals = Vec::new();
 
@@ -75,10 +70,20 @@ pub fn sum_rev_no_range_u64_core(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-) -> Result<(Array1<i64>, Array1<u64>), &'static str> {
-    validate_inputs(arr, left_index, right_index, booleans)?;
-    let capacity = right_index.len();
-    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
+) -> Result<(Array1<i64>, Array1<u64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("left_index", left_index.len())?;
+    ensure_nonempty_core("right_index", right_index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_equal_lengths_core(
+        "left_index",
+        left_index.len(),
+        "right_index",
+        right_index.len(),
+    )?;
+    // Use the same on-demand allocation policy for the u64 sum path. It saves
+    // memory for repeated labels but may rehash for unique labels.
+    let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut totals = Vec::new();
 
@@ -113,10 +118,20 @@ pub fn sum_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
     right_index: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
     mut to_f64: F,
-) -> Result<(Array1<i64>, Array1<f64>), &'static str> {
-    validate_inputs(arr, left_index, right_index, booleans)?;
-    let capacity = right_index.len();
-    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
+) -> Result<(Array1<i64>, Array1<f64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("left_index", left_index.len())?;
+    ensure_nonempty_core("right_index", right_index.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    ensure_equal_lengths_core(
+        "left_index",
+        left_index.len(),
+        "right_index",
+        right_index.len(),
+    )?;
+    // Use the same on-demand allocation policy for the float sum path. It
+    // saves memory for repeated labels but may rehash for unique labels.
+    let mut slots = HashMap::<i64, usize>::new();
     let mut labels = Vec::new();
     let mut values = Vec::new();
 
@@ -331,6 +346,41 @@ mod tests {
             |value| value,
         )
         .is_err());
+    }
+
+    #[test]
+    fn empty_input_error_precedes_shape_mismatch() {
+        let error = sum_rev_no_range_int_core(
+            Array1::<i64>::zeros(0).view(),
+            array![].view(),
+            array![20_i64].view(),
+            array![false].view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+    }
+
+    #[test]
+    fn empty_input_error_precedes_shape_mismatch_for_u64_and_float_cores() {
+        let error = sum_rev_no_range_u64_core(
+            Array1::<u64>::zeros(0).view(),
+            array![].view(),
+            array![20_i64].view(),
+            array![false].view(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+
+        let error = sum_rev_no_range_float_core(
+            Array1::<f64>::zeros(0).view(),
+            array![].view(),
+            array![20_i64].view(),
+            array![false].view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
     }
 
     #[test]

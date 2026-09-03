@@ -48,6 +48,10 @@ name = "no_range_aggs"
 harness = false
 
 [[bench]]
+name = "no_range_production"
+harness = false
+
+[[bench]]
 name = "rev_min_sweep"
 harness = false
 
