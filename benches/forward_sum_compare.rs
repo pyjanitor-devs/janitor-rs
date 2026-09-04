@@ -108,6 +108,24 @@ fn bench_forward_sum(c: &mut Criterion) {
             })
         });
     }
+
+    let n = 20_000;
+    let queries = 20_000;
+    let arr = Array1::from_elem(n, 1_i64);
+    let starts = Array1::from_elem(queries, 0_i64);
+    let booleans = Array1::from_elem(n, false);
+    group.bench_function("dense_20k_x_20k/old_direct", |b| {
+        b.iter(|| old_sum_start(black_box(&arr), black_box(&starts), black_box(&booleans)))
+    });
+    group.bench_function("dense_20k_x_20k/adaptive_rust", |b| {
+        b.iter(|| {
+            sum_start_core(
+                black_box(arr.view()),
+                black_box(starts.view()),
+                black_box(booleans.view()),
+            )
+        })
+    });
     group.finish();
 }
 
