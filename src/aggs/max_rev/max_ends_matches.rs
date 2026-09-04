@@ -10,6 +10,11 @@ use crate::aggs::{
 };
 
 /// Aggregate the survivor tape by right-position ordinal.
+/// Output label/position pairs are aligned, but their order is unspecified.
+///
+/// ELI5: the match tape points into numbered right-side drawers. We record
+/// each drawer's best row, then print the original label from that drawer;
+/// a sparse map may print drawers in any order.
 ///
 /// `index[item]` is the label returned to Python; `item` is the state key.
 /// Pyjanitor normalizes the right index to unique labels, but those labels are
@@ -51,7 +56,6 @@ pub fn max_rev_end_match_core<T: PartialOrd + Copy>(
     if should_use_dense_match_storage(index.len(), max_end) {
         let mut seen = vec![false; max_end];
         let mut states = vec![(arr[0], -1_i64); max_end];
-        let mut touched = Vec::with_capacity(max_end);
         let mut tape = 0_usize;
         for (row, (current, end, count, boolean)) in
             izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter(),).enumerate()
@@ -65,10 +69,7 @@ pub fn max_rev_end_match_core<T: PartialOrd + Copy>(
                     tape += 1;
                     continue;
                 }
-                if !seen[item] {
-                    seen[item] = true;
-                    touched.push(item);
-                }
+                seen[item] = true;
                 tape += 1;
                 if *boolean || *count == 0_i64 {
                     continue;
@@ -79,17 +80,18 @@ pub fn max_rev_end_match_core<T: PartialOrd + Copy>(
                 }
             }
         }
-        let mut indexers = Vec::with_capacity(touched.len());
-        let mut result = Vec::with_capacity(touched.len());
-        for item in touched {
-            indexers.push(index[item]);
-            result.push(states[item].1);
+        let mut indexers = Vec::new();
+        let mut result = Vec::new();
+        for (item, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                indexers.push(index[item]);
+                result.push(states[item].1);
+            }
         }
         return Ok((indexers, result));
     }
 
     let mut states: HashMap<usize, (T, i64)> = HashMap::new();
-    let mut touched = Vec::new();
     let mut tape = 0_usize;
     for (row, (current, end, count, boolean)) in
         izip!(arr.iter(), ends.iter(), counts.iter(), booleans.iter(),).enumerate()
@@ -103,10 +105,7 @@ pub fn max_rev_end_match_core<T: PartialOrd + Copy>(
                 tape += 1;
                 continue;
             }
-            let state = states.entry(item).or_insert_with(|| {
-                touched.push(item);
-                (*current, -1)
-            });
+            let state = states.entry(item).or_insert((*current, -1));
             tape += 1;
             if *boolean || *count == 0_i64 {
                 continue;
@@ -116,11 +115,11 @@ pub fn max_rev_end_match_core<T: PartialOrd + Copy>(
             }
         }
     }
-    let mut indexers = Vec::with_capacity(touched.len());
-    let mut result = Vec::with_capacity(touched.len());
-    for item in touched {
+    let mut indexers = Vec::with_capacity(states.len());
+    let mut result = Vec::with_capacity(states.len());
+    for (item, (_, best_position)) in states {
         indexers.push(index[item]);
-        result.push(states[&item].1);
+        result.push(best_position);
     }
     Ok((indexers, result))
 }

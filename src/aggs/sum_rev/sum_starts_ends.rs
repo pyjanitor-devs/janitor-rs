@@ -10,6 +10,11 @@ use crate::aggs::{
 };
 
 /// Sum values into one compact state slot for each distinct right-hand label.
+/// Output label/total pairs are aligned, but their order is unspecified.
+///
+/// ELI5: each ordinal gets a drawer for its running total. Dense drawers are
+/// scanned by ordinal; sparse drawers come from a map, so output order can
+/// vary while each label stays paired with its total.
 ///
 /// janitor-rs is primarily called by pyjanitor. Its conditional-join path
 /// resets the right DataFrame index to unique row labels before sorting or
@@ -70,12 +75,6 @@ where
     // direct array indexing is cheaper than dictionary lookups. This value is
     // only a dispatch estimate; `width` remains the actual dense allocation.
     let dense = should_use_dense_match_storage(index.len(), total_width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
-
     if dense {
         let mut seen = vec![false; width];
         let mut totals = vec![A::ZERO; width];
@@ -92,20 +91,19 @@ where
                 // valid item is at least it. This subtraction therefore maps
                 // an absolute position into the compact array safely.
                 let slot = item - min_start;
-                if !seen[slot] {
-                    seen[slot] = true;
-                    touched.push(slot);
-                }
+                seen[slot] = true;
                 if !boolean {
                     totals[slot] = totals[slot].wrap_add(convert(current));
                 }
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut values = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            values.push(totals[slot]);
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[min_start + slot]);
+                values.push(totals[slot]);
+            }
         }
         return Ok((labels, values));
     }
@@ -121,20 +119,17 @@ where
         let boolean = *boolean;
         for item in start..end {
             let slot = item - min_start;
-            let total = totals.entry(slot).or_insert_with(|| {
-                touched.push(slot);
-                A::ZERO
-            });
+            let total = totals.entry(slot).or_insert(A::ZERO);
             if !boolean {
                 *total = total.wrap_add(convert(current));
             }
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut values = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(totals.len());
+    let mut values = Vec::with_capacity(totals.len());
+    for (slot, value) in totals {
         labels.push(index[min_start + slot]);
-        values.push(totals[&slot]);
+        values.push(value);
     }
     Ok((labels, values))
 }
@@ -178,12 +173,6 @@ where
     }
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), total_width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
-
     if dense {
         let mut seen = vec![false; width];
         let mut slots = vec![(0.0_f64, 0.0_f64); width];
@@ -198,10 +187,7 @@ where
             let current = if boolean { None } else { Some(to_f64(current)) };
             for item in start..end {
                 let slot = item - min_start;
-                if !seen[slot] {
-                    seen[slot] = true;
-                    touched.push(slot);
-                }
+                seen[slot] = true;
                 if let Some(current) = current {
                     let difference = current - slots[slot].1;
                     let increment = slots[slot].0 + difference;
@@ -217,11 +203,13 @@ where
                 }
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut values = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            values.push(slots[slot].0);
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[min_start + slot]);
+                values.push(slots[slot].0);
+            }
         }
         return Ok((labels, values));
     }
@@ -240,10 +228,7 @@ where
             // `min_start` is the smallest validated start, so this unsigned
             // subtraction cannot underflow while translating to a slot.
             let slot = item - min_start;
-            let state = slots.entry(slot).or_insert_with(|| {
-                touched.push(slot);
-                (0.0, 0.0)
-            });
+            let state = slots.entry(slot).or_insert((0.0, 0.0));
             if let Some(current) = current {
                 let difference = current - state.1;
                 let increment = state.0 + difference;
@@ -258,11 +243,11 @@ where
             }
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut values = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(slots.len());
+    let mut values = Vec::with_capacity(slots.len());
+    for (slot, (total, _compensation)) in slots {
         labels.push(index[min_start + slot]);
-        values.push(slots[&slot].0);
+        values.push(total);
     }
     Ok((labels, values))
 }

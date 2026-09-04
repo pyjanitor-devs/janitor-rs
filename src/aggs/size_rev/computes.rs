@@ -139,6 +139,11 @@ pub fn compute_size_rev_start<'py>(
 
 /// Count surviving candidates for each right-side position in reverse prefix
 /// ranges using a flat match tape.
+/// Output label/count pairs are aligned, but their order is unspecified.
+///
+/// ELI5: the tape points to numbered right-side drawers. We count surviving
+/// entries in each drawer and print its label later; sparse drawers may appear
+/// in any order.
 ///
 /// `matches` must be non-empty and contain exactly one entry per candidate
 /// position in the valid ranges. Its length is the flattened tape width.
@@ -172,36 +177,28 @@ pub fn size_rev_end_match_core(
     ensure_exact_tape_width_core(expected_matches_width, matches.len())?;
 
     let dense = should_use_dense_match_storage(index.len(), max_end);
-    let mut touched = if dense {
-        Vec::with_capacity(max_end)
-    } else {
-        Vec::new()
-    };
     let mut tape = 0_usize;
 
     if dense {
-        let mut seen = vec![false; max_end];
         let mut counts = vec![0_i64; max_end];
         for end in ends.iter() {
             let Some(end_) = checked_end(*end, index.len()) else {
                 continue;
             };
-            for item in 0..end_ {
+            for count in counts.iter_mut().take(end_) {
                 if matches[tape] != 0 {
-                    if !seen[item] {
-                        seen[item] = true;
-                        touched.push(item);
-                    }
-                    counts[item] += 1;
+                    *count += 1;
                 }
                 tape += 1;
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut values = Vec::with_capacity(touched.len());
-        for item in touched {
-            labels.push(index[item]);
-            values.push(counts[item]);
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (item, count) in counts.into_iter().enumerate() {
+            if count > 0 {
+                labels.push(index[item]);
+                values.push(count);
+            }
         }
         return Ok((labels, values));
     }
@@ -213,20 +210,17 @@ pub fn size_rev_end_match_core(
         };
         for item in 0..end_ {
             if matches[tape] != 0 {
-                let count = counts.entry(item).or_insert_with(|| {
-                    touched.push(item);
-                    0
-                });
+                let count = counts.entry(item).or_insert(0);
                 *count += 1;
             }
             tape += 1;
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut values = Vec::with_capacity(touched.len());
-    for item in touched {
+    let mut labels = Vec::with_capacity(counts.len());
+    let mut values = Vec::with_capacity(counts.len());
+    for (item, count) in counts {
         labels.push(index[item]);
-        values.push(counts[&item]);
+        values.push(count);
     }
     Ok((labels, values))
 }
@@ -249,6 +243,11 @@ pub fn compute_size_rev_end_matches<'py>(
 
 /// Count surviving candidates for each right-side position in reverse suffix
 /// ranges using a flat match tape.
+/// Output label/count pairs are aligned, but their order is unspecified.
+///
+/// ELI5: the tape points to numbered right-side drawers. We count surviving
+/// entries in each drawer and print its label later; sparse drawers may appear
+/// in any order.
 ///
 /// `matches` must be non-empty and contain exactly one entry per candidate
 /// position in the valid ranges. Its length is the flattened tape width.
@@ -273,15 +272,9 @@ pub fn size_rev_start_match_core(
 
     let width = index.len().saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
     let mut tape = 0_usize;
 
     if dense {
-        let mut seen = vec![false; width];
         let mut counts = vec![0_i64; width];
         for start in starts.iter() {
             let Some((start_, end_)) = checked_range(*start, index.len() as i64, index.len())
@@ -291,20 +284,18 @@ pub fn size_rev_start_match_core(
             for item in start_..end_ {
                 if matches[tape] != 0 {
                     let slot = item - min_start;
-                    if !seen[slot] {
-                        seen[slot] = true;
-                        touched.push(slot);
-                    }
                     counts[slot] += 1;
                 }
                 tape += 1;
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut values = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            values.push(counts[slot]);
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (slot, count) in counts.into_iter().enumerate() {
+            if count > 0 {
+                labels.push(index[min_start + slot]);
+                values.push(count);
+            }
         }
         return Ok((labels, values));
     }
@@ -317,20 +308,17 @@ pub fn size_rev_start_match_core(
         for item in start_..end_ {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                let count = counts.entry(slot).or_insert_with(|| {
-                    touched.push(slot);
-                    0
-                });
+                let count = counts.entry(slot).or_insert(0);
                 *count += 1;
             }
             tape += 1;
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut values = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(counts.len());
+    let mut values = Vec::with_capacity(counts.len());
+    for (slot, count) in counts {
         labels.push(index[min_start + slot]);
-        values.push(counts[&slot]);
+        values.push(count);
     }
     Ok((labels, values))
 }
@@ -362,6 +350,11 @@ pub fn compute_size_rev_start_matches<'py>(
 
 /// Count surviving candidates for each right-side position in reverse
 /// interval ranges using a flat match tape.
+/// Output label/count pairs are aligned, but their order is unspecified.
+///
+/// ELI5: the tape points to numbered right-side drawers. We count surviving
+/// entries in each drawer and print its label later; sparse drawers may appear
+/// in any order.
 pub fn size_rev_start_end_match_core(
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
@@ -387,15 +380,9 @@ pub fn size_rev_start_end_match_core(
 
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
     let mut tape = 0_usize;
 
     if dense {
-        let mut seen = vec![false; width];
         let mut counts = vec![0_i64; width];
         for (start, end) in starts.iter().zip(ends.iter()) {
             let Some((start_, end_)) = checked_range(*start, *end, index.len()) else {
@@ -404,20 +391,18 @@ pub fn size_rev_start_end_match_core(
             for item in start_..end_ {
                 if matches[tape] != 0 {
                     let slot = item - min_start;
-                    if !seen[slot] {
-                        seen[slot] = true;
-                        touched.push(slot);
-                    }
                     counts[slot] += 1;
                 }
                 tape += 1;
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut values = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            values.push(counts[slot]);
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (slot, count) in counts.into_iter().enumerate() {
+            if count > 0 {
+                labels.push(index[min_start + slot]);
+                values.push(count);
+            }
         }
         return Ok((labels, values));
     }
@@ -430,20 +415,17 @@ pub fn size_rev_start_end_match_core(
         for item in start_..end_ {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                let count = counts.entry(slot).or_insert_with(|| {
-                    touched.push(slot);
-                    0
-                });
+                let count = counts.entry(slot).or_insert(0);
                 *count += 1;
             }
             tape += 1;
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut values = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(counts.len());
+    let mut values = Vec::with_capacity(counts.len());
+    for (slot, count) in counts {
         labels.push(index[min_start + slot]);
-        values.push(counts[&slot]);
+        values.push(count);
     }
     Ok((labels, values))
 }
@@ -508,6 +490,7 @@ pub fn compute_size_rev_start_end_matches<'py>(
 ///
 /// ELI5: each right-row position gets a drawer. Every range adds one to each
 /// covered drawer, then we print the row identity stored in `index[item]`.
+/// Output label/count pairs are aligned, but their order is unspecified.
 pub fn size_rev_start_end_core(
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
@@ -529,14 +512,8 @@ pub fn size_rev_start_end_core(
     }
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), total_width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
 
     if dense {
-        let mut seen = vec![false; width];
         let mut counts = vec![0_i64; width];
         for (&start, &end) in starts.iter().zip(ends.iter()) {
             let Some((start, end)) = checked_range(start, end, index.len()) else {
@@ -544,18 +521,16 @@ pub fn size_rev_start_end_core(
             };
             for item in start..end {
                 let slot = item - min_start;
-                if !seen[slot] {
-                    seen[slot] = true;
-                    touched.push(slot);
-                }
                 counts[slot] += 1;
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut result = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            result.push(counts[slot]);
+        let mut labels = Vec::new();
+        let mut result = Vec::new();
+        for (slot, count) in counts.into_iter().enumerate() {
+            if count > 0 {
+                labels.push(index[min_start + slot]);
+                result.push(count);
+            }
         }
         return Ok((labels, result));
     }
@@ -566,18 +541,15 @@ pub fn size_rev_start_end_core(
             continue;
         };
         for item in start..end {
-            let count = counts.entry(item).or_insert_with(|| {
-                touched.push(item);
-                0
-            });
+            let count = counts.entry(item).or_insert(0);
             *count += 1;
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut result = Vec::with_capacity(touched.len());
-    for item in touched {
+    let mut labels = Vec::with_capacity(counts.len());
+    let mut result = Vec::with_capacity(counts.len());
+    for (item, count) in counts {
         labels.push(index[item]);
-        result.push(counts[&item]);
+        result.push(count);
     }
     Ok((labels, result))
 }

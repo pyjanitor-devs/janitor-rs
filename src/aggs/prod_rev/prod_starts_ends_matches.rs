@@ -13,6 +13,11 @@ use crate::aggs::{
 
 #[allow(clippy::too_many_arguments)]
 /// Aggregate products for interval ranges selected by a survivor tape.
+/// Output label/product pairs are aligned, but their order is unspecified.
+///
+/// ELI5: the tape points to numbered right-side drawers. We update only the
+/// drawers whose tape entries survive, then translate drawer numbers to labels
+/// at output; sparse drawers need not be printed in ordinal order.
 ///
 /// # Arguments
 ///
@@ -58,11 +63,6 @@ where
     ensure_exact_tape_width_core(expected, matches.len())?;
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
     let mut tape = 0_usize;
     if dense {
         let mut seen = vec![false; width];
@@ -81,10 +81,7 @@ where
             for item in s..e {
                 if matches[tape] != 0 {
                     let slot = item - min_start;
-                    if !seen[slot] {
-                        seen[slot] = true;
-                        touched.push(slot);
-                    }
+                    seen[slot] = true;
                     if !*boolean && *count != 0 {
                         totals[slot] = totals[slot].wrap_mul(current_);
                     }
@@ -92,11 +89,13 @@ where
                 tape += 1;
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut values = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            values.push(totals[slot]);
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[min_start + slot]);
+                values.push(totals[slot]);
+            }
         }
         return Ok((labels, values));
     }
@@ -115,10 +114,7 @@ where
         for item in s..e {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                let total = totals.entry(slot).or_insert_with(|| {
-                    touched.push(slot);
-                    A::ONE
-                });
+                let total = totals.entry(slot).or_insert(A::ONE);
                 if !*boolean && *count != 0 {
                     *total = total.wrap_mul(current_);
                 }
@@ -126,11 +122,11 @@ where
             tape += 1;
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut values = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(totals.len());
+    let mut values = Vec::with_capacity(totals.len());
+    for (slot, value) in totals {
         labels.push(index[min_start + slot]);
-        values.push(totals[&slot]);
+        values.push(value);
     }
     Ok((labels, values))
 }
@@ -226,11 +222,6 @@ where
     ensure_exact_tape_width_core(expected, matches.len())?;
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
     let mut tape = 0_usize;
     if dense {
         let mut seen = vec![false; width];
@@ -249,10 +240,7 @@ where
             for item in s..e {
                 if matches[tape] != 0 {
                     let slot = item - min_start;
-                    if !seen[slot] {
-                        seen[slot] = true;
-                        touched.push(slot);
-                    }
+                    seen[slot] = true;
                     if !*boolean && *count != 0 {
                         totals[slot] *= current_;
                     }
@@ -260,11 +248,13 @@ where
                 tape += 1;
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut values = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            values.push(totals[slot]);
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[min_start + slot]);
+                values.push(totals[slot]);
+            }
         }
         return Ok((labels, values));
     }
@@ -283,10 +273,7 @@ where
         for item in s..e {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                let total = totals.entry(slot).or_insert_with(|| {
-                    touched.push(slot);
-                    1.
-                });
+                let total = totals.entry(slot).or_insert(1.);
                 if !*boolean && *count != 0 {
                     *total *= current_;
                 }
@@ -294,11 +281,11 @@ where
             tape += 1;
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut values = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(totals.len());
+    let mut values = Vec::with_capacity(totals.len());
+    for (slot, value) in totals {
         labels.push(index[min_start + slot]);
-        values.push(totals[&slot]);
+        values.push(value);
     }
     Ok((labels, values))
 }
@@ -497,8 +484,16 @@ mod tests {
                 booleans.readonly(),
             )
             .expect("valid f64 product input");
-            assert_eq!(labels.readonly().as_slice().unwrap(), &[10, 30, 20]);
-            assert_eq!(values.readonly().as_slice().unwrap(), &[2.0, 8.0, 4.0]);
+            let mut got: Vec<_> = labels
+                .readonly()
+                .as_slice()
+                .unwrap()
+                .iter()
+                .copied()
+                .zip(values.readonly().as_slice().unwrap().iter().copied())
+                .collect();
+            got.sort_unstable_by_key(|left| left.0);
+            assert_eq!(got, vec![(10, 2.0), (20, 4.0), (30, 8.0)]);
 
             let arr_f32 = PyArray1::from_vec(py, vec![2.0_f32, 4.0]);
             let (labels, values) = compute_prod_rev_start_end_match_f32(
@@ -512,8 +507,16 @@ mod tests {
                 booleans.readonly(),
             )
             .expect("valid f32 product input");
-            assert_eq!(labels.readonly().as_slice().unwrap(), &[10, 30, 20]);
-            assert_eq!(values.readonly().as_slice().unwrap(), &[2.0, 8.0, 4.0]);
+            let mut got: Vec<_> = labels
+                .readonly()
+                .as_slice()
+                .unwrap()
+                .iter()
+                .copied()
+                .zip(values.readonly().as_slice().unwrap().iter().copied())
+                .collect();
+            got.sort_unstable_by_key(|left| left.0);
+            assert_eq!(got, vec![(10, 2.0), (20, 4.0), (30, 8.0)]);
         });
     }
 }

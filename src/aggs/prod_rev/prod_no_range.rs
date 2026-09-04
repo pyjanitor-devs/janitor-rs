@@ -3,10 +3,10 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{checked_index, ensure_equal_lengths_core, ensure_nonempty_core};
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 /// Multiply values grouped by right labels without range metadata.
+/// Output label/product pairs are aligned, but their order is unspecified.
 ///
 /// # Arguments
 ///
@@ -39,30 +39,25 @@ pub fn prod_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     // labels can make pair count much larger than distinct label count.
     // This saves memory for repeated labels, at the cost of rehashing when
     // nearly every match has a unique label.
-    let mut slots = HashMap::<i64, usize>::new();
-    let mut labels = Vec::new();
-    let mut products = Vec::new();
+    let mut products = HashMap::<i64, i64>::new();
 
     for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
         let left = checked_index(*index_left, arr.len())
             .ok_or("left_index must contain valid positions in arr")?;
-        let slot = match slots.entry(*index_right) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let slot = labels.len();
-                labels.push(*index_right);
-                products.push(1_i64);
-                entry.insert(slot);
-                slot
-            }
-        };
+        let product = products.entry(*index_right).or_insert(1_i64);
         if booleans[left] {
             continue;
         }
-        products[slot] = products[slot].wrapping_mul(to_i64(arr[left]));
+        *product = product.wrapping_mul(to_i64(arr[left]));
     }
 
-    Ok((Array1::from_vec(labels), Array1::from_vec(products)))
+    let mut labels = Vec::with_capacity(products.len());
+    let mut values = Vec::with_capacity(products.len());
+    for (label, product) in products {
+        labels.push(label);
+        values.push(product);
+    }
+    Ok((Array1::from_vec(labels), Array1::from_vec(values)))
 }
 
 /// `u64`-native counterpart to `prod_rev_no_range_int_core`.
@@ -97,30 +92,25 @@ pub fn prod_rev_no_range_u64_core(
     )?;
     // Use the same on-demand allocation policy for the u64 product path. It
     // saves memory for repeated labels but may rehash for unique labels.
-    let mut slots = HashMap::<i64, usize>::new();
-    let mut labels = Vec::new();
-    let mut products = Vec::new();
+    let mut products = HashMap::<i64, u64>::new();
 
     for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
         let left = checked_index(*index_left, arr.len())
             .ok_or("left_index must contain valid positions in arr")?;
-        let slot = match slots.entry(*index_right) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let slot = labels.len();
-                labels.push(*index_right);
-                products.push(1_u64);
-                entry.insert(slot);
-                slot
-            }
-        };
+        let product = products.entry(*index_right).or_insert(1_u64);
         if booleans[left] {
             continue;
         }
-        products[slot] = products[slot].wrapping_mul(arr[left]);
+        *product = product.wrapping_mul(arr[left]);
     }
 
-    Ok((Array1::from_vec(labels), Array1::from_vec(products)))
+    let mut labels = Vec::with_capacity(products.len());
+    let mut values = Vec::with_capacity(products.len());
+    for (label, product) in products {
+        labels.push(label);
+        values.push(product);
+    }
+    Ok((Array1::from_vec(labels), Array1::from_vec(values)))
 }
 
 /// Multiply floating-point values grouped by right labels without range
@@ -151,30 +141,25 @@ pub fn prod_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
     )?;
     // Use the same on-demand allocation policy for the float product path. It
     // saves memory for repeated labels but may rehash for unique labels.
-    let mut slots = HashMap::<i64, usize>::new();
-    let mut labels = Vec::new();
-    let mut products = Vec::new();
+    let mut products = HashMap::<i64, f64>::new();
 
     for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
         let left = checked_index(*index_left, arr.len())
             .ok_or("left_index must contain valid positions in arr")?;
-        let slot = match slots.entry(*index_right) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let slot = labels.len();
-                labels.push(*index_right);
-                products.push(1.0_f64);
-                entry.insert(slot);
-                slot
-            }
-        };
+        let product = products.entry(*index_right).or_insert(1.0_f64);
         if booleans[left] {
             continue;
         }
-        products[slot] *= to_f64(arr[left]);
+        *product *= to_f64(arr[left]);
     }
 
-    Ok((Array1::from_vec(labels), Array1::from_vec(products)))
+    let mut labels = Vec::with_capacity(products.len());
+    let mut values = Vec::with_capacity(products.len());
+    for (label, product) in products {
+        labels.push(label);
+        values.push(product);
+    }
+    Ok((Array1::from_vec(labels), Array1::from_vec(values)))
 }
 
 macro_rules! compute_ints {
@@ -310,7 +295,7 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn integer_core_returns_first_seen_labels_and_products() {
+    fn integer_core_returns_correct_label_product_pairs() {
         let got = prod_rev_no_range_int_core(
             array![5_i64, 2, 7].view(),
             array![0_i64, 1, 2, 1].view(),
@@ -318,7 +303,14 @@ mod tests {
             array![false, false, false].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![20, 40], array![35, 4])));
+        let (labels, products) = got.unwrap();
+        let mut got: Vec<_> = labels
+            .iter()
+            .zip(products.iter())
+            .map(|(&label, &product)| (label, product))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(20, 35), (40, 4)]);
     }
 
     #[test]
@@ -379,7 +371,14 @@ mod tests {
                     array![false, false, false].view(),
                     |value| value as i64,
                 );
-                assert_eq!(got, Ok((array![20, 40], array![35, 4])));
+                let (labels, products) = got.unwrap();
+                let mut got: Vec<_> = labels
+                    .iter()
+                    .zip(products.iter())
+                    .map(|(&label, &product)| (label, product))
+                    .collect();
+                got.sort_unstable();
+                assert_eq!(got, vec![(20, 35), (40, 4)]);
             };
         }
 

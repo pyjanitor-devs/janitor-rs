@@ -10,6 +10,11 @@ use crate::aggs::{
 };
 
 /// Find the row containing the minimum value for each distinct right label.
+/// Output label/position pairs are aligned, but their order is unspecified.
+///
+/// ELI5: each ordinal gets a drawer for its best row. Dense drawers are
+/// scanned by ordinal; sparse drawers come from a map, so output order can
+/// vary while each label stays paired with its result.
 ///
 /// janitor-rs is primarily called by pyjanitor. Its conditional-join path
 /// resets the right DataFrame index to unique row labels before sorting or
@@ -64,12 +69,6 @@ pub fn min_rev_start_end_core<T: PartialOrd + Copy>(
     }
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), total_width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
-
     if dense {
         let mut seen = vec![false; width];
         let mut states = vec![(arr[0], -1_i64); width];
@@ -83,10 +82,7 @@ pub fn min_rev_start_end_core<T: PartialOrd + Copy>(
             let boolean = *boolean;
             for item in start..end {
                 let slot = item - min_start;
-                if !seen[slot] {
-                    seen[slot] = true;
-                    touched.push(slot);
-                }
+                seen[slot] = true;
                 if boolean {
                     continue;
                 }
@@ -96,11 +92,13 @@ pub fn min_rev_start_end_core<T: PartialOrd + Copy>(
             }
         }
 
-        let mut result = Vec::with_capacity(touched.len());
-        let mut labels = Vec::with_capacity(touched.len());
-        for slot in touched {
-            result.push(states[slot].1);
-            labels.push(index[min_start + slot]);
+        let mut result = Vec::new();
+        let mut labels = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                result.push(states[slot].1);
+                labels.push(index[min_start + slot]);
+            }
         }
         return Ok((labels, result));
     }
@@ -116,10 +114,7 @@ pub fn min_rev_start_end_core<T: PartialOrd + Copy>(
         let boolean = *boolean;
         for item in start..end {
             let slot = item - min_start;
-            let state = states.entry(slot).or_insert_with(|| {
-                touched.push(slot);
-                (current, -1)
-            });
+            let state = states.entry(slot).or_insert((current, -1));
             if boolean {
                 continue;
             }
@@ -128,10 +123,10 @@ pub fn min_rev_start_end_core<T: PartialOrd + Copy>(
             }
         }
     }
-    let mut result = Vec::with_capacity(touched.len());
-    let mut labels = Vec::with_capacity(touched.len());
-    for slot in touched {
-        result.push(states[&slot].1);
+    let mut result = Vec::with_capacity(states.len());
+    let mut labels = Vec::with_capacity(states.len());
+    for (slot, (_, best_position)) in states {
+        result.push(best_position);
         labels.push(index[min_start + slot]);
     }
     Ok((labels, result))
