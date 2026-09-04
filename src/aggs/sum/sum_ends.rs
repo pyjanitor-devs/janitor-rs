@@ -3,7 +3,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use super::should_use_running_sum;
-use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core};
+use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
 fn is_empty_sentinel_end(end: i64) -> bool {
     end == -1
@@ -82,7 +82,7 @@ where
         return Ok(result);
     }
 
-    for (pos, end) in ends.indexed_iter() {
+    for (pos, end) in ends.iter().enumerate() {
         if is_empty_sentinel_end(*end) {
             continue; // result[pos] is already 0
         }
@@ -104,13 +104,16 @@ fn sum_end_float_core_with_cast<T, F>(
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_f64: F,
-) -> Array1<f64>
+) -> Result<Array1<f64>, String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<f64>::zeros(ends.len());
-    for (pos, end) in ends.indexed_iter() {
+    for (pos, end) in ends.iter().enumerate() {
         // ELI5: integers and floats receive the same list of slice ends.
         // Check the "no match" card before either path turns it into an
         // array position, so dtype cannot decide whether it returns 0 or
@@ -133,7 +136,7 @@ where
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
 macro_rules! generic_compute {
@@ -171,19 +174,15 @@ macro_rules! generic_compute_floats {
         ) -> PyResult<Bound<'py, PyArray1<f64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = sum_end_float_core_with_cast(
                 arr.as_array(),
                 ends.as_array(),
                 booleans.as_array(),
                 |value| value as f64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
@@ -296,7 +295,8 @@ mod tests {
         let ends = array![-1_i64];
         let booleans = array![false, false, false];
         let got =
-            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value);
+            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value)
+                .unwrap();
         assert_eq!(got, array![0.0]);
     }
 
@@ -306,7 +306,8 @@ mod tests {
         let ends = array![3_i64];
         let booleans = array![false, false, false];
         let got =
-            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value);
+            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value)
+                .unwrap();
         assert_eq!(got, array![0.0]);
     }
 

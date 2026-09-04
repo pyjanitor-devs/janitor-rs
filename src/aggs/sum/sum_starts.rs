@@ -3,7 +3,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use super::should_use_running_sum;
-use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core};
+use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `starts[i]`, sum `arr[starts[i]..]` (to the end of the array),
 /// skipping any position flagged `true` in `booleans` (a null mask).
@@ -147,6 +147,40 @@ macro_rules! generic_compute {
     };
 }
 
+fn sum_start_float_core_with_cast<T, F>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut to_f64: F,
+) -> Result<Array1<f64>, String>
+where
+    T: Copy,
+    F: FnMut(T) -> f64,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    let mut result = Array1::<f64>::zeros(starts.len());
+    let end_: usize = arr.len();
+    for (pos, start) in starts.iter().enumerate() {
+        let mut total: f64 = 0.0;
+        let mut compensation: f64 = 0.0;
+        let start_ = *start as usize;
+        for nn in start_..end_ {
+            if booleans[nn] {
+                continue;
+            }
+            let current = to_f64(arr[nn]);
+            let difference = current - compensation;
+            let increment = total + difference;
+            compensation = (increment - total) - difference;
+            total = increment;
+        }
+        result[pos] = total;
+    }
+    Ok(result)
+}
+
 macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
         #[pyfunction]
@@ -158,34 +192,15 @@ macro_rules! generic_compute_floats {
         ) -> PyResult<Bound<'py, PyArray1<f64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
-            let arr = arr.as_array();
-            let starts = starts.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<f64>::zeros(starts.len());
-            let end_: usize = arr.len();
-            for (pos, start) in starts.indexed_iter() {
-                let mut total: f64 = 0.0;
-                let mut compensation: f64 = 0.0;
-                let start_ = *start as usize;
-                for nn in start_..end_ {
-                    if booleans[nn] {
-                        continue;
-                    }
-                    let current: f64 = arr[nn] as f64;
-                    let difference = current - compensation;
-                    let increment = total + difference;
-                    compensation = (increment - total) - difference;
-                    total = increment;
-                }
-                result[pos] = total;
-            }
-            Ok(result.into_pyarray(py))
+            let result = sum_start_float_core_with_cast(
+                arr.as_array(),
+                starts.as_array(),
+                booleans.as_array(),
+                |value| value as f64,
+            );
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }

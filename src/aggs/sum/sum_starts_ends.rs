@@ -3,9 +3,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use super::should_use_running_sum;
-use crate::aggs::{
-    checked_range, ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core,
-};
+use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `(starts[i], ends[i])`, sum `arr[starts[i]..ends[i]]`,
 /// skipping any position flagged `true` in `booleans` (a null mask).
@@ -96,11 +94,16 @@ fn sum_start_end_float_core_with_cast<T, F>(
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_f64: F,
-) -> Array1<f64>
+) -> Result<Array1<f64>, String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<f64>::zeros(starts.len());
     for (pos, (start, end)) in starts.into_iter().zip(ends).enumerate() {
         // ELI5: validate the range ticket once, before either dtype-specific
@@ -123,7 +126,7 @@ where
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
 macro_rules! generic_compute_ints {
@@ -168,13 +171,6 @@ macro_rules! generic_compute_floats {
         {
             let starts = starts.as_array();
             let ends = ends.as_array();
-            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = sum_start_end_float_core_with_cast(
                 arr.as_array(),
                 starts,
@@ -182,7 +178,9 @@ macro_rules! generic_compute_floats {
                 booleans.as_array(),
                 |value| value as f64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
@@ -330,7 +328,8 @@ mod tests {
             ends.view(),
             booleans.view(),
             |value| value,
-        );
+        )
+        .unwrap();
         assert_eq!(got, array![0.0, 0.0]);
     }
 
