@@ -28,12 +28,12 @@ pub fn max_rev_start_match_core<T: PartialOrd + Copy>(
     matches: ArrayView1<'_, i8>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Vec<i64>, Vec<i64>), String> {
-    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
-    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
-    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("matches", matches.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
 
     let mut expected = 0_usize;
     let mut min_start = index.len();
@@ -252,5 +252,20 @@ mod tests {
         );
 
         assert_eq!(got, Ok((vec![10, 20], vec![1, 1])));
+    }
+
+    #[test]
+    fn empty_input_precedes_shape_mismatch() {
+        let error = max_rev_start_match_core(
+            numpy::ndarray::Array1::<i64>::zeros(0).view(),
+            numpy::ndarray::array![0_i64].view(),
+            numpy::ndarray::array![1_i64].view(),
+            numpy::ndarray::array![10_i64].view(),
+            numpy::ndarray::array![1_i8].view(),
+            numpy::ndarray::array![false].view(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "arr cannot be empty");
     }
 }

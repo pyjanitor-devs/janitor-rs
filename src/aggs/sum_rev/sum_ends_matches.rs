@@ -28,12 +28,12 @@ where
     A: Copy + WrapAdd,
     F: FnMut(T) -> A,
 {
-    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
-    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
-    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("matches", matches.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut expected = 0_usize;
     let mut max_end = 0_usize;
     for end in ends.iter() {
@@ -130,12 +130,12 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
-    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
-    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
-    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("matches", matches.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut expected = 0_usize;
     let mut max_end = 0_usize;
     for end in ends.iter() {
@@ -333,6 +333,27 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_sum_rev_end_match_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_sum_rev_end_match_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod precedence_tests {
+    use super::sum_rev_end_match_int_core;
+    use numpy::ndarray::{array, Array1};
+
+    #[test]
+    fn empty_input_precedes_shape_mismatch() {
+        let error = sum_rev_end_match_int_core::<i64, i64, _>(
+            Array1::<i64>::zeros(0).view(),
+            array![1_i64].view(),
+            array![1_i64].view(),
+            array![10_i64].view(),
+            array![1_i8].view(),
+            array![false].view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+    }
 }
 
 #[cfg(test)]

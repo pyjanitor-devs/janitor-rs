@@ -368,10 +368,10 @@ pub fn size_rev_start_end_match_core(
     index: ArrayView1<'_, i64>,
     matches: ArrayView1<'_, i8>,
 ) -> Result<(Vec<i64>, Vec<i64>), String> {
-    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
     ensure_nonempty_core("starts", starts.len())?;
     ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("matches", matches.len())?;
+    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
 
     let mut expected_matches_width = 0_usize;
     let mut min_start = index.len();
@@ -513,9 +513,9 @@ pub fn size_rev_start_end_core(
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,
 ) -> Result<(Vec<i64>, Vec<i64>), String> {
-    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
     ensure_nonempty_core("starts", starts.len())?;
     ensure_nonempty_core("index", index.len())?;
+    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
 
     let mut min_start = index.len();
     let mut max_end = 0_usize;
@@ -614,6 +614,19 @@ pub fn compute_size_rev_start_end<'py>(
 mod tests {
     use super::*;
     use numpy::{ndarray::array, PyArrayMethods};
+
+    #[test]
+    fn empty_input_precedes_shape_mismatch_for_range_matches() {
+        let error = size_rev_start_end_match_core(
+            numpy::ndarray::Array1::<i64>::zeros(0).view(),
+            array![1_i64].view(),
+            array![10_i64].view(),
+            array![1_i8].view(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "starts cannot be empty");
+    }
 
     #[test]
     fn counts_prefixes_and_suffixes_in_compact_slots() {

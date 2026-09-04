@@ -38,13 +38,13 @@ where
     A: Copy + WrapMul,
     F: FnMut(T) -> A,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    ensure_nonempty_core("arr", arr.len())?;
-    ensure_nonempty_core("index", index.len())?;
-    ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut min_start = index.len();
     let mut max_end = 0_usize;
@@ -206,13 +206,13 @@ where
     T: Copy,
     F: FnMut(T) -> f64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    ensure_nonempty_core("arr", arr.len())?;
-    ensure_nonempty_core("index", index.len())?;
-    ensure_nonempty_core("matches", matches.len())?;
     let mut expected = 0_usize;
     let mut min_start = index.len();
     let mut max_end = 0_usize;
@@ -383,9 +383,28 @@ mod tests {
     use super::{
         compute_prod_rev_start_end_match_f32, compute_prod_rev_start_end_match_f64,
         compute_prod_rev_start_end_match_int64, compute_prod_rev_start_end_match_uint64,
+        prod_rev_start_end_match_int_core,
     };
+    use numpy::ndarray::Array1;
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::Python;
+
+    #[test]
+    fn empty_input_precedes_shape_mismatch() {
+        let error = prod_rev_start_end_match_int_core(
+            Array1::<i64>::zeros(0).view(),
+            numpy::ndarray::array![0_i64].view(),
+            numpy::ndarray::array![1_i64].view(),
+            numpy::ndarray::array![10_i64].view(),
+            numpy::ndarray::array![1_i64].view(),
+            numpy::ndarray::array![1_i8].view(),
+            numpy::ndarray::array![false].view(),
+            |value| value,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "arr cannot be empty");
+    }
 
     #[test]
     fn u64_accumulator_preserves_values_at_and_above_i64_max() {

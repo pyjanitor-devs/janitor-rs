@@ -46,6 +46,12 @@ the bottom of this file.
   semantics, and dtype-widening rules here are load-bearing for pyjanitor's
   correctness, not incidental implementation details. See "Non-Obvious
   Gotchas".
+- **Keep kernel validation order stable**: `_core` functions must perform
+  required non-empty checks before parallel-array length checks, followed by
+  per-row bounds/tape validation and only then aggregation. Use
+  `ensure_nonempty_core` and `ensure_equal_lengths_core` so multiply-invalid
+  inputs have one documented error-precedence policy; add an exact-message
+  regression test when changing or extracting a validation block.
 - **ELI5 code comments, generously**: any non-obvious logic gets a `///
   ELI5: <plain-language analogy>` line (see existing examples throughout
   `src/`) - not just on the one line of code that's tricky, but on
