@@ -8,6 +8,17 @@ pub mod sum_starts_ends;
 pub mod sum_starts_ends_matches;
 pub mod sum_starts_matches;
 
+// Three is the deliberately conservative crossover used by the adaptive
+// forward-sum paths: building a running-sum buffer costs about one full scan
+// of `arr`, plus O(arr.len()) temporary memory, so repeated direct scans must
+// be meaningfully more expensive before we allocate that buffer. This value
+// matches the measured cutoff used by the corresponding pyjanitor approach
+// and the forward-sum benchmarks.
+//
+// ELI5: if only a few people ask for sums, answer each person by walking the
+// shelf they asked about. If the questions together would walk the shelf more
+// than roughly three times, walk it once while writing down every running sum,
+// then answer the questions from those notes.
 const RUNNING_SUM_WORK_FACTOR: usize = 3;
 
 /// Chooses a materialized prefix/suffix scan when repeated range work is
