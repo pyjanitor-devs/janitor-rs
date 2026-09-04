@@ -51,9 +51,9 @@ where
     // ELI5: for a few short suffixes, add each suffix directly. When many
     // suffixes ask for more than roughly three full-array scans, write one
     // running answer for every position and answer each query from it.
-    let use_suffix = if starts.len() < 8 {
-        // ELI5: for only a handful of questions, measuring every question
-        // costs more than simply answering them directly.
+    let use_suffix = if starts.len() <= 3 {
+        // ELI5: three or fewer questions cannot require more than three
+        // full-array scans, so measuring them costs more than answering them.
         false
     } else {
         let total_width = starts.iter().fold(0_usize, |total, start| {
