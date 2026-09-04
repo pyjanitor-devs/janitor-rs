@@ -262,4 +262,20 @@ mod tests {
             assert!(error.to_string().contains("matches cannot be empty"));
         });
     }
+
+    #[test]
+    fn empty_input_precedes_shape_mismatch() {
+        let error = super::max_rev_start_end_match_core(
+            numpy::ndarray::Array1::<i64>::zeros(0).view(),
+            numpy::ndarray::array![0_i64].view(),
+            numpy::ndarray::array![1_i64].view(),
+            numpy::ndarray::array![10_i64].view(),
+            numpy::ndarray::array![1_i64].view(),
+            numpy::ndarray::array![1_i8].view(),
+            numpy::ndarray::array![false].view(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "arr cannot be empty");
+    }
 }

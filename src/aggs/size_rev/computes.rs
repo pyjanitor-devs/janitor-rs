@@ -616,6 +616,19 @@ mod tests {
     use numpy::{ndarray::array, PyArrayMethods};
 
     #[test]
+    fn empty_input_precedes_shape_mismatch_for_range_matches() {
+        let error = size_rev_start_end_match_core(
+            numpy::ndarray::Array1::<i64>::zeros(0).view(),
+            array![1_i64].view(),
+            array![10_i64].view(),
+            array![1_i8].view(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "starts cannot be empty");
+    }
+
+    #[test]
     fn counts_prefixes_and_suffixes_in_compact_slots() {
         let index = array![50_i64, 10, 90];
         assert_eq!(

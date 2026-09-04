@@ -383,9 +383,28 @@ mod tests {
     use super::{
         compute_prod_rev_start_end_match_f32, compute_prod_rev_start_end_match_f64,
         compute_prod_rev_start_end_match_int64, compute_prod_rev_start_end_match_uint64,
+        prod_rev_start_end_match_int_core,
     };
+    use numpy::ndarray::Array1;
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::Python;
+
+    #[test]
+    fn empty_input_precedes_shape_mismatch() {
+        let error = prod_rev_start_end_match_int_core(
+            Array1::<i64>::zeros(0).view(),
+            numpy::ndarray::array![0_i64].view(),
+            numpy::ndarray::array![1_i64].view(),
+            numpy::ndarray::array![10_i64].view(),
+            numpy::ndarray::array![1_i64].view(),
+            numpy::ndarray::array![1_i8].view(),
+            numpy::ndarray::array![false].view(),
+            |value| value,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "arr cannot be empty");
+    }
 
     #[test]
     fn u64_accumulator_preserves_values_at_and_above_i64_max() {
