@@ -47,6 +47,7 @@ where
     F: FnMut(T) -> i64,
 {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(starts.len());
     let end_: usize = arr.len();
@@ -60,13 +61,12 @@ where
     // so it should be built only when repeated direct scans would cost more.
     // The three-scan threshold is the measured crossover used by the
     // corresponding pyjanitor prefix implementation and its Rust benchmark.
-    let total_width = starts.iter().fold(0_usize, |total, start| {
-        let width = (*start)
-            .try_into()
-            .ok()
-            .map_or(0, |start: usize| end_.saturating_sub(start));
-        total.saturating_add(width)
-    });
+    let mut total_width = 0_usize;
+    for start in starts.iter() {
+        if let Ok(start_) = usize::try_from(*start) {
+            total_width = total_width.saturating_add(end_.saturating_sub(start_));
+        }
+    }
     let use_suffix = should_use_running_sum(starts.len(), total_width, end_);
 
     if use_suffix {

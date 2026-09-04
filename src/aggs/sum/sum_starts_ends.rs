@@ -41,19 +41,19 @@ where
     F: FnMut(T) -> i64,
 {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(starts.len());
     let zipped = starts.into_iter().zip(ends);
 
-    let total_width = starts
-        .iter()
-        .zip(ends.iter())
-        .fold(0_usize, |total, (start, end)| {
-            let width =
-                checked_range(*start, *end, arr.len()).map_or(0, |(start_, end_)| end_ - start_);
-            total.saturating_add(width)
-        });
+    let mut total_width = 0_usize;
+    for (start, end) in starts.iter().zip(ends.iter()) {
+        if let Some((start_, end_)) = checked_range(*start, *end, arr.len()) {
+            total_width = total_width.saturating_add(end_ - start_);
+        }
+    }
     let use_prefix = should_use_running_sum(starts.len(), total_width, arr.len());
 
     if use_prefix {

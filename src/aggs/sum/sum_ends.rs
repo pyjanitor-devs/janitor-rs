@@ -45,18 +45,19 @@ where
     F: FnMut(T) -> i64,
 {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(ends.len());
     let start_: usize = 0;
 
-    let total_width = ends.iter().fold(0_usize, |total, end| {
-        let width = if *end == -1 {
-            0
-        } else {
-            usize::try_from(*end).map_or(0, |end_| end_.min(arr.len()))
-        };
-        total.saturating_add(width)
-    });
+    let mut total_width = 0_usize;
+    for end in ends.iter() {
+        if *end != -1 {
+            if let Ok(end_) = usize::try_from(*end) {
+                total_width = total_width.saturating_add(end_.min(arr.len()));
+            }
+        }
+    }
     let all_ranges_are_safe = ends
         .iter()
         .all(|end| *end == -1 || usize::try_from(*end).is_ok_and(|end_| end_ <= arr.len()));
