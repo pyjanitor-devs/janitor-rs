@@ -52,11 +52,6 @@ where
     ensure_exact_tape_width_core(expected, matches.len())?;
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
     let mut tape = 0_usize;
     if dense {
         let mut seen = vec![false; width];
@@ -75,10 +70,7 @@ where
             for item in start_..end_ {
                 if matches[tape] != 0 {
                     let slot = item - min_start;
-                    if !seen[slot] {
-                        seen[slot] = true;
-                        touched.push(slot);
-                    }
+                    seen[slot] = true;
                     if !*boolean && *count != 0 {
                         totals[slot] = totals[slot].wrap_add(current_);
                     }
@@ -86,11 +78,13 @@ where
                 tape += 1;
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut values = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            values.push(totals[slot]);
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[min_start + slot]);
+                values.push(totals[slot]);
+            }
         }
         return Ok((labels, values));
     }
@@ -109,10 +103,7 @@ where
         for item in start_..end_ {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                let total = totals.entry(slot).or_insert_with(|| {
-                    touched.push(slot);
-                    A::ZERO
-                });
+                let total = totals.entry(slot).or_insert(A::ZERO);
                 if !*boolean && *count != 0 {
                     *total = total.wrap_add(current_);
                 }
@@ -120,11 +111,11 @@ where
             tape += 1;
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut values = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(totals.len());
+    let mut values = Vec::with_capacity(totals.len());
+    for (slot, value) in totals {
         labels.push(index[min_start + slot]);
-        values.push(totals[&slot]);
+        values.push(value);
     }
     Ok((labels, values))
 }
@@ -170,11 +161,6 @@ where
     ensure_exact_tape_width_core(expected, matches.len())?;
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
     let mut tape = 0_usize;
     if dense {
         let mut seen = vec![false; width];
@@ -193,10 +179,7 @@ where
             for item in s..e {
                 if matches[tape] != 0 {
                     let slot = item - min_start;
-                    if !seen[slot] {
-                        seen[slot] = true;
-                        touched.push(slot);
-                    }
+                    seen[slot] = true;
                     if !*boolean && *count != 0 {
                         let state = &mut states[slot];
                         let d = current_ - state.1;
@@ -211,11 +194,13 @@ where
                 tape += 1;
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut values = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            values.push(states[slot].0);
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[min_start + slot]);
+                values.push(states[slot].0);
+            }
         }
         return Ok((labels, values));
     }
@@ -234,10 +219,7 @@ where
         for item in s..e {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                let state = states.entry(slot).or_insert_with(|| {
-                    touched.push(slot);
-                    (0., 0.)
-                });
+                let state = states.entry(slot).or_insert((0., 0.));
                 if !*boolean && *count != 0 {
                     let d = current_ - state.1;
                     let inc = state.0 + d;
@@ -251,11 +233,11 @@ where
             tape += 1;
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut values = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(states.len());
+    let mut values = Vec::with_capacity(states.len());
+    for (slot, (total, _compensation)) in states {
         labels.push(index[min_start + slot]);
-        values.push(states[&slot].0);
+        values.push(total);
     }
     Ok((labels, values))
 }

@@ -2,13 +2,12 @@ use crate::aggs::{checked_index, ensure_equal_lengths_core, ensure_nonempty_core
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 /// Sums no-range rows with arbitrary right labels using compact label slots.
 ///
-/// ELI5: the map stores one total per arbitrary label, while the label vector
-/// records first-seen order so output is deterministic.
+/// ELI5: the map stores one total per arbitrary label. Output order is
+/// unspecified, but each label remains paired with its total.
 pub fn sum_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     arr: ArrayView1<'_, T>,
     left_index: ArrayView1<'_, i64>,
@@ -34,29 +33,24 @@ pub fn sum_rev_no_range_int_core<T: Copy, F: FnMut(T) -> i64>(
     // labels can make pair count much larger than distinct label count.
     // This saves memory for repeated labels, at the cost of rehashing when
     // nearly every match has a unique label.
-    let mut slots = HashMap::<i64, usize>::new();
-    let mut labels = Vec::new();
-    let mut totals = Vec::new();
+    let mut totals = HashMap::<i64, i64>::new();
 
     for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
         let left = checked_index(*index_left, arr.len())
             .ok_or("left_index must contain valid positions in arr")?;
-        let slot = match slots.entry(*index_right) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let slot = labels.len();
-                labels.push(*index_right);
-                totals.push(0_i64);
-                entry.insert(slot);
-                slot
-            }
-        };
+        let total = totals.entry(*index_right).or_insert(0_i64);
         if !booleans[left] {
-            totals[slot] = totals[slot].wrapping_add(to_i64(arr[left]));
+            *total = total.wrapping_add(to_i64(arr[left]));
         }
     }
 
-    Ok((Array1::from_vec(labels), Array1::from_vec(totals)))
+    let mut labels = Vec::with_capacity(totals.len());
+    let mut values = Vec::with_capacity(totals.len());
+    for (label, total) in totals {
+        labels.push(label);
+        values.push(total);
+    }
+    Ok((Array1::from_vec(labels), Array1::from_vec(values)))
 }
 
 /// `u64`-native counterpart to `sum_rev_no_range_int_core`.
@@ -83,29 +77,24 @@ pub fn sum_rev_no_range_u64_core(
     )?;
     // Use the same on-demand allocation policy for the u64 sum path. It saves
     // memory for repeated labels but may rehash for unique labels.
-    let mut slots = HashMap::<i64, usize>::new();
-    let mut labels = Vec::new();
-    let mut totals = Vec::new();
+    let mut totals = HashMap::<i64, u64>::new();
 
     for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
         let left = checked_index(*index_left, arr.len())
             .ok_or("left_index must contain valid positions in arr")?;
-        let slot = match slots.entry(*index_right) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let slot = labels.len();
-                labels.push(*index_right);
-                totals.push(0_u64);
-                entry.insert(slot);
-                slot
-            }
-        };
+        let total = totals.entry(*index_right).or_insert(0_u64);
         if !booleans[left] {
-            totals[slot] = totals[slot].wrapping_add(arr[left]);
+            *total = total.wrapping_add(arr[left]);
         }
     }
 
-    Ok((Array1::from_vec(labels), Array1::from_vec(totals)))
+    let mut labels = Vec::with_capacity(totals.len());
+    let mut values = Vec::with_capacity(totals.len());
+    for (label, total) in totals {
+        labels.push(label);
+        values.push(total);
+    }
+    Ok((Array1::from_vec(labels), Array1::from_vec(values)))
 }
 
 /// Float counterpart to `sum_rev_no_range_int_core`.
@@ -131,28 +120,17 @@ pub fn sum_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
     )?;
     // Use the same on-demand allocation policy for the float sum path. It
     // saves memory for repeated labels but may rehash for unique labels.
-    let mut slots = HashMap::<i64, usize>::new();
-    let mut labels = Vec::new();
-    let mut values = Vec::new();
+    let mut values = HashMap::<i64, (f64, f64)>::new();
 
     for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
         let left = checked_index(*index_left, arr.len())
             .ok_or("left_index must contain valid positions in arr")?;
-        let slot = match slots.entry(*index_right) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let slot = labels.len();
-                labels.push(*index_right);
-                values.push((0.0, 0.0));
-                entry.insert(slot);
-                slot
-            }
-        };
+        let state = values.entry(*index_right).or_insert((0.0, 0.0));
         if booleans[left] {
             continue;
         }
         let current = to_f64(arr[left]);
-        let (total, compensation) = &mut values[slot];
+        let (total, compensation) = state;
         let difference = current - *compensation;
         let increment = *total + difference;
         *compensation = (increment - *total) - difference;
@@ -162,8 +140,13 @@ pub fn sum_rev_no_range_float_core<T: Copy, F: FnMut(T) -> f64>(
         *total = increment;
     }
 
-    let result = values.into_iter().map(|(total, _)| total).collect();
-    Ok((Array1::from_vec(labels), result))
+    let mut labels = Vec::with_capacity(values.len());
+    let mut result = Vec::with_capacity(values.len());
+    for (label, (total, _)) in values {
+        labels.push(label);
+        result.push(total);
+    }
+    Ok((Array1::from_vec(labels), Array1::from_vec(result)))
 }
 
 macro_rules! compute_ints {
@@ -279,7 +262,7 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn integer_core_compresses_arbitrary_labels_deterministically() {
+    fn integer_core_compresses_arbitrary_labels() {
         let got = sum_rev_no_range_int_core(
             array![5_i64, 2, 7].view(),
             array![0_i64, 1, 2, 1].view(),
@@ -287,7 +270,14 @@ mod tests {
             array![false, false, false].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![20, 40], array![12, 4])));
+        let (labels, values) = got.unwrap();
+        let mut got: Vec<_> = labels
+            .iter()
+            .zip(values.iter())
+            .map(|(&label, &value)| (label, value))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(20, 12), (40, 4)]);
     }
 
     #[test]
@@ -311,7 +301,14 @@ mod tests {
             array![false, false, true].view(),
             |value| value,
         );
-        assert_eq!(got, Ok((array![20, 40], array![i64::MIN, 0])));
+        let (labels, values) = got.unwrap();
+        let mut got: Vec<_> = labels
+            .iter()
+            .zip(values.iter())
+            .map(|(&label, &value)| (label, value))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(20, i64::MIN), (40, 0)]);
     }
 
     #[test]

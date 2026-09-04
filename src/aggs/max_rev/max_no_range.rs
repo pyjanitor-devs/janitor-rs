@@ -3,7 +3,6 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::{checked_index, ensure_equal_lengths_core, ensure_nonempty_core};
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 /// Find the maximum contributing row position for each right-side label
@@ -30,37 +29,25 @@ pub fn max_rev_no_range_core<T: Copy + PartialOrd>(
     // compact layout still avoids the second map used by the old reducer.
     // This saves memory for repeated labels, at the cost of rehashing when
     // nearly every match has a unique label.
-    let mut slots = HashMap::<i64, usize>::new();
-    let mut labels = Vec::new();
-    let mut positions = Vec::new();
-    let mut values = Vec::new();
+    let mut states = HashMap::<i64, (T, i64)>::new();
 
     for (index_left, index_right) in left_index.iter().zip(right_index.iter()) {
         let left = checked_index(*index_left, arr.len())
             .ok_or("left_index must contain valid positions in arr")?;
         let current = arr[left];
         let boolean = booleans[left];
-        match slots.entry(*index_right) {
-            Entry::Occupied(entry) => {
-                let slot = *entry.get();
-                if boolean {
-                    continue;
-                }
-                if positions[slot] == -1 || current > values[slot] {
-                    positions[slot] = left as i64;
-                    values[slot] = current;
-                }
-            }
-            Entry::Vacant(entry) => {
-                let slot = labels.len();
-                labels.push(*index_right);
-                positions.push(if boolean { -1 } else { left as i64 });
-                values.push(current);
-                entry.insert(slot);
-            }
+        let state = states.entry(*index_right).or_insert((current, -1));
+        if !boolean && (state.1 == -1 || current > state.0) {
+            *state = (current, left as i64);
         }
     }
 
+    let mut labels = Vec::with_capacity(states.len());
+    let mut positions = Vec::with_capacity(states.len());
+    for (label, (_, position)) in states {
+        labels.push(label);
+        positions.push(position);
+    }
     Ok((Array1::from_vec(labels), Array1::from_vec(positions)))
 }
 
@@ -134,14 +121,21 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn core_returns_first_seen_labels_and_max_positions() {
+    fn core_returns_correct_label_position_pairs() {
         let got = max_rev_no_range_core(
             array![5_i64, 2, 7].view(),
             array![0_i64, 1, 2, 1].view(),
             array![20_i64, 40, 20, 40].view(),
             array![false, false, false].view(),
         );
-        assert_eq!(got, Ok((array![20, 40], array![2, 1])));
+        let (labels, positions) = got.unwrap();
+        let mut got: Vec<_> = labels
+            .iter()
+            .zip(positions.iter())
+            .map(|(&label, &position)| (label, position))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(20, 2), (40, 1)]);
     }
 
     #[test]
@@ -154,7 +148,14 @@ mod tests {
                     array![20_i64, 40, 20, 40].view(),
                     array![false, false, false].view(),
                 );
-                assert_eq!(got, Ok((array![20, 40], array![2, 1])));
+                let (labels, positions) = got.unwrap();
+                let mut got: Vec<_> = labels
+                    .iter()
+                    .zip(positions.iter())
+                    .map(|(&label, &position)| (label, position))
+                    .collect();
+                got.sort_unstable();
+                assert_eq!(got, vec![(20, 2), (40, 1)]);
             };
         }
 
@@ -178,7 +179,14 @@ mod tests {
             array![20_i64, 40, 40].view(),
             array![true, false].view(),
         );
-        assert_eq!(got, Ok((array![20, 40], array![-1, 1])));
+        let (labels, positions) = got.unwrap();
+        let mut got: Vec<_> = labels
+            .iter()
+            .zip(positions.iter())
+            .map(|(&label, &position)| (label, position))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(20, -1), (40, 1)]);
 
         let got = max_rev_no_range_core(
             array![5_i64, 5, 4].view(),

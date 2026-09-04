@@ -51,11 +51,6 @@ pub fn max_rev_start_end_match_core<T: PartialOrd + Copy>(
     ensure_exact_tape_width_core(expected, matches.len())?;
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
     let mut tape = 0_usize;
 
     if dense {
@@ -79,10 +74,7 @@ pub fn max_rev_start_end_match_core<T: PartialOrd + Copy>(
                     continue;
                 }
                 let slot = item - min_start;
-                if !seen[slot] {
-                    seen[slot] = true;
-                    touched.push(slot);
-                }
+                seen[slot] = true;
                 tape += 1;
                 if *boolean || *count == 0 {
                     continue;
@@ -92,11 +84,13 @@ pub fn max_rev_start_end_match_core<T: PartialOrd + Copy>(
                 }
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut result = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            result.push(states[slot].1);
+        let mut labels = Vec::new();
+        let mut result = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[min_start + slot]);
+                result.push(states[slot].1);
+            }
         }
         return Ok((labels, result));
     }
@@ -120,10 +114,7 @@ pub fn max_rev_start_end_match_core<T: PartialOrd + Copy>(
                 continue;
             }
             let slot = item - min_start;
-            let state = states.entry(slot).or_insert_with(|| {
-                touched.push(slot);
-                (*current, -1)
-            });
+            let state = states.entry(slot).or_insert((*current, -1));
             tape += 1;
             if *boolean || *count == 0 {
                 continue;
@@ -133,11 +124,11 @@ pub fn max_rev_start_end_match_core<T: PartialOrd + Copy>(
             }
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut result = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(states.len());
+    let mut result = Vec::with_capacity(states.len());
+    for (slot, (_, best_position)) in states {
         labels.push(index[min_start + slot]);
-        result.push(states[&slot].1);
+        result.push(best_position);
     }
     Ok((labels, result))
 }

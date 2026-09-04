@@ -67,12 +67,6 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
     // up in a dictionary. `total_width` is the estimated amount of work; it
     // is intentionally only a dispatch hint, not the allocated width.
     let dense = should_use_dense_match_storage(index.len(), total_width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
-
     if dense {
         let mut seen = vec![false; width];
         let mut states = vec![(arr[0], -1_i64); width];
@@ -90,10 +84,7 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
                 // unsigned subtraction cannot underflow: it translates an
                 // absolute right-row position into the compact domain.
                 let slot = item - min_start;
-                if !seen[slot] {
-                    seen[slot] = true;
-                    touched.push(slot);
-                }
+                seen[slot] = true;
                 if boolean {
                     continue;
                 }
@@ -102,11 +93,13 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
                 }
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut result = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            result.push(states[slot].1);
+        let mut labels = Vec::new();
+        let mut result = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[min_start + slot]);
+                result.push(states[slot].1);
+            }
         }
         return Ok((labels, result));
     }
@@ -125,10 +118,7 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
             // item is at least `min_start`; subtraction is a safe compact-slot
             // translation rather than an unchecked signed-boundary operation.
             let slot = item - min_start;
-            let state = states.entry(slot).or_insert_with(|| {
-                touched.push(slot);
-                (current, -1)
-            });
+            let state = states.entry(slot).or_insert((current, -1));
 
             if boolean {
                 continue;
@@ -139,11 +129,11 @@ pub fn max_rev_start_end_core<T: PartialOrd + Copy>(
             }
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut result = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(states.len());
+    let mut result = Vec::with_capacity(states.len());
+    for (slot, (_, best_position)) in states {
         labels.push(index[min_start + slot]);
-        result.push(states[&slot].1);
+        result.push(best_position);
     }
     Ok((labels, result))
 }

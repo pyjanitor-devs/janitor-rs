@@ -75,11 +75,6 @@ where
     }
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), total_width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
     if dense {
         let mut seen = vec![false; width];
         let mut states = vec![A::ONE; width];
@@ -93,20 +88,19 @@ where
             let boolean = *boolean;
             for item in start..end {
                 let slot = item - min_start;
-                if !seen[slot] {
-                    seen[slot] = true;
-                    touched.push(slot);
-                }
+                seen[slot] = true;
                 if !boolean {
                     states[slot] = states[slot].wrap_mul(convert(current));
                 }
             }
         }
-        let mut result = Vec::with_capacity(touched.len());
-        let mut labels = Vec::with_capacity(touched.len());
-        for slot in touched {
-            result.push(states[slot]);
-            labels.push(index[min_start + slot]);
+        let mut result = Vec::new();
+        let mut labels = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                result.push(states[slot]);
+                labels.push(index[min_start + slot]);
+            }
         }
         return Ok((labels, result));
     }
@@ -122,19 +116,16 @@ where
         let boolean = *boolean;
         for item in start..end {
             let slot = item - min_start;
-            let product = states.entry(slot).or_insert_with(|| {
-                touched.push(slot);
-                A::ONE
-            });
+            let product = states.entry(slot).or_insert(A::ONE);
             if !boolean {
                 *product = product.wrap_mul(convert(current));
             }
         }
     }
-    let mut result = Vec::with_capacity(touched.len());
-    let mut labels = Vec::with_capacity(touched.len());
-    for slot in touched {
-        result.push(states[&slot]);
+    let mut result = Vec::with_capacity(states.len());
+    let mut labels = Vec::with_capacity(states.len());
+    for (slot, product) in states {
+        result.push(product);
         labels.push(index[min_start + slot]);
     }
     Ok((labels, result))
@@ -187,11 +178,6 @@ where
     }
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), total_width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
     if dense {
         let mut seen = vec![false; width];
         let mut states = vec![1.0_f64; width];
@@ -206,20 +192,19 @@ where
             let current = if boolean { None } else { Some(to_f64(current)) };
             for item in start..end {
                 let slot = item - min_start;
-                if !seen[slot] {
-                    seen[slot] = true;
-                    touched.push(slot);
-                }
+                seen[slot] = true;
                 if let Some(current) = current {
                     states[slot] *= current;
                 }
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut result = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            result.push(states[slot]);
+        let mut labels = Vec::new();
+        let mut result = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[min_start + slot]);
+                result.push(states[slot]);
+            }
         }
         return Ok((labels, result));
     }
@@ -236,20 +221,17 @@ where
         let current = if boolean { None } else { Some(to_f64(current)) };
         for item in start..end {
             let slot = item - min_start;
-            let product = states.entry(slot).or_insert_with(|| {
-                touched.push(slot);
-                1.0_f64
-            });
+            let product = states.entry(slot).or_insert(1.0_f64);
             if let Some(current) = current {
                 *product *= current;
             }
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut result = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(states.len());
+    let mut result = Vec::with_capacity(states.len());
+    for (slot, product) in states {
         labels.push(index[min_start + slot]);
-        result.push(states[&slot]);
+        result.push(product);
     }
     Ok((labels, result))
 }

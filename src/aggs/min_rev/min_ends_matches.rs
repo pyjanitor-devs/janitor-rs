@@ -44,11 +44,6 @@ pub fn min_rev_end_match_core<T: PartialOrd + Copy>(
     }
     ensure_exact_tape_width_core(expected, matches.len())?;
     let dense = should_use_dense_match_storage(index.len(), max_end);
-    let mut touched = if dense {
-        Vec::with_capacity(max_end)
-    } else {
-        Vec::new()
-    };
     let mut tape = 0_usize;
     if dense {
         let mut seen = vec![false; max_end];
@@ -64,10 +59,7 @@ pub fn min_rev_end_match_core<T: PartialOrd + Copy>(
                     tape += 1;
                     continue;
                 }
-                if !seen[item] {
-                    seen[item] = true;
-                    touched.push(item);
-                }
+                seen[item] = true;
                 tape += 1;
                 if *boolean || *count == 0 {
                     continue;
@@ -77,11 +69,13 @@ pub fn min_rev_end_match_core<T: PartialOrd + Copy>(
                 }
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut result = Vec::with_capacity(touched.len());
-        for item in touched {
-            labels.push(index[item]);
-            result.push(states[item].1);
+        let mut labels = Vec::new();
+        let mut result = Vec::new();
+        for (item, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[item]);
+                result.push(states[item].1);
+            }
         }
         return Ok((labels, result));
     }
@@ -97,10 +91,7 @@ pub fn min_rev_end_match_core<T: PartialOrd + Copy>(
                 tape += 1;
                 continue;
             }
-            let state = states.entry(item).or_insert_with(|| {
-                touched.push(item);
-                (*current, -1)
-            });
+            let state = states.entry(item).or_insert((*current, -1));
             tape += 1;
             if *boolean || *count == 0 {
                 continue;
@@ -110,11 +101,11 @@ pub fn min_rev_end_match_core<T: PartialOrd + Copy>(
             }
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut result = Vec::with_capacity(touched.len());
-    for item in touched {
+    let mut labels = Vec::with_capacity(states.len());
+    let mut result = Vec::with_capacity(states.len());
+    for (item, (_, best_position)) in states {
         labels.push(index[item]);
-        result.push(states[&item].1);
+        result.push(best_position);
     }
     Ok((labels, result))
 }

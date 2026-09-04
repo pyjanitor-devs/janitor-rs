@@ -172,11 +172,6 @@ pub fn size_rev_end_match_core(
     ensure_exact_tape_width_core(expected_matches_width, matches.len())?;
 
     let dense = should_use_dense_match_storage(index.len(), max_end);
-    let mut touched = if dense {
-        Vec::with_capacity(max_end)
-    } else {
-        Vec::new()
-    };
     let mut tape = 0_usize;
 
     if dense {
@@ -188,20 +183,19 @@ pub fn size_rev_end_match_core(
             };
             for item in 0..end_ {
                 if matches[tape] != 0 {
-                    if !seen[item] {
-                        seen[item] = true;
-                        touched.push(item);
-                    }
+                    seen[item] = true;
                     counts[item] += 1;
                 }
                 tape += 1;
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut values = Vec::with_capacity(touched.len());
-        for item in touched {
-            labels.push(index[item]);
-            values.push(counts[item]);
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (item, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[item]);
+                values.push(counts[item]);
+            }
         }
         return Ok((labels, values));
     }
@@ -213,20 +207,17 @@ pub fn size_rev_end_match_core(
         };
         for item in 0..end_ {
             if matches[tape] != 0 {
-                let count = counts.entry(item).or_insert_with(|| {
-                    touched.push(item);
-                    0
-                });
+                let count = counts.entry(item).or_insert(0);
                 *count += 1;
             }
             tape += 1;
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut values = Vec::with_capacity(touched.len());
-    for item in touched {
+    let mut labels = Vec::with_capacity(counts.len());
+    let mut values = Vec::with_capacity(counts.len());
+    for (item, count) in counts {
         labels.push(index[item]);
-        values.push(counts[&item]);
+        values.push(count);
     }
     Ok((labels, values))
 }
@@ -273,11 +264,6 @@ pub fn size_rev_start_match_core(
 
     let width = index.len().saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
     let mut tape = 0_usize;
 
     if dense {
@@ -291,20 +277,19 @@ pub fn size_rev_start_match_core(
             for item in start_..end_ {
                 if matches[tape] != 0 {
                     let slot = item - min_start;
-                    if !seen[slot] {
-                        seen[slot] = true;
-                        touched.push(slot);
-                    }
+                    seen[slot] = true;
                     counts[slot] += 1;
                 }
                 tape += 1;
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut values = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            values.push(counts[slot]);
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[min_start + slot]);
+                values.push(counts[slot]);
+            }
         }
         return Ok((labels, values));
     }
@@ -317,20 +302,17 @@ pub fn size_rev_start_match_core(
         for item in start_..end_ {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                let count = counts.entry(slot).or_insert_with(|| {
-                    touched.push(slot);
-                    0
-                });
+                let count = counts.entry(slot).or_insert(0);
                 *count += 1;
             }
             tape += 1;
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut values = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(counts.len());
+    let mut values = Vec::with_capacity(counts.len());
+    for (slot, count) in counts {
         labels.push(index[min_start + slot]);
-        values.push(counts[&slot]);
+        values.push(count);
     }
     Ok((labels, values))
 }
@@ -387,11 +369,6 @@ pub fn size_rev_start_end_match_core(
 
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
     let mut tape = 0_usize;
 
     if dense {
@@ -404,20 +381,19 @@ pub fn size_rev_start_end_match_core(
             for item in start_..end_ {
                 if matches[tape] != 0 {
                     let slot = item - min_start;
-                    if !seen[slot] {
-                        seen[slot] = true;
-                        touched.push(slot);
-                    }
+                    seen[slot] = true;
                     counts[slot] += 1;
                 }
                 tape += 1;
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut values = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            values.push(counts[slot]);
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[min_start + slot]);
+                values.push(counts[slot]);
+            }
         }
         return Ok((labels, values));
     }
@@ -430,20 +406,17 @@ pub fn size_rev_start_end_match_core(
         for item in start_..end_ {
             if matches[tape] != 0 {
                 let slot = item - min_start;
-                let count = counts.entry(slot).or_insert_with(|| {
-                    touched.push(slot);
-                    0
-                });
+                let count = counts.entry(slot).or_insert(0);
                 *count += 1;
             }
             tape += 1;
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut values = Vec::with_capacity(touched.len());
-    for slot in touched {
+    let mut labels = Vec::with_capacity(counts.len());
+    let mut values = Vec::with_capacity(counts.len());
+    for (slot, count) in counts {
         labels.push(index[min_start + slot]);
-        values.push(counts[&slot]);
+        values.push(count);
     }
     Ok((labels, values))
 }
@@ -529,11 +502,6 @@ pub fn size_rev_start_end_core(
     }
     let width = max_end.saturating_sub(min_start);
     let dense = should_use_dense_match_storage(index.len(), total_width);
-    let mut touched = if dense {
-        Vec::with_capacity(width)
-    } else {
-        Vec::new()
-    };
 
     if dense {
         let mut seen = vec![false; width];
@@ -544,18 +512,17 @@ pub fn size_rev_start_end_core(
             };
             for item in start..end {
                 let slot = item - min_start;
-                if !seen[slot] {
-                    seen[slot] = true;
-                    touched.push(slot);
-                }
+                seen[slot] = true;
                 counts[slot] += 1;
             }
         }
-        let mut labels = Vec::with_capacity(touched.len());
-        let mut result = Vec::with_capacity(touched.len());
-        for slot in touched {
-            labels.push(index[min_start + slot]);
-            result.push(counts[slot]);
+        let mut labels = Vec::new();
+        let mut result = Vec::new();
+        for (slot, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[min_start + slot]);
+                result.push(counts[slot]);
+            }
         }
         return Ok((labels, result));
     }
@@ -566,18 +533,15 @@ pub fn size_rev_start_end_core(
             continue;
         };
         for item in start..end {
-            let count = counts.entry(item).or_insert_with(|| {
-                touched.push(item);
-                0
-            });
+            let count = counts.entry(item).or_insert(0);
             *count += 1;
         }
     }
-    let mut labels = Vec::with_capacity(touched.len());
-    let mut result = Vec::with_capacity(touched.len());
-    for item in touched {
+    let mut labels = Vec::with_capacity(counts.len());
+    let mut result = Vec::with_capacity(counts.len());
+    for (item, count) in counts {
         labels.push(index[item]);
-        result.push(counts[&item]);
+        result.push(count);
     }
     Ok((labels, result))
 }
