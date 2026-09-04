@@ -3,7 +3,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use janitor_rs::bench_support::{
     max_positions_core_with_storage, min_positions_core_with_storage,
-    prod_positions_i64_with_storage, size_positions_core_with_storage,
+    prod_positions_float_core_with_storage, prod_positions_i64_with_storage,
+    size_positions_core_with_storage, sum_positions_float_core_with_storage,
     sum_positions_i64_with_storage,
 };
 use numpy::ndarray::Array1;
@@ -12,6 +13,7 @@ use std::hint::black_box;
 
 struct Fixture {
     arr: Array1<i64>,
+    arr_float: Array1<f64>,
     starts: Array1<i64>,
     ends: Array1<i64>,
     index: Array1<i64>,
@@ -25,6 +27,7 @@ impl Fixture {
         let domain = rows.max(WIDTH);
         Self {
             arr: Array1::from_iter((0..rows).map(|row| (rows - row) as i64)),
+            arr_float: Array1::from_iter((0..rows).map(|row| (rows - row) as f64)),
             starts: Array1::from_iter((0..rows).map(|row| (row * WIDTH) as i64)),
             ends: Array1::from_iter((0..rows).map(|row| ((row + 1) * WIDTH) as i64)),
             index: Array1::from_iter((0..domain).map(|ordinal| 10_000 + ordinal as i64 * 7)),
@@ -219,6 +222,86 @@ fn old_prod(f: &Fixture) -> (Vec<i64>, Vec<i64>) {
     (labels, products)
 }
 
+fn old_sum_float(f: &Fixture) -> (Vec<i64>, Vec<f64>) {
+    let capacity = f.index.len().min(f.positions.len());
+    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
+    let mut labels = Vec::with_capacity(capacity);
+    let mut totals = Vec::with_capacity(capacity);
+    for (((current, start), end), boolean) in f
+        .arr_float
+        .iter()
+        .zip(f.starts.iter())
+        .zip(f.ends.iter())
+        .zip(f.booleans.iter())
+    {
+        let Some((start, end)) = valid_range(*start, *end, f.positions.len()) else {
+            continue;
+        };
+        for tape_item in start..end {
+            let Some(ordinal) = usize::try_from(f.positions[tape_item])
+                .ok()
+                .filter(|&ordinal| ordinal < f.index.len())
+            else {
+                continue;
+            };
+            let slot = match slots.entry(f.index[ordinal]) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let slot = labels.len();
+                    entry.insert(slot);
+                    labels.push(f.index[ordinal]);
+                    totals.push(0.0);
+                    slot
+                }
+            };
+            if !*boolean {
+                totals[slot] += *current;
+            }
+        }
+    }
+    (labels, totals)
+}
+
+fn old_prod_float(f: &Fixture) -> (Vec<i64>, Vec<f64>) {
+    let capacity = f.index.len().min(f.positions.len());
+    let mut slots = HashMap::<i64, usize>::with_capacity(capacity);
+    let mut labels = Vec::with_capacity(capacity);
+    let mut products = Vec::with_capacity(capacity);
+    for (((current, start), end), boolean) in f
+        .arr_float
+        .iter()
+        .zip(f.starts.iter())
+        .zip(f.ends.iter())
+        .zip(f.booleans.iter())
+    {
+        let Some((start, end)) = valid_range(*start, *end, f.positions.len()) else {
+            continue;
+        };
+        for tape_item in start..end {
+            let Some(ordinal) = usize::try_from(f.positions[tape_item])
+                .ok()
+                .filter(|&ordinal| ordinal < f.index.len())
+            else {
+                continue;
+            };
+            let slot = match slots.entry(f.index[ordinal]) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let slot = labels.len();
+                    entry.insert(slot);
+                    labels.push(f.index[ordinal]);
+                    products.push(1.0);
+                    slot
+                }
+            };
+            if !*boolean {
+                products[slot] *= *current;
+            }
+        }
+    }
+    (labels, products)
+}
+
 fn old_size(f: &Fixture) -> (Vec<i64>, Vec<i64>) {
     let mut counts = HashMap::<i64, i64>::with_capacity(f.index.len());
     for (start, end) in f.starts.iter().zip(f.ends.iter()) {
@@ -312,6 +395,29 @@ fn bench(c: &mut Criterion) {
                         })
                     },
                 );
+                group.bench_with_input(
+                    BenchmarkId::new("sum_float_old", &label),
+                    &fixture,
+                    |b, f| b.iter(|| black_box(old_sum_float(black_box(f)))),
+                );
+                group.bench_with_input(
+                    BenchmarkId::new("sum_float_ordinal", &label),
+                    &fixture,
+                    |b, f| {
+                        b.iter(|| {
+                            black_box(sum_positions_float_core_with_storage(
+                                black_box(f.arr_float.view()),
+                                black_box(f.starts.view()),
+                                black_box(f.ends.view()),
+                                black_box(f.index.view()),
+                                black_box(f.positions.view()),
+                                black_box(f.booleans.view()),
+                                |value| value,
+                                dense,
+                            ))
+                        })
+                    },
+                );
                 group.bench_with_input(BenchmarkId::new("prod_old", &label), &fixture, |b, f| {
                     b.iter(|| black_box(old_prod(black_box(f))))
                 });
@@ -327,6 +433,29 @@ fn bench(c: &mut Criterion) {
                                 black_box(f.index.view()),
                                 black_box(f.positions.view()),
                                 black_box(f.booleans.view()),
+                                dense,
+                            ))
+                        })
+                    },
+                );
+                group.bench_with_input(
+                    BenchmarkId::new("prod_float_old", &label),
+                    &fixture,
+                    |b, f| b.iter(|| black_box(old_prod_float(black_box(f)))),
+                );
+                group.bench_with_input(
+                    BenchmarkId::new("prod_float_ordinal", &label),
+                    &fixture,
+                    |b, f| {
+                        b.iter(|| {
+                            black_box(prod_positions_float_core_with_storage(
+                                black_box(f.arr_float.view()),
+                                black_box(f.starts.view()),
+                                black_box(f.ends.view()),
+                                black_box(f.index.view()),
+                                black_box(f.positions.view()),
+                                black_box(f.booleans.view()),
+                                |value| value,
                                 dense,
                             ))
                         })

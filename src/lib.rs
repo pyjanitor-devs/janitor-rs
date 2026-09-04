@@ -33,6 +33,7 @@ pub mod bench_support {
     pub use crate::aggs::min_rev::min_starts_ends::min_rev_start_end_core;
     pub use crate::aggs::prod_rev::prod_ends::prod_rev_ends_int_core;
     pub use crate::aggs::prod_rev::prod_ends_matches::compute_prod_rev_end_match_int64;
+    pub use crate::aggs::prod_rev::prod_positions::prod_positions_float_core_with_storage;
     pub use crate::aggs::prod_rev::prod_starts::prod_rev_starts_int_core;
     pub use crate::aggs::size_rev::computes::compute_size_rev_end_matches;
     pub use crate::aggs::size_rev::computes::{
@@ -44,6 +45,7 @@ pub mod bench_support {
     pub use crate::aggs::sum::sum_starts_ends::sum_start_end_core;
     pub use crate::aggs::sum_rev::sum_ends::sum_rev_ends_int_core;
     pub use crate::aggs::sum_rev::sum_ends_matches::compute_sum_rev_end_match_int64;
+    pub use crate::aggs::sum_rev::sum_positions::sum_positions_float_core_with_storage;
     pub use crate::aggs::sum_rev::sum_starts::sum_rev_starts_int_core;
     pub use crate::bin_search::bin_search_ge_first::binary_search_ge_first_core;
     pub use crate::bin_search::bin_search_gt_first::binary_search_gt_first_core;
