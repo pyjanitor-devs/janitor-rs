@@ -33,6 +33,9 @@ impl Fixture {
                     if duplicate_ordinals {
                         0
                     } else {
+                        // This is high-cardinality rolling coverage, not a
+                        // one-use-per-ordinal fixture: each ordinal appears
+                        // in multiple neighboring rows when WIDTH > 1.
                         ((row + offset) % domain) as i64
                     }
                 })
@@ -244,7 +247,7 @@ fn bench(c: &mut Criterion) {
                 let kind = if duplicate_ordinals {
                     "duplicate"
                 } else {
-                    "unique"
+                    "high_cardinality"
                 };
                 let storage = if dense { "dense" } else { "hashmap" };
                 let label = format!("rows={rows}/{kind}/{storage}");

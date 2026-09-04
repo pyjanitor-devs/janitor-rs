@@ -726,6 +726,19 @@ mod tests {
         got.sort_unstable();
         assert_eq!(got, vec![(100, 2), (500, 1), (900, 1)]);
     }
+
+    #[test]
+    fn positions_rejects_empty_starts_and_ends() {
+        let starts = array![];
+        let ends = array![];
+        let index = array![10_i64];
+        let positions = array![0_i64];
+
+        assert!(
+            size_positions_core(starts.view(), ends.view(), index.view(), positions.view())
+                .is_err()
+        );
+    }
 }
 
 /// Count rows covered by each label reached through the positional candidate
@@ -751,6 +764,8 @@ pub fn size_positions_core(
     index: ArrayView1<'_, i64>,
     positions: ArrayView1<'_, i64>,
 ) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
     ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("positions", positions.len())?;
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
