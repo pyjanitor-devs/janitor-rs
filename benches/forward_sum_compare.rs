@@ -73,6 +73,7 @@ fn bench_forward_sum(c: &mut Criterion) {
                     black_box(starts.view()),
                     black_box(booleans.view()),
                 )
+                .unwrap()
             })
         });
         group.bench_function(format!("old_direct_end width={width}"), |b| {
@@ -124,6 +125,7 @@ fn bench_forward_sum(c: &mut Criterion) {
                 black_box(starts.view()),
                 black_box(booleans.view()),
             )
+            .unwrap()
         })
     });
     group.finish();

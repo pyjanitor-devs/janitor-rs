@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `starts[i]`, sum `arr[starts[i]..]` (to the end of the array),
 /// skipping any position flagged `true` in `booleans` (a null mask).
@@ -17,7 +17,7 @@ pub fn sum_start_core(
     arr: ArrayView1<i64>,
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
-) -> Array1<i64> {
+) -> Result<Array1<i64>, String> {
     sum_start_core_with_cast(arr, starts, booleans, |value| value)
 }
 
@@ -31,7 +31,7 @@ pub fn sum_start_u32_core(
     arr: ArrayView1<u32>,
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
-) -> Array1<i64> {
+) -> Result<Array1<i64>, String> {
     sum_start_core_with_cast(arr, starts, booleans, |value| value as i64)
 }
 
@@ -40,11 +40,13 @@ fn sum_start_core_with_cast<T, F>(
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_i64: F,
-) -> Array1<i64>
+) -> Result<Array1<i64>, String>
 where
     T: Copy,
     F: FnMut(T) -> i64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(starts.len());
     let end_: usize = arr.len();
 
@@ -84,7 +86,7 @@ where
                 }
             }
         }
-        return result;
+        return Ok(result);
     }
 
     for (pos, start) in starts.iter().enumerate() {
@@ -98,7 +100,7 @@ where
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
 macro_rules! generic_compute {
@@ -112,12 +114,6 @@ macro_rules! generic_compute {
         ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             // Cast only values inside the requested ranges. Widening the
             // whole column would make a tiny suffix query scan and copy it.
             //
@@ -143,7 +139,9 @@ macro_rules! generic_compute {
                 booleans.as_array(),
                 |value| value as i64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
@@ -210,8 +208,12 @@ pub fn compute_sum_start_uint32<'py>(
     arr: PyReadonlyArray1<'py, u32>,
     starts: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
-) -> Bound<'py, PyArray1<i64>> {
-    sum_start_u32_core(arr.as_array(), starts.as_array(), booleans.as_array()).into_pyarray(py)
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    Ok(
+        sum_start_u32_core(arr.as_array(), starts.as_array(), booleans.as_array())
+            .map_err(pyo3::exceptions::PyValueError::new_err)?
+            .into_pyarray(py),
+    )
 }
 
 /// Registers this file's dtype-specialized Python exports.
@@ -239,12 +241,12 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn empty_array() {
+    fn empty_array_is_rejected() {
         let arr: Array1<i64> = array![];
         let starts = array![0_i64];
         let booleans: Array1<bool> = array![];
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
-        assert_eq!(got, array![0]);
+        let error = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
     }
 
     #[test]
@@ -252,7 +254,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let starts = array![3_i64]; // boundary: nothing left to sum
         let booleans = array![false, false, false];
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
     }
 
@@ -261,7 +263,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let starts = array![0_i64]; // boundary: whole array
         let booleans = array![false, false, false];
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![6]);
     }
 
@@ -271,7 +273,7 @@ mod tests {
         let starts = array![0_i64];
         // position 1 (value 2) and position 3 (value 4) are "null"
         let booleans = array![false, true, false, true];
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![1 + 3]);
     }
 
@@ -280,7 +282,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let starts = array![0_i64];
         let booleans = array![true, true, true];
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
     }
 
@@ -292,7 +294,7 @@ mod tests {
 
         // This workload crosses the adaptive threshold and exercises the
         // suffix buffer rather than the direct per-query loop.
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![8, 8, 7, 7]);
     }
 
@@ -305,7 +307,7 @@ mod tests {
         let arr = Array1::<i64>::from_elem(100, value);
         let starts = array![0_i64];
         let booleans = Array1::<bool>::from_elem(100, false);
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got[0], -100_i64);
     }
 
@@ -323,7 +325,8 @@ mod tests {
         let booleans = array![false];
         let got = sum_start_core_with_cast(arr.view(), starts.view(), booleans.view(), |value| {
             value as i64
-        });
+        })
+        .unwrap();
         assert_eq!(got, array![i64::MIN]);
     }
 
@@ -336,7 +339,8 @@ mod tests {
         let got = sum_start_core_with_cast(arr.view(), starts.view(), booleans.view(), |value| {
             casts += 1;
             value as i64
-        });
+        })
+        .unwrap();
         assert_eq!(got, array![4]);
         assert_eq!(casts, 1);
     }

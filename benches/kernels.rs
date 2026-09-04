@@ -933,6 +933,7 @@ fn bench_sum_kernels(c: &mut Criterion) {
                     black_box(f.starts_for_sum_start.view()),
                     black_box(f.booleans.view()),
                 )
+                .unwrap()
             })
         });
         group.bench_function(format!("sum_end n={n}"), |b| {
@@ -965,6 +966,7 @@ fn bench_sum_kernels(c: &mut Criterion) {
                     black_box(f.starts.view()),
                     black_box(f.booleans.view()),
                 )
+                .unwrap()
             })
         });
     }
