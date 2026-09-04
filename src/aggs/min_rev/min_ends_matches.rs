@@ -13,6 +13,10 @@ use crate::aggs::{
 /// survives the reverse prefix-range match tape.
 /// Output label/position pairs are aligned, but their order is unspecified.
 ///
+/// ELI5: the tape points to numbered right-side drawers. We record each
+/// drawer's best row and print the original label later; sparse drawers may
+/// appear in any order.
+///
 /// # Arguments
 ///
 /// * `arr` - Left-side values to aggregate; must not be empty.
