@@ -37,6 +37,10 @@ pub fn min_rev_no_range_core<T: Copy + PartialOrd>(
             .ok_or("left_index must contain valid positions in arr")?;
         let current = arr[left];
         let boolean = booleans[left];
+        // ELI5: create the label's drawer immediately, even for a null row,
+        // so a null-only group can still be emitted. The -1 position marks
+        // the value as a placeholder, so the first later non-null row wins
+        // regardless of the placeholder's value.
         let state = states.entry(*index_right).or_insert((current, -1));
         if !boolean && (state.1 == -1 || current < state.0) {
             *state = (current, left as i64);
