@@ -770,7 +770,10 @@ pub fn size_positions_core(
     ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("positions", positions.len())?;
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
-    let dense = should_use_dense_match_storage(index.len(), positions.len().min(index.len()));
+    // `positions.len()` counts tape entries, not distinct ordinals. It is a
+    // cheap upper-bound estimate only, so repeated ordinals can still cause
+    // dense storage to be selected for sparse state.
+    let dense = should_use_dense_match_storage(index.len(), positions.len());
     Ok(size_positions_core_with_storage_unchecked(
         starts, ends, index, positions, dense,
     ))

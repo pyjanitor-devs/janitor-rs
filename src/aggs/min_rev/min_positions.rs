@@ -43,7 +43,10 @@ pub fn min_positions_core<T: PartialOrd + Copy>(
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    let dense = should_use_dense_match_storage(index.len(), positions.len().min(index.len()));
+    // `positions.len()` counts tape entries, not distinct ordinals. It is a
+    // cheap upper-bound estimate only, so repeated ordinals can still cause
+    // dense storage to be selected for sparse state.
+    let dense = should_use_dense_match_storage(index.len(), positions.len());
     Ok(min_positions_core_with_storage_unchecked(
         arr, starts, ends, index, positions, booleans, dense,
     ))
