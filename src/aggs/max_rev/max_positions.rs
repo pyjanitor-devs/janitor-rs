@@ -43,7 +43,7 @@ pub fn max_positions_core<T: PartialOrd + Copy>(
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let dense = should_use_dense_match_storage(index.len(), positions.len());
-    Ok(max_positions_core_with_storage(
+    Ok(max_positions_core_with_storage_unchecked(
         arr, starts, ends, index, positions, booleans, dense,
     ))
 }
@@ -57,6 +57,28 @@ pub fn max_positions_core<T: PartialOrd + Copy>(
 /// meanings as [`max_positions_core`]. `dense` selects vector storage when true
 /// and HashMap storage when false.
 pub fn max_positions_core_with_storage<T: PartialOrd + Copy>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    dense: bool,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    Ok(max_positions_core_with_storage_unchecked(
+        arr, starts, ends, index, positions, booleans, dense,
+    ))
+}
+
+fn max_positions_core_with_storage_unchecked<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
@@ -216,8 +238,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::max_positions_core;
-    use numpy::ndarray::array;
+    use super::{max_positions_core, max_positions_core_with_storage};
+    use numpy::ndarray::{array, Array1};
 
     #[test]
     fn positions_keep_labels_and_maximum_rows() {
@@ -260,5 +282,19 @@ mod tests {
         .unwrap();
         assert_eq!(labels, vec![4]);
         assert_eq!(rows, vec![1]);
+    }
+
+    #[test]
+    fn explicit_storage_rejects_empty_values() {
+        assert!(max_positions_core_with_storage(
+            Array1::<i64>::zeros(0).view(),
+            array![0_i64].view(),
+            array![1_i64].view(),
+            array![10_i64].view(),
+            array![0_i64].view(),
+            array![false].view(),
+            false,
+        )
+        .is_err());
     }
 }

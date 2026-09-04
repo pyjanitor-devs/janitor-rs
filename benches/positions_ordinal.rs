@@ -343,15 +343,18 @@ fn bench(c: &mut Criterion) {
                     &fixture,
                     |b, f| {
                         b.iter(|| {
-                            black_box(max_positions_core_with_storage(
-                                black_box(f.arr.view()),
-                                black_box(f.starts.view()),
-                                black_box(f.ends.view()),
-                                black_box(f.index.view()),
-                                black_box(f.positions.view()),
-                                black_box(f.booleans.view()),
-                                dense,
-                            ))
+                            black_box(
+                                max_positions_core_with_storage(
+                                    black_box(f.arr.view()),
+                                    black_box(f.starts.view()),
+                                    black_box(f.ends.view()),
+                                    black_box(f.index.view()),
+                                    black_box(f.positions.view()),
+                                    black_box(f.booleans.view()),
+                                    dense,
+                                )
+                                .unwrap(),
+                            )
                         })
                     },
                 );
@@ -363,15 +366,18 @@ fn bench(c: &mut Criterion) {
                     &fixture,
                     |b, f| {
                         b.iter(|| {
-                            black_box(min_positions_core_with_storage(
-                                black_box(f.arr.view()),
-                                black_box(f.starts.view()),
-                                black_box(f.ends.view()),
-                                black_box(f.index.view()),
-                                black_box(f.positions.view()),
-                                black_box(f.booleans.view()),
-                                dense,
-                            ))
+                            black_box(
+                                min_positions_core_with_storage(
+                                    black_box(f.arr.view()),
+                                    black_box(f.starts.view()),
+                                    black_box(f.ends.view()),
+                                    black_box(f.index.view()),
+                                    black_box(f.positions.view()),
+                                    black_box(f.booleans.view()),
+                                    dense,
+                                )
+                                .unwrap(),
+                            )
                         })
                     },
                 );
