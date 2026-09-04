@@ -2,6 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use super::should_use_running_sum;
 use crate::aggs::{
     checked_range, ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core,
 };
@@ -45,19 +46,15 @@ where
     let mut result = Array1::<i64>::zeros(starts.len());
     let zipped = starts.into_iter().zip(ends);
 
-    let use_prefix = if starts.len() <= 3 {
-        false
-    } else {
-        let total_width = starts
-            .iter()
-            .zip(ends.iter())
-            .fold(0_usize, |total, (start, end)| {
-                let width = checked_range(*start, *end, arr.len())
-                    .map_or(0, |(start_, end_)| end_ - start_);
-                total.saturating_add(width)
-            });
-        total_width > arr.len().saturating_mul(3)
-    };
+    let total_width = starts
+        .iter()
+        .zip(ends.iter())
+        .fold(0_usize, |total, (start, end)| {
+            let width =
+                checked_range(*start, *end, arr.len()).map_or(0, |(start_, end_)| end_ - start_);
+            total.saturating_add(width)
+        });
+    let use_prefix = should_use_running_sum(starts.len(), total_width, arr.len());
 
     if use_prefix {
         // ELI5: one running prefix total turns every valid interval into two

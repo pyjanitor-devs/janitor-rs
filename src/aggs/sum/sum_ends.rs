@@ -2,6 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use super::should_use_running_sum;
 use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core};
 
 fn is_empty_sentinel_end(end: i64) -> bool {
@@ -48,22 +49,19 @@ where
     let mut result = Array1::<i64>::zeros(ends.len());
     let start_: usize = 0;
 
-    let use_prefix = if ends.len() <= 3 {
-        false
-    } else {
-        let total_width = ends.iter().fold(0_usize, |total, end| {
-            let width = if *end == -1 {
-                0
-            } else {
-                usize::try_from(*end).map_or(0, |end_| end_.min(arr.len()))
-            };
-            total.saturating_add(width)
-        });
-        let all_ranges_are_safe = ends
-            .iter()
-            .all(|end| *end == -1 || usize::try_from(*end).is_ok_and(|end_| end_ <= arr.len()));
-        all_ranges_are_safe && total_width > arr.len().saturating_mul(3)
-    };
+    let total_width = ends.iter().fold(0_usize, |total, end| {
+        let width = if *end == -1 {
+            0
+        } else {
+            usize::try_from(*end).map_or(0, |end_| end_.min(arr.len()))
+        };
+        total.saturating_add(width)
+    });
+    let all_ranges_are_safe = ends
+        .iter()
+        .all(|end| *end == -1 || usize::try_from(*end).is_ok_and(|end_| end_ <= arr.len()));
+    let use_prefix =
+        all_ranges_are_safe && should_use_running_sum(ends.len(), total_width, arr.len());
 
     if use_prefix {
         // ELI5: write the running prefix total once, then answer every

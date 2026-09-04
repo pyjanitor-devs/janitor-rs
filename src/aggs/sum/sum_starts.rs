@@ -2,6 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use super::should_use_running_sum;
 use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `starts[i]`, sum `arr[starts[i]..]` (to the end of the array),
@@ -59,20 +60,14 @@ where
     // so it should be built only when repeated direct scans would cost more.
     // The three-scan threshold is the measured crossover used by the
     // corresponding pyjanitor prefix implementation and its Rust benchmark.
-    let use_suffix = if starts.len() <= 3 {
-        // ELI5: three or fewer questions cannot require more than three
-        // full-array scans, so measuring them costs more than answering them.
-        false
-    } else {
-        let total_width = starts.iter().fold(0_usize, |total, start| {
-            let width = (*start)
-                .try_into()
-                .ok()
-                .map_or(0, |start: usize| end_.saturating_sub(start));
-            total.saturating_add(width)
-        });
-        total_width > end_.saturating_mul(3)
-    };
+    let total_width = starts.iter().fold(0_usize, |total, start| {
+        let width = (*start)
+            .try_into()
+            .ok()
+            .map_or(0, |start: usize| end_.saturating_sub(start));
+        total.saturating_add(width)
+    });
+    let use_suffix = should_use_running_sum(starts.len(), total_width, end_);
 
     if use_suffix {
         // `suffix[nn]` is the wrapped sum of all non-null values from `nn`
