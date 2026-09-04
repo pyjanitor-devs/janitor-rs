@@ -39,6 +39,39 @@ where
 {
     let mut result = Array1::<i64>::zeros(starts.len());
     let zipped = starts.into_iter().zip(ends);
+
+    let use_prefix = if starts.len() <= 3 {
+        false
+    } else {
+        let total_width = starts
+            .iter()
+            .zip(ends.iter())
+            .fold(0_usize, |total, (start, end)| {
+                let width = checked_range(*start, *end, arr.len())
+                    .map_or(0, |(start_, end_)| end_ - start_);
+                total.saturating_add(width)
+            });
+        total_width > arr.len().saturating_mul(3)
+    };
+
+    if use_prefix {
+        // ELI5: one running prefix total turns every valid interval into two
+        // lookups and a wrapped subtraction instead of another full scan.
+        let mut prefix = vec![0_i64; arr.len() + 1];
+        for nn in 0..arr.len() {
+            prefix[nn + 1] = prefix[nn];
+            if !booleans[nn] {
+                prefix[nn + 1] = prefix[nn + 1].wrapping_add(to_i64(arr[nn]));
+            }
+        }
+        for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+            if let Some((start_, end_)) = checked_range(*start, *end, arr.len()) {
+                result[pos] = prefix[end_].wrapping_sub(prefix[start_]);
+            }
+        }
+        return result;
+    }
+
     for (pos, (start, end)) in zipped.enumerate() {
         let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
             continue; // result[pos] is already 0
@@ -304,6 +337,16 @@ mod tests {
         let booleans = array![false, true, false, true];
         let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
         assert_eq!(got, array![1 + 3]);
+    }
+
+    #[test]
+    fn repeated_broad_ranges_use_wrapping_prefix_differences() {
+        let arr = array![1_i64, 2, 3, 4];
+        let starts = array![0_i64, 0, 1, 2];
+        let ends = array![4_i64, 3, 4, 4];
+        let booleans = array![false, true, false, false];
+        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        assert_eq!(got, array![8, 4, 7, 7]);
     }
 
     #[test]

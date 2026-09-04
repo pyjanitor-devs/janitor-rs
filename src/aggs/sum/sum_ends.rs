@@ -45,6 +45,42 @@ where
 {
     let mut result = Array1::<i64>::zeros(ends.len());
     let start_: usize = 0;
+
+    let use_prefix = if ends.len() <= 3 {
+        false
+    } else {
+        let total_width = ends.iter().fold(0_usize, |total, end| {
+            let width = if *end == -1 {
+                0
+            } else {
+                usize::try_from(*end).map_or(0, |end_| end_.min(arr.len()))
+            };
+            total.saturating_add(width)
+        });
+        let all_ranges_are_safe = ends
+            .iter()
+            .all(|end| *end == -1 || usize::try_from(*end).is_ok_and(|end_| end_ <= arr.len()));
+        all_ranges_are_safe && total_width > arr.len().saturating_mul(3)
+    };
+
+    if use_prefix {
+        // ELI5: write the running prefix total once, then answer every
+        // prefix query by looking up its end position.
+        let mut prefix = vec![0_i64; arr.len() + 1];
+        for nn in 0..arr.len() {
+            prefix[nn + 1] = prefix[nn];
+            if !booleans[nn] {
+                prefix[nn + 1] = prefix[nn + 1].wrapping_add(to_i64(arr[nn]));
+            }
+        }
+        for (pos, end) in ends.iter().enumerate() {
+            if let Ok(end_) = usize::try_from(*end) {
+                result[pos] = prefix[end_];
+            }
+        }
+        return result;
+    }
+
     for (pos, end) in ends.indexed_iter() {
         if is_empty_sentinel_end(*end) {
             continue; // result[pos] is already 0
@@ -228,6 +264,15 @@ mod tests {
         let booleans = array![true, true, true];
         let got = sum_end_core(arr.view(), ends.view(), booleans.view());
         assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn repeated_broad_prefixes_use_the_same_wrapping_result() {
+        let arr = array![1_i64, 2, 3, 4];
+        let ends = array![4_i64, 4, 3, 2];
+        let booleans = array![false, true, false, false];
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        assert_eq!(got, array![8, 8, 4, 1]);
     }
 
     #[test]
