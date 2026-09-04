@@ -119,12 +119,17 @@ where
             continue;
         }
         let mut total = 0.0;
+        let mut compensation = 0.0;
         let end_ = *end as usize;
         for nn in 0..end_ {
             if booleans[nn] {
                 continue;
             }
-            total += to_f64(arr[nn]);
+            let current = to_f64(arr[nn]);
+            let difference = current - compensation;
+            let increment = total + difference;
+            compensation = (increment - total) - difference;
+            total = increment;
         }
         result[pos] = total;
     }
@@ -289,6 +294,16 @@ mod tests {
     fn float_sentinel_end_is_zero_not_a_panic() {
         let arr = array![1.0_f64, 2.0, 3.0];
         let ends = array![-1_i64];
+        let booleans = array![false, false, false];
+        let got =
+            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value);
+        assert_eq!(got, array![0.0]);
+    }
+
+    #[test]
+    fn float_end_uses_compensated_summation() {
+        let arr = array![1e16_f64, 1.0, -1e16];
+        let ends = array![3_i64];
         let booleans = array![false, false, false];
         let got =
             sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value);
