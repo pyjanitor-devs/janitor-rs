@@ -86,3 +86,7 @@ harness = false
 [[bench]]
 name = "rev_all_paths"
 harness = false
+
+[[bench]]
+name = "positions_ordinal"
+harness = false

@@ -1083,8 +1083,8 @@ fn bench_min_positions(c: &mut Criterion) {
                     f.index.view(),
                     f.positions.view(),
                     f.booleans.view(),
-                    f.index.len(),
                 )
+                .expect("benchmark inputs satisfy positions validation")
             });
             eprintln!("min_positions {label}: old {old:?}; compact {compact:?}");
             group.bench_function(format!("old {label}"), |b| {
@@ -1109,8 +1109,8 @@ fn bench_min_positions(c: &mut Criterion) {
                         black_box(f.index.view()),
                         black_box(f.positions.view()),
                         black_box(f.booleans.view()),
-                        f.index.len(),
                     )
+                    .expect("benchmark inputs satisfy positions validation")
                 })
             });
         }

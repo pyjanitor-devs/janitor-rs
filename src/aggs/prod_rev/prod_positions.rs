@@ -3,13 +3,20 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_index, checked_range, ensure_equal_lengths, WrapMul};
+use crate::aggs::{
+    checked_index, checked_range, ensure_equal_lengths_core, ensure_nonempty_core,
+    should_use_dense_match_storage, WrapMul,
+};
 use std::collections::{hash_map::Entry, HashMap};
 
 /// Multiply values for each label reached through the positions tape.
+/// `index` is expected to contain unique labels, as guaranteed by the
+/// pyjanitor producer for this path.
 ///
-/// ELI5: the HashMap gives each label a compact slot, while labels and
-/// products live in Vecs. New labels start at the multiplicative identity 1.
+/// ELI5: the HashMap is keyed directly by each validated ordinal. New labels
+/// start at the multiplicative identity 1. Returned label/product pairs are
+/// aligned, but their ordering is unspecified and follows HashMap iteration
+/// order in sparse mode.
 /// Integer products use wrapping arithmetic, so overflow has the same
 /// deterministic result in debug and release builds. `A` is the accumulator
 /// type: every integer dtype instantiates this with `A = i64`, except
@@ -24,7 +31,6 @@ use std::collections::{hash_map::Entry, HashMap};
 /// * `index` - Right-side labels in ordinal position order.
 /// * `positions` - Positional candidate tape mapping to `index`.
 /// * `booleans` - Null mask for `arr`; `true` rows are skipped.
-/// * `capacity` - Initial output capacity hint.
 #[allow(clippy::too_many_arguments)]
 pub fn prod_positions_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
@@ -33,18 +39,121 @@ pub fn prod_positions_int_core<T, A, F>(
     index: ArrayView1<'_, i64>,
     positions: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-    capacity: usize,
     to_value: F,
+) -> Result<(Vec<i64>, Vec<A>), String>
+where
+    T: Copy,
+    A: WrapMul,
+    F: Fn(T) -> A,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    // `positions.len()` counts tape entries, not distinct ordinals. It is a
+    // cheap upper-bound estimate only, so repeated ordinals can still cause
+    // dense storage to be selected for sparse state.
+    let dense = should_use_dense_match_storage(index.len(), positions.len());
+    Ok(prod_positions_int_core_with_storage_unchecked(
+        arr, starts, ends, index, positions, booleans, to_value, dense,
+    ))
+}
+
+/// Run integer positional product aggregation with an explicit storage mode.
+/// This is a Rust-only benchmark entry point; production callers should use
+/// [`prod_positions_int_core`] for automatic dispatch.
+///
+/// The array arguments and `to_value` have the same meanings as
+/// [`prod_positions_int_core`]. `dense` selects vector storage when true and
+/// HashMap storage when false.
+#[allow(clippy::too_many_arguments)]
+pub fn prod_positions_int_core_with_storage<T, A, F>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    to_value: F,
+    dense: bool,
+) -> Result<(Vec<i64>, Vec<A>), String>
+where
+    T: Copy,
+    A: WrapMul,
+    F: Fn(T) -> A,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    Ok(prod_positions_int_core_with_storage_unchecked(
+        arr, starts, ends, index, positions, booleans, to_value, dense,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prod_positions_int_core_with_storage_unchecked<T, A, F>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    to_value: F,
+    dense: bool,
 ) -> (Vec<i64>, Vec<A>)
 where
     T: Copy,
     A: WrapMul,
     F: Fn(T) -> A,
 {
-    let capacity = capacity.min(index.len()).min(positions.len());
-    let mut slots: HashMap<i64, usize> = HashMap::with_capacity(capacity);
-    let mut labels = Vec::with_capacity(capacity);
-    let mut products = Vec::with_capacity(capacity);
+    // ELI5: reserve only for ordinals actually encountered; the tape length
+    // is not a reliable estimate of distinct right-side state.
+    if dense {
+        let mut seen = vec![false; index.len()];
+        let mut products = vec![A::ONE; index.len()];
+        for (current, start, end, boolean) in izip!(
+            arr.into_iter(),
+            starts.into_iter(),
+            ends.into_iter(),
+            booleans.into_iter()
+        ) {
+            let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+                continue;
+            };
+            let current_ = to_value(*current);
+            for nn in start_..end_ {
+                let Some(indexer_) = checked_index(positions[nn], index.len()) else {
+                    continue;
+                };
+                seen[indexer_] = true;
+                // Insert state before checking the mask: null-only labels
+                // must still be emitted with the multiplicative identity.
+                if !*boolean {
+                    products[indexer_] = products[indexer_].wrap_mul(current_);
+                }
+            }
+        }
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (ordinal, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[ordinal]);
+                values.push(products[ordinal]);
+            }
+        }
+        return (labels, values);
+    }
+
+    let mut products: HashMap<usize, A> = HashMap::new();
     for (current, start, end, boolean) in izip!(
         arr.into_iter(),
         starts.into_iter(),
@@ -59,30 +168,33 @@ where
             let Some(indexer_) = checked_index(positions[nn], index.len()) else {
                 continue;
             };
-            let label = index[indexer_];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    products.push(A::ONE);
-                    slot
-                }
+            let product = match products.entry(indexer_) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(A::ONE),
             };
+            // Insert state before checking the mask: null-only labels must
+            // still be emitted with the multiplicative identity.
             if !*boolean {
                 // ELI5: use the same defined wraparound arithmetic as the
                 // forward kernel, so debug and release builds agree when an
                 // integer product exceeds its type's range.
-                products[slot] = products[slot].wrap_mul(current_);
+                *product = product.wrap_mul(current_);
             }
         }
     }
-    (labels, products)
+    let mut labels = Vec::with_capacity(products.len());
+    let mut values = Vec::with_capacity(products.len());
+    for (ordinal, product) in products {
+        labels.push(index[ordinal]);
+        values.push(product);
+    }
+    (labels, values)
 }
 
 #[allow(clippy::too_many_arguments)]
 /// Multiply floating-point values for each label reached through `positions`.
+/// `index` is expected to contain unique labels, as guaranteed by the
+/// pyjanitor producer for this path.
 ///
 /// # Arguments
 ///
@@ -92,7 +204,6 @@ where
 /// * `index` - Right-side labels in ordinal position order.
 /// * `positions` - Positional candidate tape mapping to `index`.
 /// * `booleans` - Null mask for `arr`; `true` rows are skipped.
-/// * `capacity` - Initial output capacity hint.
 pub fn prod_positions_float_core<T, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -100,17 +211,113 @@ pub fn prod_positions_float_core<T, F>(
     index: ArrayView1<'_, i64>,
     positions: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-    capacity: usize,
     to_value: F,
+) -> Result<(Vec<i64>, Vec<f64>), String>
+where
+    T: Copy,
+    F: Fn(T) -> f64,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    let dense = should_use_dense_match_storage(index.len(), positions.len());
+    Ok(prod_positions_float_core_with_storage_unchecked(
+        arr, starts, ends, index, positions, booleans, to_value, dense,
+    ))
+}
+
+/// Run floating-point positional product aggregation with an explicit storage mode.
+/// This is a Rust-only benchmark entry point; production callers should use
+/// [`prod_positions_float_core`] for automatic dispatch.
+///
+/// The array arguments and `to_value` have the same meanings as
+/// [`prod_positions_float_core`]. `dense` selects vector storage when true and
+/// HashMap storage when false.
+#[allow(clippy::too_many_arguments)]
+pub fn prod_positions_float_core_with_storage<T, F>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    to_value: F,
+    dense: bool,
+) -> Result<(Vec<i64>, Vec<f64>), String>
+where
+    T: Copy,
+    F: Fn(T) -> f64,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    Ok(prod_positions_float_core_with_storage_unchecked(
+        arr, starts, ends, index, positions, booleans, to_value, dense,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prod_positions_float_core_with_storage_unchecked<T, F>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    to_value: F,
+    dense: bool,
 ) -> (Vec<i64>, Vec<f64>)
 where
     T: Copy,
     F: Fn(T) -> f64,
 {
-    let capacity = capacity.min(index.len()).min(positions.len());
-    let mut slots: HashMap<i64, usize> = HashMap::with_capacity(capacity);
-    let mut labels = Vec::with_capacity(capacity);
-    let mut products = Vec::with_capacity(capacity);
+    if dense {
+        let mut seen = vec![false; index.len()];
+        let mut products = vec![1.; index.len()];
+        for (current, start, end, boolean) in izip!(
+            arr.into_iter(),
+            starts.into_iter(),
+            ends.into_iter(),
+            booleans.into_iter()
+        ) {
+            let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+                continue;
+            };
+            let current_ = to_value(*current);
+            for nn in start_..end_ {
+                let Some(indexer_) = checked_index(positions[nn], index.len()) else {
+                    continue;
+                };
+                seen[indexer_] = true;
+                // Insert state before checking the mask: null-only labels
+                // must still be emitted with the multiplicative identity.
+                if !*boolean {
+                    products[indexer_] *= current_;
+                }
+            }
+        }
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (ordinal, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[ordinal]);
+                values.push(products[ordinal]);
+            }
+        }
+        return (labels, values);
+    }
+
+    let mut products: HashMap<usize, f64> = HashMap::new();
     for (current, start, end, boolean) in izip!(
         arr.into_iter(),
         starts.into_iter(),
@@ -125,23 +332,24 @@ where
             let Some(indexer_) = checked_index(positions[nn], index.len()) else {
                 continue;
             };
-            let label = index[indexer_];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    products.push(1.);
-                    slot
-                }
+            let product = match products.entry(indexer_) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(1.),
             };
+            // Insert state before checking the mask: null-only labels must
+            // still be emitted with the multiplicative identity.
             if !*boolean {
-                products[slot] *= current_;
+                *product *= current_;
             }
         }
     }
-    (labels, products)
+    let mut labels = Vec::with_capacity(products.len());
+    let mut values = Vec::with_capacity(products.len());
+    for (ordinal, product) in products {
+        labels.push(index[ordinal]);
+        values.push(product);
+    }
+    (labels, values)
 }
 
 macro_rules! compute_ints {
@@ -157,7 +365,10 @@ macro_rules! compute_ints {
         /// * `index` - Right-side labels in ordinal position order.
         /// * `positions` - Positional candidate tape mapping to `index`.
         /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
-        /// * `capacity` - Initial output capacity hint.
+        ///
+        /// `arr`, `index`, and `positions` must not be empty. `starts`, `ends`,
+        /// and `booleans` must match `arr` in length. Returned label/value
+        /// pairs are aligned but unordered.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -173,27 +384,14 @@ macro_rules! compute_ints {
             let arr = arr.as_array();
             let starts = starts.as_array();
             let ends = ends.as_array();
-            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let index = index.as_array();
             let positions = positions.as_array();
             let booleans = booleans.as_array();
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            if arr.is_empty() || index.is_empty() || positions.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "arr, starts, ends, booleans, index, and positions cannot be empty",
-                ));
-            }
-            let (labels, products) = prod_positions_int_core(
-                arr,
-                starts,
-                ends,
-                index,
-                positions,
-                booleans,
-                index.len().min(positions.len()),
-                |value| value as $acc,
-            );
+            let (labels, products) =
+                prod_positions_int_core(arr, starts, ends, index, positions, booleans, |value| {
+                    value as $acc
+                })
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
             let indexers = Array1::from_vec(labels);
             let result = Array1::from_vec(products);
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
@@ -225,7 +423,10 @@ macro_rules! compute_floats {
         /// * `index` - Right-side labels in ordinal position order.
         /// * `positions` - Positional candidate tape mapping to `index`.
         /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
-        /// * `capacity` - Initial output capacity hint.
+        ///
+        /// `arr`, `index`, and `positions` must not be empty. `starts`, `ends`,
+        /// and `booleans` must match `arr` in length. Returned label/value
+        /// pairs are aligned but unordered.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -241,27 +442,14 @@ macro_rules! compute_floats {
             let arr = arr.as_array();
             let starts = starts.as_array();
             let ends = ends.as_array();
-            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let index = index.as_array();
             let positions = positions.as_array();
             let booleans = booleans.as_array();
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            if arr.is_empty() || index.is_empty() || positions.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "arr, starts, ends, booleans, index, and positions cannot be empty",
-                ));
-            }
-            let (labels, products) = prod_positions_float_core(
-                arr,
-                starts,
-                ends,
-                index,
-                positions,
-                booleans,
-                index.len().min(positions.len()),
-                |value| value as f64,
-            );
+            let (labels, products) =
+                prod_positions_float_core(arr, starts, ends, index, positions, booleans, |value| {
+                    value as f64
+                })
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
             let indexers = Array1::from_vec(labels);
             let result = Array1::from_vec(products);
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
@@ -297,11 +485,11 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn positions_keep_first_seen_labels_and_products() {
+    fn positions_keep_labels_and_products() {
         let arr = array![2_i64, 3, 4];
         let starts = array![0_i64, 2, 4];
         let ends = array![2_i64, 4, 5];
-        let index = array![10_i64, 20, 10];
+        let index = array![10_i64, 20, 30];
         let positions = array![0_i64, 1, 2, 1, -1];
         let booleans = array![false, false, false];
         let (labels, products) = prod_positions_int_core(
@@ -311,11 +499,12 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            100,
             |value| value,
-        );
-        assert_eq!(labels, vec![10, 20]);
-        assert_eq!(products, vec![6, 6]);
+        )
+        .unwrap();
+        let mut got: Vec<_> = labels.into_iter().zip(products).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(10, 2), (20, 6), (30, 3)]);
     }
 
     #[test]
@@ -333,19 +522,19 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
             |value| value,
-        );
+        )
+        .unwrap();
         assert_eq!(labels, vec![4]);
         assert_eq!(products, vec![1]);
     }
 
     #[test]
-    fn floating_positions_handle_duplicate_labels_and_zero_values() {
+    fn floating_positions_handle_unique_labels_and_zero_values() {
         let arr = array![2.0_f64, 3.0, 4.0, 0.0];
         let starts = array![0_i64, 2, 4, 6];
         let ends = array![2_i64, 4, 6, 8];
-        let index = array![10_i64, 20, 10];
+        let index = array![10_i64, 20, 30];
         let positions = array![0_i64, 1, 2, 1, 0, 2, 0, 2];
         let booleans = array![false, false, false, false];
 
@@ -356,12 +545,13 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            3,
             |value| value,
-        );
+        )
+        .unwrap();
 
-        assert_eq!(labels, vec![10, 20]);
-        assert_eq!(products, vec![0.0, 6.0]);
+        let mut got: Vec<_> = labels.into_iter().zip(products).collect();
+        got.sort_unstable_by_key(|(label, _)| *label);
+        assert_eq!(got, vec![(10, 0.0), (20, 6.0), (30, 0.0)]);
     }
 
     #[test]
@@ -380,9 +570,9 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
             |value| value,
-        );
+        )
+        .unwrap();
 
         assert_eq!(labels, vec![4]);
         assert_eq!(products, vec![1.0]);
@@ -404,9 +594,9 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
             |v: u64| v,
-        );
+        )
+        .unwrap();
         assert_eq!(labels, vec![5]);
         assert_eq!(products, vec![value]);
     }
@@ -427,9 +617,9 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
             |value| value,
-        );
+        )
+        .unwrap();
 
         assert_eq!(labels, vec![5]);
         assert_eq!(products, vec![-2]);
