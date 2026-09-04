@@ -236,8 +236,10 @@ where
         for (ordinal, was_seen) in seen.into_iter().enumerate() {
             if was_seen {
                 labels.push(index[ordinal]);
-                let (total, compensation) = totals[ordinal];
-                values.push(total + compensation);
+                let (total, _compensation) = totals[ordinal];
+                // Preserve the established reverse-sum result contract. The
+                // compensation is internal correction state, not output.
+                values.push(total);
             }
         }
         return (labels, values);
@@ -282,9 +284,11 @@ where
 
     let mut labels = Vec::with_capacity(totals.len());
     let mut values = Vec::with_capacity(totals.len());
-    for (ordinal, (total, compensation)) in totals {
+    for (ordinal, (total, _compensation)) in totals {
         labels.push(index[ordinal]);
-        values.push(total + compensation);
+        // Preserve the established reverse-sum result contract. The
+        // compensation is internal correction state, not output.
+        values.push(total);
     }
     (labels, values)
 }
@@ -416,7 +420,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{sum_positions_float_core, sum_positions_int_core};
+    use super::{
+        sum_positions_float_core, sum_positions_float_core_with_storage, sum_positions_int_core,
+    };
     use numpy::ndarray::array;
 
     #[test]
@@ -491,6 +497,31 @@ mod tests {
 
         assert_eq!(labels, vec![5]);
         assert!((totals[0] - 0.6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn floating_positions_preserve_cancellation_result_in_both_storage_modes() {
+        let arr = array![1e16_f64, 1.0, -1e16];
+        let starts = array![0_i64, 1, 2];
+        let ends = array![1_i64, 2, 3];
+        let index = array![7_i64];
+        let positions = array![0_i64, 0, 0];
+        let booleans = array![false, false, false];
+
+        for dense in [false, true] {
+            let (labels, totals) = sum_positions_float_core_with_storage(
+                arr.view(),
+                starts.view(),
+                ends.view(),
+                index.view(),
+                positions.view(),
+                booleans.view(),
+                |value| value,
+                dense,
+            );
+            assert_eq!(labels, vec![7]);
+            assert_eq!(totals, vec![0.0]);
+        }
     }
 
     #[test]
