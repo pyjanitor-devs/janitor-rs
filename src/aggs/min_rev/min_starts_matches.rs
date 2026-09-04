@@ -205,6 +205,26 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[cfg(test)]
+mod precedence_tests {
+    use super::min_rev_start_match_core;
+    use numpy::ndarray::{array, Array1};
+
+    #[test]
+    fn empty_input_precedes_shape_mismatch() {
+        let error = min_rev_start_match_core(
+            Array1::<i64>::zeros(0).view(),
+            array![0_i64].view(),
+            array![1_i64].view(),
+            array![10_i64].view(),
+            array![1_i8].view(),
+            array![false].view(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::min_rev_start_match_core;
     use numpy::ndarray::array;
