@@ -11,6 +11,12 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// `booleans` (a null mask). Returns `-1` when `end` is negative or past
 /// `arr.len()`, `arr` is empty, or every candidate is null.
 ///
+/// # Arguments
+///
+/// * `arr` - Values to inspect.
+/// * `ends` - Exclusive prefix boundaries, one per output.
+/// * `booleans` - Null mask aligned with `arr`; `true` values are skipped.
+///
 /// ELI5 (the guard): `checked_range(0, end, arr.len())` rejects a negative
 /// or too-large `end` *and* an empty `arr` in one call, since `0 < end`
 /// already fails when `arr.len() == 0`; that also means `arr[0]` below is
@@ -79,6 +85,12 @@ macro_rules! generic_compute {
         /// prefix. `arr` is the value array, `ends` contains exclusive
         /// boundaries, and `booleans` marks null values to skip. Invalid or
         /// all-null prefixes return `-1`.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to inspect.
+        /// * `ends` - Exclusive prefix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

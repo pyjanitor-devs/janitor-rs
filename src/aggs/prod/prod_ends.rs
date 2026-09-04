@@ -9,6 +9,12 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// input array. `ends` contains exclusive zero-based boundaries, and `true`
 /// entries in `booleans` mark null values that contribute the identity `1`.
 /// Integer products use fixed-width wrapping multiplication.
+///
+/// # Arguments
+///
+/// * `arr` - Values to multiply.
+/// * `ends` - Exclusive prefix boundaries.
+/// * `booleans` - Null mask aligned with `arr`.
 fn prod_end_core<T, F>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
@@ -81,6 +87,12 @@ mod tests {
 /// This core is separate from the integer version so IEEE-754 behavior is
 /// preserved for zero, infinity, NaN, overflow, and underflow. The running
 /// prefix path preserves the multiplication order of each prefix.
+///
+/// # Arguments
+///
+/// * `arr` - Values to multiply.
+/// * `ends` - Exclusive prefix boundaries.
+/// * `booleans` - Null mask aligned with `arr`.
 fn prod_end_float_core<T, F>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
@@ -136,6 +148,12 @@ macro_rules! generic_compute {
         /// Compute products over prefixes of `arr` for integer-compatible
         /// values. `ends` supplies exclusive boundaries and `booleans` marks
         /// null values to skip; the returned array follows `ends`.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to multiply.
+        /// * `ends` - Exclusive prefix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -163,6 +181,12 @@ macro_rules! generic_compute_floats {
         /// Compute floating-point products over prefixes of `arr`.
         /// `ends` supplies exclusive boundaries and `booleans` marks null
         /// values to skip; the returned array follows `ends`.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to multiply.
+        /// * `ends` - Exclusive prefix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

@@ -12,6 +12,12 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// absent, not as zero" -- we skip it in the running total rather than
 /// adding it in.
 ///
+/// # Arguments
+///
+/// * `arr` - Values to sum.
+/// * `starts` - Inclusive suffix boundaries, one per output.
+/// * `booleans` - Null mask aligned with `arr`.
+///
 /// Overflow note: `wrapping_add` makes two's-complement wraparound explicit,
 /// matching NumPy `i64` arithmetic in debug, test, and release builds.
 pub fn sum_start_core(
@@ -108,6 +114,12 @@ macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
         /// Sum non-null values in each suffix of `arr`. `starts` contains
         /// inclusive boundaries and `booleans` marks null values to skip.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to sum.
+        /// * `starts` - Inclusive suffix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

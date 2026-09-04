@@ -15,6 +15,12 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 ///
 /// Integer multiplication uses `wrapping_mul`, matching the explicit
 /// fixed-width wrapping behavior used by the integer sum cores.
+///
+/// # Arguments
+///
+/// * `arr` - Values to multiply.
+/// * `starts` - Inclusive suffix boundaries.
+/// * `booleans` - Null mask aligned with `arr`.
 fn prod_start_core<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -91,6 +97,12 @@ mod tests {
 /// follows IEEE-754 behavior for zero, infinity, NaN, overflow, and underflow
 /// instead of applying integer wrapping semantics. The running suffix path
 /// is valid because it preserves the multiplication order of each suffix.
+///
+/// # Arguments
+///
+/// * `arr` - Values to multiply.
+/// * `starts` - Inclusive suffix boundaries.
+/// * `booleans` - Null mask aligned with `arr`.
 fn prod_start_float_core<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -147,6 +159,12 @@ macro_rules! generic_compute {
         /// Compute products over suffixes of `arr` for integer-compatible
         /// values. `starts` supplies inclusive boundaries and `booleans`
         /// marks null values to skip; the returned array follows `starts`.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to multiply.
+        /// * `starts` - Inclusive suffix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -174,6 +192,12 @@ macro_rules! generic_compute_floats {
         /// Compute floating-point products over suffixes of `arr`.
         /// `starts` supplies inclusive boundaries and `booleans` marks null
         /// values to skip; the returned array follows `starts`.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to multiply.
+        /// * `starts` - Inclusive suffix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

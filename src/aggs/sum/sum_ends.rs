@@ -26,6 +26,12 @@ fn is_empty_sentinel_end(end: i64) -> bool {
 /// number instead (`usize::MAX`). So without checking `-1` first, "no
 /// match" would silently turn into "sum almost the whole address space",
 /// which reads past the array and crashes rather than just giving `0`.
+///
+/// # Arguments
+///
+/// * `arr` - Values to sum.
+/// * `ends` - Exclusive prefix boundaries, one per output.
+/// * `booleans` - Null mask aligned with `arr`.
 pub fn sum_end_core(
     arr: ArrayView1<i64>,
     ends: ArrayView1<i64>,
@@ -143,6 +149,12 @@ macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
         /// Sum non-null values in each prefix of `arr`. `ends` contains
         /// exclusive boundaries and `booleans` marks null values to skip.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to sum.
+        /// * `ends` - Exclusive prefix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

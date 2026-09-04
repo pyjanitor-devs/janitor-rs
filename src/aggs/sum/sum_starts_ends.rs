@@ -18,6 +18,13 @@ use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core
 /// two but not the third, so a valid-looking but oversized `end` still
 /// walked `arr`/`booleans` out of bounds. Any rejected row contributes
 /// `0`.
+///
+/// # Arguments
+///
+/// * `arr` - Values to sum.
+/// * `starts` - Inclusive range boundaries.
+/// * `ends` - Exclusive range boundaries paired with `starts`.
+/// * `booleans` - Null mask aligned with `arr`.
 pub fn sum_start_end_core(
     arr: ArrayView1<i64>,
     starts: ArrayView1<i64>,
@@ -134,6 +141,13 @@ macro_rules! generic_compute_ints {
         /// Sum non-null values in each half-open `arr[start..end]` range.
         /// `starts` and `ends` are parallel boundaries; `booleans` marks
         /// null values to skip. Invalid ranges return zero.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to sum.
+        /// * `starts` - Inclusive range boundaries.
+        /// * `ends` - Exclusive range boundaries paired with `starts`.
+        /// * `booleans` - Null mask aligned with `arr`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

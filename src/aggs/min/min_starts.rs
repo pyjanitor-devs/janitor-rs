@@ -12,6 +12,12 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// empty or invalid (`starts[i] < 0` or `starts[i] >= arr.len()`) or every
 /// candidate is null.
 ///
+/// # Arguments
+///
+/// * `arr` - Values to inspect.
+/// * `starts` - Inclusive suffix boundaries, one per output.
+/// * `booleans` - Null mask aligned with `arr`; `true` values are skipped.
+///
 /// ELI5 (the guard): unlike `sum`, which can start a running total at `0`
 /// with no data read, `min` needs an actual array element to compare
 /// against first. Reading `arr[start_]` unconditionally before checking
@@ -82,6 +88,12 @@ macro_rules! generic_compute {
         /// suffix. `arr` is the value array, `starts` contains inclusive
         /// boundaries, and `booleans` marks null values to skip. Invalid or
         /// all-null suffixes return `-1`.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to inspect.
+        /// * `starts` - Inclusive suffix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
