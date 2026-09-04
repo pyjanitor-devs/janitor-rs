@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 
 use crate::aggs::checked_range;
 use crate::aggs::ensure_equal_lengths;
+use crate::aggs::sum::should_use_running_sum;
 
 /// For every `ends[i]`, find the position (not the value) of the largest
 /// element in `arr[..ends[i]]`, skipping positions flagged `true` in
@@ -20,6 +21,30 @@ pub fn max_end_core<T: PartialOrd + Copy>(
     booleans: ArrayView1<bool>,
 ) -> Array1<i64> {
     let mut result = Array1::<i64>::from_elem(ends.len(), -1);
+
+    let mut total_width = 0_usize;
+    for end in ends.iter() {
+        if let Some((_, end_)) = checked_range(0, *end, arr.len()) {
+            total_width = total_width.saturating_add(end_);
+        }
+    }
+    if should_use_running_sum(ends.len(), total_width, arr.len()) {
+        let mut prefix = vec![-1_i64; arr.len()];
+        let mut winner = -1_i64;
+        for nn in 0..arr.len() {
+            if !booleans[nn] && (winner == -1 || arr[nn] > arr[winner as usize]) {
+                winner = nn as i64;
+            }
+            prefix[nn] = winner;
+        }
+        for (pos, end) in ends.iter().enumerate() {
+            if let Some((_, end_)) = checked_range(0, *end, arr.len()) {
+                result[pos] = prefix[end_ - 1];
+            }
+        }
+        return result;
+    }
+
     for (pos, end) in ends.indexed_iter() {
         let Some((_, end_)) = checked_range(0, *end, arr.len()) else {
             continue;
@@ -137,5 +162,14 @@ mod tests {
         let booleans = array![true, false, false]; // largest (3) is null
         let got = max_end_core(arr.view(), ends.view(), booleans.view());
         assert_eq!(got, array![1]); // position of value 2
+    }
+
+    #[test]
+    fn broad_prefix_batch_uses_running_winners() {
+        let arr = array![5_i64, 1, 4, 2, 3, 0];
+        let ends = array![1_i64, 2, 3, 4, 5, 6];
+        let booleans = array![false, false, false, false, false, false];
+        let got = max_end_core(arr.view(), ends.view(), booleans.view());
+        assert_eq!(got, array![0, 0, 0, 0, 0, 0]);
     }
 }

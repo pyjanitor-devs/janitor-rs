@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 
 use crate::aggs::checked_index;
 use crate::aggs::ensure_equal_lengths;
+use crate::aggs::sum::should_use_running_sum;
 
 /// For every `starts[i]`, find the position (not the value) of the
 /// largest element in `arr[starts[i]..]`, skipping positions flagged
@@ -23,6 +24,30 @@ pub fn max_start_core<T: PartialOrd + Copy>(
 ) -> Array1<i64> {
     let mut result = Array1::<i64>::from_elem(starts.len(), -1);
     let end_ = arr.len();
+
+    let mut total_width = 0_usize;
+    for start in starts.iter() {
+        if let Ok(start_) = usize::try_from(*start) {
+            total_width = total_width.saturating_add(end_.saturating_sub(start_));
+        }
+    }
+    if should_use_running_sum(starts.len(), total_width, end_) {
+        let mut suffix = vec![-1_i64; end_];
+        let mut winner = -1_i64;
+        for nn in (0..end_).rev() {
+            if !booleans[nn] && (winner == -1 || arr[nn] >= arr[winner as usize]) {
+                winner = nn as i64;
+            }
+            suffix[nn] = winner;
+        }
+        for (pos, start) in starts.iter().enumerate() {
+            if let Some(start_) = checked_index(*start, end_) {
+                result[pos] = suffix[start_];
+            }
+        }
+        return result;
+    }
+
     for (pos, start) in starts.indexed_iter() {
         let Some(start_) = checked_index(*start, end_) else {
             continue;
@@ -150,5 +175,14 @@ mod tests {
         let booleans = array![true, true, true];
         let got = max_start_core(arr.view(), starts.view(), booleans.view());
         assert_eq!(got, array![-1]);
+    }
+
+    #[test]
+    fn broad_suffix_batch_uses_running_winners() {
+        let arr = array![5_i64, 1, 4, 2, 3, 0];
+        let starts = array![0_i64, 1, 2, 3, 4, 5];
+        let booleans = array![false, false, false, false, false, false];
+        let got = max_start_core(arr.view(), starts.view(), booleans.view());
+        assert_eq!(got, array![0, 2, 2, 4, 4, 5]);
     }
 }
