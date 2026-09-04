@@ -1,8 +1,121 @@
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::ensure_equal_lengths;
+use crate::aggs::sum::should_use_running_sum;
+
+fn prod_end_core<T, F>(
+    arr: ArrayView1<T>,
+    ends: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut convert: F,
+) -> Array1<i64>
+where
+    T: Copy,
+    F: FnMut(T) -> i64,
+{
+    let mut result = Array1::<i64>::zeros(ends.len());
+    let mut total_width = 0_usize;
+    for end in ends.iter() {
+        if let Ok(end_) = usize::try_from(*end) {
+            total_width = total_width.saturating_add(end_.min(arr.len()));
+        }
+    }
+    if should_use_running_sum(ends.len(), total_width, arr.len()) {
+        // ELI5: when many prefix questions together would walk the array
+        // repeatedly, multiply each prefix once and answer the questions by
+        // lookup. Null entries contribute the multiplicative identity `1`.
+        let mut prefix = vec![1_i64; arr.len() + 1];
+        for nn in 0..arr.len() {
+            prefix[nn + 1] = prefix[nn];
+            if !booleans[nn] {
+                prefix[nn + 1] *= convert(arr[nn]);
+            }
+        }
+        for (pos, end) in ends.iter().enumerate() {
+            if let Ok(end_) = usize::try_from(*end) {
+                if end_ <= arr.len() {
+                    result[pos] = prefix[end_];
+                }
+            }
+        }
+        return result;
+    }
+    for (pos, end) in ends.iter().enumerate() {
+        let mut total = 1_i64;
+        let end_ = *end as usize;
+        for nn in 0..end_ {
+            if !booleans[nn] {
+                total *= convert(arr[nn]);
+            }
+        }
+        result[pos] = total;
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn broad_prefix_batch_uses_running_products() {
+        let arr = array![2_i64, 3, 4, 5, 6, 7];
+        let ends = array![1_i64, 2, 3, 4, 5, 6];
+        let booleans = array![false, false, false, false, false, false];
+        let got = prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value);
+        assert_eq!(got, array![2, 6, 24, 120, 720, 5040]);
+    }
+}
+
+fn prod_end_float_core<T, F>(
+    arr: ArrayView1<T>,
+    ends: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut convert: F,
+) -> Array1<f64>
+where
+    T: Copy,
+    F: FnMut(T) -> f64,
+{
+    let mut result = Array1::<f64>::zeros(ends.len());
+    let mut total_width = 0_usize;
+    for end in ends.iter() {
+        if let Ok(end_) = usize::try_from(*end) {
+            total_width = total_width.saturating_add(end_.min(arr.len()));
+        }
+    }
+    if should_use_running_sum(ends.len(), total_width, arr.len()) {
+        let mut prefix = vec![1.0_f64; arr.len() + 1];
+        for nn in 0..arr.len() {
+            prefix[nn + 1] = prefix[nn];
+            if !booleans[nn] {
+                prefix[nn + 1] *= convert(arr[nn]);
+            }
+        }
+        for (pos, end) in ends.iter().enumerate() {
+            if let Ok(end_) = usize::try_from(*end) {
+                if end_ <= arr.len() {
+                    result[pos] = prefix[end_];
+                }
+            }
+        }
+        return result;
+    }
+    for (pos, end) in ends.iter().enumerate() {
+        let mut total = 1.0_f64;
+        let end_ = *end as usize;
+        for nn in 0..end_ {
+            if !booleans[nn] {
+                total *= convert(arr[nn]);
+            }
+        }
+        result[pos] = total;
+    }
+    result
+}
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
@@ -21,23 +134,12 @@ macro_rules! generic_compute {
                 "booleans",
                 booleans.as_array().len(),
             )?;
-            let arr = arr.as_array();
-            let ends = ends.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<i64>::zeros(ends.len());
-            let start_: usize = 0;
-            for (pos, end) in ends.indexed_iter() {
-                let mut total: i64 = 1;
-                let end_ = *end as usize;
-                for nn in start_..end_ {
-                    if booleans[nn] {
-                        continue;
-                    }
-                    let current = arr[nn];
-                    total *= current as i64;
-                }
-                result[pos] = total;
-            }
+            let result = prod_end_core(
+                arr.as_array(),
+                ends.as_array(),
+                booleans.as_array(),
+                |value| value as i64,
+            );
             Ok(result.into_pyarray(py))
         }
     };
@@ -60,22 +162,12 @@ macro_rules! generic_compute_floats {
                 "booleans",
                 booleans.as_array().len(),
             )?;
-            let arr = arr.as_array();
-            let ends = ends.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<f64>::zeros(ends.len());
-            for (pos, end) in ends.indexed_iter() {
-                let mut total: f64 = 1.;
-                let end_ = *end as usize;
-                for nn in 0..end_ {
-                    if booleans[nn] {
-                        continue;
-                    }
-                    let current = arr[nn];
-                    total *= current as f64;
-                }
-                result[pos] = total;
-            }
+            let result = prod_end_float_core(
+                arr.as_array(),
+                ends.as_array(),
+                booleans.as_array(),
+                |value| value as f64,
+            );
             Ok(result.into_pyarray(py))
         }
     };
