@@ -54,7 +54,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    let dense = should_use_dense_match_storage(index.len(), positions.len());
+    let dense = should_use_dense_match_storage(index.len(), positions.len().min(index.len()));
     Ok(prod_positions_int_core_with_storage_unchecked(
         arr, starts, ends, index, positions, booleans, to_value, dense,
     ))
@@ -222,7 +222,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    let dense = should_use_dense_match_storage(index.len(), positions.len());
+    let dense = should_use_dense_match_storage(index.len(), positions.len().min(index.len()));
     Ok(prod_positions_float_core_with_storage_unchecked(
         arr, starts, ends, index, positions, booleans, to_value, dense,
     ))

@@ -250,16 +250,23 @@ fn old_sum_float(f: &Fixture) -> (Vec<i64>, Vec<f64>) {
                     let slot = labels.len();
                     entry.insert(slot);
                     labels.push(f.index[ordinal]);
-                    totals.push(0.0);
+                    totals.push((0.0, 0.0));
                     slot
                 }
             };
             if !*boolean {
-                totals[slot] += *current;
+                let (total, compensation) = &mut totals[slot];
+                let difference = *current - *compensation;
+                let increment = *total + difference;
+                *compensation = (increment - *total) - difference;
+                if !compensation.is_finite() {
+                    *compensation = 0.0;
+                }
+                *total = increment;
             }
         }
     }
-    (labels, totals)
+    (labels, totals.into_iter().map(|(total, _)| total).collect())
 }
 
 fn old_prod_float(f: &Fixture) -> (Vec<i64>, Vec<f64>) {

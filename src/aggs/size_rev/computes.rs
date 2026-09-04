@@ -770,7 +770,7 @@ pub fn size_positions_core(
     ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("positions", positions.len())?;
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
-    let dense = should_use_dense_match_storage(index.len(), positions.len());
+    let dense = should_use_dense_match_storage(index.len(), positions.len().min(index.len()));
     Ok(size_positions_core_with_storage_unchecked(
         starts, ends, index, positions, dense,
     ))
