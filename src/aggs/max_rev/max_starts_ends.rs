@@ -151,6 +151,12 @@ macro_rules! compute {
         /// Null rows, identified by `booleans`, do not participate in the
         /// maximum. The returned positions use `-1` when no non-null row
         /// covers a label.
+        /// Output label/position pairs are aligned, but their order is
+        /// unspecified.
+        ///
+        /// ELI5: each ordinal gets a drawer for its best row. Dense drawers
+        /// are scanned by ordinal; sparse drawers come from a map, so output
+        /// order can vary while each label stays paired with its result.
         ///
         /// # Arguments
         ///
@@ -233,7 +239,10 @@ mod tests {
             array![42_i64, 7, 100].view(),
             array![false, false, false].view(),
         );
-        assert_eq!(got, Ok((vec![42, 7, 100], vec![0, 0, 1])));
+        let (labels, positions) = got.unwrap();
+        let mut got: Vec<_> = labels.into_iter().zip(positions).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(7, 0), (42, 0), (100, 1)]);
     }
 
     #[test]
@@ -246,7 +255,10 @@ mod tests {
             array![false, false, false].view(),
         );
         // Ordinal slots are independent; duplicate labels are not merged.
-        assert_eq!(got, Ok((vec![10, 20, 10], vec![0, 0, 1])));
+        let (labels, positions) = got.unwrap();
+        let mut got: Vec<_> = labels.into_iter().zip(positions).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(10, 0), (10, 1), (20, 0)]);
     }
 
     #[test]
@@ -258,7 +270,10 @@ mod tests {
             array![10_i64, 20].view(),
             array![true].view(),
         );
-        assert_eq!(got, Ok((vec![10, 20], vec![-1, -1])));
+        let (labels, positions) = got.unwrap();
+        let mut got: Vec<_> = labels.into_iter().zip(positions).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(10, -1), (20, -1)]);
     }
 
     #[test]
