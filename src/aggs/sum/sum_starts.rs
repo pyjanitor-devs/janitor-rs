@@ -47,7 +47,47 @@ where
 {
     let mut result = Array1::<i64>::zeros(starts.len());
     let end_: usize = arr.len();
-    for (pos, start) in starts.indexed_iter() {
+
+    // ELI5: for a few short suffixes, add each suffix directly. When many
+    // suffixes ask for more than roughly three full-array scans, write one
+    // running answer for every position and answer each query from it.
+    let use_suffix = if starts.len() < 8 {
+        // ELI5: for only a handful of questions, measuring every question
+        // costs more than simply answering them directly.
+        false
+    } else {
+        let total_width = starts.iter().fold(0_usize, |total, start| {
+            let width = (*start)
+                .try_into()
+                .ok()
+                .map_or(0, |start: usize| end_.saturating_sub(start));
+            total.saturating_add(width)
+        });
+        total_width > end_.saturating_mul(3)
+    };
+
+    if use_suffix {
+        // `suffix[nn]` is the wrapped sum of all non-null values from `nn`
+        // through the end. The extra zero slot makes the final position easy
+        // to initialize without a special case.
+        let mut suffix = vec![0_i64; end_ + 1];
+        for nn in (0..end_).rev() {
+            suffix[nn] = suffix[nn + 1];
+            if !booleans[nn] {
+                suffix[nn] = suffix[nn].wrapping_add(to_i64(arr[nn]));
+            }
+        }
+        for (pos, start) in starts.iter().enumerate() {
+            if let Ok(start_) = usize::try_from(*start) {
+                if start_ < end_ {
+                    result[pos] = suffix[start_];
+                }
+            }
+        }
+        return result;
+    }
+
+    for (pos, start) in starts.iter().enumerate() {
         let mut total: i64 = 0;
         let start_ = *start as usize;
         for nn in start_..end_ {
@@ -242,6 +282,18 @@ mod tests {
         let booleans = array![true, true, true];
         let got = sum_start_core(arr.view(), starts.view(), booleans.view());
         assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn repeated_broad_suffixes_use_the_same_wrapping_result() {
+        let arr = array![1_i64, 2, 3, 4];
+        let starts = array![0_i64, 0, 1, 2];
+        let booleans = array![false, true, false, false];
+
+        // This workload crosses the adaptive threshold and exercises the
+        // suffix buffer rather than the direct per-query loop.
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        assert_eq!(got, array![8, 8, 7, 7]);
     }
 
     #[test]
