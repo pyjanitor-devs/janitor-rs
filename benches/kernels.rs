@@ -1083,7 +1083,6 @@ fn bench_min_positions(c: &mut Criterion) {
                     f.index.view(),
                     f.positions.view(),
                     f.booleans.view(),
-                    f.index.len(),
                 )
             });
             eprintln!("min_positions {label}: old {old:?}; compact {compact:?}");
@@ -1109,7 +1108,6 @@ fn bench_min_positions(c: &mut Criterion) {
                         black_box(f.index.view()),
                         black_box(f.positions.view()),
                         black_box(f.booleans.view()),
-                        f.index.len(),
                     )
                 })
             });

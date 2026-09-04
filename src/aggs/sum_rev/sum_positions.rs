@@ -3,15 +3,19 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_index, checked_range, ensure_equal_lengths, WrapAdd};
+use crate::aggs::{
+    checked_index, checked_range, ensure_equal_lengths_core, ensure_nonempty_core,
+    should_use_dense_match_storage, WrapAdd,
+};
 use std::collections::{hash_map::Entry, HashMap};
 
 /// Accumulate integer values for the indirect ranges in `positions`.
+/// `index` is expected to contain unique labels, as guaranteed by the
+/// pyjanitor producer for this path.
 ///
-/// ELI5: the HashMap stores only a small slot number for each label. The
-/// actual labels and totals live side-by-side in Vecs, so duplicate labels do
-/// not require a separate hash entry or a second lookup when producing the
-/// result. Integer totals use wrapping arithmetic, so overflow has the same
+/// ELI5: `positions` already gives us a validated ordinal into `index`, so the
+/// HashMap can use that ordinal directly. We only look up the original label
+/// while emitting the result. Integer totals use wrapping arithmetic, so overflow has the same
 /// deterministic result in debug and release builds. `A` is the accumulator
 /// type: every integer dtype instantiates this with `A = i64`, except
 /// `uint64`, which instantiates it with `A = u64` so values `>= 2**63`
@@ -24,18 +28,86 @@ pub fn sum_positions_int_core<T, A, F>(
     index: ArrayView1<'_, i64>,
     positions: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-    capacity: usize,
     to_acc: F,
+) -> Result<(Vec<i64>, Vec<A>), String>
+where
+    T: Copy,
+    A: WrapAdd,
+    F: Fn(T) -> A,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    let dense = should_use_dense_match_storage(index.len(), positions.len());
+    Ok(sum_positions_int_core_with_storage(
+        arr, starts, ends, index, positions, booleans, to_acc, dense,
+    ))
+}
+
+/// Run integer positional summation with an explicit storage mode.
+/// This is a Rust-only benchmark entry point; production callers should use
+/// [`sum_positions_int_core`] for automatic dispatch.
+#[allow(clippy::too_many_arguments)]
+pub fn sum_positions_int_core_with_storage<T, A, F>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    to_acc: F,
+    dense: bool,
 ) -> (Vec<i64>, Vec<A>)
 where
     T: Copy,
     A: WrapAdd,
     F: Fn(T) -> A,
 {
-    let capacity = capacity.min(index.len()).min(positions.len());
-    let mut slots: HashMap<i64, usize> = HashMap::with_capacity(capacity);
-    let mut labels = Vec::with_capacity(capacity);
-    let mut totals = Vec::with_capacity(capacity);
+    // Dense storage trades memory for direct ordinal indexing. `positions.len()`
+    // is only a cheap tape-size heuristic, not a distinct-ordinal count; a
+    // highly repeated tape can therefore overselect dense storage. The sparse
+    // fallback handles shorter tapes, and adaptive promotion is a future
+    // refinement.
+    if dense {
+        let mut seen = vec![false; index.len()];
+        let mut totals = vec![A::ZERO; index.len()];
+        for (current, start, end, boolean) in izip!(
+            arr.into_iter(),
+            starts.into_iter(),
+            ends.into_iter(),
+            booleans.into_iter()
+        ) {
+            let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+                continue;
+            };
+            let current_ = to_acc(*current);
+            for nn in start_..end_ {
+                let Some(indexer_) = checked_index(positions[nn], index.len()) else {
+                    continue;
+                };
+                seen[indexer_] = true;
+                // Insert state before checking the mask: null-only labels
+                // must still be emitted with the additive identity.
+                if !*boolean {
+                    totals[indexer_] = totals[indexer_].wrap_add(current_);
+                }
+            }
+        }
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (ordinal, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[ordinal]);
+                values.push(totals[ordinal]);
+            }
+        }
+        return (labels, values);
+    }
+
+    let mut totals: HashMap<usize, A> = HashMap::new();
 
     for (current, start, end, boolean) in izip!(
         arr.into_iter(),
@@ -51,34 +123,37 @@ where
             let Some(indexer_) = checked_index(positions[nn], index.len()) else {
                 continue;
             };
-            let label = index[indexer_];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    totals.push(A::ZERO);
-                    slot
-                }
+            let total = match totals.entry(indexer_) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(A::ZERO),
             };
+            // Insert state before checking the mask: null-only labels must
+            // still be emitted with the additive identity.
             if !*boolean {
                 // ELI5: once a label's bucket is found, add in the same
                 // wraparound style as the forward kernel. This keeps a very
                 // large integer from panicking only in debug/test builds.
-                totals[slot] = totals[slot].wrap_add(current_);
+                *total = total.wrap_add(current_);
             }
         }
     }
 
-    (labels, totals)
+    let mut labels = Vec::with_capacity(totals.len());
+    let mut values = Vec::with_capacity(totals.len());
+    for (ordinal, value) in totals {
+        labels.push(index[ordinal]);
+        values.push(value);
+    }
+    (labels, values)
 }
 
 /// Accumulate floating-point values while retaining pandas-style compensated
-/// summation. The labels and both pieces of state use the same compact slot.
+/// summation. The ordinal map stores both pieces of state together.
+/// `index` is expected to contain unique labels, as guaranteed by the
+/// pyjanitor producer for this path.
 ///
-/// ELI5: instead of looking up a label in two dictionaries, we find its slot
-/// once and update the total and its rounding-error correction in Vecs.
+/// ELI5: the ordinal is the state key, so one map lookup finds both the total
+/// and its rounding-error correction without a label-to-slot translation.
 #[allow(clippy::too_many_arguments)]
 pub fn sum_positions_float_core<T, F>(
     arr: ArrayView1<'_, T>,
@@ -87,18 +162,88 @@ pub fn sum_positions_float_core<T, F>(
     index: ArrayView1<'_, i64>,
     positions: ArrayView1<'_, i64>,
     booleans: ArrayView1<'_, bool>,
-    capacity: usize,
     to_f64: F,
+) -> Result<(Vec<i64>, Vec<f64>), String>
+where
+    T: Copy,
+    F: Fn(T) -> f64,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    let dense = should_use_dense_match_storage(index.len(), positions.len());
+    Ok(sum_positions_float_core_with_storage(
+        arr, starts, ends, index, positions, booleans, to_f64, dense,
+    ))
+}
+
+/// Run floating-point positional summation with an explicit storage mode.
+/// This is a Rust-only benchmark entry point; production callers should use
+/// [`sum_positions_float_core`] for automatic dispatch.
+#[allow(clippy::too_many_arguments)]
+pub fn sum_positions_float_core_with_storage<T, F>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    to_f64: F,
+    dense: bool,
 ) -> (Vec<i64>, Vec<f64>)
 where
     T: Copy,
     F: Fn(T) -> f64,
 {
-    let capacity = capacity.min(index.len()).min(positions.len());
-    let mut slots: HashMap<i64, usize> = HashMap::with_capacity(capacity);
-    let mut labels = Vec::with_capacity(capacity);
-    let mut totals = Vec::with_capacity(capacity);
-    let mut compensations = Vec::with_capacity(capacity);
+    if dense {
+        let mut seen = vec![false; index.len()];
+        let mut totals = vec![(0., 0.); index.len()];
+        for (current, start, end, boolean) in izip!(
+            arr.into_iter(),
+            starts.into_iter(),
+            ends.into_iter(),
+            booleans.into_iter()
+        ) {
+            let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+                continue;
+            };
+            let current_ = to_f64(*current);
+            for nn in start_..end_ {
+                let Some(indexer_) = checked_index(positions[nn], index.len()) else {
+                    continue;
+                };
+                seen[indexer_] = true;
+                // Insert state before checking the mask: null-only labels
+                // must still be emitted with the additive identity.
+                if *boolean {
+                    continue;
+                }
+                let (total, compensation) = &mut totals[indexer_];
+                let difference = current_ - *compensation;
+                let increment = *total + difference;
+                *compensation = (increment - *total) - difference;
+                if !compensation.is_finite() {
+                    *compensation = 0.;
+                }
+                *total = increment;
+            }
+        }
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (ordinal, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[ordinal]);
+                let (total, compensation) = totals[ordinal];
+                values.push(total + compensation);
+            }
+        }
+        return (labels, values);
+    }
+
+    let mut totals: HashMap<usize, (f64, f64)> = HashMap::new();
 
     for (current, start, end, boolean) in izip!(
         arr.into_iter(),
@@ -114,34 +259,34 @@ where
             let Some(indexer_) = checked_index(positions[nn], index.len()) else {
                 continue;
             };
-            let label = index[indexer_];
-            let slot = match slots.entry(label) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let slot = labels.len();
-                    entry.insert(slot);
-                    labels.push(label);
-                    totals.push(0.);
-                    compensations.push(0.);
-                    slot
-                }
+            let (total, compensation) = match totals.entry(indexer_) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert((0., 0.)),
             };
+            // Insert state before checking the mask: null-only labels must
+            // still be emitted with the additive identity.
             if *boolean {
                 continue;
             }
-            let difference = current_ - compensations[slot];
-            let increment = totals[slot] + difference;
-            compensations[slot] = (increment - totals[slot]) - difference;
+            let difference = current_ - *compensation;
+            let increment = *total + difference;
+            *compensation = (increment - *total) - difference;
             // Adapted from pandas' cython code. Infinite values should not
             // turn the compensation term into NaN and poison later sums.
-            if !compensations[slot].is_finite() {
-                compensations[slot] = 0.;
+            if !compensation.is_finite() {
+                *compensation = 0.;
             }
-            totals[slot] = increment;
+            *total = increment;
         }
     }
 
-    (labels, totals)
+    let mut labels = Vec::with_capacity(totals.len());
+    let mut values = Vec::with_capacity(totals.len());
+    for (ordinal, (total, compensation)) in totals {
+        labels.push(index[ordinal]);
+        values.push(total + compensation);
+    }
+    (labels, values)
 }
 
 macro_rules! compute_ints {
@@ -156,6 +301,10 @@ macro_rules! compute_ints {
         /// * `index` - Right-side labels addressed by `positions`.
         /// * `positions` - Positional candidate tape.
         /// * `booleans` - Null mask; `True` rows are ignored.
+        ///
+        /// `arr`, `index`, and `positions` must not be empty. `starts`, `ends`,
+        /// and `booleans` must match `arr` in length. Returned label/value
+        /// pairs are aligned but unordered.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -171,27 +320,14 @@ macro_rules! compute_ints {
             let arr = arr.as_array();
             let starts = starts.as_array();
             let ends = ends.as_array();
-            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let index = index.as_array();
             let positions = positions.as_array();
             let booleans = booleans.as_array();
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            if arr.is_empty() || index.is_empty() || positions.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "arr, starts, ends, booleans, index, and positions cannot be empty",
-                ));
-            }
-            let (labels, totals) = sum_positions_int_core(
-                arr,
-                starts,
-                ends,
-                index,
-                positions,
-                booleans,
-                index.len().min(positions.len()),
-                |value| value as $acc,
-            );
+            let (labels, totals) =
+                sum_positions_int_core(arr, starts, ends, index, positions, booleans, |value| {
+                    value as $acc
+                })
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
             let indexers = Array1::from_vec(labels);
             let result = Array1::from_vec(totals);
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
@@ -222,6 +358,10 @@ macro_rules! compute_floats {
         /// * `index` - Right-side labels addressed by `positions`.
         /// * `positions` - Positional candidate tape.
         /// * `booleans` - Null mask; `True` rows are ignored.
+        ///
+        /// `arr`, `index`, and `positions` must not be empty. `starts`, `ends`,
+        /// and `booleans` must match `arr` in length. Returned label/value
+        /// pairs are aligned but unordered.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -237,27 +377,14 @@ macro_rules! compute_floats {
             let arr = arr.as_array();
             let starts = starts.as_array();
             let ends = ends.as_array();
-            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-            ensure_equal_lengths("arr", arr.len(), "starts", starts.len())?;
             let index = index.as_array();
             let positions = positions.as_array();
             let booleans = booleans.as_array();
-            ensure_equal_lengths("arr", arr.len(), "booleans", booleans.len())?;
-            if arr.is_empty() || index.is_empty() || positions.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "arr, starts, ends, booleans, index, and positions cannot be empty",
-                ));
-            }
-            let (labels, totals) = sum_positions_float_core(
-                arr,
-                starts,
-                ends,
-                index,
-                positions,
-                booleans,
-                index.len().min(positions.len()),
-                |value| value as f64,
-            );
+            let (labels, totals) =
+                sum_positions_float_core(arr, starts, ends, index, positions, booleans, |value| {
+                    value as f64
+                })
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
             let indexers = Array1::from_vec(labels);
             let result = Array1::from_vec(totals);
             Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
@@ -293,7 +420,7 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn integer_positions_keep_first_seen_labels_and_skip_invalid_entries() {
+    fn integer_positions_keep_labels_and_skip_invalid_entries() {
         let arr = array![10_i64, 20, 30];
         let starts = array![0_i64, 2, 4];
         let ends = array![2_i64, 4, 5];
@@ -308,13 +435,14 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            100,
             |value| value,
-        );
+        )
+        .unwrap();
 
-        assert_eq!(labels, vec![200, 100, 300]);
+        let mut got: Vec<_> = labels.into_iter().zip(totals).collect();
+        got.sort_unstable();
         // The null row still creates slots, but contributes no value.
-        assert_eq!(totals, vec![10, 10, 0]);
+        assert_eq!(got, vec![(100, 10), (200, 10), (300, 0)]);
     }
 
     #[test]
@@ -333,9 +461,9 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
             |value| value,
-        );
+        )
+        .unwrap();
 
         assert!(labels.is_empty());
         assert!(totals.is_empty());
@@ -357,9 +485,9 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
             |value| value,
-        );
+        )
+        .unwrap();
 
         assert_eq!(labels, vec![5]);
         assert!((totals[0] - 0.6).abs() < f64::EPSILON);
@@ -381,9 +509,9 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
             |v: u64| v,
-        );
+        )
+        .unwrap();
         assert_eq!(labels, vec![5]);
         assert_eq!(totals, vec![value]);
     }
@@ -404,9 +532,9 @@ mod tests {
             index.view(),
             positions.view(),
             booleans.view(),
-            1,
             |value| value,
-        );
+        )
+        .unwrap();
 
         assert_eq!(labels, vec![5]);
         assert_eq!(totals, vec![i64::MIN]);

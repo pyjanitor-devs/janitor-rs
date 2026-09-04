@@ -7,7 +7,7 @@
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 use crate::aggs::{
     checked_end, checked_index, checked_range, ends_domain, ensure_equal_lengths,
@@ -712,10 +712,26 @@ mod tests {
             Ok((array![10, 20], array![1, 1]))
         );
     }
+
+    #[test]
+    fn positions_count_ordinals_and_emit_original_labels() {
+        let starts = array![0_i64, 1];
+        let ends = array![2_i64, 3];
+        let index = array![100_i64, 900, 500];
+        let positions = array![2_i64, 0, 1];
+        let (labels, counts) =
+            size_positions_core(starts.view(), ends.view(), index.view(), positions.view())
+                .unwrap();
+        let mut got: Vec<_> = labels.into_iter().zip(counts).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(100, 2), (500, 1), (900, 1)]);
+    }
 }
 
 /// Count rows covered by each label reached through the positional candidate
 /// tape.
+/// `index` is expected to contain unique labels, as guaranteed by the
+/// pyjanitor producer for this path.
 ///
 /// # Arguments
 ///
@@ -726,7 +742,99 @@ mod tests {
 ///
 /// # Returns
 ///
-/// The labels reached through `positions` and their coverage counts.
+/// The labels reached through `positions` and their coverage counts. `starts`,
+/// `ends`, `index`, and `positions` must not be empty; `starts` and `ends` must
+/// have equal lengths. Returned label/count pairs are aligned but unordered.
+pub fn size_positions_core(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
+    let dense = should_use_dense_match_storage(index.len(), positions.len());
+    Ok(size_positions_core_with_storage(
+        starts, ends, index, positions, dense,
+    ))
+}
+
+/// Run positional coverage counting with an explicit storage mode.
+/// This is a Rust-only benchmark entry point; production callers should use
+/// [`size_positions_core`] for automatic dispatch.
+pub fn size_positions_core_with_storage(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    dense: bool,
+) -> (Vec<i64>, Vec<i64>) {
+    // ELI5: a long candidate tape does not imply many distinct ordinals, so
+    // avoid reserving a table for candidates that may never become state.
+    if dense {
+        let mut seen = vec![false; index.len()];
+        let mut counts = vec![0_i64; index.len()];
+        for (start, end) in starts.into_iter().zip(ends) {
+            let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+                continue;
+            };
+            for item in start_..end_ {
+                let Some(ordinal) = checked_index(positions[item], index.len()) else {
+                    continue;
+                };
+                seen[ordinal] = true;
+                counts[ordinal] += 1;
+            }
+        }
+        let mut labels = Vec::new();
+        let mut values = Vec::new();
+        for (ordinal, was_seen) in seen.into_iter().enumerate() {
+            if was_seen {
+                labels.push(index[ordinal]);
+                values.push(counts[ordinal]);
+            }
+        }
+        return (labels, values);
+    }
+
+    let mut counts: HashMap<usize, i64> = HashMap::new();
+    for (start, end) in starts.into_iter().zip(ends) {
+        let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
+            continue;
+        };
+        for item in start_..end_ {
+            let Some(ordinal) = checked_index(positions[item], index.len()) else {
+                continue;
+            };
+            let count = match counts.entry(ordinal) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(0),
+            };
+            *count += 1;
+        }
+    }
+    let mut labels = Vec::with_capacity(counts.len());
+    let mut values = Vec::with_capacity(counts.len());
+    for (ordinal, count) in counts {
+        labels.push(index[ordinal]);
+        values.push(count);
+    }
+    (labels, values)
+}
+
+/// Count positional-tape coverage for each reached right-side label.
+///
+/// # Arguments
+///
+/// * `starts` - Inclusive start of each positional tape range.
+/// * `ends` - Exclusive end of each positional tape range.
+/// * `index` - Right-side labels addressed by positional ordinals.
+/// * `positions` - Positional candidate tape mapping to `index`.
+///
+/// `starts`, `ends`, `index`, and `positions` must not be empty, and `starts`
+/// and `ends` must have equal lengths. Returned label/count pairs are aligned
+/// but unordered.
 #[pyfunction]
 pub fn compute_size_rev_positions<'py>(
     py: Python<'py>,
@@ -737,36 +845,12 @@ pub fn compute_size_rev_positions<'py>(
 ) -> SizeRevResult<'py> {
     let starts = starts.as_array();
     let ends = ends.as_array();
-    ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
     let index = index.as_array();
     let positions = positions.as_array();
-    if starts.is_empty() || index.is_empty() || positions.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "starts, ends, index, and positions cannot be empty",
-        ));
-    }
-    let mut dictionary: HashMap<i64, i64> = HashMap::with_capacity(index.len());
-    let zipped = starts.into_iter().zip(ends);
-    for (start, end) in zipped {
-        let Some((start_, end_)) = checked_range(*start, *end, positions.len()) else {
-            continue;
-        };
-        for item in start_..end_ {
-            let Some(indexer_) = checked_index(positions[item], index.len()) else {
-                continue;
-            };
-            let pos = index[indexer_];
-            let total = dictionary.entry(pos).or_insert(0);
-            *total += 1;
-        }
-    }
-    let length = dictionary.len();
-    let mut indexers = Array1::<i64>::zeros(length);
-    let mut result = Array1::<i64>::zeros(length);
-    for (pos, (key, val)) in dictionary.iter().enumerate() {
-        indexers[pos] = *key;
-        result[pos] = *val;
-    }
+    let (labels, counts) = size_positions_core(starts, ends, index, positions)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let indexers = Array1::from_vec(labels);
+    let result = Array1::from_vec(counts);
     Ok((indexers.into_pyarray(py), result.into_pyarray(py)))
 }
 
