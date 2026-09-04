@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core};
 
 fn is_empty_sentinel_end(end: i64) -> bool {
     end == -1
@@ -29,7 +29,7 @@ pub fn sum_end_core(
     arr: ArrayView1<i64>,
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
-) -> Array1<i64> {
+) -> Result<Array1<i64>, String> {
     sum_end_core_with_cast(arr, ends, booleans, |value| value)
 }
 
@@ -38,11 +38,13 @@ fn sum_end_core_with_cast<T, F>(
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_i64: F,
-) -> Array1<i64>
+) -> Result<Array1<i64>, String>
 where
     T: Copy,
     F: FnMut(T) -> i64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(ends.len());
     let start_: usize = 0;
 
@@ -78,7 +80,7 @@ where
                 result[pos] = prefix[end_];
             }
         }
-        return result;
+        return Ok(result);
     }
 
     for (pos, end) in ends.indexed_iter() {
@@ -95,7 +97,7 @@ where
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
 fn sum_end_float_core_with_cast<T, F>(
@@ -141,19 +143,15 @@ macro_rules! generic_compute {
         ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = sum_end_core_with_cast(
                 arr.as_array(),
                 ends.as_array(),
                 booleans.as_array(),
                 |value| value as i64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
@@ -222,12 +220,12 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn empty_array() {
+    fn empty_array_is_rejected() {
         let arr: Array1<i64> = array![];
         let ends = array![0_i64];
         let booleans: Array1<bool> = array![];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
-        assert_eq!(got, array![0]);
+        let error = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
     }
 
     #[test]
@@ -235,7 +233,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let ends = array![0_i64]; // boundary: nothing yet
         let booleans = array![false, false, false];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
     }
 
@@ -244,7 +242,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let ends = array![3_i64]; // boundary: whole array
         let booleans = array![false, false, false];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![6]);
     }
 
@@ -253,7 +251,7 @@ mod tests {
         let arr = array![1_i64, 2, 3, 4];
         let ends = array![4_i64];
         let booleans = array![false, true, false, true];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![1 + 3]);
     }
 
@@ -262,7 +260,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let ends = array![3_i64];
         let booleans = array![true, true, true];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
     }
 
@@ -271,7 +269,7 @@ mod tests {
         let arr = array![1_i64, 2, 3, 4];
         let ends = array![4_i64, 4, 3, 2];
         let booleans = array![false, true, false, false];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![8, 8, 4, 1]);
     }
 
@@ -284,7 +282,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let ends = array![-1_i64];
         let booleans = array![false, false, false];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
     }
 
@@ -304,7 +302,7 @@ mod tests {
         let arr = Array1::<i64>::from_elem(100, value);
         let ends = array![100_i64];
         let booleans = Array1::<bool>::from_elem(100, false);
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got[0], -100_i64);
     }
 
@@ -317,7 +315,8 @@ mod tests {
         let got = sum_end_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| {
             casts += 1;
             value as i64
-        });
+        })
+        .unwrap();
         assert_eq!(got, array![1]);
         assert_eq!(casts, 1);
     }

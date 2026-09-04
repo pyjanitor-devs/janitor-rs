@@ -53,6 +53,12 @@ where
     // ELI5: for a few short suffixes, add each suffix directly. When many
     // suffixes ask for more than roughly three full-array scans, write one
     // running answer for every position and answer each query from it.
+    //
+    // The cutoff is deliberately based on work, not just query count: the
+    // suffix buffer costs one full array traversal plus O(arr.len()) memory,
+    // so it should be built only when repeated direct scans would cost more.
+    // The three-scan threshold is the measured crossover used by the
+    // corresponding pyjanitor prefix implementation and its Rust benchmark.
     let use_suffix = if starts.len() <= 3 {
         // ELI5: three or fewer questions cannot require more than three
         // full-array scans, so measuring them costs more than answering them.
