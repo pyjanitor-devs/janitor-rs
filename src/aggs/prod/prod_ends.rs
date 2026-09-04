@@ -5,6 +5,10 @@ use pyo3::prelude::*;
 use crate::aggs::sum::should_use_running_aggregation;
 use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
+/// Computes the product of every prefix selected by `ends` for an integer
+/// input array. `ends` contains exclusive zero-based boundaries, and `true`
+/// entries in `booleans` mark null values that contribute the identity `1`.
+/// Integer products use fixed-width wrapping multiplication.
 fn prod_end_core<T, F>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
@@ -73,6 +77,10 @@ mod tests {
     }
 }
 
+/// Computes floating-point products for prefix queries described by `ends`.
+/// This core is separate from the integer version so IEEE-754 behavior is
+/// preserved for zero, infinity, NaN, overflow, and underflow. The running
+/// prefix path preserves the multiplication order of each prefix.
 fn prod_end_float_core<T, F>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
@@ -125,6 +133,9 @@ where
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
+        /// Compute products over prefixes of `arr` for integer-compatible
+        /// values. `ends` supplies exclusive boundaries and `booleans` marks
+        /// null values to skip; the returned array follows `ends`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -149,6 +160,9 @@ macro_rules! generic_compute {
 
 macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Compute floating-point products over prefixes of `arr`.
+        /// `ends` supplies exclusive boundaries and `booleans` marks null
+        /// values to skip; the returned array follows `ends`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

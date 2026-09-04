@@ -131,6 +131,9 @@ where
 
 macro_rules! generic_compute_ints {
     ($fname:ident, $type:ty) => {
+        /// Sum non-null values in each half-open `arr[start..end]` range.
+        /// `starts` and `ends` are parallel boundaries; `booleans` marks
+        /// null values to skip. Invalid ranges return zero.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -159,6 +162,9 @@ macro_rules! generic_compute_ints {
 
 macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Sum floating-point non-null values in each half-open range.
+        /// `starts` and `ends` are parallel boundaries; `booleans` marks
+        /// null values to skip. Invalid ranges return zero.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

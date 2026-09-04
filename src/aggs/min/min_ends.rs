@@ -75,6 +75,10 @@ pub fn min_end_core<T: PartialOrd + Copy>(
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
+        /// Return the positions of the minimum non-null values in each
+        /// prefix. `arr` is the value array, `ends` contains exclusive
+        /// boundaries, and `booleans` marks null values to skip. Invalid or
+        /// all-null prefixes return `-1`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

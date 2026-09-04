@@ -106,6 +106,8 @@ where
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
+        /// Sum non-null values in each suffix of `arr`. `starts` contains
+        /// inclusive boundaries and `booleans` marks null values to skip.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -183,6 +185,8 @@ where
 
 macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Sum floating-point non-null values in each suffix of `arr`.
+        /// `starts` contains inclusive boundaries and `booleans` marks nulls.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
