@@ -17,6 +17,15 @@ use std::collections::{hash_map::Entry, HashMap};
 /// HashMap can use that ordinal directly. We only look up the original label
 /// while emitting the result; null rows may create state but cannot win. The
 /// returned label/state pairs follow HashMap iteration order.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values; must not be empty.
+/// * `starts` - Inclusive start of each half-open tape range.
+/// * `ends` - Exclusive end of each half-open tape range.
+/// * `index` - Right-side labels addressed by ordinal; must not be empty.
+/// * `positions` - Candidate tape of ordinals into `index`; must not be empty.
+/// * `booleans` - Null mask for `arr`; true rows do not contribute maxima.
 pub fn max_positions_core<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
@@ -43,6 +52,10 @@ pub fn max_positions_core<T: PartialOrd + Copy>(
 ///
 /// This Rust-only entry point is used by benchmarks; production callers should
 /// use [`max_positions_core`] so the dense/sparse heuristic remains automatic.
+///
+/// `arr`, `starts`, `ends`, `index`, `positions`, and `booleans` have the same
+/// meanings as [`max_positions_core`]. `dense` selects vector storage when true
+/// and HashMap storage when false.
 pub fn max_positions_core_with_storage<T: PartialOrd + Copy>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,

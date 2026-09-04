@@ -778,6 +778,14 @@ pub fn size_positions_core(
 /// Run positional coverage counting with an explicit storage mode.
 /// This is a Rust-only benchmark entry point; production callers should use
 /// [`size_positions_core`] for automatic dispatch.
+///
+/// # Arguments
+///
+/// * `starts` - Inclusive start of each half-open interval; must not be empty.
+/// * `ends` - Exclusive end of each half-open interval; must not be empty.
+/// * `index` - Right-side labels addressed by ordinal; must not be empty.
+/// * `positions` - Candidate tape of ordinals into `index`; must not be empty.
+/// * `dense` - Selects vector storage when true and HashMap storage when false.
 pub fn size_positions_core_with_storage(
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,

@@ -20,6 +20,16 @@ use std::collections::{hash_map::Entry, HashMap};
 /// type: every integer dtype instantiates this with `A = i64`, except
 /// `uint64`, which instantiates it with `A = u64` so values `>= 2**63`
 /// don't get sign-flipped by a forced `i64` cast (see `WrapAdd`).
+///
+/// # Arguments
+///
+/// * `arr` - Left-side values; must not be empty.
+/// * `starts` - Inclusive start of each half-open tape range.
+/// * `ends` - Exclusive end of each half-open tape range.
+/// * `index` - Right-side labels addressed by ordinal; must not be empty.
+/// * `positions` - Candidate tape of ordinals into `index`; must not be empty.
+/// * `booleans` - Null mask for `arr`; true rows do not contribute sums.
+/// * `to_acc` - Converts each left value to the accumulator type.
 #[allow(clippy::too_many_arguments)]
 pub fn sum_positions_int_core<T, A, F>(
     arr: ArrayView1<'_, T>,
@@ -52,6 +62,10 @@ where
 /// Run integer positional summation with an explicit storage mode.
 /// This is a Rust-only benchmark entry point; production callers should use
 /// [`sum_positions_int_core`] for automatic dispatch.
+///
+/// The array arguments and `to_acc` have the same meanings as
+/// [`sum_positions_int_core`]. `dense` selects vector storage when true and
+/// HashMap storage when false.
 #[allow(clippy::too_many_arguments)]
 pub fn sum_positions_int_core_with_storage<T, A, F>(
     arr: ArrayView1<'_, T>,
@@ -156,6 +170,16 @@ where
 ///
 /// ELI5: the ordinal is the state key, so one map lookup finds both the total
 /// and its rounding-error correction without a label-to-slot translation.
+///
+/// # Arguments
+///
+/// * `arr` - Left-side floating-point values; must not be empty.
+/// * `starts` - Inclusive start of each half-open tape range.
+/// * `ends` - Exclusive end of each half-open tape range.
+/// * `index` - Right-side labels addressed by ordinal; must not be empty.
+/// * `positions` - Candidate tape of ordinals into `index`; must not be empty.
+/// * `booleans` - Null mask for `arr`; true rows do not contribute sums.
+/// * `to_f64` - Converts each left value to `f64`.
 #[allow(clippy::too_many_arguments)]
 pub fn sum_positions_float_core<T, F>(
     arr: ArrayView1<'_, T>,
@@ -187,6 +211,10 @@ where
 /// Run floating-point positional summation with an explicit storage mode.
 /// This is a Rust-only benchmark entry point; production callers should use
 /// [`sum_positions_float_core`] for automatic dispatch.
+///
+/// The array arguments and `to_f64` have the same meanings as
+/// [`sum_positions_float_core`]. `dense` selects vector storage when true and
+/// HashMap storage when false.
 #[allow(clippy::too_many_arguments)]
 pub fn sum_positions_float_core_with_storage<T, F>(
     arr: ArrayView1<'_, T>,
