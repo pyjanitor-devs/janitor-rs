@@ -10,6 +10,11 @@ use crate::aggs::{
 };
 
 /// Aggregate the survivor tape by right-position ordinal.
+/// Output label/position pairs are aligned, but their order is unspecified.
+///
+/// ELI5: the match tape points into numbered right-side drawers. We record
+/// each drawer's best row, then print the original label from that drawer;
+/// a sparse map may print drawers in any order.
 ///
 /// `index[item]` is the label returned to Python; `item` is the state key.
 /// Pyjanitor normalizes the right index to unique labels, but those labels are

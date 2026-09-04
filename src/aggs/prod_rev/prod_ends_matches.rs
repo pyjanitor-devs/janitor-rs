@@ -11,6 +11,11 @@ use crate::aggs::{
 };
 
 /// Aggregate products for prefix ranges selected by a survivor tape.
+/// Output label/product pairs are aligned, but their order is unspecified.
+///
+/// ELI5: the match tape points into numbered right-side drawers. We keep one
+/// product per drawer and translate drawer numbers to labels only at output;
+/// a sparse map may print drawers in any order.
 ///
 /// # Arguments
 ///

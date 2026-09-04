@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 /// Find the minimum contributing row position for each right-side label
 /// without range metadata. Null rows create labels but cannot win.
+/// Output label/position pairs are aligned, but their order is unspecified.
 pub fn min_rev_no_range_core<T: Copy + PartialOrd>(
     arr: ArrayView1<'_, T>,
     left_index: ArrayView1<'_, i64>,

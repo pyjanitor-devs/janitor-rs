@@ -10,6 +10,7 @@ use crate::aggs::{
 };
 
 /// Aggregate products for suffix ranges selected by a survivor tape.
+/// Output label/product pairs are aligned, but their order is unspecified.
 ///
 /// ELI5: every row contributes to the right-side positions from `start` to
 /// the end of `index`. The flat `matches` tape removes candidates that failed

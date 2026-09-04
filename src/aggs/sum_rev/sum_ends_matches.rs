@@ -10,6 +10,11 @@ use crate::aggs::{
 };
 
 /// Aggregate integer sums for reverse prefixes selected by a survivor tape.
+/// Output label/total pairs are aligned, but their order is unspecified.
+///
+/// ELI5: the match tape points into numbered right-side drawers. We keep one
+/// total per drawer and translate drawer numbers to labels only at output; a
+/// sparse map may print drawers in any order.
 ///
 /// `arr` must not be empty; `matches` must contain one entry per candidate
 /// position in the supplied prefix tape. Null rows and rows with zero counts

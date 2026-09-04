@@ -13,6 +13,11 @@ use crate::aggs::{
 
 #[allow(clippy::too_many_arguments)]
 /// Aggregate integer sums for reverse intervals selected by a survivor tape.
+/// Output label/total pairs are aligned, but their order is unspecified.
+///
+/// ELI5: the tape points to numbered right-side drawers. We update only the
+/// drawers whose tape entries survive, then translate drawer numbers to labels
+/// at output; sparse drawers need not be printed in ordinal order.
 ///
 /// `arr` must not be empty; `matches` must contain one entry per candidate
 /// position in the supplied interval tape. Null rows and rows with zero counts

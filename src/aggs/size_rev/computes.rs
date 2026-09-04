@@ -558,6 +558,7 @@ pub fn size_rev_start_end_core(
 /// # Returns
 ///
 /// The emitted labels and one count per touched interval position.
+/// Output label/count pairs are aligned, but their order is unspecified.
 #[pyfunction]
 pub fn compute_size_rev_start_end<'py>(
     py: Python<'py>,

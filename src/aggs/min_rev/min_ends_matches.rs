@@ -11,6 +11,7 @@ use crate::aggs::{
 
 /// Finds the row containing the minimum value for each right-side label that
 /// survives the reverse prefix-range match tape.
+/// Output label/position pairs are aligned, but their order is unspecified.
 ///
 /// # Arguments
 ///

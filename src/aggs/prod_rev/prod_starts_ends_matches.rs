@@ -13,6 +13,11 @@ use crate::aggs::{
 
 #[allow(clippy::too_many_arguments)]
 /// Aggregate products for interval ranges selected by a survivor tape.
+/// Output label/product pairs are aligned, but their order is unspecified.
+///
+/// ELI5: the tape points to numbered right-side drawers. We update only the
+/// drawers whose tape entries survive, then translate drawer numbers to labels
+/// at output; sparse drawers need not be printed in ordinal order.
 ///
 /// # Arguments
 ///

@@ -11,6 +11,11 @@ use std::collections::HashMap;
 
 /// Finds the row containing the minimum value for each right-side label that
 /// survives the reverse interval-range match tape.
+/// Output label/position pairs are aligned, but their order is unspecified.
+///
+/// ELI5: the tape points to numbered right-side drawers. We update only the
+/// drawers whose tape entries survive, then translate drawer numbers to labels
+/// at output; sparse drawers need not be printed in ordinal order.
 ///
 /// # Arguments
 ///

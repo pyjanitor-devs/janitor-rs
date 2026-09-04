@@ -10,6 +10,11 @@ use crate::aggs::{
 };
 
 /// Find the row containing the maximum value for each distinct right label.
+/// Output label/position pairs are aligned, but their order is unspecified.
+///
+/// ELI5: each ordinal gets a drawer for its best row. Dense drawers are
+/// scanned by ordinal; sparse drawers come from a map, so output order can
+/// vary while each label stays paired with its result.
 ///
 /// janitor-rs is primarily called by pyjanitor. Its conditional-join path
 /// resets the right DataFrame index to unique row labels before sorting or

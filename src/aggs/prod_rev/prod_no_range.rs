@@ -6,6 +6,7 @@ use crate::aggs::{checked_index, ensure_equal_lengths_core, ensure_nonempty_core
 use std::collections::HashMap;
 
 /// Multiply values grouped by right labels without range metadata.
+/// Output label/product pairs are aligned, but their order is unspecified.
 ///
 /// # Arguments
 ///
