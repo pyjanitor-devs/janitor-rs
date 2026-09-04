@@ -28,12 +28,12 @@ pub fn min_rev_end_match_core<T: PartialOrd + Copy>(
     matches: ArrayView1<'_, i8>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Vec<i64>, Vec<i64>), String> {
-    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
-    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
-    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("matches", matches.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut expected = 0_usize;
     let mut max_end = 0_usize;
     for end in ends.iter() {
@@ -198,4 +198,25 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_min_rev_end_match_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_min_rev_end_match_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::min_rev_end_match_core;
+    use numpy::ndarray::{array, Array1};
+
+    #[test]
+    fn empty_input_precedes_shape_mismatch() {
+        let error = min_rev_end_match_core(
+            Array1::<i64>::zeros(0).view(),
+            array![10_i64].view(),
+            array![1_i64].view(),
+            array![1_i64].view(),
+            array![1_i8].view(),
+            array![false].view(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "arr cannot be empty");
+    }
 }

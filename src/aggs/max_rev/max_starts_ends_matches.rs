@@ -30,13 +30,13 @@ pub fn max_rev_start_end_match_core<T: PartialOrd + Copy>(
     matches: ArrayView1<'_, i8>,
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("matches", matches.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "counts", counts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    ensure_nonempty_core("arr", arr.len())?;
-    ensure_nonempty_core("index", index.len())?;
-    ensure_nonempty_core("matches", matches.len())?;
 
     let mut expected = 0_usize;
     let mut min_start = index.len();

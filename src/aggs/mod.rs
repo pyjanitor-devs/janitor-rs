@@ -416,7 +416,9 @@ pub(crate) fn ensure_tape_width(expected_width: usize, matches_len: usize) -> Py
     )))
 }
 
-/// Rust-only generic empty-array check.
+/// Rust-only generic empty-array check. Reverse cores call this before their
+/// parallel-array length checks so multiply-invalid inputs have consistent,
+/// documented error precedence.
 pub(crate) fn ensure_nonempty_core(array_name: &str, array_len: usize) -> Result<(), String> {
     if array_len == 0 {
         Err(format!("{array_name} cannot be empty"))
