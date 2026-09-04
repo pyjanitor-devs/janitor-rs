@@ -2,19 +2,22 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
-use crate::aggs::sum::should_use_running_sum;
+use crate::aggs::sum::should_use_running_aggregation;
+use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
 fn prod_start_core<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut convert: F,
-) -> Array1<i64>
+) -> Result<Array1<i64>, String>
 where
     T: Copy,
     F: FnMut(T) -> i64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(starts.len());
     let end_ = arr.len();
     let mut total_width = 0_usize;
@@ -23,7 +26,7 @@ where
             total_width = total_width.saturating_add(end_.saturating_sub(start_));
         }
     }
-    if should_use_running_sum(starts.len(), total_width, end_) {
+    if should_use_running_aggregation(starts.len(), total_width, end_) {
         // ELI5: when many suffix questions together would walk the array
         // repeatedly, multiply each suffix once and answer the questions by
         // lookup. Null entries contribute the multiplicative identity `1`.
@@ -31,7 +34,7 @@ where
         for nn in (0..end_).rev() {
             suffix[nn] = suffix[nn + 1];
             if !booleans[nn] {
-                suffix[nn] *= convert(arr[nn]);
+                suffix[nn] = suffix[nn].wrapping_mul(convert(arr[nn]));
             }
         }
         for (pos, start) in starts.iter().enumerate() {
@@ -41,19 +44,19 @@ where
                 }
             }
         }
-        return result;
+        return Ok(result);
     }
     for (pos, start) in starts.iter().enumerate() {
         let mut total = 1_i64;
         let start_ = *start as usize;
         for nn in start_..end_ {
             if !booleans[nn] {
-                total *= convert(arr[nn]);
+                total = total.wrapping_mul(convert(arr[nn]));
             }
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -66,7 +69,8 @@ mod tests {
         let arr = array![2_i64, 3, 4, 5, 6, 7];
         let starts = array![0_i64, 1, 2, 3, 4, 5];
         let booleans = array![false, false, false, false, false, false];
-        let got = prod_start_core(arr.view(), starts.view(), booleans.view(), |value| value);
+        let got =
+            prod_start_core(arr.view(), starts.view(), booleans.view(), |value| value).unwrap();
         assert_eq!(got, array![5040, 2520, 840, 210, 42, 7]);
     }
 }
@@ -76,11 +80,14 @@ fn prod_start_float_core<T, F>(
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut convert: F,
-) -> Array1<f64>
+) -> Result<Array1<f64>, String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<f64>::zeros(starts.len());
     let end_ = arr.len();
     let mut total_width = 0_usize;
@@ -89,7 +96,7 @@ where
             total_width = total_width.saturating_add(end_.saturating_sub(start_));
         }
     }
-    if should_use_running_sum(starts.len(), total_width, end_) {
+    if should_use_running_aggregation(starts.len(), total_width, end_) {
         let mut suffix = vec![1.0_f64; end_ + 1];
         for nn in (0..end_).rev() {
             suffix[nn] = suffix[nn + 1];
@@ -104,7 +111,7 @@ where
                 }
             }
         }
-        return result;
+        return Ok(result);
     }
     for (pos, start) in starts.iter().enumerate() {
         let mut total = 1.0_f64;
@@ -116,7 +123,7 @@ where
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
 macro_rules! generic_compute {
@@ -130,19 +137,15 @@ macro_rules! generic_compute {
         ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = prod_start_core(
                 arr.as_array(),
                 starts.as_array(),
                 booleans.as_array(),
                 |value| value as i64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
@@ -158,19 +161,15 @@ macro_rules! generic_compute_floats {
         ) -> PyResult<Bound<'py, PyArray1<f64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = prod_start_float_core(
                 arr.as_array(),
                 starts.as_array(),
                 booleans.as_array(),
                 |value| value as f64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }

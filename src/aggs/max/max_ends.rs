@@ -3,8 +3,8 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::checked_range;
-use crate::aggs::ensure_equal_lengths;
-use crate::aggs::sum::should_use_running_sum;
+use crate::aggs::sum::should_use_running_aggregation;
+use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `ends[i]`, find the position (not the value) of the largest
 /// element in `arr[..ends[i]]`, skipping positions flagged `true` in
@@ -19,7 +19,10 @@ pub fn max_end_core<T: PartialOrd + Copy>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
-) -> Array1<i64> {
+) -> Result<Array1<i64>, String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::from_elem(ends.len(), -1);
 
     let mut total_width = 0_usize;
@@ -28,7 +31,7 @@ pub fn max_end_core<T: PartialOrd + Copy>(
             total_width = total_width.saturating_add(end_);
         }
     }
-    if should_use_running_sum(ends.len(), total_width, arr.len()) {
+    if should_use_running_aggregation(ends.len(), total_width, arr.len()) {
         let mut prefix = vec![-1_i64; arr.len()];
         let mut winner = -1_i64;
         for nn in 0..arr.len() {
@@ -42,7 +45,7 @@ pub fn max_end_core<T: PartialOrd + Copy>(
                 result[pos] = prefix[end_ - 1];
             }
         }
-        return result;
+        return Ok(result);
     }
 
     for (pos, end) in ends.indexed_iter() {
@@ -67,7 +70,7 @@ pub fn max_end_core<T: PartialOrd + Copy>(
         }
         result[pos] = base;
     }
-    result
+    Ok(result)
 }
 
 macro_rules! generic_compute {
@@ -81,14 +84,10 @@ macro_rules! generic_compute {
         ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = max_end_core(arr.as_array(), ends.as_array(), booleans.as_array());
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
@@ -134,7 +133,7 @@ mod tests {
         let ends = array![0_i64];
         let booleans: Array1<bool> = array![];
         let got = max_end_core(arr.view(), ends.view(), booleans.view());
-        assert_eq!(got, array![-1]);
+        assert_eq!(got, Err("arr cannot be empty".to_string()));
     }
 
     #[test]
@@ -142,7 +141,7 @@ mod tests {
         let arr = array![3_i64, 1, 9, 2, 5];
         let ends = array![3_i64]; // prefix [3, 1, 9]
         let booleans = array![false, false, false, false, false];
-        let got = max_end_core(arr.view(), ends.view(), booleans.view());
+        let got = max_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![2]); // position of value 9
     }
 
@@ -151,7 +150,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let ends = array![0_i64];
         let booleans = array![false, false, false];
-        let got = max_end_core(arr.view(), ends.view(), booleans.view());
+        let got = max_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![-1]);
     }
 
@@ -160,7 +159,7 @@ mod tests {
         let arr = array![3_i64, 2, 1];
         let ends = array![3_i64];
         let booleans = array![true, false, false]; // largest (3) is null
-        let got = max_end_core(arr.view(), ends.view(), booleans.view());
+        let got = max_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![1]); // position of value 2
     }
 
@@ -169,7 +168,7 @@ mod tests {
         let arr = array![5_i64, 1, 4, 2, 3, 0];
         let ends = array![1_i64, 2, 3, 4, 5, 6];
         let booleans = array![false, false, false, false, false, false];
-        let got = max_end_core(arr.view(), ends.view(), booleans.view());
+        let got = max_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0, 0, 0, 0, 0, 0]);
     }
 }

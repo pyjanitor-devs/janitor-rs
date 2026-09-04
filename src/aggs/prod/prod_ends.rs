@@ -2,19 +2,22 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
-use crate::aggs::sum::should_use_running_sum;
+use crate::aggs::sum::should_use_running_aggregation;
+use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
 fn prod_end_core<T, F>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut convert: F,
-) -> Array1<i64>
+) -> Result<Array1<i64>, String>
 where
     T: Copy,
     F: FnMut(T) -> i64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(ends.len());
     let mut total_width = 0_usize;
     for end in ends.iter() {
@@ -22,7 +25,7 @@ where
             total_width = total_width.saturating_add(end_.min(arr.len()));
         }
     }
-    if should_use_running_sum(ends.len(), total_width, arr.len()) {
+    if should_use_running_aggregation(ends.len(), total_width, arr.len()) {
         // ELI5: when many prefix questions together would walk the array
         // repeatedly, multiply each prefix once and answer the questions by
         // lookup. Null entries contribute the multiplicative identity `1`.
@@ -30,7 +33,7 @@ where
         for nn in 0..arr.len() {
             prefix[nn + 1] = prefix[nn];
             if !booleans[nn] {
-                prefix[nn + 1] *= convert(arr[nn]);
+                prefix[nn + 1] = prefix[nn + 1].wrapping_mul(convert(arr[nn]));
             }
         }
         for (pos, end) in ends.iter().enumerate() {
@@ -40,19 +43,19 @@ where
                 }
             }
         }
-        return result;
+        return Ok(result);
     }
     for (pos, end) in ends.iter().enumerate() {
         let mut total = 1_i64;
         let end_ = *end as usize;
         for nn in 0..end_ {
             if !booleans[nn] {
-                total *= convert(arr[nn]);
+                total = total.wrapping_mul(convert(arr[nn]));
             }
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -65,7 +68,7 @@ mod tests {
         let arr = array![2_i64, 3, 4, 5, 6, 7];
         let ends = array![1_i64, 2, 3, 4, 5, 6];
         let booleans = array![false, false, false, false, false, false];
-        let got = prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value);
+        let got = prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
         assert_eq!(got, array![2, 6, 24, 120, 720, 5040]);
     }
 }
@@ -75,11 +78,14 @@ fn prod_end_float_core<T, F>(
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut convert: F,
-) -> Array1<f64>
+) -> Result<Array1<f64>, String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<f64>::zeros(ends.len());
     let mut total_width = 0_usize;
     for end in ends.iter() {
@@ -87,7 +93,7 @@ where
             total_width = total_width.saturating_add(end_.min(arr.len()));
         }
     }
-    if should_use_running_sum(ends.len(), total_width, arr.len()) {
+    if should_use_running_aggregation(ends.len(), total_width, arr.len()) {
         let mut prefix = vec![1.0_f64; arr.len() + 1];
         for nn in 0..arr.len() {
             prefix[nn + 1] = prefix[nn];
@@ -102,7 +108,7 @@ where
                 }
             }
         }
-        return result;
+        return Ok(result);
     }
     for (pos, end) in ends.iter().enumerate() {
         let mut total = 1.0_f64;
@@ -114,7 +120,7 @@ where
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
 macro_rules! generic_compute {
@@ -128,19 +134,15 @@ macro_rules! generic_compute {
         ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = prod_end_core(
                 arr.as_array(),
                 ends.as_array(),
                 booleans.as_array(),
                 |value| value as i64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
@@ -156,19 +158,15 @@ macro_rules! generic_compute_floats {
         ) -> PyResult<Bound<'py, PyArray1<f64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = prod_end_float_core(
                 arr.as_array(),
                 ends.as_array(),
                 booleans.as_array(),
                 |value| value as f64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }

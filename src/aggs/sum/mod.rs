@@ -26,7 +26,7 @@ const RUNNING_SUM_WORK_FACTOR: usize = 3;
 ///
 /// The query-count guard avoids paying for a prepass and buffer for a handful
 /// of queries. The work comparison is conservative and overflow-safe.
-pub(crate) fn should_use_running_sum(
+pub(crate) fn should_use_running_aggregation(
     query_count: usize,
     total_width: usize,
     array_len: usize,
@@ -54,22 +54,22 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::should_use_running_sum;
+    use super::should_use_running_aggregation;
 
     #[test]
     fn prefix_sum_cutoff_avoids_small_query_batches() {
-        assert!(!should_use_running_sum(3, usize::MAX, 10));
+        assert!(!should_use_running_aggregation(3, usize::MAX, 10));
     }
 
     #[test]
     fn prefix_sum_cutoff_requires_more_than_three_scans() {
-        assert!(!should_use_running_sum(4, 30, 10));
-        assert!(should_use_running_sum(4, 31, 10));
+        assert!(!should_use_running_aggregation(4, 30, 10));
+        assert!(should_use_running_aggregation(4, 31, 10));
     }
 
     #[test]
     fn prefix_sum_cutoff_is_overflow_safe() {
-        assert!(!should_use_running_sum(4, usize::MAX, usize::MAX));
-        assert!(should_use_running_sum(4, usize::MAX, 1));
+        assert!(!should_use_running_aggregation(4, usize::MAX, usize::MAX));
+        assert!(should_use_running_aggregation(4, usize::MAX, 1));
     }
 }

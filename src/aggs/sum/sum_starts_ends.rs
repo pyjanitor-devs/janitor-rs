@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use super::should_use_running_sum;
+use super::should_use_running_aggregation;
 use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `(starts[i], ends[i])`, sum `arr[starts[i]..ends[i]]`,
@@ -52,7 +52,7 @@ where
             total_width = total_width.saturating_add(end_ - start_);
         }
     }
-    let use_prefix = should_use_running_sum(starts.len(), total_width, arr.len());
+    let use_prefix = should_use_running_aggregation(starts.len(), total_width, arr.len());
 
     if use_prefix {
         // ELI5: one running prefix total turns every valid interval into two

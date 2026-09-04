@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use super::should_use_running_sum;
+use super::should_use_running_aggregation;
 use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
 fn is_empty_sentinel_end(end: i64) -> bool {
@@ -62,7 +62,7 @@ where
         .iter()
         .all(|end| *end == -1 || usize::try_from(*end).is_ok_and(|end_| end_ <= arr.len()));
     let use_prefix =
-        all_ranges_are_safe && should_use_running_sum(ends.len(), total_width, arr.len());
+        all_ranges_are_safe && should_use_running_aggregation(ends.len(), total_width, arr.len());
 
     if use_prefix {
         // ELI5: write the running prefix total once, then answer every

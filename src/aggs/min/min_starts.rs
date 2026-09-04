@@ -3,8 +3,8 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::checked_index;
-use crate::aggs::ensure_equal_lengths;
-use crate::aggs::sum::should_use_running_sum;
+use crate::aggs::sum::should_use_running_aggregation;
+use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `starts[i]`, find the position (not the value) of the
 /// smallest element in `arr[starts[i]..]`, skipping positions flagged
@@ -21,7 +21,10 @@ pub fn min_start_core<T: PartialOrd + Copy>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
-) -> Array1<i64> {
+) -> Result<Array1<i64>, String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::from_elem(starts.len(), -1);
     let end_ = arr.len();
 
@@ -31,7 +34,7 @@ pub fn min_start_core<T: PartialOrd + Copy>(
             total_width = total_width.saturating_add(end_.saturating_sub(start_));
         }
     }
-    if should_use_running_sum(starts.len(), total_width, end_) {
+    if should_use_running_aggregation(starts.len(), total_width, end_) {
         let mut suffix = vec![-1_i64; end_];
         let mut winner = -1_i64;
         for nn in (0..end_).rev() {
@@ -45,7 +48,7 @@ pub fn min_start_core<T: PartialOrd + Copy>(
                 result[pos] = suffix[start_];
             }
         }
-        return result;
+        return Ok(result);
     }
 
     for (pos, start) in starts.indexed_iter() {
@@ -70,7 +73,7 @@ pub fn min_start_core<T: PartialOrd + Copy>(
         }
         result[pos] = base;
     }
-    result
+    Ok(result)
 }
 
 macro_rules! generic_compute {
@@ -84,14 +87,10 @@ macro_rules! generic_compute {
         ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = min_start_core(arr.as_array(), starts.as_array(), booleans.as_array());
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
@@ -137,7 +136,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let starts = array![3_i64]; // == arr.len()
         let booleans = array![false, false, false];
-        let got = min_start_core(arr.view(), starts.view(), booleans.view());
+        let got = min_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![-1]);
     }
 
@@ -146,7 +145,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let starts = array![-1_i64];
         let booleans = array![false, false, false];
-        let got = min_start_core(arr.view(), starts.view(), booleans.view());
+        let got = min_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![-1]);
     }
 
@@ -155,7 +154,7 @@ mod tests {
         let arr = array![5_i64, 1, 4, 2, 3];
         let starts = array![1_i64]; // suffix [1, 4, 2, 3]
         let booleans = array![false, false, false, false, false];
-        let got = min_start_core(arr.view(), starts.view(), booleans.view());
+        let got = min_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![1]); // position of value 1
     }
 
@@ -164,7 +163,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let starts = array![0_i64];
         let booleans = array![true, false, false]; // smallest (1) is null
-        let got = min_start_core(arr.view(), starts.view(), booleans.view());
+        let got = min_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![1]); // position of value 2
     }
 
@@ -173,7 +172,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let starts = array![0_i64];
         let booleans = array![true, true, true];
-        let got = min_start_core(arr.view(), starts.view(), booleans.view());
+        let got = min_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![-1]);
     }
 
@@ -182,7 +181,7 @@ mod tests {
         let arr = array![5_i64, 1, 4, 2, 3, 0];
         let starts = array![0_i64, 1, 2, 3, 4, 5];
         let booleans = array![false, false, false, false, false, false];
-        let got = min_start_core(arr.view(), starts.view(), booleans.view());
+        let got = min_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![5, 5, 5, 5, 5, 5]);
     }
 }

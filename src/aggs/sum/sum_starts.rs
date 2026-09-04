@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use super::should_use_running_sum;
+use super::should_use_running_aggregation;
 use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `starts[i]`, sum `arr[starts[i]..]` (to the end of the array),
@@ -67,7 +67,7 @@ where
             total_width = total_width.saturating_add(end_.saturating_sub(start_));
         }
     }
-    let use_suffix = should_use_running_sum(starts.len(), total_width, end_);
+    let use_suffix = should_use_running_aggregation(starts.len(), total_width, end_);
 
     if use_suffix {
         // `suffix[nn]` is the wrapped sum of all non-null values from `nn`
