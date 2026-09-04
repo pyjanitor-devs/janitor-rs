@@ -16,7 +16,8 @@ use std::collections::{hash_map::Entry, HashMap};
 /// ELI5: `positions` already gives us a validated ordinal into `index`, so the
 /// HashMap can use that ordinal directly. We only look up the original label
 /// while emitting the result; a null row can create state but cannot win. The
-/// returned label/state pairs follow HashMap iteration order.
+/// Returned label/state pairs are aligned, but their ordering is unspecified
+/// and follows HashMap iteration order in sparse mode.
 ///
 /// # Arguments
 ///

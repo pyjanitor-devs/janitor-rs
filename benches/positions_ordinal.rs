@@ -411,16 +411,19 @@ fn bench(c: &mut Criterion) {
                     &fixture,
                     |b, f| {
                         b.iter(|| {
-                            black_box(sum_positions_float_core_with_storage(
-                                black_box(f.arr_float.view()),
-                                black_box(f.starts.view()),
-                                black_box(f.ends.view()),
-                                black_box(f.index.view()),
-                                black_box(f.positions.view()),
-                                black_box(f.booleans.view()),
-                                |value| value,
-                                dense,
-                            ))
+                            black_box(
+                                sum_positions_float_core_with_storage(
+                                    black_box(f.arr_float.view()),
+                                    black_box(f.starts.view()),
+                                    black_box(f.ends.view()),
+                                    black_box(f.index.view()),
+                                    black_box(f.positions.view()),
+                                    black_box(f.booleans.view()),
+                                    |value| value,
+                                    dense,
+                                )
+                                .unwrap(),
+                            )
                         })
                     },
                 );
@@ -454,16 +457,19 @@ fn bench(c: &mut Criterion) {
                     &fixture,
                     |b, f| {
                         b.iter(|| {
-                            black_box(prod_positions_float_core_with_storage(
-                                black_box(f.arr_float.view()),
-                                black_box(f.starts.view()),
-                                black_box(f.ends.view()),
-                                black_box(f.index.view()),
-                                black_box(f.positions.view()),
-                                black_box(f.booleans.view()),
-                                |value| value,
-                                dense,
-                            ))
+                            black_box(
+                                prod_positions_float_core_with_storage(
+                                    black_box(f.arr_float.view()),
+                                    black_box(f.starts.view()),
+                                    black_box(f.ends.view()),
+                                    black_box(f.index.view()),
+                                    black_box(f.positions.view()),
+                                    black_box(f.booleans.view()),
+                                    |value| value,
+                                    dense,
+                                )
+                                .unwrap(),
+                            )
                         })
                     },
                 );
@@ -475,13 +481,16 @@ fn bench(c: &mut Criterion) {
                     &fixture,
                     |b, f| {
                         b.iter(|| {
-                            black_box(size_positions_core_with_storage(
-                                black_box(f.starts.view()),
-                                black_box(f.ends.view()),
-                                black_box(f.index.view()),
-                                black_box(f.positions.view()),
-                                dense,
-                            ))
+                            black_box(
+                                size_positions_core_with_storage(
+                                    black_box(f.starts.view()),
+                                    black_box(f.ends.view()),
+                                    black_box(f.index.view()),
+                                    black_box(f.positions.view()),
+                                    dense,
+                                )
+                                .unwrap(),
+                            )
                         })
                     },
                 );

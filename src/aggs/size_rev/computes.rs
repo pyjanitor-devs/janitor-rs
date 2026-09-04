@@ -757,7 +757,8 @@ mod tests {
 ///
 /// The labels reached through `positions` and their coverage counts. `starts`,
 /// `ends`, `index`, and `positions` must not be empty; `starts` and `ends` must
-/// have equal lengths. Returned label/count pairs are aligned but unordered.
+/// have equal lengths. Returned label/count pairs are aligned, but their
+/// ordering is unspecified and follows HashMap iteration order in sparse mode.
 pub fn size_positions_core(
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
@@ -770,7 +771,7 @@ pub fn size_positions_core(
     ensure_nonempty_core("positions", positions.len())?;
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
     let dense = should_use_dense_match_storage(index.len(), positions.len());
-    Ok(size_positions_core_with_storage(
+    Ok(size_positions_core_with_storage_unchecked(
         starts, ends, index, positions, dense,
     ))
 }
@@ -787,6 +788,23 @@ pub fn size_positions_core(
 /// * `positions` - Candidate tape of ordinals into `index`; must not be empty.
 /// * `dense` - Selects vector storage when true and HashMap storage when false.
 pub fn size_positions_core_with_storage(
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    dense: bool,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
+    Ok(size_positions_core_with_storage_unchecked(
+        starts, ends, index, positions, dense,
+    ))
+}
+
+fn size_positions_core_with_storage_unchecked(
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
     index: ArrayView1<'_, i64>,

@@ -177,6 +177,7 @@ pub mod bench_support {
             |value| value,
             dense,
         )
+        .expect("benchmark inputs satisfy positions validation")
     }
 
     pub fn sum_positions_i64(
@@ -218,6 +219,7 @@ pub mod bench_support {
             |value| value,
             dense,
         )
+        .expect("benchmark inputs satisfy positions validation")
     }
 
     /// Build the fully registered Python module for wrapper benchmarks.

@@ -15,7 +15,9 @@ use std::collections::{hash_map::Entry, HashMap};
 ///
 /// ELI5: `positions` already gives us a validated ordinal into `index`, so the
 /// HashMap can use that ordinal directly. We only look up the original label
-/// while emitting the result. Integer totals use wrapping arithmetic, so overflow has the same
+/// while emitting the result. Returned label/total pairs are aligned, but their
+/// ordering is unspecified and follows HashMap iteration order in sparse mode.
+/// Integer totals use wrapping arithmetic, so overflow has the same
 /// deterministic result in debug and release builds. `A` is the accumulator
 /// type: every integer dtype instantiates this with `A = i64`, except
 /// `uint64`, which instantiates it with `A = u64` so values `>= 2**63`
@@ -54,7 +56,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let dense = should_use_dense_match_storage(index.len(), positions.len());
-    Ok(sum_positions_int_core_with_storage(
+    Ok(sum_positions_int_core_with_storage_unchecked(
         arr, starts, ends, index, positions, booleans, to_acc, dense,
     ))
 }
@@ -68,6 +70,35 @@ where
 /// HashMap storage when false.
 #[allow(clippy::too_many_arguments)]
 pub fn sum_positions_int_core_with_storage<T, A, F>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    to_acc: F,
+    dense: bool,
+) -> Result<(Vec<i64>, Vec<A>), String>
+where
+    T: Copy,
+    A: WrapAdd,
+    F: Fn(T) -> A,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    Ok(sum_positions_int_core_with_storage_unchecked(
+        arr, starts, ends, index, positions, booleans, to_acc, dense,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sum_positions_int_core_with_storage_unchecked<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
@@ -203,7 +234,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let dense = should_use_dense_match_storage(index.len(), positions.len());
-    Ok(sum_positions_float_core_with_storage(
+    Ok(sum_positions_float_core_with_storage_unchecked(
         arr, starts, ends, index, positions, booleans, to_f64, dense,
     ))
 }
@@ -217,6 +248,34 @@ where
 /// HashMap storage when false.
 #[allow(clippy::too_many_arguments)]
 pub fn sum_positions_float_core_with_storage<T, F>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    to_f64: F,
+    dense: bool,
+) -> Result<(Vec<i64>, Vec<f64>), String>
+where
+    T: Copy,
+    F: Fn(T) -> f64,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    Ok(sum_positions_float_core_with_storage_unchecked(
+        arr, starts, ends, index, positions, booleans, to_f64, dense,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sum_positions_float_core_with_storage_unchecked<T, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
@@ -550,7 +609,8 @@ mod tests {
                 booleans.view(),
                 |value| value,
                 dense,
-            );
+            )
+            .unwrap();
             assert_eq!(labels, vec![7]);
             assert_eq!(totals, vec![0.0]);
         }

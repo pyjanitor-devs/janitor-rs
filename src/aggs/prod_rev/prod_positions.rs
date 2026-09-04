@@ -14,8 +14,9 @@ use std::collections::{hash_map::Entry, HashMap};
 /// pyjanitor producer for this path.
 ///
 /// ELI5: the HashMap is keyed directly by each validated ordinal. New labels
-/// start at the multiplicative identity 1, and pairs are emitted in HashMap
-/// iteration order.
+/// start at the multiplicative identity 1. Returned label/product pairs are
+/// aligned, but their ordering is unspecified and follows HashMap iteration
+/// order in sparse mode.
 /// Integer products use wrapping arithmetic, so overflow has the same
 /// deterministic result in debug and release builds. `A` is the accumulator
 /// type: every integer dtype instantiates this with `A = i64`, except
@@ -54,7 +55,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let dense = should_use_dense_match_storage(index.len(), positions.len());
-    Ok(prod_positions_int_core_with_storage(
+    Ok(prod_positions_int_core_with_storage_unchecked(
         arr, starts, ends, index, positions, booleans, to_value, dense,
     ))
 }
@@ -68,6 +69,35 @@ where
 /// HashMap storage when false.
 #[allow(clippy::too_many_arguments)]
 pub fn prod_positions_int_core_with_storage<T, A, F>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    to_value: F,
+    dense: bool,
+) -> Result<(Vec<i64>, Vec<A>), String>
+where
+    T: Copy,
+    A: WrapMul,
+    F: Fn(T) -> A,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    Ok(prod_positions_int_core_with_storage_unchecked(
+        arr, starts, ends, index, positions, booleans, to_value, dense,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prod_positions_int_core_with_storage_unchecked<T, A, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
@@ -193,7 +223,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let dense = should_use_dense_match_storage(index.len(), positions.len());
-    Ok(prod_positions_float_core_with_storage(
+    Ok(prod_positions_float_core_with_storage_unchecked(
         arr, starts, ends, index, positions, booleans, to_value, dense,
     ))
 }
@@ -207,6 +237,34 @@ where
 /// HashMap storage when false.
 #[allow(clippy::too_many_arguments)]
 pub fn prod_positions_float_core_with_storage<T, F>(
+    arr: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    index: ArrayView1<'_, i64>,
+    positions: ArrayView1<'_, i64>,
+    booleans: ArrayView1<'_, bool>,
+    to_value: F,
+    dense: bool,
+) -> Result<(Vec<i64>, Vec<f64>), String>
+where
+    T: Copy,
+    F: Fn(T) -> f64,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_nonempty_core("index", index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    Ok(prod_positions_float_core_with_storage_unchecked(
+        arr, starts, ends, index, positions, booleans, to_value, dense,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prod_positions_float_core_with_storage_unchecked<T, F>(
     arr: ArrayView1<'_, T>,
     starts: ArrayView1<'_, i64>,
     ends: ArrayView1<'_, i64>,
