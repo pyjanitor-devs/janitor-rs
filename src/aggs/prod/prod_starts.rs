@@ -21,7 +21,7 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// * `arr` - Values to multiply.
 /// * `starts` - Inclusive suffix boundaries.
 /// * `booleans` - Null mask aligned with `arr`.
-fn prod_start_core<T, F>(
+pub fn prod_start_core<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
@@ -103,7 +103,7 @@ mod tests {
 /// * `arr` - Values to multiply.
 /// * `starts` - Inclusive suffix boundaries.
 /// * `booleans` - Null mask aligned with `arr`.
-fn prod_start_float_core<T, F>(
+pub fn prod_start_float_core<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,

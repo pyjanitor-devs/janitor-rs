@@ -105,7 +105,7 @@ where
     Ok(result)
 }
 
-fn sum_end_float_core_with_cast<T, F>(
+pub fn sum_end_float_core_with_cast<T, F>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,

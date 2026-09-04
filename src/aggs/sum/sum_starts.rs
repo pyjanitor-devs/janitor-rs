@@ -161,7 +161,7 @@ macro_rules! generic_compute {
     };
 }
 
-fn sum_start_float_core_with_cast<T, F>(
+pub fn sum_start_float_core_with_cast<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
