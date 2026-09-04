@@ -46,6 +46,8 @@ where
     F: Fn(T) -> A,
 {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
     ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("positions", positions.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
@@ -179,6 +181,8 @@ where
     F: Fn(T) -> f64,
 {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
     ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("positions", positions.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;

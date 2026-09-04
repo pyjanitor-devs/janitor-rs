@@ -26,6 +26,8 @@ pub fn max_positions_core<T: PartialOrd + Copy>(
     booleans: ArrayView1<'_, bool>,
 ) -> Result<(Vec<i64>, Vec<i64>), String> {
     ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
     ensure_nonempty_core("index", index.len())?;
     ensure_nonempty_core("positions", positions.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "starts", starts.len())?;
