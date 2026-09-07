@@ -260,6 +260,9 @@ macro_rules! compute_ints {
         /// The accumulator type `$acc` is `i64` for every dtype except
         /// `uint64`, which uses `u64` so values `>= 2**63` don't get
         /// sign-flipped by a forced `i64` cast (issue #90's bug class).
+        ///
+        /// Output label/total pairs are aligned, but their order is
+        /// unspecified.
         #[allow(clippy::too_many_arguments)]
         #[pyfunction]
         pub fn $fname<'py>(
@@ -310,6 +313,9 @@ macro_rules! compute_floats {
         /// scan the tape to enforce that value-level contract. Normally
         /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
         /// full candidate-tape width.
+        ///
+        /// Output label/total pairs are aligned, but their order is
+        /// unspecified.
         #[allow(clippy::too_many_arguments)]
         #[pyfunction]
         pub fn $fname<'py>(

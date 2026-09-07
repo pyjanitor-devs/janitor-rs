@@ -222,6 +222,9 @@ macro_rules! compute_ints {
         /// * `counts` - Number of surviving candidates for each row.
         /// * `matches` - Flat match mask with the exact candidate-tape width.
         /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
+        ///
+        /// Output label/product pairs are aligned, but their order is
+        /// unspecified.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -273,6 +276,9 @@ macro_rules! compute_floats {
         /// * `counts` - Number of surviving candidates for each row.
         /// * `matches` - Flat match mask with the exact candidate-tape width.
         /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
+        ///
+        /// Output label/product pairs are aligned, but their order is
+        /// unspecified.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

@@ -107,6 +107,9 @@ macro_rules! compute_ints {
         ///
         /// Null rows do not participate; untouched products remain `1`.
         ///
+        /// Labels and products are emitted in ordinal order and remain
+        /// positionally aligned.
+        ///
         /// # Arguments
         ///
         /// * `arr` - Left-side values to aggregate; must not be empty.
@@ -142,6 +145,9 @@ macro_rules! compute_floats {
         /// suffix ranges.
         ///
         /// Null rows do not participate; untouched products remain `1.0`.
+        ///
+        /// Labels and products are emitted in ordinal order and remain
+        /// positionally aligned.
         ///
         /// # Arguments
         ///

@@ -246,6 +246,10 @@ macro_rules! compute_ints {
         /// Finds products for each right-side label covered by reverse interval
         /// ranges.
         ///
+        /// Output label/product pairs are aligned, but their order is
+        /// unspecified. Dense storage may emit ordinal order; sparse storage
+        /// may emit HashMap iteration order.
+        ///
         /// # Arguments
         ///
         /// * `arr` - Left-side values to aggregate; must not be empty.
@@ -286,6 +290,10 @@ macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
         /// Finds floating-point products for each right-side label covered by
         /// reverse interval ranges.
+        ///
+        /// Output label/product pairs are aligned, but their order is
+        /// unspecified. Dense storage may emit ordinal order; sparse storage
+        /// may emit HashMap iteration order.
         ///
         /// # Arguments
         ///

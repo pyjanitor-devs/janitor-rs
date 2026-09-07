@@ -98,6 +98,9 @@ macro_rules! compute_ints {
         /// Finds the product for each right-side label covered by the reverse
         /// prefix ranges.
         ///
+        /// Labels and products are emitted in ordinal order and remain
+        /// positionally aligned.
+        ///
         /// # Arguments
         ///
         /// * `arr` - Left-side values to aggregate; must not be empty.
@@ -131,6 +134,9 @@ macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
         /// Finds the product for each right-side label covered by the reverse
         /// prefix ranges.
+        ///
+        /// Labels and products are emitted in ordinal order and remain
+        /// positionally aligned.
         ///
         /// # Arguments
         ///

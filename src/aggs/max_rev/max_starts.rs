@@ -70,6 +70,9 @@ macro_rules! compute {
         /// maximum. The returned positions use `-1` when no non-null row
         /// covers a label.
         ///
+        /// Labels and positions are emitted in ordinal order and remain
+        /// positionally aligned.
+        ///
         /// # Arguments
         ///
         /// * `arr` - Left-side values to aggregate; must not be empty.

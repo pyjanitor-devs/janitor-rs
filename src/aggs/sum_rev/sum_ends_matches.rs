@@ -223,6 +223,9 @@ macro_rules! compute_ints {
         /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
         /// full candidate-tape width.
         ///
+        /// Output label/total pairs are aligned, but their order is
+        /// unspecified.
+        ///
         /// The accumulator type `$acc` is `i64` for every dtype except
         /// `uint64`, which uses `u64` so values `>= 2**63` don't get
         /// sign-flipped by a forced `i64` cast (issue #90's bug class).
@@ -273,6 +276,9 @@ macro_rules! compute_floats {
         /// scan the tape to enforce that value-level contract. Normally
         /// `counts_array.sum() == matches.sum()`, while `matches.len()` is the
         /// full candidate-tape width.
+        ///
+        /// Output label/total pairs are aligned, but their order is
+        /// unspecified.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

@@ -218,6 +218,9 @@ macro_rules! compute_ints {
         /// * `index` - Right-side labels in ordinal position order.
         /// * `matches` - Flat match mask with the exact candidate-tape width.
         /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
+        ///
+        /// Output label/product pairs are aligned, but their order is
+        /// unspecified.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -265,6 +268,9 @@ macro_rules! compute_floats {
         /// * `index` - Right-side labels in ordinal position order.
         /// * `matches` - Flat match mask with the exact candidate-tape width.
         /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
+        ///
+        /// Output label/product pairs are aligned, but their order is
+        /// unspecified.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
