@@ -71,7 +71,7 @@ pub fn min_start_end_core<T: PartialOrd + Copy>(
                 }
                 if right % 2 == 1 {
                     right -= 1;
-                    best = min_node(values[right], positions[right], best.0, best.1);
+                    best = min_node(best.0, best.1, values[right], positions[right]);
                 }
                 left /= 2;
                 right /= 2;
@@ -260,5 +260,16 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "arr cannot be empty");
+    }
+
+    #[test]
+    fn segment_tree_keeps_earliest_position_for_minimum_ties() {
+        let arr = array![4_i64, 1, 1, 1, 1, 1, 1, 4];
+        let starts = array![1_i64, 1, 1, 1];
+        let ends = array![7_i64, 7, 7, 7];
+        let booleans = Array1::from_elem(8, false);
+        let got =
+            min_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![1, 1, 1, 1]);
     }
 }
