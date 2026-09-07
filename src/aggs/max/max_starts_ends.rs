@@ -15,6 +15,10 @@ use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core
 /// ELI5 (the guard): same reasoning as `max_start_core` -- `max` needs a
 /// real array element to seed its comparison, so the range must be
 /// checked *before* that seed read, not after. See issue #27.
+///
+/// Input contract: `arr`, `starts`, and `ends` must be non-empty, and
+/// `starts` and `ends` must have equal lengths. The Python wrapper raises
+/// `ValueError` when this contract is violated.
 pub fn max_start_end_core<T: PartialOrd + Copy>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -128,6 +132,9 @@ fn max_node<T: PartialOrd + Copy>(
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
+        /// Finds the position of the largest value in each half-open
+        /// `arr[start..end]` range. `arr`, `starts`, and `ends` must be
+        /// non-empty; invalid ranges return `-1`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -265,6 +272,24 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "arr cannot be empty");
+
+        let error = max_start_end_core(
+            arr.view(),
+            Array1::<i64>::zeros(0).view(),
+            ends_short.view(),
+            booleans.view(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "starts cannot be empty");
+
+        let error = max_start_end_core(
+            arr.view(),
+            starts.view(),
+            Array1::<i64>::zeros(0).view(),
+            booleans.view(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "ends cannot be empty");
     }
 
     #[test]

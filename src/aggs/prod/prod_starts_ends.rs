@@ -11,6 +11,10 @@ use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core
 /// broad, overlapping slices, the local segment tree stores each block's
 /// product once and combines only the blocks covering a query. Null values
 /// contribute the multiplicative identity, `1`.
+///
+/// Input contract: `arr`, `starts`, and `ends` must be non-empty, and
+/// `starts` and `ends` must have equal lengths. The Python wrapper raises
+/// `ValueError` when this contract is violated.
 pub fn prod_start_end_core<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -125,6 +129,9 @@ where
 
 macro_rules! generic_compute_ints {
     ($fname:ident, $type:ty) => {
+        /// Computes products for each half-open `arr[start..end]` range.
+        /// `arr`, `starts`, and `ends` must be non-empty; invalid ranges
+        /// return the multiplicative identity, `1`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -149,6 +156,9 @@ macro_rules! generic_compute_ints {
 
 macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Computes floating-point products for each half-open range.
+        /// `arr`, `starts`, and `ends` must be non-empty; invalid ranges
+        /// return the multiplicative identity, `1.0`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

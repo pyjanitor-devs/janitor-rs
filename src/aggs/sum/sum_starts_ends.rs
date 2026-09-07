@@ -25,6 +25,10 @@ use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core
 /// * `starts` - Inclusive range boundaries.
 /// * `ends` - Exclusive range boundaries paired with `starts`.
 /// * `booleans` - Null mask aligned with `arr`.
+///
+/// `arr`, `starts`, and `ends` must be non-empty, and `starts` and `ends`
+/// must have equal lengths. The Python wrapper raises `ValueError` when this
+/// contract is violated.
 pub fn sum_start_end_core(
     arr: ArrayView1<i64>,
     starts: ArrayView1<i64>,
@@ -146,6 +150,9 @@ macro_rules! generic_compute_ints {
         /// * `starts` - Inclusive range boundaries.
         /// * `ends` - Exclusive range boundaries paired with `starts`.
         /// * `booleans` - Null mask aligned with `arr`.
+        ///
+        /// `arr`, `starts`, and `ends` must be non-empty. Invalid ranges
+        /// produce zero.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -177,6 +184,7 @@ macro_rules! generic_compute_floats {
         /// Sum floating-point non-null values in each half-open range.
         /// `starts` and `ends` are parallel boundaries; `booleans` marks
         /// null values to skip. Invalid ranges return zero.
+        /// `arr`, `starts`, and `ends` must be non-empty.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
