@@ -28,7 +28,7 @@ where
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    let mut result = Array1::<i64>::zeros(ends.len());
+    let mut result = Array1::<i64>::from_elem(ends.len(), 1);
     let mut total_width = 0_usize;
     for end in ends.iter() {
         if let Ok(end_) = usize::try_from(*end) {
@@ -81,6 +81,15 @@ mod tests {
         let got = prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
         assert_eq!(got, array![2, 6, 24, 120, 720, 5040]);
     }
+
+    #[test]
+    fn invalid_adaptive_prefixes_keep_product_identity() {
+        let arr = array![2_i64, 3, 4];
+        let ends = array![-1_i64, 3, 3, 3, 3];
+        let booleans = array![false, false, false];
+        let got = prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
+        assert_eq!(got, array![1, 24, 24, 24, 24]);
+    }
 }
 
 /// Computes floating-point products for prefix queries described by `ends`.
@@ -106,7 +115,7 @@ where
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    let mut result = Array1::<f64>::zeros(ends.len());
+    let mut result = Array1::<f64>::from_elem(ends.len(), 1.0);
     let mut total_width = 0_usize;
     for end in ends.iter() {
         if let Ok(end_) = usize::try_from(*end) {

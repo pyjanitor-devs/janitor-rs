@@ -114,10 +114,16 @@ fn min_node<T: PartialOrd + Copy>(
 ) -> (T, i64) {
     if left_position == -1 {
         (right_value, right_position)
-    } else if right_position == -1 || right_value.partial_cmp(&left_value) != Some(Ordering::Less) {
+    } else if right_position == -1 {
         (left_value, left_position)
     } else {
-        (right_value, right_position)
+        match right_value.partial_cmp(&left_value) {
+            Some(Ordering::Less) => (right_value, right_position),
+            Some(Ordering::Equal) if right_position < left_position => {
+                (right_value, right_position)
+            }
+            _ => (left_value, left_position),
+        }
     }
 }
 

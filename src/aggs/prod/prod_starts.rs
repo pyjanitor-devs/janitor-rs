@@ -34,7 +34,7 @@ where
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    let mut result = Array1::<i64>::zeros(starts.len());
+    let mut result = Array1::<i64>::from_elem(starts.len(), 1);
     let end_ = arr.len();
     let mut total_width = 0_usize;
     for start in starts.iter() {
@@ -89,14 +89,26 @@ mod tests {
             prod_start_core(arr.view(), starts.view(), booleans.view(), |value| value).unwrap();
         assert_eq!(got, array![5040, 2520, 840, 210, 42, 7]);
     }
+
+    #[test]
+    fn invalid_adaptive_suffixes_keep_product_identity() {
+        let arr = array![2_i64, 3, 4];
+        let starts = array![-1_i64, 0, 0, 0, 0];
+        let booleans = array![false, false, false];
+        let got =
+            prod_start_core(arr.view(), starts.view(), booleans.view(), |value| value).unwrap();
+        assert_eq!(got, array![1, 24, 24, 24, 24]);
+    }
 }
 
 /// Computes floating-point products for suffix queries described by `starts`.
 ///
 /// Floating-point multiplication is kept separate from the integer core so it
 /// follows IEEE-754 behavior for zero, infinity, NaN, overflow, and underflow
-/// instead of applying integer wrapping semantics. The running suffix path
-/// is valid because it preserves the multiplication order of each suffix.
+/// instead of applying integer wrapping semantics. It deliberately uses the
+/// direct left-to-right loop because a right-to-left suffix buffer changes the
+/// grouping of floating-point multiplications and therefore can change the
+/// result.
 ///
 /// # Arguments
 ///
@@ -116,31 +128,8 @@ where
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("starts", starts.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
-    let mut result = Array1::<f64>::zeros(starts.len());
+    let mut result = Array1::<f64>::from_elem(starts.len(), 1.0);
     let end_ = arr.len();
-    let mut total_width = 0_usize;
-    for start in starts.iter() {
-        if let Ok(start_) = usize::try_from(*start) {
-            total_width = total_width.saturating_add(end_.saturating_sub(start_));
-        }
-    }
-    if should_use_running_aggregation(starts.len(), total_width, end_) {
-        let mut suffix = vec![1.0_f64; end_ + 1];
-        for nn in (0..end_).rev() {
-            suffix[nn] = suffix[nn + 1];
-            if !booleans[nn] {
-                suffix[nn] *= convert(arr[nn]);
-            }
-        }
-        for (pos, start) in starts.iter().enumerate() {
-            if let Ok(start_) = usize::try_from(*start) {
-                if start_ < end_ {
-                    result[pos] = suffix[start_];
-                }
-            }
-        }
-        return Ok(result);
-    }
     for (pos, start) in starts.iter().enumerate() {
         let mut total = 1.0_f64;
         let start_ = *start as usize;
@@ -152,6 +141,23 @@ where
         result[pos] = total;
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod float_tests {
+    use super::prod_start_float_core;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn suffix_product_keeps_direct_left_to_right_rounding() {
+        let arr = array![1.0e16_f64, 1.0e-16, std::f64::consts::PI];
+        let starts = array![0_i64, 0, 0, 0];
+        let booleans = array![false, false, false];
+        let got = prod_start_float_core(arr.view(), starts.view(), booleans.view(), |value| value)
+            .unwrap();
+        let expected = (arr[0] * arr[1]) * arr[2];
+        assert_eq!(got, array![expected, expected, expected, expected]);
+    }
 }
 
 macro_rules! generic_compute {

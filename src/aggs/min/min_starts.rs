@@ -1,6 +1,7 @@
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
+use std::cmp::Ordering;
 
 use crate::aggs::adaptive::should_use_running_aggregation;
 use crate::aggs::checked_index;
@@ -44,7 +45,10 @@ pub fn min_start_core<T: PartialOrd + Copy>(
         let mut suffix = vec![-1_i64; end_];
         let mut winner = -1_i64;
         for nn in (0..end_).rev() {
-            if !booleans[nn] && (winner == -1 || arr[nn] <= arr[winner as usize]) {
+            if !booleans[nn]
+                && (winner == -1
+                    || arr[winner as usize].partial_cmp(&arr[nn]) != Some(Ordering::Less))
+            {
                 winner = nn as i64;
             }
             suffix[nn] = winner;
@@ -199,5 +203,14 @@ mod tests {
         let booleans = array![false, false, false, false, false, false];
         let got = min_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![5, 5, 5, 5, 5, 5]);
+    }
+
+    #[test]
+    fn adaptive_suffix_preserves_direct_nan_semantics() {
+        let arr = array![1.0_f64, f64::NAN];
+        let starts = array![0_i64, 0, 0, 0];
+        let booleans = array![false, false];
+        let got = min_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![0, 0, 0, 0]);
     }
 }
