@@ -57,8 +57,6 @@ where
     ensure_nonempty_core("ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(ends.len());
-    let start_: usize = 0;
-
     let mut total_width = 0_usize;
     for end in ends.iter() {
         if *end != -1 {
@@ -107,7 +105,7 @@ where
         if end_ > arr.len() {
             continue;
         }
-        for nn in start_..end_ {
+        for nn in 0..end_ {
             if booleans[nn] {
                 continue;
             }
