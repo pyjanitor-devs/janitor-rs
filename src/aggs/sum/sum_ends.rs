@@ -59,22 +59,11 @@ where
     let mut result = Array1::<i64>::zeros(ends.len());
     let mut total_width = 0_usize;
     for end in ends.iter() {
-        if *end != -1 {
-            if let Ok(end_) = usize::try_from(*end) {
-                total_width = total_width.saturating_add(end_.min(arr.len()));
-            }
+        if let Ok(end_) = usize::try_from(*end) {
+            total_width = total_width.saturating_add(end_.min(arr.len()));
         }
     }
-    // The width estimate deliberately clamps oversized ends so the heuristic
-    // still reflects the useful work. The prefix path cannot use that same
-    // estimate: it indexes `prefix[end_]` directly. Keep it disabled unless
-    // every boundary is safe, otherwise one oversized query in an otherwise
-    // dense batch could make the adaptive path panic.
-    let all_ranges_are_safe = ends
-        .iter()
-        .all(|end| *end == -1 || usize::try_from(*end).is_ok_and(|end_| end_ <= arr.len()));
-    let use_prefix =
-        all_ranges_are_safe && should_use_running_aggregation(ends.len(), total_width, arr.len());
+    let use_prefix = should_use_running_aggregation(ends.len(), total_width, arr.len());
 
     if use_prefix {
         // ELI5: write the running prefix total once, then answer every
@@ -88,7 +77,9 @@ where
         }
         for (pos, end) in ends.iter().enumerate() {
             if let Ok(end_) = usize::try_from(*end) {
-                result[pos] = prefix[end_];
+                if end_ <= arr.len() {
+                    result[pos] = prefix[end_];
+                }
             }
         }
         return Ok(result);
