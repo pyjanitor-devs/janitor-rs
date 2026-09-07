@@ -67,6 +67,11 @@ where
             }
         }
     }
+    // The width estimate deliberately clamps oversized ends so the heuristic
+    // still reflects the useful work. The prefix path cannot use that same
+    // estimate: it indexes `prefix[end_]` directly. Keep it disabled unless
+    // every boundary is safe, otherwise one oversized query in an otherwise
+    // dense batch could make the adaptive path panic.
     let all_ranges_are_safe = ends
         .iter()
         .all(|end| *end == -1 || usize::try_from(*end).is_ok_and(|end_| end_ <= arr.len()));
@@ -330,6 +335,15 @@ mod tests {
         let booleans = array![false, false, false];
         let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0, 0]);
+    }
+
+    #[test]
+    fn oversized_prefix_in_dense_batch_stays_on_safe_path() {
+        let arr = array![1_i64, 2, 3];
+        let ends = array![3_i64, 3, 4, 3];
+        let booleans = array![false, false, false];
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![6, 6, 0, 6]);
     }
 
     #[test]
