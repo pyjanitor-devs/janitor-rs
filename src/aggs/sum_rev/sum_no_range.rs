@@ -154,6 +154,8 @@ macro_rules! compute_ints {
         /// Sum joined values by right-side label without range metadata.
         /// Integer accumulation wraps on overflow; null rows are skipped.
         ///
+        /// Label/total pairs are aligned, but their order is unspecified.
+        ///
         /// # Arguments
         /// * `arr` - Left-side values; must not be empty.
         /// * `left_index` - Positions into `arr`.
@@ -185,6 +187,8 @@ macro_rules! compute_floats {
         /// Sum joined floating-point values by right-side label without range
         /// metadata, using compensated accumulation.
         ///
+        /// Label/total pairs are aligned, but their order is unspecified.
+        ///
         /// # Arguments
         /// * `arr` - Left-side values; must not be empty.
         /// * `left_index` - Positions into `arr`.
@@ -213,6 +217,9 @@ macro_rules! compute_floats {
 
 /// `uint64` export: returns `u64` totals so values `>= 2**63` survive
 /// the round trip to Python instead of wrapping to a negative `i64`.
+///
+/// Label/total pairs are aligned, but their order is unspecified.
+///
 #[pyfunction]
 #[allow(clippy::type_complexity)]
 pub fn compute_sum_rev_no_range_uint64<'py>(

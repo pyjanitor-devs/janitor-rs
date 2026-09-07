@@ -104,6 +104,9 @@ pub fn size_rev_starts_core(
 /// ranges. Empty prefixes contribute no counts; `index` labels are emitted in
 /// positional order.
 ///
+/// Output labels and counts are positionally aligned and emitted in ordinal
+/// order.
+///
 /// # Arguments
 ///
 /// * `ends` - Exclusive prefix end for each row.
@@ -122,6 +125,9 @@ pub fn compute_size_rev_end<'py>(
 /// Count rows covered by each compact right-side position for reverse suffix
 /// ranges. Empty suffixes are omitted from the compact output.
 ///
+/// Output labels and counts are positionally aligned and emitted in ordinal
+/// order.
+///
 /// # Arguments
 ///
 /// * `starts` - Inclusive suffix start for each row.
@@ -139,7 +145,9 @@ pub fn compute_size_rev_start<'py>(
 
 /// Count surviving candidates for each right-side position in reverse prefix
 /// ranges using a flat match tape.
-/// Output label/count pairs are aligned, but their order is unspecified.
+///
+/// Output label/count pairs are aligned, but their order is unspecified. The
+/// sparse implementation may emit labels in HashMap iteration order.
 ///
 /// ELI5: the tape points to numbered right-side drawers. We count surviving
 /// entries in each drawer and print its label later; sparse drawers may appear
@@ -192,6 +200,8 @@ pub fn size_rev_end_match_core(
                 tape += 1;
             }
         }
+        // ELI5: dense drawers are already in ordinal order, so scanning them
+        // keeps labels and counts paired without an extra ordering structure.
         let mut labels = Vec::new();
         let mut values = Vec::new();
         for (item, count) in counts.into_iter().enumerate() {
@@ -216,6 +226,9 @@ pub fn size_rev_end_match_core(
             tape += 1;
         }
     }
+    // ELI5: sparse drawers exist only for labels with surviving matches. A
+    // HashMap saves memory, and its iteration order is intentionally not part
+    // of the result contract; each label still travels with its count.
     let mut labels = Vec::with_capacity(counts.len());
     let mut values = Vec::with_capacity(counts.len());
     for (item, count) in counts {
@@ -225,6 +238,18 @@ pub fn size_rev_end_match_core(
     Ok((labels, values))
 }
 
+/// Count surviving candidates for each right-side position in reverse prefix
+/// ranges using a flat match tape.
+///
+/// Output label/count pairs are aligned, but their order is unspecified. The
+/// sparse implementation may emit labels in HashMap iteration order.
+///
+/// # Arguments
+///
+/// * `ends` - Exclusive prefix end for each row.
+/// * `index` - Right-side labels in ordinal position order.
+/// * `matches` - Flat per-candidate match mask.
+///
 /// # Returns
 ///
 /// The labels with at least one surviving candidate and their counts.
@@ -289,6 +314,8 @@ pub fn size_rev_start_match_core(
                 tape += 1;
             }
         }
+        // ELI5: dense drawers are already in ordinal order, so zero-count
+        // drawers can be filtered while preserving label/count alignment.
         let mut labels = Vec::new();
         let mut values = Vec::new();
         for (slot, count) in counts.into_iter().enumerate() {
@@ -314,6 +341,8 @@ pub fn size_rev_start_match_core(
             tape += 1;
         }
     }
+    // ELI5: sparse drawers are printed in whatever order the map provides;
+    // the important promise is that each label remains beside its count.
     let mut labels = Vec::with_capacity(counts.len());
     let mut values = Vec::with_capacity(counts.len());
     for (slot, count) in counts {
@@ -326,11 +355,17 @@ pub fn size_rev_start_match_core(
 /// Count surviving candidates for each right-side position in reverse suffix
 /// ranges using a flat match tape.
 ///
+/// Output label/count pairs are aligned, but their order is unspecified. The
+/// sparse implementation may emit labels in HashMap iteration order.
+///
 /// # Arguments
 ///
 /// * `starts` - Inclusive suffix start for each row.
 /// * `index` - Right-side labels in ordinal position order.
 /// * `matches` - Flat per-candidate match mask with the exact tape width.
+///
+/// Output label/count pairs are aligned, but their order is unspecified. The
+/// sparse implementation may emit labels in HashMap iteration order.
 ///
 /// # Returns
 ///
@@ -396,6 +431,8 @@ pub fn size_rev_start_end_match_core(
                 tape += 1;
             }
         }
+        // ELI5: dense slots are scanned by ordinal, then empty drawers are
+        // skipped without disturbing the label/count pairing.
         let mut labels = Vec::new();
         let mut values = Vec::new();
         for (slot, count) in counts.into_iter().enumerate() {
@@ -421,6 +458,8 @@ pub fn size_rev_start_end_match_core(
             tape += 1;
         }
     }
+    // ELI5: the sparse map contains only touched slots, so we avoid allocating
+    // a wide ordinal array when the tape touches few labels.
     let mut labels = Vec::with_capacity(counts.len());
     let mut values = Vec::with_capacity(counts.len());
     for (slot, count) in counts {
@@ -433,12 +472,18 @@ pub fn size_rev_start_end_match_core(
 /// `matches` must be non-empty and contain exactly one entry per candidate
 /// position in the valid ranges. Its length is the flattened tape width.
 ///
+/// Output label/count pairs are aligned, but their order is unspecified. The
+/// sparse implementation may emit labels in HashMap iteration order.
+///
 /// # Arguments
 ///
 /// * `starts` - Inclusive interval start for each row.
 /// * `ends` - Exclusive interval end for each row.
 /// * `index` - Right-side labels in ordinal position order.
 /// * `matches` - Flat per-candidate match mask.
+///
+/// Output label/count pairs are aligned, but their order is unspecified. The
+/// sparse implementation may emit labels in HashMap iteration order.
 ///
 /// # Returns
 ///
@@ -556,6 +601,9 @@ pub fn size_rev_start_end_core(
 
 /// Count rows covered by each compact right-side position for reverse interval
 /// ranges. Ranges use half-open `[start, end)` semantics.
+///
+/// Output labels and counts are positionally aligned and emitted in ordinal
+/// order.
 ///
 /// # Arguments
 ///

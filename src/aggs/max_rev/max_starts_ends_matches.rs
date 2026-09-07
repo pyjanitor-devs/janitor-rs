@@ -157,6 +157,9 @@ macro_rules! compute {
         /// * `counts` - Number of matching candidates for each row.
         /// * `matches` - Flat per-candidate match mask.
         /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
+        ///
+        /// Output label/position pairs are aligned, but their order is
+        /// unspecified.
         #[allow(clippy::too_many_arguments)]
         #[pyfunction]
         pub fn $fname<'py>(

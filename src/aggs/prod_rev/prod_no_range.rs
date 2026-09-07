@@ -166,6 +166,8 @@ macro_rules! compute_ints {
     ($fname:ident, $type:ty) => {
         /// Groups products by right-side labels without range metadata.
         ///
+        /// Label/product pairs are aligned, but their order is unspecified.
+        ///
         /// # Arguments
         ///
         /// * `arr` - Left-side values to aggregate; must not be empty.
@@ -202,6 +204,8 @@ macro_rules! compute_ints {
 #[allow(clippy::type_complexity)]
 /// Groups `uint64` products by right-side labels without range metadata.
 ///
+/// Label/product pairs are aligned, but their order is unspecified.
+///
 /// # Arguments
 ///
 /// * `arr` - Left-side unsigned values to aggregate; must not be empty.
@@ -236,6 +240,8 @@ macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
         /// Groups floating-point products by right-side labels without range
         /// metadata.
+        ///
+        /// Label/product pairs are aligned, but their order is unspecified.
         ///
         /// # Arguments
         ///

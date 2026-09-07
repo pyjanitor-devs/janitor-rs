@@ -64,6 +64,8 @@ macro_rules! compute {
         /// `arr`, `left_index`, and `right_index` must not be empty. Null
         /// rows create labels but cannot win the minimum.
         ///
+        /// Label/position pairs are aligned, but their order is unspecified.
+        ///
         /// # Arguments
         /// * `arr` - Left-side values.
         /// * `left_index` - Positions into `arr`.

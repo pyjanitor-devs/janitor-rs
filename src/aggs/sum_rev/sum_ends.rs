@@ -101,6 +101,9 @@ macro_rules! compute_ints {
         /// Sum values for each right-side label covered by reverse prefix
         /// ranges. Integer accumulation wraps on overflow.
         ///
+        /// Labels and totals are emitted in ordinal order and remain
+        /// positionally aligned.
+        ///
         /// # Arguments
         /// * `arr` - Left-side values; must not be empty.
         /// * `ends` - Exclusive prefix ends.
@@ -145,6 +148,9 @@ macro_rules! compute_floats {
     ($fname:ident, $type:ty) => {
         /// Sum floating-point values for each right-side label covered by
         /// reverse prefix ranges using compensated accumulation.
+        ///
+        /// Labels and totals are emitted in ordinal order and remain
+        /// positionally aligned.
         ///
         /// # Arguments
         /// * `arr` - Left-side values; must not be empty.

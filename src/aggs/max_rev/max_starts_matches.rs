@@ -140,6 +140,9 @@ macro_rules! compute {
         /// * `index` - Right-side labels in ordinal position order.
         /// * `matches` - Flat per-candidate match mask.
         /// * `booleans` - Null mask for `arr`; `True` rows are skipped.
+        ///
+        /// Output label/position pairs are aligned, but their order is
+        /// unspecified.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
