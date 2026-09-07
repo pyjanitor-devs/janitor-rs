@@ -141,6 +141,10 @@ macro_rules! compute {
         /// minimum. The returned positions use `-1` when no non-null row
         /// covers a label.
         ///
+        /// Output label/position pairs are aligned, but their order is
+        /// unspecified. Dense storage may emit ordinal order; sparse storage
+        /// may emit HashMap iteration order.
+        ///
         /// # Arguments
         ///
         /// * `arr` - Left-side values to aggregate; must not be empty.
