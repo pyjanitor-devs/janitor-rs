@@ -9,7 +9,8 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// For every `ends[i]`, find the position (not the value) of the smallest
 /// element in `arr[..ends[i]]`, skipping positions flagged `true` in
 /// `booleans` (a null mask). Returns `-1` when `end` is negative or past
-/// `arr.len()`, `arr` is empty, or every candidate is null.
+/// `arr.len()`, or every candidate is null. An empty `arr` is rejected with
+/// `Err("arr cannot be empty")` before range results are produced.
 ///
 /// # Arguments
 ///
@@ -144,7 +145,7 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn empty_array_returns_minus_one_not_a_panic() {
+    fn empty_array_is_rejected() {
         let arr: Array1<i64> = array![];
         let ends = array![0_i64];
         let booleans: Array1<bool> = array![];

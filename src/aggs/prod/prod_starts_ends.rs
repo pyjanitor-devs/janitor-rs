@@ -39,7 +39,7 @@ where
         }
     }
 
-    if !arr.is_empty() && should_use_running_aggregation(starts.len(), total_width, arr.len()) {
+    if should_use_running_aggregation(starts.len(), total_width, arr.len()) {
         let tree_size = arr.len().next_power_of_two();
         let mut tree = vec![1_i64; tree_size * 2];
         for nn in 0..arr.len() {

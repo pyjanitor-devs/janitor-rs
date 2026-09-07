@@ -16,6 +16,15 @@ use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core
 /// real array element to seed its comparison, so the range must be
 /// checked *before* that seed read, not after. See issue #27.
 ///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
+///
+/// ELI5: the value array may still contain the empty box's old contents, but
+/// the boolean mask puts a red X on that box. The tree ignores every box with
+/// a red X before comparing winners.
+///
 /// Input contract: `arr`, `starts`, and `ends` must be non-empty, and
 /// `starts` and `ends` must have equal lengths. The Python wrapper raises
 /// `ValueError` when this contract is violated.
@@ -301,5 +310,16 @@ mod tests {
         let got =
             max_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn adaptive_tree_skips_nan_values_marked_null() {
+        let arr = array![1.0_f64, f64::NAN, 2.0];
+        let starts = array![0_i64, 0, 0, 0];
+        let ends = array![3_i64, 3, 3, 3];
+        let booleans = array![false, true, false];
+        let got =
+            max_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![2, 2, 2, 2]);
     }
 }
