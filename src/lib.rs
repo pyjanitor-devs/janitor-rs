@@ -17,6 +17,7 @@ pub mod bench_support {
     use pyo3::prelude::*;
 
     pub use crate::aggs::max::max_ends::max_end_core;
+    pub use crate::aggs::max::max_positions::max_positions_core as forward_max_positions_core;
     pub use crate::aggs::max::max_starts::max_start_core;
     pub use crate::aggs::max::max_starts_ends::max_start_end_core;
     pub use crate::aggs::max_rev::max_ends::max_rev_ends_core;
@@ -28,6 +29,7 @@ pub mod bench_support {
     pub use crate::aggs::max_rev::max_starts::max_rev_starts_core;
     pub use crate::aggs::max_rev::max_starts_ends::max_rev_start_end_core;
     pub use crate::aggs::min::min_ends::min_end_core;
+    pub use crate::aggs::min::min_positions::min_positions_core as forward_min_positions_core;
     pub use crate::aggs::min::min_starts::min_start_core;
     pub use crate::aggs::min::min_starts_ends::min_start_end_core;
     pub use crate::aggs::min_rev::min_ends::min_rev_ends_core;
@@ -38,6 +40,7 @@ pub mod bench_support {
     pub use crate::aggs::min_rev::min_starts::min_rev_starts_core;
     pub use crate::aggs::min_rev::min_starts_ends::min_rev_start_end_core;
     pub use crate::aggs::prod::prod_ends::{prod_end_core, prod_end_float_core};
+    pub use crate::aggs::prod::prod_positions::{prod_positions_core, prod_positions_float_core};
     pub use crate::aggs::prod::prod_starts::{prod_start_core, prod_start_float_core};
     pub use crate::aggs::prod::prod_starts_ends::{prod_start_end_core, prod_start_end_float_core};
     pub use crate::aggs::prod_rev::prod_ends::prod_rev_ends_int_core;
@@ -50,6 +53,7 @@ pub mod bench_support {
         size_rev_start_end_core, size_rev_starts_core,
     };
     pub use crate::aggs::sum::sum_ends::{sum_end_core, sum_end_float_core_with_cast};
+    pub use crate::aggs::sum::sum_positions::{sum_positions_core, sum_positions_float_core};
     pub use crate::aggs::sum::sum_starts::{
         sum_start_core, sum_start_float_core_with_cast, sum_start_u32_core,
     };

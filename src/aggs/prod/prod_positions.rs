@@ -6,11 +6,8 @@ use crate::aggs::ensure_equal_lengths;
 
 use crate::aggs::{checked_index, checked_range};
 
-/// `#[cfg(test)]`-only entry point for direct, Python-free testing of
-/// [`prod_positions_core_with_cast`] (see its doc comment for the guard
-/// rationale) at the representative `i64` dtype.
-#[cfg(test)]
-pub(crate) fn prod_positions_core(
+/// Direct i64 entry point for benchmarks and Python-free tests.
+pub fn prod_positions_core(
     arr: ArrayView1<i64>,
     starts: ArrayView1<i64>,
     ends: ArrayView1<i64>,
@@ -71,8 +68,7 @@ where
     result
 }
 
-#[cfg(test)]
-pub(crate) fn prod_positions_float_core(
+pub fn prod_positions_float_core(
     arr: ArrayView1<f64>,
     starts: ArrayView1<i64>,
     ends: ArrayView1<i64>,

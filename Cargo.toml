@@ -94,3 +94,7 @@ harness = false
 [[bench]]
 name = "forward_sum_compare"
 harness = false
+
+[[bench]]
+name = "forward_positions_compare"
+harness = false
