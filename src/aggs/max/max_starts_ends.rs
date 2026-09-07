@@ -134,7 +134,13 @@ fn max_node<T: PartialOrd + Copy>(
             Some(Ordering::Equal) if right_position < left_position => {
                 (right_value, right_position)
             }
-            _ => (left_value, left_position),
+            Some(Ordering::Equal) | Some(Ordering::Less) => (left_value, left_position),
+            None => {
+                // `booleans` must mark NaN/null values invalid before they
+                // reach the tree. If a direct caller violates that contract,
+                // retain the earlier candidate deterministically.
+                (left_value, left_position)
+            }
         }
     }
 }
