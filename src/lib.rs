@@ -18,6 +18,7 @@ pub mod bench_support {
 
     pub use crate::aggs::max::max_ends::max_end_core;
     pub use crate::aggs::max::max_starts::max_start_core;
+    pub use crate::aggs::max::max_starts_ends::max_start_end_core;
     pub use crate::aggs::max_rev::max_ends::max_rev_ends_core;
     pub use crate::aggs::max_rev::max_ends_matches::compute_max_rev_end_match_int64;
     pub use crate::aggs::max_rev::max_ends_matches::max_rev_end_match_core;
@@ -28,6 +29,7 @@ pub mod bench_support {
     pub use crate::aggs::max_rev::max_starts_ends::max_rev_start_end_core;
     pub use crate::aggs::min::min_ends::min_end_core;
     pub use crate::aggs::min::min_starts::min_start_core;
+    pub use crate::aggs::min::min_starts_ends::min_start_end_core;
     pub use crate::aggs::min_rev::min_ends::min_rev_ends_core;
     pub use crate::aggs::min_rev::min_ends_matches::compute_min_rev_end_match_int64;
     pub use crate::aggs::min_rev::min_positions::{
@@ -37,6 +39,7 @@ pub mod bench_support {
     pub use crate::aggs::min_rev::min_starts_ends::min_rev_start_end_core;
     pub use crate::aggs::prod::prod_ends::{prod_end_core, prod_end_float_core};
     pub use crate::aggs::prod::prod_starts::{prod_start_core, prod_start_float_core};
+    pub use crate::aggs::prod::prod_starts_ends::{prod_start_end_core, prod_start_end_float_core};
     pub use crate::aggs::prod_rev::prod_ends::prod_rev_ends_int_core;
     pub use crate::aggs::prod_rev::prod_ends_matches::compute_prod_rev_end_match_int64;
     pub use crate::aggs::prod_rev::prod_positions::prod_positions_float_core_with_storage;

@@ -3,9 +3,10 @@ use numpy::ndarray::Array1;
 use std::hint::black_box;
 
 use janitor_rs::bench_support::{
-    max_end_core, max_start_core, min_end_core, min_start_core, prod_end_core, prod_end_float_core,
-    prod_start_core, prod_start_float_core, sum_end_core, sum_end_float_core_with_cast,
-    sum_start_core, sum_start_end_core, sum_start_float_core_with_cast,
+    max_end_core, max_start_core, max_start_end_core, min_end_core, min_start_core,
+    min_start_end_core, prod_end_core, prod_end_float_core, prod_start_core, prod_start_end_core,
+    prod_start_float_core, sum_end_core, sum_end_float_core_with_cast, sum_start_core,
+    sum_start_end_core, sum_start_float_core_with_cast,
 };
 
 fn old_min_start(arr: &Array1<i64>, starts: &Array1<i64>, mask: &Array1<bool>) -> Array1<i64> {
@@ -62,6 +63,61 @@ fn old_max_end(arr: &Array1<i64>, ends: &Array1<i64>, mask: &Array1<bool>) -> Ar
             }
         }
         out[pos] = winner;
+    }
+    out
+}
+
+fn old_min_start_end(
+    arr: &Array1<i64>,
+    starts: &Array1<i64>,
+    ends: &Array1<i64>,
+    mask: &Array1<bool>,
+) -> Array1<i64> {
+    let mut out = Array1::from_elem(starts.len(), -1);
+    for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        let mut winner = -1;
+        for nn in *start as usize..*end as usize {
+            if !mask[nn] && (winner < 0 || arr[nn] < arr[winner as usize]) {
+                winner = nn as i64;
+            }
+        }
+        out[pos] = winner;
+    }
+    out
+}
+
+fn old_max_start_end(
+    arr: &Array1<i64>,
+    starts: &Array1<i64>,
+    ends: &Array1<i64>,
+    mask: &Array1<bool>,
+) -> Array1<i64> {
+    let mut out = Array1::from_elem(starts.len(), -1);
+    for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        let mut winner = -1;
+        for nn in *start as usize..*end as usize {
+            if !mask[nn] && (winner < 0 || arr[nn] > arr[winner as usize]) {
+                winner = nn as i64;
+            }
+        }
+        out[pos] = winner;
+    }
+    out
+}
+
+fn old_prod_start_end(
+    arr: &Array1<i64>,
+    starts: &Array1<i64>,
+    ends: &Array1<i64>,
+    mask: &Array1<bool>,
+) -> Array1<i64> {
+    let mut out = Array1::from_elem(starts.len(), 1_i64);
+    for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        for nn in *start as usize..*end as usize {
+            if !mask[nn] {
+                out[pos] = out[pos].wrapping_mul(arr[nn]);
+            }
+        }
     }
     out
 }
@@ -272,6 +328,106 @@ fn bench_forward_all_aggregations(c: &mut Criterion) {
                         black_box(arr.view()),
                         black_box(ends.view()),
                         black_box(mask.view()),
+                    )
+                    .unwrap()
+                })
+            });
+
+            let range_starts = Array1::from_elem(queries, 0_i64);
+            let range_ends = Array1::from_elem(queries, width as i64);
+            assert_eq!(
+                old_min_start_end(&arr, &range_starts, &range_ends, &mask),
+                min_start_end_core(
+                    arr.view(),
+                    range_starts.view(),
+                    range_ends.view(),
+                    mask.view(),
+                )
+                .unwrap()
+            );
+            group.bench_function(format!("min/start_end/old/{label}"), |b| {
+                b.iter(|| {
+                    old_min_start_end(
+                        black_box(&arr),
+                        black_box(&range_starts),
+                        black_box(&range_ends),
+                        black_box(&mask),
+                    )
+                })
+            });
+            group.bench_function(format!("min/start_end/adaptive/{label}"), |b| {
+                b.iter(|| {
+                    min_start_end_core(
+                        black_box(arr.view()),
+                        black_box(range_starts.view()),
+                        black_box(range_ends.view()),
+                        black_box(mask.view()),
+                    )
+                    .unwrap()
+                })
+            });
+
+            assert_eq!(
+                old_max_start_end(&arr, &range_starts, &range_ends, &mask),
+                max_start_end_core(
+                    arr.view(),
+                    range_starts.view(),
+                    range_ends.view(),
+                    mask.view(),
+                )
+                .unwrap()
+            );
+            group.bench_function(format!("max/start_end/old/{label}"), |b| {
+                b.iter(|| {
+                    old_max_start_end(
+                        black_box(&arr),
+                        black_box(&range_starts),
+                        black_box(&range_ends),
+                        black_box(&mask),
+                    )
+                })
+            });
+            group.bench_function(format!("max/start_end/adaptive/{label}"), |b| {
+                b.iter(|| {
+                    max_start_end_core(
+                        black_box(arr.view()),
+                        black_box(range_starts.view()),
+                        black_box(range_ends.view()),
+                        black_box(mask.view()),
+                    )
+                    .unwrap()
+                })
+            });
+
+            assert_eq!(
+                old_prod_start_end(&arr, &range_starts, &range_ends, &mask),
+                prod_start_end_core(
+                    arr.view(),
+                    range_starts.view(),
+                    range_ends.view(),
+                    mask.view(),
+                    |value| value,
+                )
+                .unwrap()
+            );
+            group.bench_function(format!("prod/start_end/old/{label}"), |b| {
+                b.iter(|| {
+                    old_prod_start_end(
+                        black_box(&arr),
+                        black_box(&range_starts),
+                        black_box(&range_ends),
+                        black_box(&mask),
+                    )
+                })
+            });
+            group.bench_function(format!("prod/start_end/adaptive/{label}"), |b| {
+                b.iter(|| {
+                    prod_start_end_core(
+                        black_box(arr.view()),
+                        black_box(range_starts.view()),
+                        black_box(range_ends.view()),
+                        black_box(mask.view()),
+                        |value| value,
                     )
                     .unwrap()
                 })

@@ -54,7 +54,7 @@ pub fn max_end_core<T: PartialOrd + Copy>(
         return Ok(result);
     }
 
-    for (pos, end) in ends.indexed_iter() {
+    for (pos, end) in ends.iter().enumerate() {
         let Some((_, end_)) = checked_range(0, *end, arr.len()) else {
             continue;
         };

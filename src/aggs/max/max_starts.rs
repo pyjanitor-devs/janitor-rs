@@ -57,7 +57,7 @@ pub fn max_start_core<T: PartialOrd + Copy>(
         return Ok(result);
     }
 
-    for (pos, start) in starts.indexed_iter() {
+    for (pos, start) in starts.iter().enumerate() {
         let Some(start_) = checked_index(*start, end_) else {
             continue;
         };

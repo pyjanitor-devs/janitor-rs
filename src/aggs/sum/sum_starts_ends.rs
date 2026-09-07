@@ -51,8 +51,6 @@ where
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(starts.len());
-    let zipped = starts.into_iter().zip(ends);
-
     let mut total_width = 0_usize;
     for (start, end) in starts.iter().zip(ends.iter()) {
         if let Some((start_, end_)) = checked_range(*start, *end, arr.len()) {
@@ -79,7 +77,7 @@ where
         return Ok(result);
     }
 
-    for (pos, (start, end)) in zipped.enumerate() {
+    for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
         let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
             continue; // result[pos] is already 0
         };
@@ -112,7 +110,7 @@ where
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<f64>::zeros(starts.len());
-    for (pos, (start, end)) in starts.into_iter().zip(ends).enumerate() {
+    for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
         // ELI5: validate the range ticket once, before either dtype-specific
         // path turns its signed numbers into array positions. That keeps a
         // "no match" ticket worth zero for both integer and float columns.

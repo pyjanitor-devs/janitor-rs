@@ -1247,7 +1247,8 @@ mod adversarial_bounds_tests {
                 starts.view(),
                 invalid_ends.view(),
                 booleans.view(),
-            ),
+            )
+            .unwrap(),
             array![-1, -1]
         );
         assert_eq!(
@@ -1256,7 +1257,8 @@ mod adversarial_bounds_tests {
                 starts.view(),
                 invalid_ends.view(),
                 booleans.view(),
-            ),
+            )
+            .unwrap(),
             array![-1, -1]
         );
 
