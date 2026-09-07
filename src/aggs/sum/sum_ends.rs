@@ -32,6 +32,9 @@ fn is_empty_sentinel_end(end: i64) -> bool {
 /// * `arr` - Values to sum.
 /// * `ends` - Exclusive prefix boundaries, one per output.
 /// * `booleans` - Null mask aligned with `arr`.
+///
+/// `arr` and `ends` must both be non-empty. Boundaries in `0..=arr.len()` are
+/// valid; `-1` or oversized boundaries produce the additive identity, `0`.
 pub fn sum_end_core(
     arr: ArrayView1<i64>,
     ends: ArrayView1<i64>,
@@ -93,7 +96,12 @@ where
             continue; // result[pos] is already 0
         }
         let mut total: i64 = 0;
-        let end_ = *end as usize;
+        let Ok(end_) = usize::try_from(*end) else {
+            continue;
+        };
+        if end_ > arr.len() {
+            continue;
+        }
         for nn in start_..end_ {
             if booleans[nn] {
                 continue;
@@ -129,7 +137,12 @@ where
         }
         let mut total = 0.0;
         let mut compensation = 0.0;
-        let end_ = *end as usize;
+        let Ok(end_) = usize::try_from(*end) else {
+            continue;
+        };
+        if end_ > arr.len() {
+            continue;
+        }
         for nn in 0..end_ {
             if booleans[nn] {
                 continue;
@@ -155,6 +168,9 @@ macro_rules! generic_compute {
         /// * `arr` - Values to sum.
         /// * `ends` - Exclusive prefix boundaries.
         /// * `booleans` - Null mask aligned with `arr`.
+        ///
+        /// `arr` and `ends` must be non-empty. Invalid boundaries produce
+        /// zero, the additive identity.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -181,6 +197,8 @@ macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
         /// Sum floating-point non-null values in each prefix of `arr`.
         /// `ends` contains exclusive boundaries and `booleans` marks nulls.
+        /// `arr` and `ends` must be non-empty. Invalid boundaries produce
+        /// zero, the additive identity.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -306,6 +324,15 @@ mod tests {
     }
 
     #[test]
+    fn invalid_direct_prefix_is_zero_not_a_panic() {
+        let arr = array![1_i64, 2, 3];
+        let ends = array![-1_i64, 4];
+        let booleans = array![false, false, false];
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![0, 0]);
+    }
+
+    #[test]
     fn float_sentinel_end_is_zero_not_a_panic() {
         let arr = array![1.0_f64, 2.0, 3.0];
         let ends = array![-1_i64];
@@ -314,6 +341,17 @@ mod tests {
             sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value)
                 .unwrap();
         assert_eq!(got, array![0.0]);
+    }
+
+    #[test]
+    fn float_invalid_direct_prefix_is_zero_not_a_panic() {
+        let arr = array![1.0_f64, 2.0, 3.0];
+        let ends = array![-1_i64, 4];
+        let booleans = array![false, false, false];
+        let got =
+            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value)
+                .unwrap();
+        assert_eq!(got, array![0.0, 0.0]);
     }
 
     #[test]

@@ -15,6 +15,9 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// * `arr` - Values to multiply.
 /// * `ends` - Exclusive prefix boundaries.
 /// * `booleans` - Null mask aligned with `arr`.
+///
+/// `arr` and `ends` must both be non-empty. Boundaries in `0..=arr.len()` are
+/// valid; negative or oversized boundaries return the multiplicative identity.
 pub fn prod_end_core<T, F>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
@@ -57,7 +60,12 @@ where
     }
     for (pos, end) in ends.iter().enumerate() {
         let mut total = 1_i64;
-        let end_ = *end as usize;
+        let Ok(end_) = usize::try_from(*end) else {
+            continue;
+        };
+        if end_ > arr.len() {
+            continue;
+        }
         for nn in 0..end_ {
             if !booleans[nn] {
                 total = total.wrapping_mul(convert(arr[nn]));
@@ -90,6 +98,25 @@ mod tests {
         let got = prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
         assert_eq!(got, array![1, 24, 24, 24, 24]);
     }
+
+    #[test]
+    fn invalid_direct_prefixes_keep_product_identity() {
+        let arr = array![2_i64, 3, 4];
+        let ends = array![-1_i64, 4];
+        let booleans = array![false, false, false];
+        let got = prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
+        assert_eq!(got, array![1, 1]);
+    }
+
+    #[test]
+    fn float_invalid_direct_prefixes_keep_product_identity() {
+        let arr = array![2.0_f64, 3.0, 4.0];
+        let ends = array![-1_i64, 4];
+        let booleans = array![false, false, false];
+        let got =
+            prod_end_float_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
+        assert_eq!(got, array![1.0, 1.0]);
+    }
 }
 
 /// Computes floating-point products for prefix queries described by `ends`.
@@ -102,6 +129,9 @@ mod tests {
 /// * `arr` - Values to multiply.
 /// * `ends` - Exclusive prefix boundaries.
 /// * `booleans` - Null mask aligned with `arr`.
+///
+/// `arr` and `ends` must both be non-empty. Boundaries in `0..=arr.len()` are
+/// valid; negative or oversized boundaries return the multiplicative identity.
 pub fn prod_end_float_core<T, F>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
@@ -141,7 +171,12 @@ where
     }
     for (pos, end) in ends.iter().enumerate() {
         let mut total = 1.0_f64;
-        let end_ = *end as usize;
+        let Ok(end_) = usize::try_from(*end) else {
+            continue;
+        };
+        if end_ > arr.len() {
+            continue;
+        }
         for nn in 0..end_ {
             if !booleans[nn] {
                 total *= convert(arr[nn]);
@@ -163,6 +198,9 @@ macro_rules! generic_compute {
         /// * `arr` - Values to multiply.
         /// * `ends` - Exclusive prefix boundaries.
         /// * `booleans` - Null mask aligned with `arr`.
+        ///
+        /// `arr` and `ends` must be non-empty. Invalid boundaries return the
+        /// multiplicative identity.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -196,6 +234,9 @@ macro_rules! generic_compute_floats {
         /// * `arr` - Values to multiply.
         /// * `ends` - Exclusive prefix boundaries.
         /// * `booleans` - Null mask aligned with `arr`.
+        ///
+        /// `arr` and `ends` must be non-empty. Invalid boundaries return the
+        /// multiplicative identity.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,

@@ -21,6 +21,10 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// * `arr` - Values to multiply.
 /// * `starts` - Inclusive suffix boundaries.
 /// * `booleans` - Null mask aligned with `arr`.
+///
+/// `arr` and `starts` must both be non-empty. A boundary equal to
+/// `arr.len()` is valid and returns the multiplicative identity, `1`; invalid
+/// negative or out-of-bounds boundaries also retain that identity result.
 pub fn prod_start_core<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -55,7 +59,7 @@ where
         }
         for (pos, start) in starts.iter().enumerate() {
             if let Ok(start_) = usize::try_from(*start) {
-                if start_ < end_ {
+                if start_ <= end_ {
                     result[pos] = suffix[start_];
                 }
             }
@@ -64,7 +68,12 @@ where
     }
     for (pos, start) in starts.iter().enumerate() {
         let mut total = 1_i64;
-        let start_ = *start as usize;
+        let Ok(start_) = usize::try_from(*start) else {
+            continue;
+        };
+        if start_ > end_ {
+            continue;
+        }
         for nn in start_..end_ {
             if !booleans[nn] {
                 total = total.wrapping_mul(convert(arr[nn]));
@@ -99,6 +108,18 @@ mod tests {
             prod_start_core(arr.view(), starts.view(), booleans.view(), |value| value).unwrap();
         assert_eq!(got, array![1, 24, 24, 24, 24]);
     }
+
+    #[test]
+    fn suffix_at_array_end_keeps_product_identity() {
+        let arr = array![2_i64, 3, 4];
+        // Five broad queries take the adaptive suffix path; the equality
+        // boundary must still look up the extra identity slot.
+        let starts = array![3_i64, 3, 3, 3, 3];
+        let booleans = array![false, false, false];
+        let got =
+            prod_start_core(arr.view(), starts.view(), booleans.view(), |value| value).unwrap();
+        assert_eq!(got, array![1, 1, 1, 1, 1]);
+    }
 }
 
 /// Computes floating-point products for suffix queries described by `starts`.
@@ -115,6 +136,10 @@ mod tests {
 /// * `arr` - Values to multiply.
 /// * `starts` - Inclusive suffix boundaries.
 /// * `booleans` - Null mask aligned with `arr`.
+///
+/// `arr` and `starts` must both be non-empty. A boundary equal to
+/// `arr.len()` is valid and returns `1`; invalid negative or out-of-bounds
+/// boundaries also return the multiplicative identity.
 pub fn prod_start_float_core<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -132,7 +157,12 @@ where
     let end_ = arr.len();
     for (pos, start) in starts.iter().enumerate() {
         let mut total = 1.0_f64;
-        let start_ = *start as usize;
+        let Ok(start_) = usize::try_from(*start) else {
+            continue;
+        };
+        if start_ > end_ {
+            continue;
+        }
         for nn in start_..end_ {
             if !booleans[nn] {
                 total *= convert(arr[nn]);
@@ -158,6 +188,16 @@ mod float_tests {
         let expected = (arr[0] * arr[1]) * arr[2];
         assert_eq!(got, array![expected, expected, expected, expected]);
     }
+
+    #[test]
+    fn float_suffix_at_array_end_keeps_product_identity() {
+        let arr = array![2.0_f64, 3.0, 4.0];
+        let starts = array![3_i64];
+        let booleans = array![false, false, false];
+        let got = prod_start_float_core(arr.view(), starts.view(), booleans.view(), |value| value)
+            .unwrap();
+        assert_eq!(got, array![1.0]);
+    }
 }
 
 macro_rules! generic_compute {
@@ -171,6 +211,9 @@ macro_rules! generic_compute {
         /// * `arr` - Values to multiply.
         /// * `starts` - Inclusive suffix boundaries.
         /// * `booleans` - Null mask aligned with `arr`.
+        ///
+        /// `arr` and `starts` must be non-empty. Invalid boundaries return
+        /// the multiplicative identity.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -204,6 +247,9 @@ macro_rules! generic_compute_floats {
         /// * `arr` - Values to multiply.
         /// * `starts` - Inclusive suffix boundaries.
         /// * `booleans` - Null mask aligned with `arr`.
+        ///
+        /// `arr` and `starts` must be non-empty. Invalid boundaries return
+        /// the multiplicative identity.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
