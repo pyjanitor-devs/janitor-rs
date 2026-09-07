@@ -364,9 +364,6 @@ pub fn size_rev_start_match_core(
 /// * `index` - Right-side labels in ordinal position order.
 /// * `matches` - Flat per-candidate match mask with the exact tape width.
 ///
-/// Output label/count pairs are aligned, but their order is unspecified. The
-/// sparse implementation may emit labels in HashMap iteration order.
-///
 /// # Returns
 ///
 /// The labels with at least one surviving candidate and their counts.
@@ -481,9 +478,6 @@ pub fn size_rev_start_end_match_core(
 /// * `ends` - Exclusive interval end for each row.
 /// * `index` - Right-side labels in ordinal position order.
 /// * `matches` - Flat per-candidate match mask.
-///
-/// Output label/count pairs are aligned, but their order is unspecified. The
-/// sparse implementation may emit labels in HashMap iteration order.
 ///
 /// # Returns
 ///
@@ -602,8 +596,9 @@ pub fn size_rev_start_end_core(
 /// Count rows covered by each compact right-side position for reverse interval
 /// ranges. Ranges use half-open `[start, end)` semantics.
 ///
-/// Output labels and counts are positionally aligned and emitted in ordinal
-/// order.
+/// Output labels and counts are positionally aligned, but their order is
+/// unspecified. Dense storage may emit ordinal order; sparse storage may emit
+/// HashMap iteration order.
 ///
 /// # Arguments
 ///

@@ -231,6 +231,7 @@ macro_rules! compute_ints {
         ///
         /// Output label/total pairs are aligned, but their order is
         /// unspecified.
+        ///
         /// The accumulator type `$acc` is `i64` for every dtype except
         /// `uint64`, which uses `u64` so values `>= 2**63` don't get
         /// sign-flipped by a forced `i64` cast (issue #90's bug class).
