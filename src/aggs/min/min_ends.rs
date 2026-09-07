@@ -2,8 +2,8 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::adaptive::should_use_running_aggregation;
 use crate::aggs::checked_range;
-use crate::aggs::sum::should_use_running_aggregation;
 use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `ends[i]`, find the position (not the value) of the smallest

@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use super::super::sum::should_use_running_aggregation;
+use crate::aggs::adaptive::should_use_running_aggregation;
 use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// Compute integer products over arbitrary half-open ranges.

@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use super::should_use_running_aggregation;
+use crate::aggs::adaptive::should_use_running_aggregation;
 use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `(starts[i], ends[i])`, sum `arr[starts[i]..ends[i]]`,
