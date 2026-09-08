@@ -178,6 +178,29 @@ fn old_sum_end(arr: &Array1<i64>, ends: &Array1<i64>, booleans: &Array1<bool>) -
     result
 }
 
+fn old_sum_end_float(
+    arr: &Array1<f64>,
+    ends: &Array1<i64>,
+    booleans: &Array1<bool>,
+) -> Array1<f64> {
+    let mut result = Array1::<f64>::zeros(ends.len());
+    for (pos, end) in ends.iter().enumerate() {
+        let mut total = 0.0;
+        let mut compensation = 0.0;
+        for nn in 0..*end as usize {
+            if booleans[nn] {
+                continue;
+            }
+            let difference = arr[nn] - compensation;
+            let increment = total + difference;
+            compensation = (increment - total) - difference;
+            total = increment;
+        }
+        result[pos] = total;
+    }
+    result
+}
+
 fn old_sum_start_end(
     arr: &Array1<i64>,
     starts: &Array1<i64>,
@@ -551,7 +574,19 @@ fn bench_forward_all_aggregations(c: &mut Criterion) {
                     .unwrap()
                 })
             });
-            group.bench_function(format!("sum/end/float/{label}"), |b| {
+            assert_eq!(
+                old_sum_end_float(&float_arr, &ends, &mask),
+                sum_end_float_core_with_cast(float_arr.view(), ends.view(), mask.view(), |value| {
+                    value
+                },)
+                .unwrap()
+            );
+            group.bench_function(format!("sum/end/float/direct/{label}"), |b| {
+                b.iter(|| {
+                    old_sum_end_float(black_box(&float_arr), black_box(&ends), black_box(&mask))
+                })
+            });
+            group.bench_function(format!("sum/end/float/adaptive/{label}"), |b| {
                 b.iter(|| {
                     sum_end_float_core_with_cast(
                         black_box(float_arr.view()),

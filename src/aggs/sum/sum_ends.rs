@@ -103,9 +103,10 @@ where
     Ok(result)
 }
 
-/// Floating-point sums intentionally stay on the direct per-range Kahan loop:
-/// a shared prefix buffer would change the compensation and rounding behavior
-/// of each independently summed range.
+/// Floating-point prefix sums use the adaptive path because a left-to-right
+/// Kahan prefix table performs the same updates as every direct prefix query.
+/// The suffix and interval float kernels remain direct because their lookup
+/// tables would change the order or compensation of each range.
 pub fn sum_end_float_core_with_cast<T, F>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
@@ -120,6 +121,37 @@ where
     ensure_nonempty_core("ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<f64>::zeros(ends.len());
+    let mut total_width = 0_usize;
+    for end in ends.iter() {
+        if let Some(end_) = checked_end(*end, arr.len()) {
+            total_width = total_width.saturating_add(end_);
+        }
+    }
+    if should_use_running_aggregation(ends.len(), total_width, arr.len()) {
+        // ELI5: each direct prefix question starts at zero and walks left to
+        // right. One Kahan walk can therefore leave a reusable answer card at
+        // every end without changing any query's arithmetic order.
+        let mut prefix = vec![0.0_f64; arr.len() + 1];
+        let mut compensation = 0.0;
+        for nn in 0..arr.len() {
+            if !booleans[nn] {
+                let current = to_f64(arr[nn]);
+                let difference = current - compensation;
+                let increment = prefix[nn] + difference;
+                compensation = (increment - prefix[nn]) - difference;
+                prefix[nn + 1] = increment;
+            } else {
+                prefix[nn + 1] = prefix[nn];
+            }
+        }
+        for (pos, end) in ends.iter().enumerate() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                result[pos] = prefix[end_];
+            }
+        }
+        return Ok(result);
+    }
+
     for (pos, end) in ends.iter().enumerate() {
         // ELI5: integers and floats receive the same list of slice ends.
         // Check the "no match" card before either path turns it into an
@@ -370,6 +402,26 @@ mod tests {
             sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value)
                 .unwrap();
         assert_eq!(got, array![0.0]);
+    }
+
+    #[test]
+    fn float_adaptive_prefix_matches_direct_kahan() {
+        let arr = array![1e16_f64, 1.0, -1e16, 3.0, 1e-9];
+        let ends = array![5_i64, 5, 5, 5];
+        let booleans = array![false, false, false, false, false];
+        let got =
+            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value)
+                .unwrap();
+
+        let mut total = 0.0;
+        let mut compensation = 0.0;
+        for value in arr.iter() {
+            let difference = *value - compensation;
+            let increment = total + difference;
+            compensation = (increment - total) - difference;
+            total = increment;
+        }
+        assert_eq!(got, array![total, total, total, total]);
     }
 
     #[test]
