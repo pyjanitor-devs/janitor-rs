@@ -52,7 +52,7 @@ pub fn min_start_end_core<T: PartialOrd + Copy>(
         // ELI5: each tree node remembers the smallest non-null item in its
         // block. Once built, a range is answered by combining a few blocks
         // instead of rereading every element in every overlapping range.
-        let tree_size = arr.len().next_power_of_two();
+        let tree_size = arr.len();
         let mut values = vec![arr[0]; tree_size * 2];
         let mut positions = vec![-1_i64; tree_size * 2];
         for nn in 0..arr.len() {

@@ -102,6 +102,9 @@ where
     Ok(result)
 }
 
+/// Floating-point sums intentionally stay on the direct per-range Kahan loop:
+/// a shared prefix-difference buffer would change the compensation and
+/// rounding behavior of each independently summed range.
 pub fn sum_start_end_float_core_with_cast<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,

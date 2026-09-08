@@ -30,6 +30,7 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// `arr` and `starts` must both be non-empty. A boundary equal to
 /// `arr.len()` is valid and returns the multiplicative identity, `1`; invalid
 /// negative or out-of-bounds boundaries also retain that identity result.
+/// An empty `arr` is rejected with `Err("arr cannot be empty")`.
 pub fn prod_start_core<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
@@ -93,6 +94,16 @@ where
 mod tests {
     use super::*;
     use numpy::ndarray::array;
+
+    #[test]
+    fn empty_array_is_rejected() {
+        let arr = Array1::<i64>::zeros(0);
+        let starts = array![0_i64];
+        let booleans = Array1::<bool>::default(0);
+        let error =
+            prod_start_core(arr.view(), starts.view(), booleans.view(), |value| value).unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+    }
 
     #[test]
     fn broad_suffix_batch_uses_running_products() {

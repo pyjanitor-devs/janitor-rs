@@ -3,7 +3,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::adaptive::should_use_running_aggregation;
-use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
+use crate::aggs::{checked_end, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `ends[i]`, sum `arr[..ends[i]]` (from the start of the array),
 /// skipping any position flagged `true` in `booleans` (a null mask). An
@@ -60,8 +60,8 @@ where
     let mut result = Array1::<i64>::zeros(ends.len());
     let mut total_width = 0_usize;
     for end in ends.iter() {
-        if let Ok(end_) = usize::try_from(*end) {
-            total_width = total_width.saturating_add(end_.min(arr.len()));
+        if let Some(end_) = checked_end(*end, arr.len()) {
+            total_width = total_width.saturating_add(end_);
         }
     }
     let use_prefix = should_use_running_aggregation(ends.len(), total_width, arr.len());
@@ -77,10 +77,8 @@ where
             }
         }
         for (pos, end) in ends.iter().enumerate() {
-            if let Ok(end_) = usize::try_from(*end) {
-                if end_ <= arr.len() {
-                    result[pos] = prefix[end_];
-                }
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                result[pos] = prefix[end_];
             }
         }
         return Ok(result);
@@ -88,14 +86,12 @@ where
 
     for (pos, end) in ends.iter().enumerate() {
         let mut total: i64 = 0;
-        let Ok(end_) = usize::try_from(*end) else {
-            // ELI5: `usize::try_from` is the bouncer here -- it rejects the
-            // `-1` no-match ticket before it can become an array position.
+        let Some(end_) = checked_end(*end, arr.len()) else {
+            // ELI5: `checked_end` is the bouncer here -- it rejects the
+            // negative or oversized no-match ticket before it can become an
+            // array boundary.
             continue;
         };
-        if end_ > arr.len() {
-            continue;
-        }
         for nn in 0..end_ {
             if booleans[nn] {
                 continue;
@@ -107,6 +103,9 @@ where
     Ok(result)
 }
 
+/// Floating-point sums intentionally stay on the direct per-range Kahan loop:
+/// a shared prefix buffer would change the compensation and rounding behavior
+/// of each independently summed range.
 pub fn sum_end_float_core_with_cast<T, F>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
@@ -128,14 +127,11 @@ where
         // crashes.
         let mut total = 0.0;
         let mut compensation = 0.0;
-        let Ok(end_) = usize::try_from(*end) else {
-            // The conversion itself rejects the `-1` no-match sentinel
-            // before it can be used as an array position.
+        let Some(end_) = checked_end(*end, arr.len()) else {
+            // `checked_end` rejects the `-1` no-match sentinel before it can
+            // be used as an array boundary.
             continue;
         };
-        if end_ > arr.len() {
-            continue;
-        }
         for nn in 0..end_ {
             if booleans[nn] {
                 continue;

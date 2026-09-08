@@ -166,6 +166,9 @@ macro_rules! generic_compute {
     };
 }
 
+/// Floating-point sums intentionally stay on the direct per-range Kahan loop:
+/// a shared suffix buffer would change the compensation and rounding behavior
+/// of each independently summed range.
 pub fn sum_start_float_core_with_cast<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,

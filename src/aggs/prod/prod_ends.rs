@@ -3,7 +3,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::adaptive::should_use_running_aggregation;
-use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
+use crate::aggs::{checked_end, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// Computes the product of every prefix selected by `ends` for an integer
 /// input array. `ends` contains exclusive zero-based boundaries, and `true`
@@ -39,8 +39,8 @@ where
     let mut result = Array1::<i64>::from_elem(ends.len(), 1);
     let mut total_width = 0_usize;
     for end in ends.iter() {
-        if let Ok(end_) = usize::try_from(*end) {
-            total_width = total_width.saturating_add(end_.min(arr.len()));
+        if let Some(end_) = checked_end(*end, arr.len()) {
+            total_width = total_width.saturating_add(end_);
         }
     }
     if should_use_running_aggregation(ends.len(), total_width, arr.len()) {
@@ -55,22 +55,17 @@ where
             }
         }
         for (pos, end) in ends.iter().enumerate() {
-            if let Ok(end_) = usize::try_from(*end) {
-                if end_ <= arr.len() {
-                    result[pos] = prefix[end_];
-                }
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                result[pos] = prefix[end_];
             }
         }
         return Ok(result);
     }
     for (pos, end) in ends.iter().enumerate() {
         let mut total = 1_i64;
-        let Ok(end_) = usize::try_from(*end) else {
+        let Some(end_) = checked_end(*end, arr.len()) else {
             continue;
         };
-        if end_ > arr.len() {
-            continue;
-        }
         for nn in 0..end_ {
             if !booleans[nn] {
                 total = total.wrapping_mul(convert(arr[nn]));
@@ -85,6 +80,16 @@ where
 mod tests {
     use super::*;
     use numpy::ndarray::array;
+
+    #[test]
+    fn empty_array_is_rejected() {
+        let arr = Array1::<i64>::zeros(0);
+        let ends = array![0_i64];
+        let booleans = Array1::<bool>::default(0);
+        let error =
+            prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+    }
 
     #[test]
     fn broad_prefix_batch_uses_running_products() {
@@ -153,8 +158,8 @@ where
     let mut result = Array1::<f64>::from_elem(ends.len(), 1.0);
     let mut total_width = 0_usize;
     for end in ends.iter() {
-        if let Ok(end_) = usize::try_from(*end) {
-            total_width = total_width.saturating_add(end_.min(arr.len()));
+        if let Some(end_) = checked_end(*end, arr.len()) {
+            total_width = total_width.saturating_add(end_);
         }
     }
     if should_use_running_aggregation(ends.len(), total_width, arr.len()) {
@@ -166,22 +171,17 @@ where
             }
         }
         for (pos, end) in ends.iter().enumerate() {
-            if let Ok(end_) = usize::try_from(*end) {
-                if end_ <= arr.len() {
-                    result[pos] = prefix[end_];
-                }
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                result[pos] = prefix[end_];
             }
         }
         return Ok(result);
     }
     for (pos, end) in ends.iter().enumerate() {
         let mut total = 1.0_f64;
-        let Ok(end_) = usize::try_from(*end) else {
+        let Some(end_) = checked_end(*end, arr.len()) else {
             continue;
         };
-        if end_ > arr.len() {
-            continue;
-        }
         for nn in 0..end_ {
             if !booleans[nn] {
                 total *= convert(arr[nn]);

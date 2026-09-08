@@ -45,7 +45,7 @@ where
     }
 
     if should_use_segment_tree(starts.len(), total_width, arr.len()) {
-        let tree_size = arr.len().next_power_of_two();
+        let tree_size = arr.len();
         let mut tree = vec![1_i64; tree_size * 2];
         for nn in 0..arr.len() {
             if !booleans[nn] {

@@ -11,7 +11,8 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// largest element in `arr[starts[i]..]`, skipping positions flagged
 /// `true` in `booleans` (a null mask). Returns `-1` when the range is
 /// empty or invalid (`starts[i] < 0` or `starts[i] >= arr.len()`) or every
-/// candidate is null.
+/// candidate is null. An empty `arr` is rejected with
+/// `Err("arr cannot be empty")`.
 ///
 /// Null-mask contract: `booleans[nn] == true` is the source of truth for a
 /// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
@@ -154,6 +155,15 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use numpy::ndarray::array;
+
+    #[test]
+    fn empty_array_is_rejected() {
+        let arr = Array1::<i64>::zeros(0);
+        let starts = array![0_i64];
+        let booleans = Array1::<bool>::default(0);
+        let error = max_start_core(arr.view(), starts.view(), booleans.view()).unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+    }
 
     #[test]
     fn start_equal_to_len_returns_minus_one_not_a_panic() {

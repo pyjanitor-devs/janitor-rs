@@ -44,10 +44,10 @@ pub(crate) fn should_use_segment_tree(
     if query_count <= 3 || array_len == 0 {
         return false;
     }
-    let Some(tree_size) = array_len.checked_next_power_of_two() else {
-        return false;
-    };
-    let tree_height = tree_size.trailing_zeros() as usize;
+    // The iterative range walk works with any number of leaves; padding to a
+    // power of two only wastes memory. `array_len - 1` is safe after the zero
+    // length guard and gives the height of the smallest covering tree.
+    let tree_height = (usize::BITS - (array_len - 1).leading_zeros()) as usize;
     let build_cost = array_len.saturating_mul(SEGMENT_TREE_BUILD_WORK_FACTOR);
     let query_cost = query_count
         .saturating_mul(tree_height)
