@@ -52,6 +52,9 @@ pub fn min_start_end_core<T: PartialOrd + Copy>(
         // ELI5: each tree node remembers the smallest non-null item in its
         // block. Once built, a range is answered by combining a few blocks
         // instead of rereading every element in every overlapping range.
+        // `tree_size` is exactly the number of input leaves. The half-open
+        // iterative walk works for non-power-of-two lengths, so padding is
+        // unnecessary; checked ranges keep every leaf access below 2*n.
         let tree_size = arr.len();
         let mut values = vec![arr[0]; tree_size * 2];
         let mut positions = vec![-1_i64; tree_size * 2];

@@ -45,6 +45,9 @@ where
     }
 
     if should_use_segment_tree(starts.len(), total_width, arr.len()) {
+        // `tree_size` is exactly the number of input leaves. The half-open
+        // iterative walk works for non-power-of-two lengths, so padding is
+        // unnecessary; checked ranges keep every leaf access below 2*n.
         let tree_size = arr.len();
         let mut tree = vec![1_i64; tree_size * 2];
         for nn in 0..arr.len() {

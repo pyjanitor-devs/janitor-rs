@@ -36,6 +36,12 @@ const SEGMENT_TREE_QUERY_WORK_FACTOR: usize = 2;
 /// values. Opening the cabinet costs a full pass over the shelf, and answering
 /// a question opens several drawers. Do that only when walking each requested
 /// section directly would take longer than opening the cabinet and drawers.
+///
+/// The callers use an iterative half-open range walk with exactly `array_len`
+/// leaves, so this policy does not require padding to a power of two. The
+/// leaves occupy `[array_len, 2 * array_len)`, and every checked query has
+/// endpoints in `[0, array_len]`; the walk therefore never needs a slot past
+/// the allocated tree.
 pub(crate) fn should_use_segment_tree(
     query_count: usize,
     total_width: usize,
