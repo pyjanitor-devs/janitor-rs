@@ -211,10 +211,10 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_suffix_preserves_direct_nan_semantics() {
+    fn adaptive_suffix_skips_nan_values_marked_null() {
         let arr = array![1.0_f64, f64::NAN];
         let starts = array![0_i64, 0, 0, 0];
-        let booleans = array![false, false];
+        let booleans = array![false, true];
         let got = min_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0, 0, 0, 0]);
     }
