@@ -401,14 +401,32 @@ mod tests {
     }
 
     #[test]
+    fn float_interval_uses_compensated_direct_summation() {
+        let arr = array![1.0e16_f64, 1.0, -1.0e16, 3.0];
+        let starts = array![0_i64, 3];
+        let ends = array![3_i64, 4];
+        let booleans = array![false, false, false, false];
+        let got = sum_start_end_float_core_with_cast(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, array![0.0, 3.0]);
+    }
+
+    #[test]
     fn repeated_broad_ranges_use_wrapping_prefix_differences() {
         let arr = array![1_i64, 2, 3, 4];
-        let starts = array![0_i64, 0, 1, 2];
-        let ends = array![4_i64, 3, 4, 4];
+        // Five broad ranges cross the running-buffer threshold.
+        let starts = array![0_i64, 0, 1, 2, 0];
+        let ends = array![4_i64, 3, 4, 4, 4];
         let booleans = array![false, true, false, false];
         let got =
             sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
-        assert_eq!(got, array![8, 4, 7, 7]);
+        assert_eq!(got, array![8, 4, 7, 7, 8]);
     }
 
     #[test]

@@ -244,6 +244,35 @@ mod tests {
     }
 
     #[test]
+    fn segment_tree_handles_non_power_of_two_length() {
+        let mut arr = numpy::ndarray::Array1::from_elem(17, 1_i64);
+        arr[8] = 2;
+        let starts = numpy::ndarray::Array1::from_elem(16, 0_i64);
+        let ends = numpy::ndarray::Array1::from_elem(16, 17_i64);
+        let mut booleans = numpy::ndarray::Array1::from_elem(17, false);
+        let got = prod_start_end_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, numpy::ndarray::Array1::from_elem(16, 2_i64));
+
+        booleans[8] = true;
+        let got = prod_start_end_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, numpy::ndarray::Array1::from_elem(16, 1_i64));
+    }
+
+    #[test]
     fn validation_checks_nonempty_before_parallel_lengths() {
         let arr = array![2_i64];
         let starts = array![0_i64];

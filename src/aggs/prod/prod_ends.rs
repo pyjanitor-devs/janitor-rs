@@ -137,6 +137,16 @@ mod tests {
             prod_end_float_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
         assert_eq!(got, array![1.0, 1.0]);
     }
+
+    #[test]
+    fn broad_float_prefix_batch_uses_running_products() {
+        let arr = array![2.0_f64, 3.0, 4.0];
+        let ends = array![3_i64, 3, 3, 3, 3];
+        let booleans = array![false, true, false];
+        let got =
+            prod_end_float_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
+        assert_eq!(got, array![8.0, 8.0, 8.0, 8.0, 8.0]);
+    }
 }
 
 /// Computes floating-point products for prefix queries described by `ends`.

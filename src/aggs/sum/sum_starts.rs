@@ -336,6 +336,19 @@ mod tests {
     }
 
     #[test]
+    fn float_suffix_uses_compensated_direct_summation() {
+        let arr = array![1.0e16_f64, 1.0, -1.0e16];
+        let starts = array![0_i64, 1];
+        let booleans = array![false, false, false];
+        let got =
+            sum_start_float_core_with_cast(arr.view(), starts.view(), booleans.view(), |value| {
+                value
+            })
+            .unwrap();
+        assert_eq!(got, array![0.0, -1.0e16]);
+    }
+
+    #[test]
     fn repeated_broad_suffixes_use_the_same_wrapping_result() {
         let arr = array![1_i64, 2, 3, 4];
         let starts = array![0_i64, 0, 1, 2];

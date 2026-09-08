@@ -331,4 +331,15 @@ mod tests {
             max_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![2, 2, 2, 2]);
     }
+
+    #[test]
+    fn segment_tree_handles_non_power_of_two_length() {
+        let arr = numpy::ndarray::Array1::from_iter(0_i64..17);
+        let starts = numpy::ndarray::Array1::from_elem(16, 0_i64);
+        let ends = numpy::ndarray::Array1::from_elem(16, 17_i64);
+        let booleans = numpy::ndarray::Array1::from_elem(17, false);
+        let got =
+            max_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
+        assert_eq!(got, numpy::ndarray::Array1::from_elem(16, 16_i64));
+    }
 }
