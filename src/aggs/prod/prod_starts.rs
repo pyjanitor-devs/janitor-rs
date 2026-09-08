@@ -138,13 +138,13 @@ mod tests {
     #[test]
     fn suffix_at_array_end_keeps_product_identity() {
         let arr = array![2_i64, 3, 4];
-        // Five broad queries take the adaptive suffix path; the equality
-        // boundary must still look up the extra identity slot.
-        let starts = array![3_i64, 3, 3, 3, 3];
+        // Five queries with broad ranges take the adaptive suffix path; the
+        // equality boundary must still look up the extra identity slot.
+        let starts = array![0_i64, 0, 0, 0, 3];
         let booleans = array![false, false, false];
         let got =
             prod_start_core(arr.view(), starts.view(), booleans.view(), |value| value).unwrap();
-        assert_eq!(got, array![1, 1, 1, 1, 1]);
+        assert_eq!(got, array![24, 24, 24, 24, 1]);
     }
 }
 

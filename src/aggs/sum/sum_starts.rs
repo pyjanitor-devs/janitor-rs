@@ -93,7 +93,7 @@ where
         }
         for (pos, start) in starts.iter().enumerate() {
             if let Ok(start_) = usize::try_from(*start) {
-                if start_ < end_ {
+                if start_ <= end_ {
                     result[pos] = suffix[start_];
                 }
             }
@@ -345,6 +345,15 @@ mod tests {
         // suffix buffer rather than the direct per-query loop.
         let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![8, 8, 7, 7]);
+    }
+
+    #[test]
+    fn adaptive_suffix_at_array_end_keeps_sum_identity() {
+        let arr = array![1_i64, 2, 3, 4];
+        let starts = array![0_i64, 0, 0, 0, 4];
+        let booleans = array![false, false, false, false];
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![10, 10, 10, 10, 0]);
     }
 
     #[test]
