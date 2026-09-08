@@ -313,13 +313,15 @@ mod tests {
 
     #[test]
     fn segment_tree_keeps_earliest_position_for_minimum_ties() {
-        let arr = array![4_i64, 1, 1, 1, 1, 1, 1, 4];
-        let starts = array![1_i64, 1, 1, 1];
-        let ends = array![7_i64, 7, 7, 7];
-        let booleans = Array1::from_elem(8, false);
+        // Sixteen broad queries over a length-17 array cross the segment-tree
+        // threshold while keeping several equal minima in every range.
+        let arr = Array1::from_iter(std::iter::once(4_i64).chain(std::iter::repeat_n(1, 16)));
+        let starts = Array1::from_elem(16, 1_i64);
+        let ends = Array1::from_elem(16, 17_i64);
+        let booleans = Array1::from_elem(17, false);
         let got =
             min_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
-        assert_eq!(got, array![1, 1, 1, 1]);
+        assert_eq!(got, Array1::from_elem(16, 1_i64));
     }
 
     #[test]
