@@ -357,6 +357,15 @@ mod tests {
     }
 
     #[test]
+    fn invalid_adaptive_suffixes_keep_sum_identity() {
+        let arr = array![1_i64, 2, 3, 4];
+        let starts = array![-1_i64, 0, 0, 0, 4];
+        let booleans = array![false, false, false, false];
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![0, 10, 10, 10, 0]);
+    }
+
+    #[test]
     fn accumulation_overflow_wraps_instead_of_panicking() {
         // 100 copies of i64::MAX / 2 overflows i64 many times over; this
         // must wrap (two's complement), matching the NumPy/pyjanitor side

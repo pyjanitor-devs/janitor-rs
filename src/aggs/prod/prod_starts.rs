@@ -146,6 +146,16 @@ mod tests {
             prod_start_core(arr.view(), starts.view(), booleans.view(), |value| value).unwrap();
         assert_eq!(got, array![24, 24, 24, 24, 1]);
     }
+
+    #[test]
+    fn adaptive_suffix_skips_null_values() {
+        let arr = array![2_i64, 3, 4];
+        let starts = array![0_i64, 0, 0, 0, 3];
+        let booleans = array![false, true, false];
+        let got =
+            prod_start_core(arr.view(), starts.view(), booleans.view(), |value| value).unwrap();
+        assert_eq!(got, array![8, 8, 8, 8, 1]);
+    }
 }
 
 /// Computes floating-point products for suffix queries described by `starts`.
