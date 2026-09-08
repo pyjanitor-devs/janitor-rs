@@ -12,6 +12,11 @@ use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core
 /// product once and combines only the blocks covering a query. Null values
 /// contribute the multiplicative identity, `1`.
 ///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
+///
 /// Input contract: `arr`, `starts`, and `ends` must be non-empty, and
 /// `starts` and `ends` must have equal lengths. The Python wrapper raises
 /// `ValueError` when this contract is violated.

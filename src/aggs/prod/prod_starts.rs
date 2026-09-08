@@ -13,6 +13,11 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// The result has one `i64` product per entry in `starts`; null-only suffixes
 /// therefore return the multiplicative identity, `1`.
 ///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
+///
 /// Integer multiplication uses `wrapping_mul`, matching the explicit
 /// fixed-width wrapping behavior used by the integer sum cores.
 ///

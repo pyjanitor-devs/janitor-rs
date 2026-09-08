@@ -8,6 +8,11 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// For every `starts[i]`, sum `arr[starts[i]..]` (to the end of the array),
 /// skipping any position flagged `true` in `booleans` (a null mask).
 ///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
+///
 /// ELI5: `booleans[nn] == true` means "this value is missing, treat it as
 /// absent, not as zero" -- we skip it in the running total rather than
 /// adding it in.

@@ -8,6 +8,11 @@ use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core
 /// For every `(starts[i], ends[i])`, sum `arr[starts[i]..ends[i]]`,
 /// skipping any position flagged `true` in `booleans` (a null mask).
 ///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
+///
 /// ELI5: an arbitrary `[start, end)` slice instead of "to the end" or
 /// "from the beginning" -- same null-skip/overflow-wrap contract as
 /// `sum_start_core`. `checked_range(start, end, arr.len())` rejects an

@@ -10,6 +10,11 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// entries in `booleans` mark null values that contribute the identity `1`.
 /// Integer products use fixed-width wrapping multiplication.
 ///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
+///
 /// # Arguments
 ///
 /// * `arr` - Values to multiply.

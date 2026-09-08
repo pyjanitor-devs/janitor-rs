@@ -12,6 +12,11 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// `arr.len()`, or every candidate is null. An empty `arr` is rejected with
 /// `Err("arr cannot be empty")` before range results are produced.
 ///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
+///
 /// # Arguments
 ///
 /// * `arr` - Values to inspect.

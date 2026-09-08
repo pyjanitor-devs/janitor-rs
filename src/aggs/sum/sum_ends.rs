@@ -12,6 +12,11 @@ use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 /// sentinel's meaning elsewhere rather than being cast to `usize` and
 /// walked off the end of `arr`.
 ///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
+///
 /// ELI5: the mirror image of `sum_start_core` -- instead of "everything
 /// from here to the end", it's "everything from the beginning up to here".
 /// Same null-skip and overflow-wrap contract; see `sum_start_core` for the
