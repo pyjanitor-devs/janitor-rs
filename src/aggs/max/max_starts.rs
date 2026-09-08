@@ -166,6 +166,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_starts_are_rejected() {
+        let arr = array![1_i64];
+        let starts: Array1<i64> = array![];
+        let booleans = array![false];
+        let error = max_start_core(arr.view(), starts.view(), booleans.view()).unwrap_err();
+        assert_eq!(error, "starts cannot be empty");
+    }
+
+    #[test]
     fn start_equal_to_len_returns_minus_one_not_a_panic() {
         // The exact reproduction from issue #27.
         let arr = array![1_i64, 2, 3];

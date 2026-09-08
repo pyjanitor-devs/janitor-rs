@@ -159,6 +159,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_ends_are_rejected() {
+        let arr = array![1_i64];
+        let ends: Array1<i64> = array![];
+        let booleans = array![false];
+        let error = max_end_core(arr.view(), ends.view(), booleans.view()).unwrap_err();
+        assert_eq!(error, "ends cannot be empty");
+    }
+
+    #[test]
     fn finds_position_of_largest_in_prefix() {
         let arr = array![3_i64, 1, 9, 2, 5];
         let ends = array![3_i64]; // prefix [3, 1, 9]

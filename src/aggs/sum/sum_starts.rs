@@ -290,6 +290,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_starts_are_rejected() {
+        let arr = array![1_i64];
+        let starts: Array1<i64> = array![];
+        let booleans = array![false];
+        let error = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap_err();
+        assert_eq!(error, "starts cannot be empty");
+    }
+
+    #[test]
     fn start_at_end_is_zero() {
         let arr = array![1_i64, 2, 3];
         let starts = array![3_i64]; // boundary: nothing left to sum

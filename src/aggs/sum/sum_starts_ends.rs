@@ -265,6 +265,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_starts_are_rejected() {
+        let arr = array![1_i64];
+        let starts: Array1<i64> = array![];
+        let ends = array![0_i64];
+        let booleans = array![false];
+        let error = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view())
+            .unwrap_err();
+        assert_eq!(error, "starts cannot be empty");
+    }
+
+    #[test]
+    fn empty_ends_are_rejected() {
+        let arr = array![1_i64];
+        let starts = array![0_i64];
+        let ends: Array1<i64> = array![];
+        let booleans = array![false];
+        let error = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view())
+            .unwrap_err();
+        assert_eq!(error, "ends cannot be empty");
+    }
+
+    #[test]
     fn full_array_range() {
         let arr = array![1_i64, 2, 3, 4];
         let starts = array![0_i64];

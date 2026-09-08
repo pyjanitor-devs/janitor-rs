@@ -106,6 +106,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_starts_are_rejected() {
+        let arr = array![1_i64];
+        let starts: Array1<i64> = array![];
+        let booleans = array![false];
+        let error =
+            prod_start_core(arr.view(), starts.view(), booleans.view(), |value| value).unwrap_err();
+        assert_eq!(error, "starts cannot be empty");
+    }
+
+    #[test]
     fn broad_suffix_batch_uses_running_products() {
         let arr = array![2_i64, 3, 4, 5, 6, 7];
         let starts = array![0_i64, 1, 2, 3, 4, 5];

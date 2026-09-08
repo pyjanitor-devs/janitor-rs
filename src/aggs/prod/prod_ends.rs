@@ -92,6 +92,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_ends_are_rejected() {
+        let arr = array![1_i64];
+        let ends: Array1<i64> = array![];
+        let booleans = array![false];
+        let error =
+            prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap_err();
+        assert_eq!(error, "ends cannot be empty");
+    }
+
+    #[test]
     fn broad_prefix_batch_uses_running_products() {
         let arr = array![2_i64, 3, 4, 5, 6, 7];
         let ends = array![1_i64, 2, 3, 4, 5, 6];
