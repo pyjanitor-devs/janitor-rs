@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::adaptive::should_use_running_aggregation;
+use crate::aggs::adaptive::should_use_segment_tree;
 use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// Compute integer products over arbitrary half-open ranges.
@@ -39,7 +39,7 @@ where
         }
     }
 
-    if should_use_running_aggregation(starts.len(), total_width, arr.len()) {
+    if should_use_segment_tree(starts.len(), total_width, arr.len()) {
         let tree_size = arr.len().next_power_of_two();
         let mut tree = vec![1_i64; tree_size * 2];
         for nn in 0..arr.len() {

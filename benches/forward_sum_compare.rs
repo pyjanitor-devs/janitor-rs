@@ -589,5 +589,111 @@ fn bench_forward_all_aggregations(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_forward_sum, bench_forward_all_aggregations);
+fn bench_segment_tree_cutoff(c: &mut Criterion) {
+    let mut group = c.benchmark_group("forward_segment_tree_cutoff");
+    group.sample_size(10);
+    let n = 100_000;
+    let arr = Array1::from_iter((0..n).map(|value| (value % 97) as i64 + 1));
+    let mask = Array1::from_elem(n, false);
+
+    for (label, queries, width) in [("narrow", 100_000, 4), ("broad", 1_000, 50_000)] {
+        let starts =
+            Array1::from_iter((0..queries).map(|query| ((query * 97) % (n - width)) as i64));
+        let ends = starts.mapv(|start| start + width as i64);
+
+        assert_eq!(
+            old_min_start_end(&arr, &starts, &ends, &mask),
+            min_start_end_core(arr.view(), starts.view(), ends.view(), mask.view()).unwrap()
+        );
+        group.bench_function(format!("min/old/{label}"), |b| {
+            b.iter(|| {
+                old_min_start_end(
+                    black_box(&arr),
+                    black_box(&starts),
+                    black_box(&ends),
+                    black_box(&mask),
+                )
+            })
+        });
+        group.bench_function(format!("min/adaptive/{label}"), |b| {
+            b.iter(|| {
+                min_start_end_core(
+                    black_box(arr.view()),
+                    black_box(starts.view()),
+                    black_box(ends.view()),
+                    black_box(mask.view()),
+                )
+                .unwrap()
+            })
+        });
+
+        assert_eq!(
+            old_max_start_end(&arr, &starts, &ends, &mask),
+            max_start_end_core(arr.view(), starts.view(), ends.view(), mask.view()).unwrap()
+        );
+        group.bench_function(format!("max/old/{label}"), |b| {
+            b.iter(|| {
+                old_max_start_end(
+                    black_box(&arr),
+                    black_box(&starts),
+                    black_box(&ends),
+                    black_box(&mask),
+                )
+            })
+        });
+        group.bench_function(format!("max/adaptive/{label}"), |b| {
+            b.iter(|| {
+                max_start_end_core(
+                    black_box(arr.view()),
+                    black_box(starts.view()),
+                    black_box(ends.view()),
+                    black_box(mask.view()),
+                )
+                .unwrap()
+            })
+        });
+
+        assert_eq!(
+            old_prod_start_end(&arr, &starts, &ends, &mask),
+            prod_start_end_core(
+                arr.view(),
+                starts.view(),
+                ends.view(),
+                mask.view(),
+                |value| value,
+            )
+            .unwrap()
+        );
+        group.bench_function(format!("prod/old/{label}"), |b| {
+            b.iter(|| {
+                old_prod_start_end(
+                    black_box(&arr),
+                    black_box(&starts),
+                    black_box(&ends),
+                    black_box(&mask),
+                )
+            })
+        });
+        group.bench_function(format!("prod/adaptive/{label}"), |b| {
+            b.iter(|| {
+                prod_start_end_core(
+                    black_box(arr.view()),
+                    black_box(starts.view()),
+                    black_box(ends.view()),
+                    black_box(mask.view()),
+                    |value| value,
+                )
+                .unwrap()
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_forward_sum,
+    bench_forward_all_aggregations,
+    bench_segment_tree_cutoff
+);
 criterion_main!(benches);

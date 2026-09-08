@@ -3,7 +3,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::cmp::Ordering;
 
-use crate::aggs::adaptive::should_use_running_aggregation;
+use crate::aggs::adaptive::should_use_segment_tree;
 use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `(starts[i], ends[i])`, find the position (not the value) of
@@ -48,7 +48,7 @@ pub fn max_start_end_core<T: PartialOrd + Copy>(
         }
     }
 
-    if should_use_running_aggregation(starts.len(), total_width, arr.len()) {
+    if should_use_segment_tree(starts.len(), total_width, arr.len()) {
         // ELI5: each tree node remembers the largest non-null item in its
         // block. Overlapping ranges then reuse those block winners.
         let tree_size = arr.len().next_power_of_two();

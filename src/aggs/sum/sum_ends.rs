@@ -5,10 +5,6 @@ use pyo3::prelude::*;
 use crate::aggs::adaptive::should_use_running_aggregation;
 use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
-fn is_empty_sentinel_end(end: i64) -> bool {
-    end == -1
-}
-
 /// For every `ends[i]`, sum `arr[..ends[i]]` (from the start of the array),
 /// skipping any position flagged `true` in `booleans` (a null mask). An
 /// `end` of `-1` (the crate's sentinel for "invalid/no match", e.g. as
@@ -86,11 +82,10 @@ where
     }
 
     for (pos, end) in ends.iter().enumerate() {
-        if is_empty_sentinel_end(*end) {
-            continue; // result[pos] is already 0
-        }
         let mut total: i64 = 0;
         let Ok(end_) = usize::try_from(*end) else {
+            // ELI5: `usize::try_from` is the bouncer here -- it rejects the
+            // `-1` no-match ticket before it can become an array position.
             continue;
         };
         if end_ > arr.len() {
@@ -126,12 +121,11 @@ where
         // Check the "no match" card before either path turns it into an
         // array position, so dtype cannot decide whether it returns 0 or
         // crashes.
-        if is_empty_sentinel_end(*end) {
-            continue;
-        }
         let mut total = 0.0;
         let mut compensation = 0.0;
         let Ok(end_) = usize::try_from(*end) else {
+            // The conversion itself rejects the `-1` no-match sentinel
+            // before it can be used as an array position.
             continue;
         };
         if end_ > arr.len() {
