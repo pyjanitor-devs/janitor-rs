@@ -51,10 +51,18 @@ pub fn min_start_core<T: PartialOrd + Copy>(
         let mut suffix = vec![-1_i64; end_];
         let mut winner = -1_i64;
         for nn in (0..end_).rev() {
-            if !booleans[nn]
-                && (winner == -1
-                    || arr[winner as usize].partial_cmp(&arr[nn]) != Some(Ordering::Less))
-            {
+            // `booleans` is the null mask; a NaN is only missing when its
+            // corresponding mask entry is true. If an unmasked NaN reaches
+            // this defensive path, `partial_cmp` returns `None`, which must
+            // not replace a real winner. Equal values still replace the
+            // winner because this right-to-left scan must keep the earliest
+            // position.
+            let replaces_winner = winner == -1
+                || matches!(
+                    arr[winner as usize].partial_cmp(&arr[nn]),
+                    Some(Ordering::Greater | Ordering::Equal)
+                );
+            if !booleans[nn] && replaces_winner {
                 winner = nn as i64;
             }
             suffix[nn] = winner;
@@ -236,5 +244,14 @@ mod tests {
         let booleans = array![false, true];
         let got = min_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn adaptive_suffix_does_not_let_unmasked_nan_replace_minimum() {
+        let arr = array![1.0_f64, f64::NAN, 5.0];
+        let starts = array![0_i64, 0, 0, 0, 0];
+        let booleans = array![false, false, false];
+        let got = min_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![0, 0, 0, 0, 0]);
     }
 }
