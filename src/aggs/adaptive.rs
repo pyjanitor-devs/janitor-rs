@@ -28,6 +28,7 @@ pub(crate) fn should_use_running_aggregation(
 // tree merely because their total width exceeds the running-buffer cutoff.
 const SEGMENT_TREE_BUILD_WORK_FACTOR: usize = 5;
 const SEGMENT_TREE_QUERY_WORK_FACTOR: usize = 2;
+const SEGMENT_TREE_MIN_QUERY_COUNT: usize = 3;
 
 /// Choose a segment tree only when direct range scans are estimated to cost
 /// more than building the tree and visiting its nodes for every query.
@@ -47,7 +48,7 @@ pub(crate) fn should_use_segment_tree(
     total_width: usize,
     array_len: usize,
 ) -> bool {
-    if query_count <= RUNNING_AGGREGATION_WORK_FACTOR || array_len == 0 {
+    if query_count <= SEGMENT_TREE_MIN_QUERY_COUNT || array_len == 0 {
         return false;
     }
     // The iterative range walk works with any number of leaves; padding to a

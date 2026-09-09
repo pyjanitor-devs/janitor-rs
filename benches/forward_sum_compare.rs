@@ -5,8 +5,9 @@ use std::hint::black_box;
 use janitor_rs::bench_support::{
     max_end_core, max_start_core, max_start_end_core, min_end_core, min_start_core,
     min_start_end_core, prod_end_core, prod_end_float_core, prod_start_core, prod_start_end_core,
-    prod_start_float_core, sum_end_core, sum_end_float_core_with_cast, sum_start_core,
-    sum_start_end_core, sum_start_float_core_with_cast,
+    prod_start_end_float_core, prod_start_float_core, sum_end_core, sum_end_float_core_with_cast,
+    sum_start_core, sum_start_end_core, sum_start_end_float_core_with_cast,
+    sum_start_float_core_with_cast,
 };
 
 fn old_min_start(arr: &Array1<i64>, starts: &Array1<i64>, mask: &Array1<bool>) -> Array1<i64> {
@@ -220,6 +221,47 @@ fn old_sum_start_end(
     result
 }
 
+fn old_sum_start_end_float(
+    arr: &Array1<f64>,
+    starts: &Array1<i64>,
+    ends: &Array1<i64>,
+    booleans: &Array1<bool>,
+) -> Array1<f64> {
+    let mut result = Array1::<f64>::zeros(starts.len());
+    for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        let mut total = 0.0;
+        let mut compensation = 0.0;
+        for nn in *start as usize..*end as usize {
+            if booleans[nn] {
+                continue;
+            }
+            let difference = arr[nn] - compensation;
+            let increment = total + difference;
+            compensation = (increment - total) - difference;
+            total = increment;
+        }
+        result[pos] = total;
+    }
+    result
+}
+
+fn old_prod_start_end_float(
+    arr: &Array1<f64>,
+    starts: &Array1<i64>,
+    ends: &Array1<i64>,
+    mask: &Array1<bool>,
+) -> Array1<f64> {
+    let mut result = Array1::from_elem(starts.len(), 1.0);
+    for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        for nn in *start as usize..*end as usize {
+            if !mask[nn] {
+                result[pos] *= arr[nn];
+            }
+        }
+    }
+    result
+}
+
 fn bench_forward_sum(c: &mut Criterion) {
     let mut group = c.benchmark_group("forward_sum_origin_main_vs_adaptive");
     let n = 1_000_000;
@@ -307,14 +349,25 @@ fn bench_forward_all_aggregations(c: &mut Criterion) {
     group.sample_size(10);
 
     for (size_name, n) in [
+        ("tiny", 32_usize),
         ("small", 1_000_usize),
         ("large", 100_000),
         ("very_large", 1_000_000),
+        ("super_large", 5_000_000),
     ] {
         let arr = Array1::from_iter((0..n).map(|value| (value % 97) as i64 + 1));
         let float_arr = arr.mapv(|value| value as f64);
         let mask = Array1::from_elem(n, false);
-        for (shape, width) in [("narrow", 1_usize), ("broad", n / 2)] {
+        // Keep the super-large cases bounded so the old direct reference
+        // remains a useful benchmark instead of turning into an accidental
+        // multi-billion-element run. Smaller tiers retain a broad case to
+        // exercise the adaptive crossover.
+        let widths = if n == 5_000_000 {
+            vec![("narrow", 1_usize), ("bounded", 8)]
+        } else {
+            vec![("narrow", 1_usize), ("broad", n / 2)]
+        };
+        for (shape, width) in widths {
             let queries = 1_000.min(n.max(1));
             let start = (n - width) as i64;
             let starts = Array1::from_elem(queries, start);
@@ -447,6 +500,54 @@ fn bench_forward_all_aggregations(c: &mut Criterion) {
                 b.iter(|| {
                     prod_start_end_core(
                         black_box(arr.view()),
+                        black_box(range_starts.view()),
+                        black_box(range_ends.view()),
+                        black_box(mask.view()),
+                        |value| value,
+                    )
+                    .unwrap()
+                })
+            });
+
+            assert_eq!(
+                old_sum_start_end_float(&float_arr, &range_starts, &range_ends, &mask),
+                sum_start_end_float_core_with_cast(
+                    float_arr.view(),
+                    range_starts.view(),
+                    range_ends.view(),
+                    mask.view(),
+                    |value| value,
+                )
+                .unwrap()
+            );
+            group.bench_function(format!("sum/start_end/float/{label}"), |b| {
+                b.iter(|| {
+                    sum_start_end_float_core_with_cast(
+                        black_box(float_arr.view()),
+                        black_box(range_starts.view()),
+                        black_box(range_ends.view()),
+                        black_box(mask.view()),
+                        |value| value,
+                    )
+                    .unwrap()
+                })
+            });
+
+            assert_eq!(
+                old_prod_start_end_float(&float_arr, &range_starts, &range_ends, &mask),
+                prod_start_end_float_core(
+                    float_arr.view(),
+                    range_starts.view(),
+                    range_ends.view(),
+                    mask.view(),
+                    |value| value,
+                )
+                .unwrap()
+            );
+            group.bench_function(format!("prod/start_end/float/{label}"), |b| {
+                b.iter(|| {
+                    prod_start_end_float_core(
+                        black_box(float_arr.view()),
                         black_box(range_starts.view()),
                         black_box(range_ends.view()),
                         black_box(mask.view()),
