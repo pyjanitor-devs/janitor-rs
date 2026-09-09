@@ -365,10 +365,10 @@ mod tests {
     #[test]
     fn oversized_prefix_in_dense_batch_stays_on_safe_path() {
         let arr = array![1_i64, 2, 3];
-        let ends = array![3_i64, 3, 4, 3];
+        let ends = array![3_i64, 3, 4, 3, 3];
         let booleans = array![false, false, false];
         let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
-        assert_eq!(got, array![6, 6, 0, 6]);
+        assert_eq!(got, array![6, 6, 0, 6, 6]);
     }
 
     #[test]

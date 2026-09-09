@@ -3,7 +3,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::adaptive::should_use_running_aggregation;
-use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
+use crate::aggs::{checked_end, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// Computes the product of every suffix selected by `starts` for an integer
 /// input array.
@@ -48,8 +48,8 @@ where
     let end_ = arr.len();
     let mut total_width = 0_usize;
     for start in starts.iter() {
-        if let Ok(start_) = usize::try_from(*start) {
-            total_width = total_width.saturating_add(end_.saturating_sub(start_));
+        if let Some(start_) = checked_end(*start, end_) {
+            total_width = total_width.saturating_add(end_ - start_);
         }
     }
     if should_use_running_aggregation(starts.len(), total_width, end_) {
@@ -64,22 +64,17 @@ where
             }
         }
         for (pos, start) in starts.iter().enumerate() {
-            if let Ok(start_) = usize::try_from(*start) {
-                if start_ <= end_ {
-                    result[pos] = suffix[start_];
-                }
+            if let Some(start_) = checked_end(*start, end_) {
+                result[pos] = suffix[start_];
             }
         }
         return Ok(result);
     }
     for (pos, start) in starts.iter().enumerate() {
         let mut total = 1_i64;
-        let Ok(start_) = usize::try_from(*start) else {
+        let Some(start_) = checked_end(*start, end_) else {
             continue;
         };
-        if start_ > end_ {
-            continue;
-        }
         for nn in start_..end_ {
             if !booleans[nn] {
                 total = total.wrapping_mul(convert(arr[nn]));
@@ -193,12 +188,9 @@ where
     let end_ = arr.len();
     for (pos, start) in starts.iter().enumerate() {
         let mut total = 1.0_f64;
-        let Ok(start_) = usize::try_from(*start) else {
+        let Some(start_) = checked_end(*start, end_) else {
             continue;
         };
-        if start_ > end_ {
-            continue;
-        }
         for nn in start_..end_ {
             if !booleans[nn] {
                 total *= convert(arr[nn]);

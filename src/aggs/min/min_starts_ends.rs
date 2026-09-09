@@ -128,6 +128,9 @@ fn min_node<T: PartialOrd + Copy>(
     right_value: T,
     right_position: i64,
 ) -> (T, i64) {
+    // ELI5: a position of `-1` means that side of the tree has no valid
+    // ticket, so the other side wins automatically. When both sides have a
+    // ticket, equal values keep the smaller position—the first occurrence.
     if left_position == -1 {
         (right_value, right_position)
     } else if right_position == -1 {

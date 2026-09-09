@@ -3,7 +3,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use crate::aggs::adaptive::should_use_running_aggregation;
-use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
+use crate::aggs::{checked_end, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `starts[i]`, sum `arr[starts[i]..]` (to the end of the array),
 /// skipping any position flagged `true` in `booleans` (a null mask).
@@ -74,8 +74,8 @@ where
     // corresponding pyjanitor prefix implementation and its Rust benchmark.
     let mut total_width = 0_usize;
     for start in starts.iter() {
-        if let Ok(start_) = usize::try_from(*start) {
-            total_width = total_width.saturating_add(end_.saturating_sub(start_));
+        if let Some(start_) = checked_end(*start, end_) {
+            total_width = total_width.saturating_add(end_ - start_);
         }
     }
     let use_suffix = should_use_running_aggregation(starts.len(), total_width, end_);
@@ -92,10 +92,8 @@ where
             }
         }
         for (pos, start) in starts.iter().enumerate() {
-            if let Ok(start_) = usize::try_from(*start) {
-                if start_ <= end_ {
-                    result[pos] = suffix[start_];
-                }
+            if let Some(start_) = checked_end(*start, end_) {
+                result[pos] = suffix[start_];
             }
         }
         return Ok(result);
@@ -103,7 +101,9 @@ where
 
     for (pos, start) in starts.iter().enumerate() {
         let mut total: i64 = 0;
-        let start_ = *start as usize;
+        let Some(start_) = checked_end(*start, end_) else {
+            continue;
+        };
         for nn in start_..end_ {
             if booleans[nn] {
                 continue;
@@ -187,7 +187,9 @@ where
     for (pos, start) in starts.iter().enumerate() {
         let mut total: f64 = 0.0;
         let mut compensation: f64 = 0.0;
-        let start_ = *start as usize;
+        let Some(start_) = checked_end(*start, end_) else {
+            continue;
+        };
         for nn in start_..end_ {
             if booleans[nn] {
                 continue;
@@ -372,10 +374,10 @@ mod tests {
     #[test]
     fn invalid_adaptive_suffixes_keep_sum_identity() {
         let arr = array![1_i64, 2, 3, 4];
-        let starts = array![-1_i64, 0, 0, 0, 4];
+        let starts = array![-1_i64, 0, 0, 0, 0, 4];
         let booleans = array![false, false, false, false];
         let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
-        assert_eq!(got, array![0, 10, 10, 10, 0]);
+        assert_eq!(got, array![0, 10, 10, 10, 10, 0]);
     }
 
     #[test]

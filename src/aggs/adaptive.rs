@@ -47,7 +47,7 @@ pub(crate) fn should_use_segment_tree(
     total_width: usize,
     array_len: usize,
 ) -> bool {
-    if query_count <= 3 || array_len == 0 {
+    if query_count <= RUNNING_AGGREGATION_WORK_FACTOR || array_len == 0 {
         return false;
     }
     // The iterative range walk works with any number of leaves; padding to a

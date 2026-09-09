@@ -303,6 +303,26 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, "arr cannot be empty");
 
+        let error = prod_start_end_core(
+            arr.view(),
+            numpy::ndarray::Array1::<i64>::zeros(0).view(),
+            ends_short.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(error, "starts cannot be empty");
+
+        let error = prod_start_end_core(
+            arr.view(),
+            starts.view(),
+            numpy::ndarray::Array1::<i64>::zeros(0).view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(error, "ends cannot be empty");
+
         let error = super::prod_start_end_float_core(
             arr.view(),
             starts.view(),
