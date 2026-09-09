@@ -49,6 +49,18 @@ where
         // iterative walk works for non-power-of-two lengths, so padding is
         // unnecessary; checked ranges keep every leaf access below 2*n.
         let tree_size = arr.len();
+        // The vector uses the conventional 1-based heap layout: leaves live
+        // at `[tree_size, 2 * tree_size)`, internal nodes at
+        // `[1, tree_size)`, and slot 0 is intentionally unused. The internal
+        // product slots are overwritten by the bottom-up build immediately
+        // below, but `Vec<i64>` still requires every element to be initialized
+        // before it can be indexed. Initializing with the multiplicative
+        // identity keeps those temporary values harmless, while the leaf
+        // positions are replaced with the actual values or left as identity
+        // for nulls. A sparse/optional representation would add branching to
+        // every tree access; unsafe uninitialized storage would add more risk
+        // than this one-time initialization saves. This deliberate trade-off
+        // keeps the hot query loop compact and safe.
         let mut tree = vec![1_i64; tree_size * 2];
         for nn in 0..arr.len() {
             if !booleans[nn] {

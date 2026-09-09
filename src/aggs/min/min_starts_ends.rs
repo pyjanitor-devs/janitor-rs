@@ -56,6 +56,20 @@ pub fn min_start_end_core<T: PartialOrd + Copy>(
         // iterative walk works for non-power-of-two lengths, so padding is
         // unnecessary; checked ranges keep every leaf access below 2*n.
         let tree_size = arr.len();
+        // The vectors use the conventional 1-based heap layout: leaves live
+        // at `[tree_size, 2 * tree_size)`, internal nodes at
+        // `[1, tree_size)`, and slot 0 is intentionally unused. The internal
+        // value slots are overwritten by the bottom-up build immediately
+        // below, but `Vec<T>` still requires every element to be initialized
+        // before it can be indexed. `T` is only `Copy`, not `Default`, so
+        // `arr[0]` is the only generally available safe initializer. The
+        // corresponding positions are initialized to `-1` because that is
+        // the real no-candidate sentinel used for null leaves and empty tree
+        // branches. Avoiding this initialization with `Option<T>` would add
+        // branching to every tree access; using `MaybeUninit<T>` would add
+        // unsafe invariants for a one-time build allocation. The small
+        // initialization cost is therefore deliberate and keeps the query
+        // path simple and safe.
         let mut values = vec![arr[0]; tree_size * 2];
         let mut positions = vec![-1_i64; tree_size * 2];
         for nn in 0..arr.len() {
