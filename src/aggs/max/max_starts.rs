@@ -41,13 +41,18 @@ pub fn max_start_core<T: PartialOrd + Copy>(
     let mut result = Array1::<i64>::from_elem(starts.len(), -1);
     let end_ = arr.len();
 
-    let mut total_width = 0_usize;
-    for start in starts.iter() {
-        if let Ok(start_) = usize::try_from(*start) {
-            total_width = total_width.saturating_add(end_.saturating_sub(start_));
+    let use_suffix = if starts.len() <= 3 {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for start in starts.iter() {
+            if let Ok(start_) = usize::try_from(*start) {
+                total_width = total_width.saturating_add(end_.saturating_sub(start_));
+            }
         }
-    }
-    if should_use_running_aggregation(starts.len(), total_width, end_) {
+        should_use_running_aggregation(starts.len(), total_width, end_)
+    };
+    if use_suffix {
         let mut suffix = vec![-1_i64; end_];
         let mut winner = -1_i64;
         for nn in (0..end_).rev() {

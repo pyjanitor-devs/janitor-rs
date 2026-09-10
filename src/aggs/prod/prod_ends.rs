@@ -37,13 +37,18 @@ where
     ensure_nonempty_core("ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::from_elem(ends.len(), 1);
-    let mut total_width = 0_usize;
-    for end in ends.iter() {
-        if let Some(end_) = checked_end(*end, arr.len()) {
-            total_width = total_width.saturating_add(end_);
+    let use_prefix = if ends.len() <= 3 {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for end in ends.iter() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                total_width = total_width.saturating_add(end_);
+            }
         }
-    }
-    if should_use_running_aggregation(ends.len(), total_width, arr.len()) {
+        should_use_running_aggregation(ends.len(), total_width, arr.len())
+    };
+    if use_prefix {
         // ELI5: when many prefix questions together would walk the array
         // repeatedly, multiply each prefix once and answer the questions by
         // lookup. Null entries contribute the multiplicative identity `1`.
@@ -176,13 +181,18 @@ where
     ensure_nonempty_core("ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<f64>::from_elem(ends.len(), 1.0);
-    let mut total_width = 0_usize;
-    for end in ends.iter() {
-        if let Some(end_) = checked_end(*end, arr.len()) {
-            total_width = total_width.saturating_add(end_);
+    let use_prefix = if ends.len() <= 3 {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for end in ends.iter() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                total_width = total_width.saturating_add(end_);
+            }
         }
-    }
-    if should_use_running_aggregation(ends.len(), total_width, arr.len()) {
+        should_use_running_aggregation(ends.len(), total_width, arr.len())
+    };
+    if use_prefix {
         let mut prefix = vec![1.0_f64; arr.len() + 1];
         for nn in 0..arr.len() {
             prefix[nn + 1] = prefix[nn];

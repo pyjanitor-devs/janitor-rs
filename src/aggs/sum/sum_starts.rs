@@ -72,13 +72,17 @@ where
     // so it should be built only when repeated direct scans would cost more.
     // The three-scan threshold is the measured crossover used by the
     // corresponding pyjanitor prefix implementation and its Rust benchmark.
-    let mut total_width = 0_usize;
-    for start in starts.iter() {
-        if let Some(start_) = checked_end(*start, end_) {
-            total_width = total_width.saturating_add(end_ - start_);
+    let use_suffix = if starts.len() <= 3 {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for start in starts.iter() {
+            if let Some(start_) = checked_end(*start, end_) {
+                total_width = total_width.saturating_add(end_ - start_);
+            }
         }
-    }
-    let use_suffix = should_use_running_aggregation(starts.len(), total_width, end_);
+        should_use_running_aggregation(starts.len(), total_width, end_)
+    };
 
     if use_suffix {
         // `suffix[nn]` is the wrapped sum of all non-null values from `nn`

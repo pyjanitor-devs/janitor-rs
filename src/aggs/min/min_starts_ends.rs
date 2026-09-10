@@ -41,14 +41,22 @@ pub fn min_start_end_core<T: PartialOrd + Copy>(
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::from_elem(starts.len(), -1);
 
-    let mut total_width = 0_usize;
-    for (start, end) in starts.iter().zip(ends.iter()) {
-        if let Some((start_, end_)) = checked_range(*start, *end, arr.len()) {
-            total_width = total_width.saturating_add(end_ - start_);
+    // ELI5: a few questions are cheaper to answer by walking their ranges.
+    // For larger batches, estimate the direct-scan work and build summaries
+    // only when sharing tree blocks should repay the build and query cost.
+    let use_segment_tree = if starts.len() <= 3 {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for (start, end) in starts.iter().zip(ends.iter()) {
+            if let Some((start_, end_)) = checked_range(*start, *end, arr.len()) {
+                total_width = total_width.saturating_add(end_ - start_);
+            }
         }
-    }
+        should_use_segment_tree(starts.len(), total_width, arr.len())
+    };
 
-    if should_use_segment_tree(starts.len(), total_width, arr.len()) {
+    if use_segment_tree {
         // ELI5: each tree node remembers the smallest non-null item in its
         // block. Once built, a range is answered by combining a few blocks
         // instead of rereading every element in every overlapping range.
@@ -93,20 +101,22 @@ pub fn min_start_end_core<T: PartialOrd + Copy>(
             };
             let mut left = start_ + tree_size;
             let mut right = end_ + tree_size;
-            let mut best = (arr[0], -1_i64);
+            let mut left_best = (arr[0], -1_i64);
+            let mut right_best = (arr[0], -1_i64);
             while left < right {
                 if left % 2 == 1 {
-                    best = min_node(best.0, best.1, values[left], positions[left]);
+                    left_best = min_node(left_best.0, left_best.1, values[left], positions[left]);
                     left += 1;
                 }
                 if right % 2 == 1 {
                     right -= 1;
-                    best = min_node(best.0, best.1, values[right], positions[right]);
+                    right_best =
+                        min_node(values[right], positions[right], right_best.0, right_best.1);
                 }
                 left /= 2;
                 right /= 2;
             }
-            result[pos] = best.1;
+            result[pos] = min_node(left_best.0, left_best.1, right_best.0, right_best.1).1;
         }
         return Ok(result);
     }

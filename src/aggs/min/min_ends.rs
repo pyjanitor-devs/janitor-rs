@@ -37,13 +37,18 @@ pub fn min_end_core<T: PartialOrd + Copy>(
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::from_elem(ends.len(), -1);
 
-    let mut total_width = 0_usize;
-    for end in ends.iter() {
-        if let Some((_, end_)) = checked_range(0, *end, arr.len()) {
-            total_width = total_width.saturating_add(end_);
+    let use_prefix = if ends.len() <= 3 {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for end in ends.iter() {
+            if let Some((_, end_)) = checked_range(0, *end, arr.len()) {
+                total_width = total_width.saturating_add(end_);
+            }
         }
-    }
-    if should_use_running_aggregation(ends.len(), total_width, arr.len()) {
+        should_use_running_aggregation(ends.len(), total_width, arr.len())
+    };
+    if use_prefix {
         let mut prefix = vec![-1_i64; arr.len()];
         let mut winner = -1_i64;
         for nn in 0..arr.len() {

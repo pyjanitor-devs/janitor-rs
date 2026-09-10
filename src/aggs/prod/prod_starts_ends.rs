@@ -11,6 +11,8 @@ use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core
 /// broad, overlapping slices, the local segment tree stores each block's
 /// product once and combines only the blocks covering a query. Null values
 /// contribute the multiplicative identity, `1`.
+/// Integer products use fixed-width wrapping multiplication, matching NumPy
+/// `int64` behavior rather than panicking on overflow in debug builds.
 ///
 /// Null-mask contract: `booleans[nn] == true` is the source of truth for a
 /// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
@@ -37,14 +39,22 @@ where
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::from_elem(starts.len(), 1);
-    let mut total_width = 0_usize;
-    for (start, end) in starts.iter().zip(ends.iter()) {
-        if let Some((start_, end_)) = checked_range(*start, *end, arr.len()) {
-            total_width = total_width.saturating_add(end_ - start_);
+    // ELI5: for only a few ranges, multiply each range directly. For many
+    // broad ranges, summarize blocks once and reuse those products instead of
+    // multiplying the same array positions repeatedly.
+    let use_segment_tree = if starts.len() <= 3 {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for (start, end) in starts.iter().zip(ends.iter()) {
+            if let Some((start_, end_)) = checked_range(*start, *end, arr.len()) {
+                total_width = total_width.saturating_add(end_ - start_);
+            }
         }
-    }
+        should_use_segment_tree(starts.len(), total_width, arr.len())
+    };
 
-    if should_use_segment_tree(starts.len(), total_width, arr.len()) {
+    if use_segment_tree {
         // `tree_size` is exactly the number of input leaves. The half-open
         // iterative walk works for non-power-of-two lengths, so padding is
         // unnecessary; checked ranges keep every leaf access below 2*n.

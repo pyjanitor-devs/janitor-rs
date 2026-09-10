@@ -58,13 +58,17 @@ where
     ensure_nonempty_core("ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(ends.len());
-    let mut total_width = 0_usize;
-    for end in ends.iter() {
-        if let Some(end_) = checked_end(*end, arr.len()) {
-            total_width = total_width.saturating_add(end_);
+    let use_prefix = if ends.len() <= 3 {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for end in ends.iter() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                total_width = total_width.saturating_add(end_);
+            }
         }
-    }
-    let use_prefix = should_use_running_aggregation(ends.len(), total_width, arr.len());
+        should_use_running_aggregation(ends.len(), total_width, arr.len())
+    };
 
     if use_prefix {
         // ELI5: write the running prefix total once, then answer every

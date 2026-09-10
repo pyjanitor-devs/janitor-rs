@@ -46,13 +46,18 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::from_elem(starts.len(), 1);
     let end_ = arr.len();
-    let mut total_width = 0_usize;
-    for start in starts.iter() {
-        if let Some(start_) = checked_end(*start, end_) {
-            total_width = total_width.saturating_add(end_ - start_);
+    let use_suffix = if starts.len() <= 3 {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for start in starts.iter() {
+            if let Some(start_) = checked_end(*start, end_) {
+                total_width = total_width.saturating_add(end_ - start_);
+            }
         }
-    }
-    if should_use_running_aggregation(starts.len(), total_width, end_) {
+        should_use_running_aggregation(starts.len(), total_width, end_)
+    };
+    if use_suffix {
         // ELI5: when many suffix questions together would walk the array
         // repeatedly, multiply each suffix once and answer the questions by
         // lookup. Null entries contribute the multiplicative identity `1`.

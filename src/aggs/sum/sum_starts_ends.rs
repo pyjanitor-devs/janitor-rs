@@ -60,13 +60,20 @@ where
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(starts.len());
-    let mut total_width = 0_usize;
-    for (start, end) in starts.iter().zip(ends.iter()) {
-        if let Some((start_, end_)) = checked_range(*start, *end, arr.len()) {
-            total_width = total_width.saturating_add(end_ - start_);
+    // ELI5: a few ranges are cheaper to sum directly. For many broad ranges,
+    // build one prefix total and answer each interval with two lookups rather
+    // than walking the same positions repeatedly.
+    let use_prefix = if starts.len() <= 3 {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for (start, end) in starts.iter().zip(ends.iter()) {
+            if let Some((start_, end_)) = checked_range(*start, *end, arr.len()) {
+                total_width = total_width.saturating_add(end_ - start_);
+            }
         }
-    }
-    let use_prefix = should_use_running_aggregation(starts.len(), total_width, arr.len());
+        should_use_running_aggregation(starts.len(), total_width, arr.len())
+    };
 
     if use_prefix {
         // ELI5: one running prefix total turns every valid interval into two
