@@ -323,18 +323,18 @@ mod tests {
 
     #[test]
     fn segment_tree_preserves_minimum_positions_and_nulls() {
-        let arr = array![5_i64, 1, 9, 2, 3];
-        let starts = array![0_i64, 0, 1, 0];
-        let ends = array![5_i64, 5, 5, 4];
-        let booleans = array![false, false, false, false, false];
+        let arr = Array1::from_iter(0_i64..17);
+        let starts = Array1::from_elem(16, 0_i64);
+        let ends = Array1::from_elem(16, 17_i64);
+        let booleans = Array1::from_elem(17, false);
         let got =
             min_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
-        assert_eq!(got, array![1, 1, 1, 1]);
+        assert_eq!(got, Array1::from_elem(16, 0_i64));
 
-        let booleans = array![true, true, true, true, true];
+        let booleans = Array1::from_elem(17, true);
         let got =
             min_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
-        assert_eq!(got, array![-1, -1, -1, -1]);
+        assert_eq!(got, Array1::from_elem(16, -1_i64));
     }
 
     #[test]
@@ -395,15 +395,15 @@ mod tests {
 
     #[test]
     fn segment_tree_does_not_let_unmasked_nan_poison_minimum() {
-        // Nine full-width queries over eight values cross the real tree
-        // cutoff: total width 72 is greater than build/query cost 64.
+        // Twelve full-width queries over eight values cross the real tree
+        // cutoff: total width 96 is greater than build/query cost 94.
         let arr = array![1.0_f64, 0.5, 0.4, 0.3, f64::NAN, 2.0, 0.01, 0.2];
-        let starts = Array1::from_elem(9, 0_i64);
-        let ends = Array1::from_elem(9, 8_i64);
+        let starts = Array1::from_elem(12, 0_i64);
+        let ends = Array1::from_elem(12, 8_i64);
         let booleans = Array1::from_elem(8, false);
         let got =
             min_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
-        assert_eq!(got, Array1::from_elem(9, 6_i64));
+        assert_eq!(got, Array1::from_elem(12, 6_i64));
     }
 
     #[test]

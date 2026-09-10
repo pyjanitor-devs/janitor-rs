@@ -253,10 +253,11 @@ mod tests {
 
     #[test]
     fn segment_tree_preserves_wrapping_products_and_nulls() {
-        let arr = array![2_i64, 3, 5, 7];
-        let starts = array![0_i64, 0, 1, 0];
-        let ends = array![4_i64, 3, 4, 2];
-        let booleans = array![false, false, true, false];
+        let mut arr = numpy::ndarray::Array1::from_elem(17, 1_i64);
+        arr[8] = 2;
+        let starts = numpy::ndarray::Array1::from_elem(16, 0_i64);
+        let ends = numpy::ndarray::Array1::from_elem(16, 17_i64);
+        let booleans = numpy::ndarray::Array1::from_elem(17, false);
         let got = prod_start_end_core(
             arr.view(),
             starts.view(),
@@ -265,7 +266,20 @@ mod tests {
             |value| value,
         )
         .unwrap();
-        assert_eq!(got, array![42, 6, 21, 6]);
+        assert_eq!(got, numpy::ndarray::Array1::from_elem(16, 2_i64));
+
+        arr[8] = 2;
+        let mut booleans = numpy::ndarray::Array1::from_elem(17, false);
+        booleans[8] = true;
+        let got = prod_start_end_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, numpy::ndarray::Array1::from_elem(16, 1_i64));
     }
 
     #[test]
