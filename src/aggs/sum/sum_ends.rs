@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::adaptive::should_use_running_aggregation;
+use crate::aggs::adaptive::{should_use_running_aggregation, MAX_DIRECT_QUERY_COUNT};
 use crate::aggs::{checked_end, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `ends[i]`, sum `arr[..ends[i]]` (from the start of the array),
@@ -58,7 +58,7 @@ where
     ensure_nonempty_core("ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(ends.len());
-    let use_prefix = if ends.len() <= 3 {
+    let use_prefix = if ends.len() <= MAX_DIRECT_QUERY_COUNT {
         false
     } else {
         let mut total_width = 0_usize;
@@ -125,13 +125,18 @@ where
     ensure_nonempty_core("ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<f64>::zeros(ends.len());
-    let mut total_width = 0_usize;
-    for end in ends.iter() {
-        if let Some(end_) = checked_end(*end, arr.len()) {
-            total_width = total_width.saturating_add(end_);
+    let use_prefix = if ends.len() <= MAX_DIRECT_QUERY_COUNT {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for end in ends.iter() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                total_width = total_width.saturating_add(end_);
+            }
         }
-    }
-    if should_use_running_aggregation(ends.len(), total_width, arr.len()) {
+        should_use_running_aggregation(ends.len(), total_width, arr.len())
+    };
+    if use_prefix {
         // ELI5: each direct prefix question starts at zero and walks left to
         // right. One Kahan walk can therefore leave a reusable answer card at
         // every end without changing any query's arithmetic order.

@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::adaptive::should_use_segment_tree;
+use crate::aggs::adaptive::{should_use_segment_tree, MAX_DIRECT_QUERY_COUNT};
 use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// Compute integer products over arbitrary half-open ranges.
@@ -42,7 +42,7 @@ where
     // ELI5: for only a few ranges, multiply each range directly. For many
     // broad ranges, summarize blocks once and reuse those products instead of
     // multiplying the same array positions repeatedly.
-    let use_segment_tree = if starts.len() <= 3 {
+    let use_segment_tree = if starts.len() <= MAX_DIRECT_QUERY_COUNT {
         false
     } else {
         let mut total_width = 0_usize;

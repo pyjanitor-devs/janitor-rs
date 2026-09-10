@@ -8,6 +8,7 @@
 // the shelf more than roughly three times, walk it once while writing down
 // running answers, then answer from those notes.
 const RUNNING_AGGREGATION_WORK_FACTOR: usize = 3;
+pub(crate) const MAX_DIRECT_QUERY_COUNT: usize = 3;
 
 /// Choose a materialized running scan when repeated range work is expected to
 /// exceed the cost of building one full-array aggregation buffer.
@@ -19,7 +20,7 @@ pub(crate) fn should_use_running_aggregation(
     total_width: usize,
     array_len: usize,
 ) -> bool {
-    query_count > RUNNING_AGGREGATION_WORK_FACTOR
+    query_count > MAX_DIRECT_QUERY_COUNT
         && total_width > array_len.saturating_mul(RUNNING_AGGREGATION_WORK_FACTOR)
 }
 

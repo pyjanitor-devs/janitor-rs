@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::adaptive::should_use_running_aggregation;
+use crate::aggs::adaptive::{should_use_running_aggregation, MAX_DIRECT_QUERY_COUNT};
 use crate::aggs::{checked_end, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `starts[i]`, sum `arr[starts[i]..]` (to the end of the array),
@@ -72,7 +72,7 @@ where
     // so it should be built only when repeated direct scans would cost more.
     // The three-scan threshold is the measured crossover used by the
     // corresponding pyjanitor prefix implementation and its Rust benchmark.
-    let use_suffix = if starts.len() <= 3 {
+    let use_suffix = if starts.len() <= MAX_DIRECT_QUERY_COUNT {
         false
     } else {
         let mut total_width = 0_usize;

@@ -3,7 +3,7 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use std::cmp::Ordering;
 
-use crate::aggs::adaptive::should_use_segment_tree;
+use crate::aggs::adaptive::{should_use_segment_tree, MAX_DIRECT_QUERY_COUNT};
 use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `(starts[i], ends[i])`, find the position (not the value) of
@@ -44,7 +44,7 @@ pub fn min_start_end_core<T: PartialOrd + Copy>(
     // ELI5: a few questions are cheaper to answer by walking their ranges.
     // For larger batches, estimate the direct-scan work and build summaries
     // only when sharing tree blocks should repay the build and query cost.
-    let use_segment_tree = if starts.len() <= 3 {
+    let use_segment_tree = if starts.len() <= MAX_DIRECT_QUERY_COUNT {
         false
     } else {
         let mut total_width = 0_usize;

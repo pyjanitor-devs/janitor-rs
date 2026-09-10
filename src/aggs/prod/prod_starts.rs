@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::adaptive::should_use_running_aggregation;
+use crate::aggs::adaptive::{should_use_running_aggregation, MAX_DIRECT_QUERY_COUNT};
 use crate::aggs::{checked_end, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// Computes the product of every suffix selected by `starts` for an integer
@@ -46,7 +46,7 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::from_elem(starts.len(), 1);
     let end_ = arr.len();
-    let use_suffix = if starts.len() <= 3 {
+    let use_suffix = if starts.len() <= MAX_DIRECT_QUERY_COUNT {
         false
     } else {
         let mut total_width = 0_usize;

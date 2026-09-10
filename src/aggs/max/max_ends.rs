@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::adaptive::should_use_running_aggregation;
+use crate::aggs::adaptive::{should_use_running_aggregation, MAX_DIRECT_QUERY_COUNT};
 use crate::aggs::checked_range;
 use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
@@ -37,7 +37,7 @@ pub fn max_end_core<T: PartialOrd + Copy>(
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::from_elem(ends.len(), -1);
 
-    let use_prefix = if ends.len() <= 3 {
+    let use_prefix = if ends.len() <= MAX_DIRECT_QUERY_COUNT {
         false
     } else {
         let mut total_width = 0_usize;

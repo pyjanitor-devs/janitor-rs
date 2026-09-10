@@ -2,7 +2,7 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::adaptive::should_use_running_aggregation;
+use crate::aggs::adaptive::{should_use_running_aggregation, MAX_DIRECT_QUERY_COUNT};
 use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `(starts[i], ends[i])`, sum `arr[starts[i]..ends[i]]`,
@@ -63,7 +63,7 @@ where
     // ELI5: a few ranges are cheaper to sum directly. For many broad ranges,
     // build one prefix total and answer each interval with two lookups rather
     // than walking the same positions repeatedly.
-    let use_prefix = if starts.len() <= 3 {
+    let use_prefix = if starts.len() <= MAX_DIRECT_QUERY_COUNT {
         false
     } else {
         let mut total_width = 0_usize;
