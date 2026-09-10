@@ -157,10 +157,18 @@ fn min_node<T: PartialOrd + Copy>(
             }
             Some(Ordering::Equal) | Some(Ordering::Greater) => (left_value, left_position),
             None => {
-                // `booleans` must mark NaN/null values invalid before they
-                // reach the tree. If a direct caller violates that contract,
-                // retain the earlier candidate deterministically.
-                (left_value, left_position)
+                // ELI5: `partial_cmp` returns no answer for a NaN. Check
+                // each value against itself to identify that invalid ticket;
+                // discard it when the other side is a real candidate instead
+                // of letting it poison the whole parent subtree. If both
+                // sides are incomparable, retain the left one deterministically.
+                let left_invalid = left_value.partial_cmp(&left_value).is_none();
+                let right_invalid = right_value.partial_cmp(&right_value).is_none();
+                match (left_invalid, right_invalid) {
+                    (true, false) => (right_value, right_position),
+                    (false, true) => (left_value, left_position),
+                    _ => (left_value, left_position),
+                }
             }
         }
     }
@@ -339,6 +347,19 @@ mod tests {
         let got =
             min_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, Array1::from_elem(16, 1_i64));
+    }
+
+    #[test]
+    fn segment_tree_does_not_let_unmasked_nan_poison_minimum() {
+        // Nine full-width queries over eight values cross the real tree
+        // cutoff: total width 72 is greater than build/query cost 64.
+        let arr = array![1.0_f64, 0.5, 0.4, 0.3, f64::NAN, 2.0, 0.01, 0.2];
+        let starts = Array1::from_elem(9, 0_i64);
+        let ends = Array1::from_elem(9, 8_i64);
+        let booleans = Array1::from_elem(8, false);
+        let got =
+            min_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
+        assert_eq!(got, Array1::from_elem(9, 6_i64));
     }
 
     #[test]
