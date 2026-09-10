@@ -46,6 +46,9 @@ where
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::from_elem(starts.len(), 1);
     let end_ = arr.len();
+    // ELI5: an i64 product is a fixed-width box. If the answer outgrows the
+    // box, wrapping_mul keeps the low bits, just like NumPy int64 arithmetic;
+    // this also avoids a debug-only overflow panic.
     let use_suffix = if starts.len() <= MAX_DIRECT_QUERY_COUNT {
         false
     } else {

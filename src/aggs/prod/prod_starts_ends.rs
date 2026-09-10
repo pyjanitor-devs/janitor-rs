@@ -39,6 +39,9 @@ where
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
     ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::from_elem(starts.len(), 1);
+    // ELI5: an i64 product is a fixed-width box. If the answer outgrows the
+    // box, wrapping_mul keeps the low bits, just like NumPy int64 arithmetic;
+    // this also avoids a debug-only overflow panic.
     // ELI5: for only a few ranges, multiply each range directly. For many
     // broad ranges, summarize blocks once and reuse those products instead of
     // multiplying the same array positions repeatedly.
