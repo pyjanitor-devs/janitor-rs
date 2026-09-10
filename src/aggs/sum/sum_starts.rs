@@ -430,4 +430,26 @@ mod tests {
         assert_eq!(got, array![4]);
         assert_eq!(casts, 1);
     }
+
+    #[test]
+    fn adaptive_suffix_documents_overlapping_narrow_conversion_cost() {
+        let arr = Array1::<i32>::from_elem(100, 1);
+        let starts = Array1::from_elem(8, 60_i64);
+        let booleans = Array1::<bool>::from_elem(100, false);
+        let mut casts = 0;
+        let got = sum_start_core_with_cast(arr.view(), starts.view(), booleans.view(), |value| {
+            casts += 1;
+            value as i64
+        })
+        .unwrap();
+
+        // Eight overlapping width-40 queries total 320 positions, crossing
+        // the adaptive cutoff of three full scans (300). The running suffix
+        // therefore converts the whole 100-element column once, even though
+        // every query touches only the same 40 positions. This is deliberate:
+        // it trades temporary full-column work and memory for fewer repeated
+        // scans; a distinct-coverage heuristic is a possible future tuning.
+        assert_eq!(got, Array1::from_elem(8, 40_i64));
+        assert_eq!(casts, 100);
+    }
 }
