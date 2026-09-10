@@ -150,24 +150,58 @@ fn min_node<T: PartialOrd + Copy>(
     } else if right_position == -1 {
         (left_value, left_position)
     } else {
+        // `right_value` is compared against `left_value` because this
+        // function returns the smaller value. On an equal-value tie, the
+        // smaller original array position wins; this preserves the same
+        // earliest-position contract as the direct scan, regardless of how
+        // the segment tree grouped the leaves.
         match right_value.partial_cmp(&left_value) {
-            Some(Ordering::Less) => (right_value, right_position),
-            Some(Ordering::Equal) if right_position < left_position => {
+            Some(Ordering::Less) => {
+                // The right child contains the smaller value, so propagate
+                // its value and its original position to the parent node.
                 (right_value, right_position)
             }
-            Some(Ordering::Equal) | Some(Ordering::Greater) => (left_value, left_position),
+            Some(Ordering::Equal) if right_position < left_position => {
+                // Values are equal, but the right child refers to an earlier
+                // input position. Keep it so tree results match a left-to-
+                // right direct scan's tie-breaking behavior.
+                (right_value, right_position)
+            }
+            Some(Ordering::Equal) | Some(Ordering::Greater) => {
+                // The left child is smaller, or it wins the equal-value tie.
+                (left_value, left_position)
+            }
             None => {
                 // ELI5: `partial_cmp` returns no answer for a NaN. Check
                 // each value against itself to identify that invalid ticket;
                 // discard it when the other side is a real candidate instead
                 // of letting it poison the whole parent subtree. If both
                 // sides are incomparable, retain the left one deterministically.
+                // For IEEE floating-point values, a NaN is not comparable
+                // even with itself, while ordinary finite values and
+                // infinities compare equal to themselves. This gives us a
+                // generic way to recognize the invalid floating-point case
+                // without adding a floating-point-only bound to this kernel.
                 let left_invalid = left_value.partial_cmp(&left_value).is_none();
                 let right_invalid = right_value.partial_cmp(&right_value).is_none();
                 match (left_invalid, right_invalid) {
-                    (true, false) => (right_value, right_position),
-                    (false, true) => (left_value, left_position),
-                    _ => (left_value, left_position),
+                    (true, false) => {
+                        // The left value is invalid, so the real right
+                        // candidate must survive into the parent node.
+                        (right_value, right_position)
+                    }
+                    (false, true) => {
+                        // The right value is invalid, so retain the valid
+                        // left candidate.
+                        (left_value, left_position)
+                    }
+                    _ => {
+                        // Both values are incomparable (or the type has an
+                        // unusual partial-order implementation). Keep the
+                        // left candidate deterministically; there is no
+                        // ordering information with which to prefer either.
+                        (left_value, left_position)
+                    }
                 }
             }
         }
