@@ -2,11 +2,8 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
-
-fn is_empty_sentinel_end(end: i64) -> bool {
-    end == -1
-}
+use crate::aggs::adaptive::{should_use_running_aggregation, MAX_DIRECT_QUERY_COUNT};
+use crate::aggs::{checked_end, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `ends[i]`, sum `arr[..ends[i]]` (from the start of the array),
 /// skipping any position flagged `true` in `booleans` (a null mask). An
@@ -14,6 +11,11 @@ fn is_empty_sentinel_end(end: i64) -> bool {
 /// returned by `binary_search_lt_core`) contributes `0`, matching that
 /// sentinel's meaning elsewhere rather than being cast to `usize` and
 /// walked off the end of `arr`.
+///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
 ///
 /// ELI5: the mirror image of `sum_start_core` -- instead of "everything
 /// from here to the end", it's "everything from the beginning up to here".
@@ -25,11 +27,20 @@ fn is_empty_sentinel_end(end: i64) -> bool {
 /// number instead (`usize::MAX`). So without checking `-1` first, "no
 /// match" would silently turn into "sum almost the whole address space",
 /// which reads past the array and crashes rather than just giving `0`.
+///
+/// # Arguments
+///
+/// * `arr` - Values to sum.
+/// * `ends` - Exclusive prefix boundaries, one per output.
+/// * `booleans` - Null mask aligned with `arr`.
+///
+/// `arr` and `ends` must both be non-empty. Boundaries in `0..=arr.len()` are
+/// valid; `-1` or oversized boundaries produce the additive identity, `0`.
 pub fn sum_end_core(
     arr: ArrayView1<i64>,
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
-) -> Array1<i64> {
+) -> Result<Array1<i64>, String> {
     sum_end_core_with_cast(arr, ends, booleans, |value| value)
 }
 
@@ -38,20 +49,54 @@ fn sum_end_core_with_cast<T, F>(
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_i64: F,
-) -> Array1<i64>
+) -> Result<Array1<i64>, String>
 where
     T: Copy,
     F: FnMut(T) -> i64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(ends.len());
-    let start_: usize = 0;
-    for (pos, end) in ends.indexed_iter() {
-        if is_empty_sentinel_end(*end) {
-            continue; // result[pos] is already 0
+    let use_prefix = if ends.len() <= MAX_DIRECT_QUERY_COUNT {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for end in ends.iter() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                total_width = total_width.saturating_add(end_);
+            }
         }
+        should_use_running_aggregation(ends.len(), total_width, arr.len())
+    };
+
+    if use_prefix {
+        // ELI5: write the running prefix total once, then answer every
+        // prefix query by looking up its end position.
+        let mut prefix = vec![0_i64; arr.len() + 1];
+        for nn in 0..arr.len() {
+            prefix[nn + 1] = prefix[nn];
+            if !booleans[nn] {
+                prefix[nn + 1] = prefix[nn + 1].wrapping_add(to_i64(arr[nn]));
+            }
+        }
+        for (pos, end) in ends.iter().enumerate() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                result[pos] = prefix[end_];
+            }
+        }
+        return Ok(result);
+    }
+
+    for (pos, end) in ends.iter().enumerate() {
         let mut total: i64 = 0;
-        let end_ = *end as usize;
-        for nn in start_..end_ {
+        let Some(end_) = checked_end(*end, arr.len()) else {
+            // ELI5: `checked_end` is the bouncer here -- it rejects the
+            // negative or oversized no-match ticket before it can become an
+            // array boundary.
+            continue;
+        };
+        for nn in 0..end_ {
             if booleans[nn] {
                 continue;
             }
@@ -59,43 +104,103 @@ where
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
-fn sum_end_float_core_with_cast<T, F>(
+/// Floating-point prefix sums use the adaptive path because a left-to-right
+/// Kahan prefix table performs the same updates as every direct prefix query.
+/// The suffix and interval float kernels remain direct because their lookup
+/// tables would change the order or compensation of each range.
+pub fn sum_end_float_core_with_cast<T, F>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_f64: F,
-) -> Array1<f64>
+) -> Result<Array1<f64>, String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<f64>::zeros(ends.len());
-    for (pos, end) in ends.indexed_iter() {
+    let use_prefix = if ends.len() <= MAX_DIRECT_QUERY_COUNT {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for end in ends.iter() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                total_width = total_width.saturating_add(end_);
+            }
+        }
+        should_use_running_aggregation(ends.len(), total_width, arr.len())
+    };
+    if use_prefix {
+        // ELI5: each direct prefix question starts at zero and walks left to
+        // right. One Kahan walk can therefore leave a reusable answer card at
+        // every end without changing any query's arithmetic order.
+        let mut prefix = vec![0.0_f64; arr.len() + 1];
+        let mut compensation = 0.0;
+        for nn in 0..arr.len() {
+            if !booleans[nn] {
+                let current = to_f64(arr[nn]);
+                let difference = current - compensation;
+                let increment = prefix[nn] + difference;
+                compensation = (increment - prefix[nn]) - difference;
+                prefix[nn + 1] = increment;
+            } else {
+                prefix[nn + 1] = prefix[nn];
+            }
+        }
+        for (pos, end) in ends.iter().enumerate() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                result[pos] = prefix[end_];
+            }
+        }
+        return Ok(result);
+    }
+
+    for (pos, end) in ends.iter().enumerate() {
         // ELI5: integers and floats receive the same list of slice ends.
         // Check the "no match" card before either path turns it into an
         // array position, so dtype cannot decide whether it returns 0 or
         // crashes.
-        if is_empty_sentinel_end(*end) {
-            continue;
-        }
         let mut total = 0.0;
-        let end_ = *end as usize;
+        let mut compensation = 0.0;
+        let Some(end_) = checked_end(*end, arr.len()) else {
+            // `checked_end` rejects the `-1` no-match sentinel before it can
+            // be used as an array boundary.
+            continue;
+        };
         for nn in 0..end_ {
             if booleans[nn] {
                 continue;
             }
-            total += to_f64(arr[nn]);
+            let current = to_f64(arr[nn]);
+            let difference = current - compensation;
+            let increment = total + difference;
+            compensation = (increment - total) - difference;
+            total = increment;
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
+        /// Sum non-null values in each prefix of `arr`. `ends` contains
+        /// exclusive boundaries and `booleans` marks null values to skip.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to sum.
+        /// * `ends` - Exclusive prefix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
+        ///
+        /// `arr` and `ends` must be non-empty. Invalid boundaries produce
+        /// zero, the additive identity.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -105,25 +210,25 @@ macro_rules! generic_compute {
         ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = sum_end_core_with_cast(
                 arr.as_array(),
                 ends.as_array(),
                 booleans.as_array(),
                 |value| value as i64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
 
 macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Sum floating-point non-null values in each prefix of `arr`.
+        /// `ends` contains exclusive boundaries and `booleans` marks nulls.
+        /// `arr` and `ends` must be non-empty. Invalid boundaries produce
+        /// zero, the additive identity.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -133,19 +238,15 @@ macro_rules! generic_compute_floats {
         ) -> PyResult<Bound<'py, PyArray1<f64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = sum_end_float_core_with_cast(
                 arr.as_array(),
                 ends.as_array(),
                 booleans.as_array(),
                 |value| value as f64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
@@ -186,12 +287,21 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn empty_array() {
+    fn empty_array_is_rejected() {
         let arr: Array1<i64> = array![];
         let ends = array![0_i64];
         let booleans: Array1<bool> = array![];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
-        assert_eq!(got, array![0]);
+        let error = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+    }
+
+    #[test]
+    fn empty_ends_are_rejected() {
+        let arr = array![1_i64];
+        let ends: Array1<i64> = array![];
+        let booleans = array![false];
+        let error = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap_err();
+        assert_eq!(error, "ends cannot be empty");
     }
 
     #[test]
@@ -199,7 +309,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let ends = array![0_i64]; // boundary: nothing yet
         let booleans = array![false, false, false];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
     }
 
@@ -208,7 +318,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let ends = array![3_i64]; // boundary: whole array
         let booleans = array![false, false, false];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![6]);
     }
 
@@ -217,7 +327,7 @@ mod tests {
         let arr = array![1_i64, 2, 3, 4];
         let ends = array![4_i64];
         let booleans = array![false, true, false, true];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![1 + 3]);
     }
 
@@ -226,8 +336,17 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let ends = array![3_i64];
         let booleans = array![true, true, true];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn repeated_broad_prefixes_use_the_same_wrapping_result() {
+        let arr = array![1_i64, 2, 3, 4];
+        let ends = array![4_i64, 4, 3, 2];
+        let booleans = array![false, true, false, false];
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![8, 8, 4, 1]);
     }
 
     #[test]
@@ -239,8 +358,26 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let ends = array![-1_i64];
         let booleans = array![false, false, false];
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn invalid_direct_prefix_is_zero_not_a_panic() {
+        let arr = array![1_i64, 2, 3];
+        let ends = array![-1_i64, 4];
+        let booleans = array![false, false, false];
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![0, 0]);
+    }
+
+    #[test]
+    fn oversized_prefix_in_dense_batch_stays_on_safe_path() {
+        let arr = array![1_i64, 2, 3];
+        let ends = array![3_i64, 3, 4, 3, 3];
+        let booleans = array![false, false, false];
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![6, 6, 0, 6, 6]);
     }
 
     #[test]
@@ -249,8 +386,51 @@ mod tests {
         let ends = array![-1_i64];
         let booleans = array![false, false, false];
         let got =
-            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value);
+            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value)
+                .unwrap();
         assert_eq!(got, array![0.0]);
+    }
+
+    #[test]
+    fn float_invalid_direct_prefix_is_zero_not_a_panic() {
+        let arr = array![1.0_f64, 2.0, 3.0];
+        let ends = array![-1_i64, 4];
+        let booleans = array![false, false, false];
+        let got =
+            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value)
+                .unwrap();
+        assert_eq!(got, array![0.0, 0.0]);
+    }
+
+    #[test]
+    fn float_end_uses_compensated_summation() {
+        let arr = array![1e16_f64, 1.0, -1e16];
+        let ends = array![3_i64];
+        let booleans = array![false, false, false];
+        let got =
+            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value)
+                .unwrap();
+        assert_eq!(got, array![0.0]);
+    }
+
+    #[test]
+    fn float_adaptive_prefix_matches_direct_kahan() {
+        let arr = array![1e16_f64, 1.0, -1e16, 3.0, 1e-9];
+        let ends = array![5_i64, 5, 5, 5];
+        let booleans = array![false, false, false, false, false];
+        let got =
+            sum_end_float_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| value)
+                .unwrap();
+
+        let mut total = 0.0;
+        let mut compensation = 0.0;
+        for value in arr.iter() {
+            let difference = *value - compensation;
+            let increment = total + difference;
+            compensation = (increment - total) - difference;
+            total = increment;
+        }
+        assert_eq!(got, array![total, total, total, total]);
     }
 
     #[test]
@@ -259,7 +439,7 @@ mod tests {
         let arr = Array1::<i64>::from_elem(100, value);
         let ends = array![100_i64];
         let booleans = Array1::<bool>::from_elem(100, false);
-        let got = sum_end_core(arr.view(), ends.view(), booleans.view());
+        let got = sum_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got[0], -100_i64);
     }
 
@@ -272,7 +452,8 @@ mod tests {
         let got = sum_end_core_with_cast(arr.view(), ends.view(), booleans.view(), |value| {
             casts += 1;
             value as i64
-        });
+        })
+        .unwrap();
         assert_eq!(got, array![1]);
         assert_eq!(casts, 1);
     }

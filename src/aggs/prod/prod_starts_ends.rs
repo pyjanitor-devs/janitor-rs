@@ -1,11 +1,170 @@
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths};
+use crate::aggs::adaptive::{should_use_segment_tree, MAX_DIRECT_QUERY_COUNT};
+use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core};
+
+/// Compute integer products over arbitrary half-open ranges.
+///
+/// ELI5: narrow workloads multiply each requested slice directly. For many
+/// broad, overlapping slices, the local segment tree stores each block's
+/// product once and combines only the blocks covering a query. Null values
+/// contribute the multiplicative identity, `1`.
+/// Integer products use fixed-width wrapping multiplication, matching NumPy
+/// `int64` behavior rather than panicking on overflow in debug builds.
+///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
+///
+/// Input contract: `arr`, `starts`, and `ends` must be non-empty, and
+/// `starts` and `ends` must have equal lengths. The Python wrapper raises
+/// `ValueError` when this contract is violated.
+pub fn prod_start_end_core<T, F>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut to_i64: F,
+) -> Result<Array1<i64>, String>
+where
+    T: Copy,
+    F: FnMut(T) -> i64,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    let mut result = Array1::<i64>::from_elem(starts.len(), 1);
+    // ELI5: an i64 product is a fixed-width box. If the answer outgrows the
+    // box, wrapping_mul keeps the low bits, just like NumPy int64 arithmetic;
+    // this also avoids a debug-only overflow panic.
+    // ELI5: for only a few ranges, multiply each range directly. For many
+    // broad ranges, summarize blocks once and reuse those products instead of
+    // multiplying the same array positions repeatedly.
+    let use_segment_tree = if starts.len() <= MAX_DIRECT_QUERY_COUNT {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for (start, end) in starts.iter().zip(ends.iter()) {
+            if let Some((start_, end_)) = checked_range(*start, *end, arr.len()) {
+                total_width = total_width.saturating_add(end_ - start_);
+            }
+        }
+        should_use_segment_tree(starts.len(), total_width, arr.len())
+    };
+
+    if use_segment_tree {
+        // `tree_size` is exactly the number of input leaves. The half-open
+        // iterative walk works for non-power-of-two lengths, so padding is
+        // unnecessary; checked ranges keep every leaf access below 2*n.
+        let tree_size = arr.len();
+        // The vector uses the conventional 1-based heap layout: leaves live
+        // at `[tree_size, 2 * tree_size)`, internal nodes at
+        // `[1, tree_size)`, and slot 0 is intentionally unused. The internal
+        // product slots are overwritten by the bottom-up build immediately
+        // below, but `Vec<i64>` still requires every element to be initialized
+        // before it can be indexed. Initializing with the multiplicative
+        // identity keeps those temporary values harmless, while the leaf
+        // positions are replaced with the actual values or left as identity
+        // for nulls. A sparse/optional representation would add branching to
+        // every tree access; unsafe uninitialized storage would add more risk
+        // than this one-time initialization saves. This deliberate trade-off
+        // keeps the hot query loop compact and safe.
+        let mut tree = vec![1_i64; tree_size * 2];
+        for nn in 0..arr.len() {
+            if !booleans[nn] {
+                tree[tree_size + nn] = to_i64(arr[nn]);
+            }
+        }
+        for node in (1..tree_size).rev() {
+            tree[node] = tree[node * 2].wrapping_mul(tree[node * 2 + 1]);
+        }
+
+        for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+            let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
+                continue;
+            };
+            let mut left = start_ + tree_size;
+            let mut right = end_ + tree_size;
+            let mut total = 1_i64;
+            while left < right {
+                if left % 2 == 1 {
+                    total = total.wrapping_mul(tree[left]);
+                    left += 1;
+                }
+                if right % 2 == 1 {
+                    right -= 1;
+                    total = total.wrapping_mul(tree[right]);
+                }
+                left /= 2;
+                right /= 2;
+            }
+            result[pos] = total;
+        }
+        return Ok(result);
+    }
+
+    for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
+            continue;
+        };
+        let mut total = 1_i64;
+        for nn in start_..end_ {
+            if !booleans[nn] {
+                total = total.wrapping_mul(to_i64(arr[nn]));
+            }
+        }
+        result[pos] = total;
+    }
+    Ok(result)
+}
+
+/// Compute floating-point products over arbitrary half-open ranges.
+///
+/// This intentionally keeps the direct left-to-right loop: regrouping
+/// floating-point multiplications in a tree can change rounding, signed-zero,
+/// infinity, and NaN behavior.
+pub fn prod_start_end_float_core<T, F>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut to_f64: F,
+) -> Result<Array1<f64>, String>
+where
+    T: Copy,
+    F: FnMut(T) -> f64,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    let mut result = Array1::<f64>::from_elem(starts.len(), 1.0);
+    for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
+            continue;
+        };
+        let mut total = 1.0;
+        for nn in start_..end_ {
+            if !booleans[nn] {
+                total *= to_f64(arr[nn]);
+            }
+        }
+        result[pos] = total;
+    }
+    Ok(result)
+}
 
 macro_rules! generic_compute_ints {
     ($fname:ident, $type:ty) => {
+        /// Computes products for each half-open `arr[start..end]` range.
+        /// `arr`, `starts`, and `ends` must be non-empty; invalid ranges
+        /// return the multiplicative identity, `1`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -18,39 +177,11 @@ macro_rules! generic_compute_ints {
         {
             let starts = starts.as_array();
             let ends = ends.as_array();
-            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
-            let arr = arr.as_array();
-            let booleans = booleans.as_array();
-            // ELI5: `1`, not `0` -- an empty or rejected range must
-            // preserve product's multiplicative identity, or a bounds
-            // guard would silently change the result for rows it rejects.
-            let mut result = Array1::<i64>::from_elem(starts.len(), 1);
-            let zipped = starts.into_iter().zip(ends.into_iter());
-            for (pos, (start, end)) in zipped.enumerate() {
-                // ELI5 (the guard): `checked_range` rejects a negative,
-                // inverted, or too-large range before it's cast to `usize`;
-                // an unguarded `-1` "no match" sentinel would otherwise
-                // wrap to `usize::MAX` and walk `arr`/`booleans` out of
-                // bounds.
-                let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
-                    continue;
-                };
-                let mut total: i64 = 1;
-                for nn in start_..end_ {
-                    if booleans[nn] {
-                        continue;
-                    }
-                    let current = arr[nn];
-                    total *= current as i64;
-                }
-                result[pos] = total;
-            }
+            let result =
+                prod_start_end_core(arr.as_array(), starts, ends, booleans.as_array(), |value| {
+                    value as i64
+                })
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok(result.into_pyarray(py))
         }
     };
@@ -58,6 +189,9 @@ macro_rules! generic_compute_ints {
 
 macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Computes floating-point products for each half-open range.
+        /// `arr`, `starts`, and `ends` must be non-empty; invalid ranges
+        /// return the multiplicative identity, `1.0`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -70,31 +204,14 @@ macro_rules! generic_compute_floats {
         {
             let starts = starts.as_array();
             let ends = ends.as_array();
-            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
-            let arr = arr.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<f64>::from_elem(starts.len(), 1.0);
-            let zipped = starts.into_iter().zip(ends.into_iter());
-            for (pos, (start, end)) in zipped.enumerate() {
-                let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
-                    continue;
-                };
-                let mut total: f64 = 1.0;
-                for nn in start_..end_ {
-                    if booleans[nn] {
-                        continue;
-                    }
-                    let current = arr[nn];
-                    total *= current as f64;
-                }
-                result[pos] = total;
-            }
+            let result = prod_start_end_float_core(
+                arr.as_array(),
+                starts,
+                ends,
+                booleans.as_array(),
+                |value| value as f64,
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
             Ok(result.into_pyarray(py))
         }
     };
@@ -127,4 +244,135 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_prod_start_end_f32, m)?)?;
     m.add_function(wrap_pyfunction!(compute_prod_start_end_f64, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prod_start_end_core;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn segment_tree_preserves_wrapping_products_and_nulls() {
+        let mut arr = numpy::ndarray::Array1::from_elem(17, 1_i64);
+        arr[8] = 2;
+        let starts = numpy::ndarray::Array1::from_elem(16, 0_i64);
+        let ends = numpy::ndarray::Array1::from_elem(16, 17_i64);
+        let booleans = numpy::ndarray::Array1::from_elem(17, false);
+        let got = prod_start_end_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, numpy::ndarray::Array1::from_elem(16, 2_i64));
+
+        arr[8] = 2;
+        let mut booleans = numpy::ndarray::Array1::from_elem(17, false);
+        booleans[8] = true;
+        let got = prod_start_end_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, numpy::ndarray::Array1::from_elem(16, 1_i64));
+    }
+
+    #[test]
+    fn segment_tree_handles_non_power_of_two_length() {
+        let mut arr = numpy::ndarray::Array1::from_elem(17, 1_i64);
+        arr[8] = 2;
+        let starts = numpy::ndarray::Array1::from_elem(16, 0_i64);
+        let ends = numpy::ndarray::Array1::from_elem(16, 17_i64);
+        let mut booleans = numpy::ndarray::Array1::from_elem(17, false);
+        let got = prod_start_end_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, numpy::ndarray::Array1::from_elem(16, 2_i64));
+
+        booleans[8] = true;
+        let got = prod_start_end_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, numpy::ndarray::Array1::from_elem(16, 1_i64));
+    }
+
+    #[test]
+    fn validation_checks_nonempty_before_parallel_lengths() {
+        let arr = array![2_i64];
+        let starts = array![0_i64];
+        let ends = array![1_i64, 1];
+        let ends_short = array![1_i64];
+        let booleans = array![false];
+        let error = prod_start_end_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "starts and ends must have equal lengths; got 1 and 2"
+        );
+
+        let empty_arr = numpy::ndarray::Array1::<i64>::zeros(0);
+        let error = prod_start_end_core(
+            empty_arr.view(),
+            starts.view(),
+            ends_short.view(),
+            numpy::ndarray::Array1::<bool>::from_vec(vec![]).view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+
+        let error = prod_start_end_core(
+            arr.view(),
+            numpy::ndarray::Array1::<i64>::zeros(0).view(),
+            ends_short.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(error, "starts cannot be empty");
+
+        let error = prod_start_end_core(
+            arr.view(),
+            starts.view(),
+            numpy::ndarray::Array1::<i64>::zeros(0).view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap_err();
+        assert_eq!(error, "ends cannot be empty");
+
+        let error = super::prod_start_end_float_core(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            booleans.view(),
+            |value| value as f64,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "starts and ends must have equal lengths; got 1 and 2"
+        );
+    }
 }

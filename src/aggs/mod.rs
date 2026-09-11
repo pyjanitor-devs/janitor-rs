@@ -19,6 +19,7 @@
 use numpy::ndarray::ArrayView1;
 use pyo3::prelude::*;
 
+pub(crate) mod adaptive;
 pub mod min;
 
 pub mod prod;
@@ -1224,19 +1225,19 @@ mod adversarial_bounds_tests {
         let empty_matches = array![];
 
         assert_eq!(
-            min_start_core(arr.view(), invalid_starts.view(), booleans.view()),
+            min_start_core(arr.view(), invalid_starts.view(), booleans.view()).unwrap(),
             array![-1, -1, -1]
         );
         assert_eq!(
-            max_start_core(arr.view(), invalid_starts.view(), booleans.view()),
+            max_start_core(arr.view(), invalid_starts.view(), booleans.view()).unwrap(),
             array![-1, -1, -1]
         );
         assert_eq!(
-            min_end_core(arr.view(), invalid_ends.view(), booleans.view()),
+            min_end_core(arr.view(), invalid_ends.view(), booleans.view()).unwrap(),
             array![-1, -1]
         );
         assert_eq!(
-            max_end_core(arr.view(), invalid_ends.view(), booleans.view()),
+            max_end_core(arr.view(), invalid_ends.view(), booleans.view()).unwrap(),
             array![-1, -1]
         );
 
@@ -1247,7 +1248,8 @@ mod adversarial_bounds_tests {
                 starts.view(),
                 invalid_ends.view(),
                 booleans.view(),
-            ),
+            )
+            .unwrap(),
             array![-1, -1]
         );
         assert_eq!(
@@ -1256,7 +1258,8 @@ mod adversarial_bounds_tests {
                 starts.view(),
                 invalid_ends.view(),
                 booleans.view(),
-            ),
+            )
+            .unwrap(),
             array![-1, -1]
         );
 

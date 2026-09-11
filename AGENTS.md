@@ -80,6 +80,15 @@ the bottom of this file.
   "obviously safe" case is -- for each *input*, not just the ones the
   existing tests already cover. Trust a "no bugs found" review only as
   far as the adversarial inputs it actually tried.
+- **Use the review skills in sequence for every PR review**: first apply the
+  `adversarial-pr-review` skill to establish the contract, derive the complete
+  branch/threshold matrix, verify actual branch execution, compare optimized
+  paths with simple reference implementations, and test adversarial inputs.
+  Then apply the `code-review-and-quality` skill as a second pass for
+  readability, architecture, maintainability, security, performance, and
+  verification quality. Do not treat a green test suite or a test name as
+  proof that an optimized branch executed; record empirical branch evidence
+  and any unverified matrix cells in the review.
 
 ---
 

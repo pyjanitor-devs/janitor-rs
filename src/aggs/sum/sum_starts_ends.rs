@@ -2,10 +2,16 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::{checked_range, ensure_equal_lengths};
+use crate::aggs::adaptive::{should_use_running_aggregation, MAX_DIRECT_QUERY_COUNT};
+use crate::aggs::{checked_range, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `(starts[i], ends[i])`, sum `arr[starts[i]..ends[i]]`,
 /// skipping any position flagged `true` in `booleans` (a null mask).
+///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
 ///
 /// ELI5: an arbitrary `[start, end)` slice instead of "to the end" or
 /// "from the beginning" -- same null-skip/overflow-wrap contract as
@@ -17,12 +23,23 @@ use crate::aggs::{checked_range, ensure_equal_lengths};
 /// two but not the third, so a valid-looking but oversized `end` still
 /// walked `arr`/`booleans` out of bounds. Any rejected row contributes
 /// `0`.
+///
+/// # Arguments
+///
+/// * `arr` - Values to sum.
+/// * `starts` - Inclusive range boundaries.
+/// * `ends` - Exclusive range boundaries paired with `starts`.
+/// * `booleans` - Null mask aligned with `arr`.
+///
+/// `arr`, `starts`, and `ends` must be non-empty, and `starts` and `ends`
+/// must have equal lengths. The Python wrapper raises `ValueError` when this
+/// contract is violated.
 pub fn sum_start_end_core(
     arr: ArrayView1<i64>,
     starts: ArrayView1<i64>,
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
-) -> Array1<i64> {
+) -> Result<Array1<i64>, String> {
     sum_start_end_core_with_cast(arr, starts, ends, booleans, |value| value)
 }
 
@@ -32,14 +49,51 @@ fn sum_start_end_core_with_cast<T, F>(
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_i64: F,
-) -> Array1<i64>
+) -> Result<Array1<i64>, String>
 where
     T: Copy,
     F: FnMut(T) -> i64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(starts.len());
-    let zipped = starts.into_iter().zip(ends);
-    for (pos, (start, end)) in zipped.enumerate() {
+    // ELI5: a few ranges are cheaper to sum directly. For many broad ranges,
+    // build one prefix total and answer each interval with two lookups rather
+    // than walking the same positions repeatedly.
+    let use_prefix = if starts.len() <= MAX_DIRECT_QUERY_COUNT {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for (start, end) in starts.iter().zip(ends.iter()) {
+            if let Some((start_, end_)) = checked_range(*start, *end, arr.len()) {
+                total_width = total_width.saturating_add(end_ - start_);
+            }
+        }
+        should_use_running_aggregation(starts.len(), total_width, arr.len())
+    };
+
+    if use_prefix {
+        // ELI5: one running prefix total turns every valid interval into two
+        // lookups and a wrapped subtraction instead of another full scan.
+        let mut prefix = vec![0_i64; arr.len() + 1];
+        for nn in 0..arr.len() {
+            prefix[nn + 1] = prefix[nn];
+            if !booleans[nn] {
+                prefix[nn + 1] = prefix[nn + 1].wrapping_add(to_i64(arr[nn]));
+            }
+        }
+        for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+            if let Some((start_, end_)) = checked_range(*start, *end, arr.len()) {
+                result[pos] = prefix[end_].wrapping_sub(prefix[start_]);
+            }
+        }
+        return Ok(result);
+    }
+
+    for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
         let Some((start_, end_)) = checked_range(*start, *end, arr.len()) else {
             continue; // result[pos] is already 0
         };
@@ -52,22 +106,30 @@ where
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
-fn sum_start_end_float_core_with_cast<T, F>(
+/// Floating-point sums intentionally stay on the direct per-range Kahan loop:
+/// a shared prefix-difference buffer would change the compensation and
+/// rounding behavior of each independently summed range.
+pub fn sum_start_end_float_core_with_cast<T, F>(
     arr: ArrayView1<T>,
     starts: ArrayView1<i64>,
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_f64: F,
-) -> Array1<f64>
+) -> Result<Array1<f64>, String>
 where
     T: Copy,
     F: FnMut(T) -> f64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<f64>::zeros(starts.len());
-    for (pos, (start, end)) in starts.into_iter().zip(ends).enumerate() {
+    for (pos, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
         // ELI5: validate the range ticket once, before either dtype-specific
         // path turns its signed numbers into array positions. That keeps a
         // "no match" ticket worth zero for both integer and float columns.
@@ -88,11 +150,24 @@ where
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
 macro_rules! generic_compute_ints {
     ($fname:ident, $type:ty) => {
+        /// Sum non-null values in each half-open `arr[start..end]` range.
+        /// `starts` and `ends` are parallel boundaries; `booleans` marks
+        /// null values to skip. Invalid ranges return zero.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to sum.
+        /// * `starts` - Inclusive range boundaries.
+        /// * `ends` - Exclusive range boundaries paired with `starts`.
+        /// * `booleans` - Null mask aligned with `arr`.
+        ///
+        /// `arr`, `starts`, and `ends` must be non-empty. Invalid ranges
+        /// produce zero.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -105,13 +180,6 @@ macro_rules! generic_compute_ints {
         {
             let starts = starts.as_array();
             let ends = ends.as_array();
-            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = sum_start_end_core_with_cast(
                 arr.as_array(),
                 starts,
@@ -119,13 +187,19 @@ macro_rules! generic_compute_ints {
                 booleans.as_array(),
                 |value| value as i64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
 
 macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Sum floating-point non-null values in each half-open range.
+        /// `starts` and `ends` are parallel boundaries; `booleans` marks
+        /// null values to skip. Invalid ranges return zero.
+        /// `arr`, `starts`, and `ends` must be non-empty.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -138,13 +212,6 @@ macro_rules! generic_compute_floats {
         {
             let starts = starts.as_array();
             let ends = ends.as_array();
-            ensure_equal_lengths("starts", starts.len(), "ends", ends.len())?;
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = sum_start_end_float_core_with_cast(
                 arr.as_array(),
                 starts,
@@ -152,7 +219,9 @@ macro_rules! generic_compute_floats {
                 booleans.as_array(),
                 |value| value as f64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
@@ -192,13 +261,36 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn empty_array() {
+    fn empty_array_is_rejected() {
         let arr: Array1<i64> = array![];
         let starts = array![0_i64];
         let ends = array![0_i64];
         let booleans: Array1<bool> = array![];
-        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
-        assert_eq!(got, array![0]);
+        let error = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view())
+            .unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+    }
+
+    #[test]
+    fn empty_starts_are_rejected() {
+        let arr = array![1_i64];
+        let starts: Array1<i64> = array![];
+        let ends = array![0_i64];
+        let booleans = array![false];
+        let error = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view())
+            .unwrap_err();
+        assert_eq!(error, "starts cannot be empty");
+    }
+
+    #[test]
+    fn empty_ends_are_rejected() {
+        let arr = array![1_i64];
+        let starts = array![0_i64];
+        let ends: Array1<i64> = array![];
+        let booleans = array![false];
+        let error = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view())
+            .unwrap_err();
+        assert_eq!(error, "ends cannot be empty");
     }
 
     #[test]
@@ -207,7 +299,8 @@ mod tests {
         let starts = array![0_i64];
         let ends = array![4_i64];
         let booleans = array![false, false, false, false];
-        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        let got =
+            sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![10]);
     }
 
@@ -217,7 +310,8 @@ mod tests {
         let starts = array![1_i64];
         let ends = array![4_i64]; // [2, 3, 4]
         let booleans = array![false, false, false, false, false];
-        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        let got =
+            sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![9]);
     }
 
@@ -227,7 +321,8 @@ mod tests {
         let starts = array![3_i64];
         let ends = array![1_i64]; // start > end
         let booleans = array![false, false, false, false, false];
-        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        let got =
+            sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
     }
 
@@ -237,7 +332,8 @@ mod tests {
         let starts = array![1_i64];
         let ends = array![1_i64];
         let booleans = array![false, false, false];
-        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        let got =
+            sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
     }
 
@@ -251,7 +347,8 @@ mod tests {
         let starts = array![2_i64];
         let ends = array![-1_i64];
         let booleans = array![false, false, false, false, false];
-        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        let got =
+            sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
     }
 
@@ -261,7 +358,8 @@ mod tests {
         let starts = array![-1_i64];
         let ends = array![3_i64];
         let booleans = array![false, false, false, false, false];
-        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        let got =
+            sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
     }
 
@@ -276,7 +374,8 @@ mod tests {
         let starts = array![0_i64];
         let ends = array![1000_i64];
         let booleans = array![false, false, false, false, false];
-        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        let got =
+            sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
     }
 
@@ -292,7 +391,8 @@ mod tests {
             ends.view(),
             booleans.view(),
             |value| value,
-        );
+        )
+        .unwrap();
         assert_eq!(got, array![0.0, 0.0]);
     }
 
@@ -302,8 +402,38 @@ mod tests {
         let starts = array![0_i64];
         let ends = array![4_i64];
         let booleans = array![false, true, false, true];
-        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        let got =
+            sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![1 + 3]);
+    }
+
+    #[test]
+    fn float_interval_uses_compensated_direct_summation() {
+        let arr = array![1.0e16_f64, 1.0, -1.0e16, 3.0];
+        let starts = array![0_i64, 3];
+        let ends = array![3_i64, 4];
+        let booleans = array![false, false, false, false];
+        let got = sum_start_end_float_core_with_cast(
+            arr.view(),
+            starts.view(),
+            ends.view(),
+            booleans.view(),
+            |value| value,
+        )
+        .unwrap();
+        assert_eq!(got, array![0.0, 3.0]);
+    }
+
+    #[test]
+    fn repeated_broad_ranges_use_wrapping_prefix_differences() {
+        let arr = array![1_i64, 2, 3, 4];
+        // Five broad ranges cross the running-buffer threshold.
+        let starts = array![0_i64, 0, 1, 2, 0];
+        let ends = array![4_i64, 3, 4, 4, 4];
+        let booleans = array![false, true, false, false];
+        let got =
+            sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![8, 4, 7, 7, 8]);
     }
 
     #[test]
@@ -313,7 +443,8 @@ mod tests {
         let starts = array![0_i64];
         let ends = array![100_i64];
         let booleans = Array1::<bool>::from_elem(100, false);
-        let got = sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view());
+        let got =
+            sum_start_end_core(arr.view(), starts.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got[0], -100_i64);
     }
 
@@ -333,7 +464,8 @@ mod tests {
                 casts += 1;
                 value as i64
             },
-        );
+        )
+        .unwrap();
         assert_eq!(got, array![3]);
         assert_eq!(casts, 1);
     }

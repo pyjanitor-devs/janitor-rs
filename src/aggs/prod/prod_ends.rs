@@ -1,11 +1,244 @@
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::adaptive::{should_use_running_aggregation, MAX_DIRECT_QUERY_COUNT};
+use crate::aggs::{checked_end, ensure_equal_lengths_core, ensure_nonempty_core};
+
+/// Computes the product of every prefix selected by `ends` for an integer
+/// input array. `ends` contains exclusive zero-based boundaries, and `true`
+/// entries in `booleans` mark null values that contribute the identity `1`.
+/// Integer products use fixed-width wrapping multiplication.
+///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
+///
+/// # Arguments
+///
+/// * `arr` - Values to multiply.
+/// * `ends` - Exclusive prefix boundaries.
+/// * `booleans` - Null mask aligned with `arr`.
+///
+/// `arr` and `ends` must both be non-empty. Boundaries in `0..=arr.len()` are
+/// valid; negative or oversized boundaries return the multiplicative identity.
+pub fn prod_end_core<T, F>(
+    arr: ArrayView1<T>,
+    ends: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut convert: F,
+) -> Result<Array1<i64>, String>
+where
+    T: Copy,
+    F: FnMut(T) -> i64,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    let mut result = Array1::<i64>::from_elem(ends.len(), 1);
+    // ELI5: an i64 product is a fixed-width box. If the answer outgrows the
+    // box, wrapping_mul keeps the low bits, just like NumPy int64 arithmetic;
+    // this also avoids a debug-only overflow panic.
+    let use_prefix = if ends.len() <= MAX_DIRECT_QUERY_COUNT {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for end in ends.iter() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                total_width = total_width.saturating_add(end_);
+            }
+        }
+        should_use_running_aggregation(ends.len(), total_width, arr.len())
+    };
+    if use_prefix {
+        // ELI5: when many prefix questions together would walk the array
+        // repeatedly, multiply each prefix once and answer the questions by
+        // lookup. Null entries contribute the multiplicative identity `1`.
+        let mut prefix = vec![1_i64; arr.len() + 1];
+        for nn in 0..arr.len() {
+            prefix[nn + 1] = prefix[nn];
+            if !booleans[nn] {
+                prefix[nn + 1] = prefix[nn + 1].wrapping_mul(convert(arr[nn]));
+            }
+        }
+        for (pos, end) in ends.iter().enumerate() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                result[pos] = prefix[end_];
+            }
+        }
+        return Ok(result);
+    }
+    for (pos, end) in ends.iter().enumerate() {
+        let mut total = 1_i64;
+        let Some(end_) = checked_end(*end, arr.len()) else {
+            continue;
+        };
+        for nn in 0..end_ {
+            if !booleans[nn] {
+                total = total.wrapping_mul(convert(arr[nn]));
+            }
+        }
+        result[pos] = total;
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::ndarray::array;
+
+    #[test]
+    fn empty_array_is_rejected() {
+        let arr = Array1::<i64>::zeros(0);
+        let ends = array![0_i64];
+        let booleans = Array1::<bool>::default(0);
+        let error =
+            prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+    }
+
+    #[test]
+    fn empty_ends_are_rejected() {
+        let arr = array![1_i64];
+        let ends: Array1<i64> = array![];
+        let booleans = array![false];
+        let error =
+            prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap_err();
+        assert_eq!(error, "ends cannot be empty");
+    }
+
+    #[test]
+    fn broad_prefix_batch_uses_running_products() {
+        let arr = array![2_i64, 3, 4, 5, 6, 7];
+        let ends = array![1_i64, 2, 3, 4, 5, 6];
+        let booleans = array![false, false, false, false, false, false];
+        let got = prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
+        assert_eq!(got, array![2, 6, 24, 120, 720, 5040]);
+    }
+
+    #[test]
+    fn invalid_adaptive_prefixes_keep_product_identity() {
+        let arr = array![2_i64, 3, 4];
+        let ends = array![-1_i64, 3, 3, 3, 3];
+        let booleans = array![false, false, false];
+        let got = prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
+        assert_eq!(got, array![1, 24, 24, 24, 24]);
+    }
+
+    #[test]
+    fn invalid_direct_prefixes_keep_product_identity() {
+        let arr = array![2_i64, 3, 4];
+        let ends = array![-1_i64, 4];
+        let booleans = array![false, false, false];
+        let got = prod_end_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
+        assert_eq!(got, array![1, 1]);
+    }
+
+    #[test]
+    fn float_invalid_direct_prefixes_keep_product_identity() {
+        let arr = array![2.0_f64, 3.0, 4.0];
+        let ends = array![-1_i64, 4];
+        let booleans = array![false, false, false];
+        let got =
+            prod_end_float_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
+        assert_eq!(got, array![1.0, 1.0]);
+    }
+
+    #[test]
+    fn broad_float_prefix_batch_uses_running_products() {
+        let arr = array![2.0_f64, 3.0, 4.0];
+        let ends = array![3_i64, 3, 3, 3, 3];
+        let booleans = array![false, true, false];
+        let got =
+            prod_end_float_core(arr.view(), ends.view(), booleans.view(), |value| value).unwrap();
+        assert_eq!(got, array![8.0, 8.0, 8.0, 8.0, 8.0]);
+    }
+}
+
+/// Computes floating-point products for prefix queries described by `ends`.
+/// This core is separate from the integer version so IEEE-754 behavior is
+/// preserved for zero, infinity, NaN, overflow, and underflow. The running
+/// prefix path preserves the multiplication order of each prefix.
+///
+/// # Arguments
+///
+/// * `arr` - Values to multiply.
+/// * `ends` - Exclusive prefix boundaries.
+/// * `booleans` - Null mask aligned with `arr`.
+///
+/// `arr` and `ends` must both be non-empty. Boundaries in `0..=arr.len()` are
+/// valid; negative or oversized boundaries return the multiplicative identity.
+pub fn prod_end_float_core<T, F>(
+    arr: ArrayView1<T>,
+    ends: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut convert: F,
+) -> Result<Array1<f64>, String>
+where
+    T: Copy,
+    F: FnMut(T) -> f64,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    let mut result = Array1::<f64>::from_elem(ends.len(), 1.0);
+    let use_prefix = if ends.len() <= MAX_DIRECT_QUERY_COUNT {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for end in ends.iter() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                total_width = total_width.saturating_add(end_);
+            }
+        }
+        should_use_running_aggregation(ends.len(), total_width, arr.len())
+    };
+    if use_prefix {
+        let mut prefix = vec![1.0_f64; arr.len() + 1];
+        for nn in 0..arr.len() {
+            prefix[nn + 1] = prefix[nn];
+            if !booleans[nn] {
+                prefix[nn + 1] *= convert(arr[nn]);
+            }
+        }
+        for (pos, end) in ends.iter().enumerate() {
+            if let Some(end_) = checked_end(*end, arr.len()) {
+                result[pos] = prefix[end_];
+            }
+        }
+        return Ok(result);
+    }
+    for (pos, end) in ends.iter().enumerate() {
+        let mut total = 1.0_f64;
+        let Some(end_) = checked_end(*end, arr.len()) else {
+            continue;
+        };
+        for nn in 0..end_ {
+            if !booleans[nn] {
+                total *= convert(arr[nn]);
+            }
+        }
+        result[pos] = total;
+    }
+    Ok(result)
+}
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
+        /// Compute products over prefixes of `arr` for integer-compatible
+        /// values. `ends` supplies exclusive boundaries and `booleans` marks
+        /// null values to skip; the returned array follows `ends`.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to multiply.
+        /// * `ends` - Exclusive prefix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
+        ///
+        /// `arr` and `ends` must be non-empty. Invalid boundaries return the
+        /// multiplicative identity.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -15,36 +248,33 @@ macro_rules! generic_compute {
         ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
-            let arr = arr.as_array();
-            let ends = ends.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<i64>::zeros(ends.len());
-            let start_: usize = 0;
-            for (pos, end) in ends.indexed_iter() {
-                let mut total: i64 = 1;
-                let end_ = *end as usize;
-                for nn in start_..end_ {
-                    if booleans[nn] {
-                        continue;
-                    }
-                    let current = arr[nn];
-                    total *= current as i64;
-                }
-                result[pos] = total;
-            }
-            Ok(result.into_pyarray(py))
+            let result = prod_end_core(
+                arr.as_array(),
+                ends.as_array(),
+                booleans.as_array(),
+                |value| value as i64,
+            );
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
 
 macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Compute floating-point products over prefixes of `arr`.
+        /// `ends` supplies exclusive boundaries and `booleans` marks null
+        /// values to skip; the returned array follows `ends`.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to multiply.
+        /// * `ends` - Exclusive prefix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
+        ///
+        /// `arr` and `ends` must be non-empty. Invalid boundaries return the
+        /// multiplicative identity.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -54,29 +284,15 @@ macro_rules! generic_compute_floats {
         ) -> PyResult<Bound<'py, PyArray1<f64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
-            let arr = arr.as_array();
-            let ends = ends.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<f64>::zeros(ends.len());
-            for (pos, end) in ends.indexed_iter() {
-                let mut total: f64 = 1.;
-                let end_ = *end as usize;
-                for nn in 0..end_ {
-                    if booleans[nn] {
-                        continue;
-                    }
-                    let current = arr[nn];
-                    total *= current as f64;
-                }
-                result[pos] = total;
-            }
-            Ok(result.into_pyarray(py))
+            let result = prod_end_float_core(
+                arr.as_array(),
+                ends.as_array(),
+                booleans.as_array(),
+                |value| value as f64,
+            );
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }

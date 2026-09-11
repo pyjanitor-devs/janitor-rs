@@ -2,14 +2,26 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::adaptive::{should_use_running_aggregation, MAX_DIRECT_QUERY_COUNT};
+use crate::aggs::{checked_end, ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `starts[i]`, sum `arr[starts[i]..]` (to the end of the array),
 /// skipping any position flagged `true` in `booleans` (a null mask).
 ///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
+///
 /// ELI5: `booleans[nn] == true` means "this value is missing, treat it as
 /// absent, not as zero" -- we skip it in the running total rather than
 /// adding it in.
+///
+/// # Arguments
+///
+/// * `arr` - Values to sum.
+/// * `starts` - Inclusive suffix boundaries, one per output.
+/// * `booleans` - Null mask aligned with `arr`.
 ///
 /// Overflow note: `wrapping_add` makes two's-complement wraparound explicit,
 /// matching NumPy `i64` arithmetic in debug, test, and release builds.
@@ -17,7 +29,7 @@ pub fn sum_start_core(
     arr: ArrayView1<i64>,
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
-) -> Array1<i64> {
+) -> Result<Array1<i64>, String> {
     sum_start_core_with_cast(arr, starts, booleans, |value| value)
 }
 
@@ -31,7 +43,7 @@ pub fn sum_start_u32_core(
     arr: ArrayView1<u32>,
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
-) -> Array1<i64> {
+) -> Result<Array1<i64>, String> {
     sum_start_core_with_cast(arr, starts, booleans, |value| value as i64)
 }
 
@@ -40,16 +52,62 @@ fn sum_start_core_with_cast<T, F>(
     starts: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
     mut to_i64: F,
-) -> Array1<i64>
+) -> Result<Array1<i64>, String>
 where
     T: Copy,
     F: FnMut(T) -> i64,
 {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::zeros(starts.len());
     let end_: usize = arr.len();
-    for (pos, start) in starts.indexed_iter() {
+
+    // ELI5: for a few short suffixes, add each suffix directly. When many
+    // suffixes ask for more than roughly three full-array scans, write one
+    // running answer for every position and answer each query from it.
+    //
+    // The cutoff is deliberately based on work, not just query count: the
+    // suffix buffer costs one full array traversal plus O(arr.len()) memory,
+    // so it should be built only when repeated direct scans would cost more.
+    // The three-scan threshold is the measured crossover used by the
+    // corresponding pyjanitor prefix implementation and its Rust benchmark.
+    let use_suffix = if starts.len() <= MAX_DIRECT_QUERY_COUNT {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for start in starts.iter() {
+            if let Some(start_) = checked_end(*start, end_) {
+                total_width = total_width.saturating_add(end_ - start_);
+            }
+        }
+        should_use_running_aggregation(starts.len(), total_width, end_)
+    };
+
+    if use_suffix {
+        // `suffix[nn]` is the wrapped sum of all non-null values from `nn`
+        // through the end. The extra zero slot makes the final position easy
+        // to initialize without a special case.
+        let mut suffix = vec![0_i64; end_ + 1];
+        for nn in (0..end_).rev() {
+            suffix[nn] = suffix[nn + 1];
+            if !booleans[nn] {
+                suffix[nn] = suffix[nn].wrapping_add(to_i64(arr[nn]));
+            }
+        }
+        for (pos, start) in starts.iter().enumerate() {
+            if let Some(start_) = checked_end(*start, end_) {
+                result[pos] = suffix[start_];
+            }
+        }
+        return Ok(result);
+    }
+
+    for (pos, start) in starts.iter().enumerate() {
         let mut total: i64 = 0;
-        let start_ = *start as usize;
+        let Some(start_) = checked_end(*start, end_) else {
+            continue;
+        };
         for nn in start_..end_ {
             if booleans[nn] {
                 continue;
@@ -58,11 +116,19 @@ where
         }
         result[pos] = total;
     }
-    result
+    Ok(result)
 }
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
+        /// Sum non-null values in each suffix of `arr`. `starts` contains
+        /// inclusive boundaries and `booleans` marks null values to skip.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to sum.
+        /// * `starts` - Inclusive suffix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -72,12 +138,6 @@ macro_rules! generic_compute {
         ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             // Cast only values inside the requested ranges. Widening the
             // whole column would make a tiny suffix query scan and copy it.
             //
@@ -103,13 +163,56 @@ macro_rules! generic_compute {
                 booleans.as_array(),
                 |value| value as i64,
             );
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
 
+/// Floating-point sums intentionally stay on the direct per-range Kahan loop:
+/// a shared suffix buffer would change the compensation and rounding behavior
+/// of each independently summed range.
+pub fn sum_start_float_core_with_cast<T, F>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    booleans: ArrayView1<bool>,
+    mut to_f64: F,
+) -> Result<Array1<f64>, String>
+where
+    T: Copy,
+    F: FnMut(T) -> f64,
+{
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("starts", starts.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    let mut result = Array1::<f64>::zeros(starts.len());
+    let end_: usize = arr.len();
+    for (pos, start) in starts.iter().enumerate() {
+        let mut total: f64 = 0.0;
+        let mut compensation: f64 = 0.0;
+        let Some(start_) = checked_end(*start, end_) else {
+            continue;
+        };
+        for nn in start_..end_ {
+            if booleans[nn] {
+                continue;
+            }
+            let current = to_f64(arr[nn]);
+            let difference = current - compensation;
+            let increment = total + difference;
+            compensation = (increment - total) - difference;
+            total = increment;
+        }
+        result[pos] = total;
+    }
+    Ok(result)
+}
+
 macro_rules! generic_compute_floats {
     ($fname:ident, $type:ty) => {
+        /// Sum floating-point non-null values in each suffix of `arr`.
+        /// `starts` contains inclusive boundaries and `booleans` marks nulls.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -119,34 +222,15 @@ macro_rules! generic_compute_floats {
         ) -> PyResult<Bound<'py, PyArray1<f64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
-            let arr = arr.as_array();
-            let starts = starts.as_array();
-            let booleans = booleans.as_array();
-            let mut result = Array1::<f64>::zeros(starts.len());
-            let end_: usize = arr.len();
-            for (pos, start) in starts.indexed_iter() {
-                let mut total: f64 = 0.0;
-                let mut compensation: f64 = 0.0;
-                let start_ = *start as usize;
-                for nn in start_..end_ {
-                    if booleans[nn] {
-                        continue;
-                    }
-                    let current: f64 = arr[nn] as f64;
-                    let difference = current - compensation;
-                    let increment = total + difference;
-                    compensation = (increment - total) - difference;
-                    total = increment;
-                }
-                result[pos] = total;
-            }
-            Ok(result.into_pyarray(py))
+            let result = sum_start_float_core_with_cast(
+                arr.as_array(),
+                starts.as_array(),
+                booleans.as_array(),
+                |value| value as f64,
+            );
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
@@ -170,8 +254,12 @@ pub fn compute_sum_start_uint32<'py>(
     arr: PyReadonlyArray1<'py, u32>,
     starts: PyReadonlyArray1<'py, i64>,
     booleans: PyReadonlyArray1<'py, bool>,
-) -> Bound<'py, PyArray1<i64>> {
-    sum_start_u32_core(arr.as_array(), starts.as_array(), booleans.as_array()).into_pyarray(py)
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    Ok(
+        sum_start_u32_core(arr.as_array(), starts.as_array(), booleans.as_array())
+            .map_err(pyo3::exceptions::PyValueError::new_err)?
+            .into_pyarray(py),
+    )
 }
 
 /// Registers this file's dtype-specialized Python exports.
@@ -199,12 +287,21 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn empty_array() {
+    fn empty_array_is_rejected() {
         let arr: Array1<i64> = array![];
         let starts = array![0_i64];
         let booleans: Array1<bool> = array![];
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
-        assert_eq!(got, array![0]);
+        let error = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap_err();
+        assert_eq!(error, "arr cannot be empty");
+    }
+
+    #[test]
+    fn empty_starts_are_rejected() {
+        let arr = array![1_i64];
+        let starts: Array1<i64> = array![];
+        let booleans = array![false];
+        let error = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap_err();
+        assert_eq!(error, "starts cannot be empty");
     }
 
     #[test]
@@ -212,7 +309,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let starts = array![3_i64]; // boundary: nothing left to sum
         let booleans = array![false, false, false];
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
     }
 
@@ -221,7 +318,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let starts = array![0_i64]; // boundary: whole array
         let booleans = array![false, false, false];
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![6]);
     }
 
@@ -231,7 +328,7 @@ mod tests {
         let starts = array![0_i64];
         // position 1 (value 2) and position 3 (value 4) are "null"
         let booleans = array![false, true, false, true];
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![1 + 3]);
     }
 
@@ -240,8 +337,51 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let starts = array![0_i64];
         let booleans = array![true, true, true];
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got, array![0]);
+    }
+
+    #[test]
+    fn float_suffix_uses_compensated_direct_summation() {
+        let arr = array![1.0e16_f64, 1.0, -1.0e16];
+        let starts = array![0_i64, 1];
+        let booleans = array![false, false, false];
+        let got =
+            sum_start_float_core_with_cast(arr.view(), starts.view(), booleans.view(), |value| {
+                value
+            })
+            .unwrap();
+        assert_eq!(got, array![0.0, -1.0e16]);
+    }
+
+    #[test]
+    fn repeated_broad_suffixes_use_the_same_wrapping_result() {
+        let arr = array![1_i64, 2, 3, 4];
+        let starts = array![0_i64, 0, 1, 2];
+        let booleans = array![false, true, false, false];
+
+        // This workload crosses the adaptive threshold and exercises the
+        // suffix buffer rather than the direct per-query loop.
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![8, 8, 7, 7]);
+    }
+
+    #[test]
+    fn adaptive_suffix_at_array_end_keeps_sum_identity() {
+        let arr = array![1_i64, 2, 3, 4];
+        let starts = array![0_i64, 0, 0, 0, 4];
+        let booleans = array![false, false, false, false];
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![10, 10, 10, 10, 0]);
+    }
+
+    #[test]
+    fn invalid_adaptive_suffixes_keep_sum_identity() {
+        let arr = array![1_i64, 2, 3, 4];
+        let starts = array![-1_i64, 0, 0, 0, 0, 4];
+        let booleans = array![false, false, false, false];
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![0, 10, 10, 10, 10, 0]);
     }
 
     #[test]
@@ -253,7 +393,7 @@ mod tests {
         let arr = Array1::<i64>::from_elem(100, value);
         let starts = array![0_i64];
         let booleans = Array1::<bool>::from_elem(100, false);
-        let got = sum_start_core(arr.view(), starts.view(), booleans.view());
+        let got = sum_start_core(arr.view(), starts.view(), booleans.view()).unwrap();
         assert_eq!(got[0], -100_i64);
     }
 
@@ -271,7 +411,8 @@ mod tests {
         let booleans = array![false];
         let got = sum_start_core_with_cast(arr.view(), starts.view(), booleans.view(), |value| {
             value as i64
-        });
+        })
+        .unwrap();
         assert_eq!(got, array![i64::MIN]);
     }
 
@@ -284,8 +425,31 @@ mod tests {
         let got = sum_start_core_with_cast(arr.view(), starts.view(), booleans.view(), |value| {
             casts += 1;
             value as i64
-        });
+        })
+        .unwrap();
         assert_eq!(got, array![4]);
         assert_eq!(casts, 1);
+    }
+
+    #[test]
+    fn adaptive_suffix_documents_overlapping_narrow_conversion_cost() {
+        let arr = Array1::<i32>::from_elem(100, 1);
+        let starts = Array1::from_elem(8, 60_i64);
+        let booleans = Array1::<bool>::from_elem(100, false);
+        let mut casts = 0;
+        let got = sum_start_core_with_cast(arr.view(), starts.view(), booleans.view(), |value| {
+            casts += 1;
+            value as i64
+        })
+        .unwrap();
+
+        // Eight overlapping width-40 queries total 320 positions, crossing
+        // the adaptive cutoff of three full scans (300). The running suffix
+        // therefore converts the whole 100-element column once, even though
+        // every query touches only the same 40 positions. This is deliberate:
+        // it trades temporary full-column work and memory for fewer repeated
+        // scans; a distinct-coverage heuristic is a possible future tuning.
+        assert_eq!(got, Array1::from_elem(8, 40_i64));
+        assert_eq!(casts, 100);
     }
 }

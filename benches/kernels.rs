@@ -933,6 +933,7 @@ fn bench_sum_kernels(c: &mut Criterion) {
                     black_box(f.starts_for_sum_start.view()),
                     black_box(f.booleans.view()),
                 )
+                .unwrap()
             })
         });
         group.bench_function(format!("sum_end n={n}"), |b| {
@@ -942,6 +943,7 @@ fn bench_sum_kernels(c: &mut Criterion) {
                     black_box(f.ends_for_sum_end.view()),
                     black_box(f.booleans.view()),
                 )
+                .unwrap()
             })
         });
         group.bench_function(format!("sum_start_end n={n}"), |b| {
@@ -952,6 +954,7 @@ fn bench_sum_kernels(c: &mut Criterion) {
                     black_box(f.sliding_ends.view()),
                     black_box(f.booleans.view()),
                 )
+                .unwrap()
             })
         });
     }
@@ -965,6 +968,7 @@ fn bench_sum_kernels(c: &mut Criterion) {
                     black_box(f.starts.view()),
                     black_box(f.booleans.view()),
                 )
+                .unwrap()
             })
         });
     }

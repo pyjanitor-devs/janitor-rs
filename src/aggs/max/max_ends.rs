@@ -2,13 +2,26 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
+use crate::aggs::adaptive::{should_use_running_aggregation, MAX_DIRECT_QUERY_COUNT};
 use crate::aggs::checked_range;
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 
 /// For every `ends[i]`, find the position (not the value) of the largest
 /// element in `arr[..ends[i]]`, skipping positions flagged `true` in
 /// `booleans` (a null mask). Returns `-1` when `end` is negative or past
-/// `arr.len()`, `arr` is empty, or every candidate is null.
+/// `arr.len()`, or every candidate is null. An empty `arr` is rejected with
+/// `Err("arr cannot be empty")` before range results are produced.
+///
+/// Null-mask contract: `booleans[nn] == true` is the source of truth for a
+/// missing value. For floating-point inputs, pyjanitor marks `NaN` entries in
+/// this mask before calling Rust; the kernel does not infer nullness from the
+/// value itself. Direct callers must preserve the same invariant.
+///
+/// # Arguments
+///
+/// * `arr` - Values to inspect.
+/// * `ends` - Exclusive prefix boundaries, one per output.
+/// * `booleans` - Null mask aligned with `arr`; `true` values are skipped.
 ///
 /// ELI5 (the guard): `checked_range(0, end, arr.len())` rejects a negative
 /// or too-large `end` *and* an empty `arr` in one call, since `0 < end`
@@ -18,9 +31,41 @@ pub fn max_end_core<T: PartialOrd + Copy>(
     arr: ArrayView1<T>,
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
-) -> Array1<i64> {
+) -> Result<Array1<i64>, String> {
+    ensure_nonempty_core("arr", arr.len())?;
+    ensure_nonempty_core("ends", ends.len())?;
+    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
     let mut result = Array1::<i64>::from_elem(ends.len(), -1);
-    for (pos, end) in ends.indexed_iter() {
+
+    let use_prefix = if ends.len() <= MAX_DIRECT_QUERY_COUNT {
+        false
+    } else {
+        let mut total_width = 0_usize;
+        for end in ends.iter() {
+            if let Some((_, end_)) = checked_range(0, *end, arr.len()) {
+                total_width = total_width.saturating_add(end_);
+            }
+        }
+        should_use_running_aggregation(ends.len(), total_width, arr.len())
+    };
+    if use_prefix {
+        let mut prefix = vec![-1_i64; arr.len()];
+        let mut winner = -1_i64;
+        for nn in 0..arr.len() {
+            if !booleans[nn] && (winner == -1 || arr[nn] > arr[winner as usize]) {
+                winner = nn as i64;
+            }
+            prefix[nn] = winner;
+        }
+        for (pos, end) in ends.iter().enumerate() {
+            if let Some((_, end_)) = checked_range(0, *end, arr.len()) {
+                result[pos] = prefix[end_ - 1];
+            }
+        }
+        return Ok(result);
+    }
+
+    for (pos, end) in ends.iter().enumerate() {
         let Some((_, end_)) = checked_range(0, *end, arr.len()) else {
             continue;
         };
@@ -42,11 +87,21 @@ pub fn max_end_core<T: PartialOrd + Copy>(
         }
         result[pos] = base;
     }
-    result
+    Ok(result)
 }
 
 macro_rules! generic_compute {
     ($fname:ident, $type:ty) => {
+        /// Return the positions of the maximum non-null values in each
+        /// prefix. `arr` is the value array, `ends` contains exclusive
+        /// boundaries, and `booleans` marks null values to skip. Invalid or
+        /// all-null prefixes return `-1`.
+        ///
+        /// # Arguments
+        ///
+        /// * `arr` - Values to inspect.
+        /// * `ends` - Exclusive prefix boundaries.
+        /// * `booleans` - Null mask aligned with `arr`.
         #[pyfunction]
         pub fn $fname<'py>(
             py: Python<'py>,
@@ -56,14 +111,10 @@ macro_rules! generic_compute {
         ) -> PyResult<Bound<'py, PyArray1<i64>>>
         // The macro will expand into the contents of this block.
         {
-            ensure_equal_lengths(
-                "arr",
-                arr.as_array().len(),
-                "booleans",
-                booleans.as_array().len(),
-            )?;
             let result = max_end_core(arr.as_array(), ends.as_array(), booleans.as_array());
-            Ok(result.into_pyarray(py))
+            Ok(result
+                .map_err(pyo3::exceptions::PyValueError::new_err)?
+                .into_pyarray(py))
         }
     };
 }
@@ -104,12 +155,21 @@ mod tests {
     use numpy::ndarray::array;
 
     #[test]
-    fn empty_array_returns_minus_one_not_a_panic() {
+    fn empty_array_is_rejected() {
         let arr: Array1<i64> = array![];
         let ends = array![0_i64];
         let booleans: Array1<bool> = array![];
         let got = max_end_core(arr.view(), ends.view(), booleans.view());
-        assert_eq!(got, array![-1]);
+        assert_eq!(got, Err("arr cannot be empty".to_string()));
+    }
+
+    #[test]
+    fn empty_ends_are_rejected() {
+        let arr = array![1_i64];
+        let ends: Array1<i64> = array![];
+        let booleans = array![false];
+        let error = max_end_core(arr.view(), ends.view(), booleans.view()).unwrap_err();
+        assert_eq!(error, "ends cannot be empty");
     }
 
     #[test]
@@ -117,7 +177,7 @@ mod tests {
         let arr = array![3_i64, 1, 9, 2, 5];
         let ends = array![3_i64]; // prefix [3, 1, 9]
         let booleans = array![false, false, false, false, false];
-        let got = max_end_core(arr.view(), ends.view(), booleans.view());
+        let got = max_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![2]); // position of value 9
     }
 
@@ -126,7 +186,7 @@ mod tests {
         let arr = array![1_i64, 2, 3];
         let ends = array![0_i64];
         let booleans = array![false, false, false];
-        let got = max_end_core(arr.view(), ends.view(), booleans.view());
+        let got = max_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![-1]);
     }
 
@@ -135,7 +195,16 @@ mod tests {
         let arr = array![3_i64, 2, 1];
         let ends = array![3_i64];
         let booleans = array![true, false, false]; // largest (3) is null
-        let got = max_end_core(arr.view(), ends.view(), booleans.view());
+        let got = max_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
         assert_eq!(got, array![1]); // position of value 2
+    }
+
+    #[test]
+    fn broad_prefix_batch_uses_running_winners() {
+        let arr = array![5_i64, 1, 4, 2, 3, 0];
+        let ends = array![1_i64, 2, 3, 4, 5, 6];
+        let booleans = array![false, false, false, false, false, false];
+        let got = max_end_core(arr.view(), ends.view(), booleans.view()).unwrap();
+        assert_eq!(got, array![0, 0, 0, 0, 0, 0]);
     }
 }

@@ -90,3 +90,7 @@ harness = false
 [[bench]]
 name = "positions_ordinal"
 harness = false
+
+[[bench]]
+name = "forward_sum_compare"
+harness = false

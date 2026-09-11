@@ -16,6 +16,9 @@ pub mod bench_support {
     use numpy::ndarray::ArrayView1;
     use pyo3::prelude::*;
 
+    pub use crate::aggs::max::max_ends::max_end_core;
+    pub use crate::aggs::max::max_starts::max_start_core;
+    pub use crate::aggs::max::max_starts_ends::max_start_end_core;
     pub use crate::aggs::max_rev::max_ends::max_rev_ends_core;
     pub use crate::aggs::max_rev::max_ends_matches::compute_max_rev_end_match_int64;
     pub use crate::aggs::max_rev::max_ends_matches::max_rev_end_match_core;
@@ -24,6 +27,9 @@ pub mod bench_support {
     };
     pub use crate::aggs::max_rev::max_starts::max_rev_starts_core;
     pub use crate::aggs::max_rev::max_starts_ends::max_rev_start_end_core;
+    pub use crate::aggs::min::min_ends::min_end_core;
+    pub use crate::aggs::min::min_starts::min_start_core;
+    pub use crate::aggs::min::min_starts_ends::min_start_end_core;
     pub use crate::aggs::min_rev::min_ends::min_rev_ends_core;
     pub use crate::aggs::min_rev::min_ends_matches::compute_min_rev_end_match_int64;
     pub use crate::aggs::min_rev::min_positions::{
@@ -31,6 +37,9 @@ pub mod bench_support {
     };
     pub use crate::aggs::min_rev::min_starts::min_rev_starts_core;
     pub use crate::aggs::min_rev::min_starts_ends::min_rev_start_end_core;
+    pub use crate::aggs::prod::prod_ends::{prod_end_core, prod_end_float_core};
+    pub use crate::aggs::prod::prod_starts::{prod_start_core, prod_start_float_core};
+    pub use crate::aggs::prod::prod_starts_ends::{prod_start_end_core, prod_start_end_float_core};
     pub use crate::aggs::prod_rev::prod_ends::prod_rev_ends_int_core;
     pub use crate::aggs::prod_rev::prod_ends_matches::compute_prod_rev_end_match_int64;
     pub use crate::aggs::prod_rev::prod_positions::prod_positions_float_core_with_storage;
@@ -40,9 +49,13 @@ pub mod bench_support {
         size_positions_core, size_positions_core_with_storage, size_rev_ends_core,
         size_rev_start_end_core, size_rev_starts_core,
     };
-    pub use crate::aggs::sum::sum_ends::sum_end_core;
-    pub use crate::aggs::sum::sum_starts::{sum_start_core, sum_start_u32_core};
-    pub use crate::aggs::sum::sum_starts_ends::sum_start_end_core;
+    pub use crate::aggs::sum::sum_ends::{sum_end_core, sum_end_float_core_with_cast};
+    pub use crate::aggs::sum::sum_starts::{
+        sum_start_core, sum_start_float_core_with_cast, sum_start_u32_core,
+    };
+    pub use crate::aggs::sum::sum_starts_ends::{
+        sum_start_end_core, sum_start_end_float_core_with_cast,
+    };
     pub use crate::aggs::sum_rev::sum_ends::sum_rev_ends_int_core;
     pub use crate::aggs::sum_rev::sum_ends_matches::compute_sum_rev_end_match_int64;
     pub use crate::aggs::sum_rev::sum_positions::sum_positions_float_core_with_storage;
