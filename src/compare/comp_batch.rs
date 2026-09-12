@@ -426,7 +426,11 @@ fn compare_batch_indices_with_selection<'py>(
     // `None` means that this left row has no selected right position. Using
     // `Option<usize>` avoids reserving a special numeric position as a
     // sentinel; valid positions remain ordinary `usize` values.
-    let mut selected = vec![None; left_len];
+    let mut selected = if matches!(&selection, Selection::All) {
+        None
+    } else {
+        Some(vec![None; left_len])
+    };
     let mut all_matches = Vec::new();
     let mut total = 0_usize;
 
@@ -479,7 +483,7 @@ fn compare_batch_indices_with_selection<'py>(
         }
 
         if let Some(selected_position) = selected_position {
-            selected[row] = Some(selected_position);
+            selected.as_mut().unwrap()[row] = Some(selected_position);
             total += 1;
         }
     }
@@ -511,7 +515,7 @@ fn compare_batch_indices_with_selection<'py>(
         }
     } else {
         for row in 0..left_len {
-            if let Some(right_position) = selected[row] {
+            if let Some(right_position) = selected.as_ref().unwrap()[row] {
                 expanded_left[output_position] = left_values[row];
                 expanded_right[output_position] = right_values[right_position];
                 output_position += 1;
