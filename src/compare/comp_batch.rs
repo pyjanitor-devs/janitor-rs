@@ -580,7 +580,9 @@ fn compare_batch_indices_all_two_pass<'py>(
         let end = ends_view
             .as_ref()
             .map_or(right_len as i64, |values| values[row]);
-        let (start, end) = checked_bounds(start, end, right_len)?;
+        let Some((start, end)) = checked_bounds(start, end, right_len)? else {
+            continue;
+        };
         for right_position in start..end {
             if predicates_match_dispatch(&views, metadata.as_deref(), row, right_position) {
                 if first_success[row].is_none() {
