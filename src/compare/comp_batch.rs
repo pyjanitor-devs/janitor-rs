@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
 use super::op::CompareOp;
-use crate::aggs::checked_end;
+use crate::aggs::{checked_end, ensure_equal_lengths};
 
 enum Predicate<'py> {
     I64(
@@ -207,27 +207,16 @@ fn predicates_match_dispatch(
 
 /// Validate one half-open candidate range and convert it to slice indices.
 ///
-/// ELI5: `checked_end` already knows how to reject negative or oversized
-/// exclusive ends. We only add the corresponding start conversion and allow
-/// `start == end`, because an empty candidate row is valid for a join. A
-/// reversed row is returned as `None`, so the caller can skip just that row.
-fn checked_bounds(start: i64, end: i64, right_len: usize) -> PyResult<Option<(usize, usize)>> {
-    let start = usize::try_from(start)
-        .map_err(|_| {
-            PyValueError::new_err(
-                "candidate start and end must be non-negative and no greater than the right array length",
-            )
-        })?;
-    let end = checked_end(end, right_len)
-        .ok_or_else(|| {
-            PyValueError::new_err(
-                "candidate start and end must be non-negative and no greater than the right array length",
-            )
-        })?;
-    if start > end {
-        return Ok(None);
+/// ELI5: a malformed or empty candidate row has no candidates to scan, so it
+/// contributes no output while other rows continue normally. Whole-array
+/// shape errors are still rejected by `parse_and_validate`.
+fn checked_bounds(start: i64, end: i64, right_len: usize) -> Option<(usize, usize)> {
+    let start = usize::try_from(start).ok()?;
+    let end = checked_end(end, right_len)?;
+    if start >= end {
+        return None;
     }
-    Ok(Some((start, end)))
+    Some((start, end))
 }
 
 fn parse_predicates<'py>(predicates: &Bound<'py, PyList>) -> PyResult<Vec<Predicate<'py>>> {
@@ -333,18 +322,20 @@ fn parse_predicates_with_nulls<'py>(
         let predicate = &parsed[position];
         let values = &metadata[position];
         if let Some(left) = &values.left {
-            if left.len()? != predicate.left_len() {
-                return Err(PyValueError::new_err(
-                    "left boolean mask must match its predicate array length",
-                ));
-            }
+            ensure_equal_lengths(
+                "left boolean mask",
+                left.len()?,
+                "left predicate array",
+                predicate.left_len(),
+            )?;
         }
         if let Some(right) = &values.right {
-            if right.len()? != predicate.right_len() {
-                return Err(PyValueError::new_err(
-                    "right boolean mask must match its predicate array length",
-                ));
-            }
+            ensure_equal_lengths(
+                "right boolean mask",
+                right.len()?,
+                "right predicate array",
+                predicate.right_len(),
+            )?;
         }
     }
     // ELI5: pyjanitor checks for actual nulls before it constructs the
@@ -386,32 +377,37 @@ fn parse_and_validate<'py>(
     }
     let left_len = predicates[0].left_len();
     let right_len = predicates[0].right_len();
-    if predicates
-        .iter()
-        .any(|predicate| predicate.left_len() != left_len || predicate.right_len() != right_len)
-    {
-        return Err(PyValueError::new_err(
-            "all comparisons must use the same left and right lengths",
-        ));
+    for predicate in predicates.iter().skip(1) {
+        ensure_equal_lengths(
+            "first left predicate array",
+            left_len,
+            "current left predicate array",
+            predicate.left_len(),
+        )?;
+        ensure_equal_lengths(
+            "first right predicate array",
+            right_len,
+            "current right predicate array",
+            predicate.right_len(),
+        )?;
     }
-    if left_index.len()? != left_len || right_index.len()? != right_len {
-        return Err(PyValueError::new_err(
-            "index lengths must match the predicate arrays",
-        ));
-    }
+    ensure_equal_lengths(
+        "left index",
+        left_index.len()?,
+        "left predicate array",
+        left_len,
+    )?;
+    ensure_equal_lengths(
+        "right index",
+        right_index.len()?,
+        "right predicate array",
+        right_len,
+    )?;
     if let Some(values) = starts {
-        if values.len()? != left_len {
-            return Err(PyValueError::new_err(
-                "candidate boundaries must match the left array length",
-            ));
-        }
+        ensure_equal_lengths("starts", values.len()?, "left predicate array", left_len)?;
     }
     if let Some(values) = ends {
-        if values.len()? != left_len {
-            return Err(PyValueError::new_err(
-                "candidate boundaries must match the left array length",
-            ));
-        }
+        ensure_equal_lengths("ends", values.len()?, "left predicate array", left_len)?;
     }
     Ok(ParsedBatch {
         predicates,
@@ -473,9 +469,9 @@ fn compare_batch_indices_with_selection<'py>(
         let end = ends_view
             .as_ref()
             .map_or(right_len as i64, |values| values[row]);
-        let Some((start, end)) = checked_bounds(start, end, right_len)? else {
-            // A reversed interval contains no candidates. Skip only this row
-            // so valid ranges elsewhere in the batch can still produce output.
+        let Some((start, end)) = checked_bounds(start, end, right_len) else {
+            // This row has no candidates. Skip it so valid ranges elsewhere
+            // in the batch can still produce output.
             continue;
         };
 
@@ -580,7 +576,7 @@ fn compare_batch_indices_all_two_pass<'py>(
         let end = ends_view
             .as_ref()
             .map_or(right_len as i64, |values| values[row]);
-        let Some((start, end)) = checked_bounds(start, end, right_len)? else {
+        let Some((start, end)) = checked_bounds(start, end, right_len) else {
             continue;
         };
         for right_position in start..end {
@@ -848,7 +844,7 @@ mod tests {
                 &predicates,
                 None,
                 None,
-                left_index,
+                left_index.clone(),
                 right_index.readonly(),
             )?
             .unwrap();
@@ -916,7 +912,7 @@ mod tests {
                 &predicates,
                 Some(starts.readonly()),
                 Some(ends.readonly()),
-                left_index,
+                left_index.clone(),
                 right_index.readonly(),
             )?
             .unwrap();
@@ -1021,10 +1017,10 @@ mod tests {
                 left_index.clone(),
                 right_index.readonly(),
             )
-            .expect_err("an oversized All boundary must be rejected");
-            assert!(error.to_string().contains("candidate start and end"));
+            .expect("an oversized All boundary should skip only that row");
+            assert!(error.is_none());
             let negative_start = PyArray1::from_vec(py, vec![-1_i64]);
-            let error = compare_batch_indices_all(
+            let result = compare_batch_indices_all(
                 py,
                 &predicates,
                 Some(negative_start.readonly()),
@@ -1032,8 +1028,37 @@ mod tests {
                 left_index.clone(),
                 right_index.readonly(),
             )
-            .expect_err("a negative All boundary must be rejected");
-            assert!(error.to_string().contains("candidate start and end"));
+            .expect("a negative All boundary should skip only that row");
+            assert!(result.is_none());
+
+            // A malformed row must not discard a valid match from another
+            // row in the same batch.
+            let left = PyArray1::from_vec(py, vec![3_i64, 3]);
+            let right = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    left.into_any(),
+                    right.into_any(),
+                    0_i8.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let starts = PyArray1::from_vec(py, vec![0_i64, -1]);
+            let ends = PyArray1::from_vec(py, vec![1_i64, 999]);
+            let left_index = PyArray1::from_vec(py, vec![10_i64, 11]);
+            let right_index = PyArray1::from_vec(py, vec![20_i64, 21]);
+            let result = compare_batch_indices_any(
+                py,
+                &predicates,
+                Some(starts.readonly()),
+                Some(ends.readonly()),
+                left_index.clone(),
+                right_index.readonly(),
+            )?
+            .unwrap();
+            assert_eq!(result.0.readonly().as_array().to_vec(), vec![10]);
+            assert_eq!(result.1.readonly().as_array().to_vec(), vec![20]);
 
             // Empty left arrays have no candidate rows and therefore no
             // output, while still satisfying the parallel-length contract.
@@ -1151,6 +1176,94 @@ mod tests {
                 right_index.readonly(),
             )?
             .is_some());
+            Ok::<(), PyErr>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn validation_errors_report_the_mismatched_names_and_lengths() {
+        Python::initialize();
+        Python::attach(|py| {
+            let left = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let right = PyArray1::from_vec(py, vec![1_i64]);
+            let left_index = PyArray1::from_vec(py, vec![10_i64, 20]);
+            let right_index = PyArray1::from_vec(py, vec![30_i64]);
+            let make_predicates = || {
+                let predicates = PyList::empty(py);
+                predicates
+                    .append(PyTuple::new(
+                        py,
+                        [
+                            left.clone().into_any(),
+                            right.clone().into_any(),
+                            5_i8.into_pyobject(py)?.into_any(),
+                        ],
+                    )?)?;
+                Ok::<Bound<'_, PyList>, PyErr>(predicates)
+            };
+
+            let predicates = PyList::empty(py);
+            let short_left_mask = PyArray1::from_vec(py, vec![false]);
+            let short_right_mask = PyArray1::from_vec(py, vec![false]);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    left.clone().into_any(),
+                    right.clone().into_any(),
+                    5_i8.into_pyobject(py)?.into_any(),
+                    short_left_mask.into_any(),
+                    short_right_mask.into_any(),
+                    1_i8.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let error = compare_batch_indices_any(
+                py,
+                &predicates,
+                None,
+                None,
+                left_index.clone(),
+                right_index.readonly(),
+            )
+            .expect_err("a short left mask must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: left boolean mask and left predicate array must have equal lengths; got 1 and 2"
+            );
+
+            let predicates = make_predicates()?;
+            let short_left_index = PyArray1::from_vec(py, vec![10_i64]);
+            let error = compare_batch_indices_any(
+                py,
+                &predicates,
+                None,
+                None,
+                short_left_index,
+                right_index.readonly(),
+            )
+            .expect_err("a short left index must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: left index and left predicate array must have equal lengths; got 1 and 2"
+            );
+
+            let predicates = make_predicates()?;
+            let short_starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![1_i64, 1]);
+            let error = compare_batch_indices_any(
+                py,
+                &predicates,
+                Some(short_starts.readonly()),
+                Some(ends.readonly()),
+                left_index,
+                right_index.readonly(),
+            )
+            .expect_err("short starts must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: starts and left predicate array must have equal lengths; got 1 and 2"
+            );
+
             Ok::<(), PyErr>(())
         })
         .unwrap();
