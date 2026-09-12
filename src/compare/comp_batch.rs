@@ -209,7 +209,8 @@ fn predicates_match_dispatch(
 ///
 /// ELI5: `checked_end` already knows how to reject negative or oversized
 /// exclusive ends. We only add the corresponding start conversion and allow
-/// `start == end`, because an empty candidate row is valid for a join.
+/// `start == end`, because an empty candidate row is valid for a join. A
+/// reversed row is also returned as an empty range and skipped by the caller.
 fn checked_bounds(start: i64, end: i64, right_len: usize) -> PyResult<(usize, usize)> {
     let start = usize::try_from(start)
         .map_err(|_| {
@@ -223,11 +224,6 @@ fn checked_bounds(start: i64, end: i64, right_len: usize) -> PyResult<(usize, us
                 "candidate start and end must be non-negative and no greater than the right array length",
             )
         })?;
-    if start > end {
-        return Err(PyValueError::new_err(
-            "candidate start must not exceed candidate end",
-        ));
-    }
     Ok((start, end))
 }
 
@@ -452,6 +448,11 @@ fn compare_batch_indices_with_selection<'py>(
             .as_ref()
             .map_or(right_len as i64, |values| values[row]);
         let (start, end) = checked_bounds(start, end, right_len)?;
+        // A reversed interval contains no candidates. Skip only this row so
+        // valid ranges elsewhere in the batch can still produce output.
+        if start > end {
+            continue;
+        }
 
         let mut selected_position = None;
         for right_position in start..end {
@@ -829,6 +830,93 @@ mod tests {
                 right_index.readonly(),
             )?;
             assert!(result.is_none());
+            Ok::<(), PyErr>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn boundary_ranges_and_empty_inputs_follow_the_batch_contract() {
+        Python::initialize();
+        Python::attach(|py| {
+            let left = PyArray1::from_vec(py, vec![3_i64]);
+            let right = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    left.clone().into_any(),
+                    right.clone().into_any(),
+                    0_i8.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let left_index = PyArray1::from_vec(py, vec![10_i64]);
+            let right_index = PyArray1::from_vec(py, vec![20_i64, 21]);
+
+            // `start == right_len` is a valid empty half-open range.
+            let start_at_end = PyArray1::from_vec(py, vec![2_i64]);
+            let end_at_end = PyArray1::from_vec(py, vec![2_i64]);
+            assert!(compare_batch_indices_any(
+                py,
+                &predicates,
+                Some(start_at_end.readonly()),
+                Some(end_at_end.readonly()),
+                left_index.clone(),
+                right_index.readonly(),
+            )?
+            .is_none());
+
+            // A reversed range is empty for this row.
+            let reversed_start = PyArray1::from_vec(py, vec![2_i64]);
+            let reversed_end = PyArray1::from_vec(py, vec![1_i64]);
+            assert!(compare_batch_indices_any(
+                py,
+                &predicates,
+                Some(reversed_start.readonly()),
+                Some(reversed_end.readonly()),
+                left_index.clone(),
+                right_index.readonly(),
+            )?
+            .is_none());
+
+            // Empty left arrays have no candidate rows and therefore no
+            // output, while still satisfying the parallel-length contract.
+            let empty_left = PyArray1::from_vec(py, Vec::<i64>::new());
+            let empty_right = PyArray1::from_vec(py, Vec::<i64>::new());
+            let empty_predicates = PyList::empty(py);
+            empty_predicates.append(PyTuple::new(
+                py,
+                [
+                    empty_left.clone().into_any(),
+                    empty_right.clone().into_any(),
+                    0_i8.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let empty_index = PyArray1::from_vec(py, Vec::<i64>::new());
+            assert!(compare_batch_indices_any(
+                py,
+                &empty_predicates,
+                None,
+                None,
+                empty_index.clone(),
+                empty_index.readonly(),
+            )?
+            .is_none());
+
+            let no_predicates = PyList::empty(py);
+            let error = compare_batch_indices_any(
+                py,
+                &no_predicates,
+                None,
+                None,
+                left_index,
+                right_index.readonly(),
+            )
+            .expect_err("an empty predicate list must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: at least one comparison is required"
+            );
             Ok::<(), PyErr>(())
         })
         .unwrap();
