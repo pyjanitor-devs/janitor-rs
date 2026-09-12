@@ -210,8 +210,8 @@ fn predicates_match_dispatch(
 /// ELI5: `checked_end` already knows how to reject negative or oversized
 /// exclusive ends. We only add the corresponding start conversion and allow
 /// `start == end`, because an empty candidate row is valid for a join. A
-/// reversed row is also returned as an empty range and skipped by the caller.
-fn checked_bounds(start: i64, end: i64, right_len: usize) -> PyResult<(usize, usize)> {
+/// reversed row is returned as `None`, so the caller can skip just that row.
+fn checked_bounds(start: i64, end: i64, right_len: usize) -> PyResult<Option<(usize, usize)>> {
     let start = usize::try_from(start)
         .map_err(|_| {
             PyValueError::new_err(
@@ -224,7 +224,10 @@ fn checked_bounds(start: i64, end: i64, right_len: usize) -> PyResult<(usize, us
                 "candidate start and end must be non-negative and no greater than the right array length",
             )
         })?;
-    Ok((start, end))
+    if start > end {
+        return Ok(None);
+    }
+    Ok(Some((start, end)))
 }
 
 fn parse_predicates<'py>(predicates: &Bound<'py, PyList>) -> PyResult<Vec<Predicate<'py>>> {
@@ -447,12 +450,11 @@ fn compare_batch_indices_with_selection<'py>(
         let end = ends_view
             .as_ref()
             .map_or(right_len as i64, |values| values[row]);
-        let (start, end) = checked_bounds(start, end, right_len)?;
-        // A reversed interval contains no candidates. Skip only this row so
-        // valid ranges elsewhere in the batch can still produce output.
-        if start > end {
+        let Some((start, end)) = checked_bounds(start, end, right_len)? else {
+            // A reversed interval contains no candidates. Skip only this row
+            // so valid ranges elsewhere in the batch can still produce output.
             continue;
-        }
+        };
 
         let mut selected_position = None;
         for right_position in start..end {
