@@ -989,7 +989,6 @@ mod tests {
                 right_index.readonly(),
             )?
             .is_none());
-
             // A reversed range is empty for this row.
             let reversed_start = PyArray1::from_vec(py, vec![2_i64]);
             let reversed_end = PyArray1::from_vec(py, vec![1_i64]);
@@ -1002,6 +1001,39 @@ mod tests {
                 right_index.readonly(),
             )?
             .is_none());
+            assert!(compare_batch_indices_all(
+                py,
+                &predicates,
+                Some(reversed_start.readonly()),
+                Some(reversed_end.readonly()),
+                left_index.clone(),
+                right_index.readonly(),
+            )?
+            .is_none());
+
+            let oversized_end = PyArray1::from_vec(py, vec![3_i64]);
+            let full_start = PyArray1::from_vec(py, vec![0_i64]);
+            let error = compare_batch_indices_all(
+                py,
+                &predicates,
+                Some(full_start.readonly()),
+                Some(oversized_end.readonly()),
+                left_index.clone(),
+                right_index.readonly(),
+            )
+            .expect_err("an oversized All boundary must be rejected");
+            assert!(error.to_string().contains("candidate start and end"));
+            let negative_start = PyArray1::from_vec(py, vec![-1_i64]);
+            let error = compare_batch_indices_all(
+                py,
+                &predicates,
+                Some(negative_start.readonly()),
+                Some(end_at_end.readonly()),
+                left_index.clone(),
+                right_index.readonly(),
+            )
+            .expect_err("a negative All boundary must be rejected");
+            assert!(error.to_string().contains("candidate start and end"));
 
             // Empty left arrays have no candidate rows and therefore no
             // output, while still satisfying the parallel-length contract.
@@ -1077,6 +1109,15 @@ mod tests {
                 right_index.readonly(),
             )?
             .is_none());
+            assert!(compare_batch_indices_all(
+                py,
+                &predicates,
+                None,
+                None,
+                left_index.clone(),
+                right_index.readonly(),
+            )?
+            .is_none());
 
             let left_booleans = PyArray1::from_vec(py, vec![true]);
             let right_booleans = PyArray1::from_vec(py, vec![false]);
@@ -1093,6 +1134,15 @@ mod tests {
                 ],
             )?)?;
             assert!(compare_batch_indices_any(
+                py,
+                &predicates,
+                None,
+                None,
+                left_index.clone(),
+                right_index.readonly(),
+            )?
+            .is_some());
+            assert!(compare_batch_indices_all(
                 py,
                 &predicates,
                 None,
