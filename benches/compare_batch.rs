@@ -52,7 +52,11 @@ fn baseline_indices(
     (!output_left.is_empty()).then_some((output_left, output_right))
 }
 
-fn baseline_any(left: &[i64], right: &[i64], right_labels: &[i64]) -> Option<(Vec<i64>, Vec<i64>)> {
+fn reference_any_core(
+    left: &[i64],
+    right: &[i64],
+    right_labels: &[i64],
+) -> Option<(Vec<i64>, Vec<i64>)> {
     let mut output_left = Vec::new();
     let mut output_right = Vec::new();
     for (left_position, left_value) in left.iter().enumerate() {
@@ -89,6 +93,10 @@ fn baseline_all(left: &[i64], right: &[i64], right_labels: &[i64]) -> Option<(Ve
 fn bench(c: &mut Criterion) {
     Python::initialize();
     let mut group = c.benchmark_group("compare_batch_indices");
+    // The reference functions below are Rust-slice implementations of the
+    // matching algorithm. The fused functions are Python-facing wrappers, so
+    // their timings also include PyO3/NumPy parsing, validation, and output
+    // conversion. Keep this distinction visible when interpreting results.
     for &(left_len, right_len) in &[
         (8, 16),
         (64, 256),
@@ -233,10 +241,10 @@ fn bench(c: &mut Criterion) {
                 "compare_batch {label}: current-all {current_all_bytes} bytes/{current_all_peak} peak; vector-baseline-all {baseline_all_bytes} bytes/{baseline_all_peak} peak; first baseline {baseline_bytes} bytes/{baseline_peak} peak; last {last_bytes} bytes/{last_peak} peak"
             );
             let (baseline_any_bytes, _, baseline_any_peak) = support::count_allocations(|| {
-                baseline_any(&left_values, &right_values, &right_labels)
+                reference_any_core(&left_values, &right_values, &right_labels)
             });
             eprintln!(
-                "compare_batch {label}: any baseline {baseline_any_bytes} bytes/{baseline_any_peak} peak"
+                "compare_batch {label}: any reference core {baseline_any_bytes} bytes/{baseline_any_peak} peak"
             );
 
             group.bench_with_input(BenchmarkId::new("ordinary", &label), &label, |b, _| {
@@ -300,11 +308,11 @@ fn bench(c: &mut Criterion) {
                 })
             });
             group.bench_with_input(
-                BenchmarkId::new("baseline_any", &label),
+                BenchmarkId::new("reference_any_core", &label),
                 &label,
                 |b, _| {
                     b.iter(|| {
-                        std::hint::black_box(baseline_any(
+                        std::hint::black_box(reference_any_core(
                             &left_values,
                             &right_values,
                             &right_labels,
