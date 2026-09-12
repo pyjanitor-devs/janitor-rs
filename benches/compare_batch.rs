@@ -2,7 +2,8 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use janitor_rs::bench_support::{
-    compare_batch_indices_all, compare_batch_indices_first, compare_batch_indices_last,
+    compare_batch_indices_all, compare_batch_indices_any, compare_batch_indices_first,
+    compare_batch_indices_last,
 };
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
@@ -32,11 +33,17 @@ fn baseline_indices(
     let mut output_right = Vec::new();
     for (left_position, _) in left.iter().enumerate() {
         let row = &matches[left_position * right.len()..(left_position + 1) * right.len()];
-        let selected = if first {
-            row.iter().position(|matched| *matched)
-        } else {
-            row.iter().rposition(|matched| *matched)
-        };
+        let mut selected = None;
+        for (right_position, matched) in row.iter().enumerate() {
+            if *matched
+                && selected.is_none_or(|current| {
+                    (first && right_labels[right_position] < right_labels[current])
+                        || (!first && right_labels[right_position] > right_labels[current])
+                })
+            {
+                selected = Some(right_position);
+            }
+        }
         if let Some(right_position) = selected {
             output_left.push(left_position as i64);
             output_right.push(right_labels[right_position]);
@@ -210,6 +217,21 @@ fn bench(c: &mut Criterion) {
                     let starts = PyArray1::from_vec(py, vec![0_i64; left_len]);
                     let ends = PyArray1::from_vec(py, vec![right_len as i64; left_len]);
                     compare_batch_indices_last(
+                        py,
+                        &predicates,
+                        Some(starts.readonly()),
+                        Some(ends.readonly()),
+                        left_index.clone(),
+                        right_index.readonly(),
+                    )
+                    .unwrap();
+                })
+            });
+            group.bench_with_input(BenchmarkId::new("any", &label), &label, |b, _| {
+                b.iter(|| {
+                    let starts = PyArray1::from_vec(py, vec![0_i64; left_len]);
+                    let ends = PyArray1::from_vec(py, vec![right_len as i64; left_len]);
+                    compare_batch_indices_any(
                         py,
                         &predicates,
                         Some(starts.readonly()),

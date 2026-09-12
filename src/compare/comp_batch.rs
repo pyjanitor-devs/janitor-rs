@@ -529,6 +529,18 @@ fn compare_batch_indices_with_selection<'py>(
     )))
 }
 
+/// Select the smallest matching right label for each left row.
+///
+/// ELI5: all predicates must approve a candidate; keep the approved candidate
+/// with the smallest right label. Returns `None` when nothing matches.
+///
+/// # Arguments
+/// * `predicates` - Heterogeneous comparison tuples.
+/// * `starts`, `ends` - Optional candidate bounds for each left row.
+/// * `left_index`, `right_index` - Labels emitted for matching positions.
+///
+/// # Returns
+/// Aligned output arrays, or `None` when there are no matches.
 #[pyfunction]
 pub fn compare_batch_indices_first<'py>(
     py: Python<'py>,
@@ -549,6 +561,18 @@ pub fn compare_batch_indices_first<'py>(
     )
 }
 
+/// Select the largest matching right label for each left row.
+///
+/// ELI5: all predicates must approve a candidate; keep the approved candidate
+/// with the largest right label. Returns `None` when nothing matches.
+///
+/// # Arguments
+/// * `predicates` - Heterogeneous comparison tuples.
+/// * `starts`, `ends` - Optional candidate bounds for each left row.
+/// * `left_index`, `right_index` - Labels emitted for matching positions.
+///
+/// # Returns
+/// Aligned output arrays, or `None` when there are no matches.
 #[pyfunction]
 pub fn compare_batch_indices_last<'py>(
     py: Python<'py>,
@@ -569,6 +593,18 @@ pub fn compare_batch_indices_last<'py>(
     )
 }
 
+/// Select any matching right position for each left row.
+///
+/// ELI5: stop scanning a row as soon as one candidate passes every predicate.
+/// Returns `None` when nothing matches.
+///
+/// # Arguments
+/// * `predicates` - Heterogeneous comparison tuples.
+/// * `starts`, `ends` - Optional candidate bounds for each left row.
+/// * `left_index`, `right_index` - Labels emitted for matching positions.
+///
+/// # Returns
+/// Aligned output arrays, or `None` when there are no matches.
 #[pyfunction]
 pub fn compare_batch_indices_any<'py>(
     py: Python<'py>,
@@ -589,6 +625,18 @@ pub fn compare_batch_indices_any<'py>(
     )
 }
 
+/// Return every left/right pair passing every predicate.
+///
+/// ELI5: keep every candidate approved by all judges instead of choosing one.
+/// Returns `None` when nothing matches.
+///
+/// # Arguments
+/// * `predicates` - Heterogeneous comparison tuples.
+/// * `starts`, `ends` - Optional candidate bounds for each left row.
+/// * `left_index`, `right_index` - Labels emitted for matching positions.
+///
+/// # Returns
+/// Aligned output arrays, or `None` when there are no matches.
 #[pyfunction]
 pub fn compare_batch_indices_all<'py>(
     py: Python<'py>,
