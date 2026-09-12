@@ -52,6 +52,21 @@ fn baseline_indices(
     (!output_left.is_empty()).then_some((output_left, output_right))
 }
 
+fn baseline_any(left: &[i64], right: &[i64], right_labels: &[i64]) -> Option<(Vec<i64>, Vec<i64>)> {
+    let mut output_left = Vec::new();
+    let mut output_right = Vec::new();
+    for (left_position, left_value) in left.iter().enumerate() {
+        for (right_position, right_value) in right.iter().enumerate() {
+            if *left_value > *right_value && *left_value != *right_value {
+                output_left.push(left_position as i64);
+                output_right.push(right_labels[right_position]);
+                break;
+            }
+        }
+    }
+    (!output_left.is_empty()).then_some((output_left, output_right))
+}
+
 fn baseline_all(left: &[i64], right: &[i64], right_labels: &[i64]) -> Option<(Vec<i64>, Vec<i64>)> {
     let mut matches = vec![false; left.len() * right.len()];
     for (left_position, left_value) in left.iter().enumerate() {
@@ -145,6 +160,42 @@ fn bench(c: &mut Criterion) {
                     )?,
                 ],
             )?;
+            let mixed_left = PyArray1::from_vec(
+                py,
+                (0..left_len).map(|row| row % 3 == 0).collect(),
+            );
+            let mixed_right = PyArray1::from_vec(
+                py,
+                (0..right_len).map(|column| column % 5 == 0).collect(),
+            );
+            let null_predicates = |extension_flag: i8| {
+                PyList::new(
+                    py,
+                    [
+                        PyTuple::new(
+                            py,
+                            [
+                                left.clone().into_any(),
+                                right.clone().into_any(),
+                                0_i8.into_pyobject(py)?.into_any(),
+                            ],
+                        )?,
+                        PyTuple::new(
+                            py,
+                            [
+                                left.clone().into_any(),
+                                right.clone().into_any(),
+                                5_i8.into_pyobject(py)?.into_any(),
+                                mixed_left.clone().into_any(),
+                                mixed_right.clone().into_any(),
+                                extension_flag.into_pyobject(py)?.into_any(),
+                            ],
+                        )?,
+                    ],
+                )
+            };
+            let null_predicates_non_extension = null_predicates(0)?;
+            let null_predicates_extension = null_predicates(1)?;
 
             let (baseline_bytes, _, baseline_peak) = support::count_allocations(|| {
                 baseline_indices(&left_values, &right_values, &right_labels, true)
@@ -180,6 +231,12 @@ fn bench(c: &mut Criterion) {
             });
             eprintln!(
                 "compare_batch {label}: current-all {current_all_bytes} bytes/{current_all_peak} peak; vector-baseline-all {baseline_all_bytes} bytes/{baseline_all_peak} peak; first baseline {baseline_bytes} bytes/{baseline_peak} peak; last {last_bytes} bytes/{last_peak} peak"
+            );
+            let (baseline_any_bytes, _, baseline_any_peak) = support::count_allocations(|| {
+                baseline_any(&left_values, &right_values, &right_labels)
+            });
+            eprintln!(
+                "compare_batch {label}: any baseline {baseline_any_bytes} bytes/{baseline_any_peak} peak"
             );
 
             group.bench_with_input(BenchmarkId::new("ordinary", &label), &label, |b, _| {
@@ -242,6 +299,39 @@ fn bench(c: &mut Criterion) {
                     .unwrap();
                 })
             });
+            group.bench_with_input(
+                BenchmarkId::new("baseline_any", &label),
+                &label,
+                |b, _| {
+                    b.iter(|| {
+                        std::hint::black_box(baseline_any(
+                            &left_values,
+                            &right_values,
+                            &right_labels,
+                        ));
+                    })
+                },
+            );
+            for (name, null_predicates) in [
+                ("nulls_non_extension", &null_predicates_non_extension),
+                ("nulls_extension", &null_predicates_extension),
+            ] {
+                group.bench_with_input(BenchmarkId::new(name, &label), &label, |b, _| {
+                    b.iter(|| {
+                        let starts = PyArray1::from_vec(py, vec![0_i64; left_len]);
+                        let ends = PyArray1::from_vec(py, vec![right_len as i64; left_len]);
+                        compare_batch_indices_first(
+                            py,
+                            null_predicates,
+                            Some(starts.readonly()),
+                            Some(ends.readonly()),
+                            left_index.clone(),
+                            right_index.readonly(),
+                        )
+                        .unwrap();
+                    })
+                });
+            }
             group.bench_with_input(BenchmarkId::new("all", &label), &label, |b, _| {
                 b.iter(|| {
                     let starts = PyArray1::from_vec(py, vec![0_i64; left_len]);

@@ -363,24 +363,23 @@ enum Selection {
     First,
     Last,
     Any,
-    All,
 }
 
-/// Run a heterogeneous predicate batch and return one expanded pair per
-/// left row that has at least one successful right candidate, or every
-/// successful pair when the `All` selection is used.
-///
-/// ELI5: first/last/any save one winning position per left row, while all
-/// saves every winning pair. The final pass only copies those saved results.
-fn compare_batch_indices_with_selection<'py>(
+struct ParsedBatch<'py> {
+    predicates: Vec<Predicate<'py>>,
+    metadata: Option<Vec<NullMetadata<'py>>>,
+    left_len: usize,
+    right_len: usize,
+}
+
+fn parse_and_validate<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
-    starts: Option<PyReadonlyArray1<'py, i64>>,
-    ends: Option<PyReadonlyArray1<'py, i64>>,
-    left_index: Bound<'py, PyArray1<i64>>,
-    right_index: PyReadonlyArray1<'py, i64>,
-    selection: Selection,
-) -> PyResult<Option<BatchIndices<'py>>> {
+    starts: &Option<PyReadonlyArray1<'py, i64>>,
+    ends: &Option<PyReadonlyArray1<'py, i64>>,
+    left_index: &Bound<'py, PyArray1<i64>>,
+    right_index: &PyReadonlyArray1<'py, i64>,
+) -> PyResult<ParsedBatch<'py>> {
     let (predicates, metadata) = parse_predicates_with_nulls(py, predicates)?;
     if predicates.is_empty() {
         return Err(PyValueError::new_err("at least one comparison is required"));
@@ -400,20 +399,49 @@ fn compare_batch_indices_with_selection<'py>(
             "index lengths must match the predicate arrays",
         ));
     }
-    if let Some(values) = &starts {
+    if let Some(values) = starts {
         if values.len()? != left_len {
             return Err(PyValueError::new_err(
                 "candidate boundaries must match the left array length",
             ));
         }
     }
-    if let Some(values) = &ends {
+    if let Some(values) = ends {
         if values.len()? != left_len {
             return Err(PyValueError::new_err(
                 "candidate boundaries must match the left array length",
             ));
         }
     }
+    Ok(ParsedBatch {
+        predicates,
+        metadata,
+        left_len,
+        right_len,
+    })
+}
+
+/// Run a heterogeneous predicate batch and return one expanded pair per
+/// left row that has at least one successful right candidate.
+///
+/// ELI5: first/last/any save one winning position per left row, then the final
+/// pass copies those saved results. `All` has a separate two-pass implementation
+/// because retaining every pair would duplicate the final output in memory.
+fn compare_batch_indices_with_selection<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    starts: Option<PyReadonlyArray1<'py, i64>>,
+    ends: Option<PyReadonlyArray1<'py, i64>>,
+    left_index: Bound<'py, PyArray1<i64>>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    selection: Selection,
+) -> PyResult<Option<BatchIndices<'py>>> {
+    let ParsedBatch {
+        predicates,
+        metadata,
+        left_len,
+        right_len,
+    } = parse_and_validate(py, predicates, &starts, &ends, &left_index, &right_index)?;
 
     let mut views = Vec::with_capacity(predicates.len());
     for predicate in &predicates {
@@ -425,12 +453,7 @@ fn compare_batch_indices_with_selection<'py>(
     // `None` means that this left row has no selected right position. Using
     // `Option<usize>` avoids reserving a special numeric position as a
     // sentinel; valid positions remain ordinary `usize` values.
-    let mut selected = if matches!(&selection, Selection::All) {
-        None
-    } else {
-        Some(vec![None; left_len])
-    };
-    let mut all_matches = Vec::new();
+    let mut selected = vec![None; left_len];
     let mut total = 0_usize;
 
     // The only comparison pass uses the original boundaries. `First` and
@@ -480,20 +503,16 @@ fn compare_batch_indices_with_selection<'py>(
                         selected_position = Some(right_position);
                         break;
                     }
-                    Selection::All => all_matches.push((row, right_position)),
                 }
             }
         }
 
         if let Some(selected_position) = selected_position {
-            selected.as_mut().unwrap()[row] = Some(selected_position);
+            selected[row] = Some(selected_position);
             total += 1;
         }
     }
 
-    if matches!(&selection, Selection::All) {
-        total = all_matches.len();
-    }
     if total == 0 {
         return Ok(None);
     }
@@ -508,17 +527,91 @@ fn compare_batch_indices_with_selection<'py>(
     let left_values = left_values.as_array();
     let mut output_position = 0_usize;
 
-    // First/last/any only copy saved positions here. All copies its saved
-    // pairs; neither branch allocates a counts array.
-    if matches!(selection, Selection::All) {
-        for (row, right_position) in all_matches {
+    for row in 0..left_len {
+        if let Some(right_position) = selected[row] {
             expanded_left[output_position] = left_values[row];
             expanded_right[output_position] = right_values[right_position];
             output_position += 1;
         }
-    } else {
-        for row in 0..left_len {
-            if let Some(right_position) = selected.as_ref().unwrap()[row] {
+    }
+    debug_assert_eq!(output_position, total);
+    Ok(Some((
+        expanded_left.into_pyarray(py),
+        expanded_right.into_pyarray(py),
+    )))
+}
+
+/// Return every matching pair using a bounded two-pass scan.
+///
+/// The first pass records each row's first and last successful candidate and
+/// counts all successes. The second pass can then allocate exact-sized output
+/// arrays and revisit only the interval between those two successes. This
+/// keeps `All` separate from the one-result selection modes and avoids keeping
+/// a full intermediate `Vec<(row, position)>` alive beside the final arrays.
+fn compare_batch_indices_all_two_pass<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    starts: Option<PyReadonlyArray1<'py, i64>>,
+    ends: Option<PyReadonlyArray1<'py, i64>>,
+    left_index: Bound<'py, PyArray1<i64>>,
+    right_index: PyReadonlyArray1<'py, i64>,
+) -> PyResult<Option<BatchIndices<'py>>> {
+    let ParsedBatch {
+        predicates,
+        metadata,
+        left_len,
+        right_len,
+    } = parse_and_validate(py, predicates, &starts, &ends, &left_index, &right_index)?;
+    let mut views = Vec::with_capacity(predicates.len());
+    for predicate in &predicates {
+        views.push(predicate.view());
+    }
+    let starts_view = starts.as_ref().map(|values| values.as_array());
+    let ends_view = ends.as_ref().map(|values| values.as_array());
+    let mut first_success = vec![None; left_len];
+    let mut last_success = vec![0_usize; left_len];
+    let mut total = 0_usize;
+
+    // ELI5: first find the first and last winning bookend for each row.
+    // Everything between those bookends is the only part the second pass
+    // needs to inspect; candidates outside them already failed.
+    for row in 0..left_len {
+        let start = starts_view.as_ref().map_or(0, |values| values[row]);
+        let end = ends_view
+            .as_ref()
+            .map_or(right_len as i64, |values| values[row]);
+        let (start, end) = checked_bounds(start, end, right_len)?;
+        for right_position in start..end {
+            if predicates_match_dispatch(&views, metadata.as_deref(), row, right_position) {
+                if first_success[row].is_none() {
+                    first_success[row] = Some(right_position);
+                }
+                last_success[row] = right_position;
+                total += 1;
+            }
+        }
+    }
+
+    if total == 0 {
+        return Ok(None);
+    }
+    let mut expanded_left = Array1::<i64>::zeros(total);
+    let mut expanded_right = Array1::<i64>::zeros(total);
+    let left_values = left_index.readonly();
+    let left_values = left_values.as_array();
+    let right_values = right_index.as_array();
+    let mut output_position = 0_usize;
+
+    // ELI5: rescan only from the first win through the last win. This still
+    // emits every successful pair, but avoids comparing the known-failing
+    // prefix and suffix of a row a second time.
+    for row in 0..left_len {
+        let Some(start) = first_success[row] else {
+            continue;
+        };
+        let end = last_success[row] + 1;
+        for right_position in start..end {
+            if predicates_match_dispatch(&views, metadata.as_deref(), row, right_position) {
                 expanded_left[output_position] = left_values[row];
                 expanded_right[output_position] = right_values[right_position];
                 output_position += 1;
@@ -649,15 +742,7 @@ pub fn compare_batch_indices_all<'py>(
     left_index: Bound<'py, PyArray1<i64>>,
     right_index: PyReadonlyArray1<'py, i64>,
 ) -> PyResult<Option<BatchIndices<'py>>> {
-    compare_batch_indices_with_selection(
-        py,
-        predicates,
-        starts,
-        ends,
-        left_index,
-        right_index,
-        Selection::All,
-    )
+    compare_batch_indices_all_two_pass(py, predicates, starts, ends, left_index, right_index)
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -800,6 +885,41 @@ mod tests {
             .unwrap();
             assert_eq!(result.0.readonly().as_array().to_vec(), vec![10, 10]);
             assert_eq!(result.1.readonly().as_array().to_vec(), vec![102, 101]);
+            Ok::<(), PyErr>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn all_indices_keep_matches_between_first_and_last_success() {
+        Python::initialize();
+        Python::attach(|py| {
+            let left = PyArray1::from_vec(py, vec![3_i64]);
+            let right = PyArray1::from_vec(py, vec![5_i64, 1, 4, 2]);
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    left.clone().into_any(),
+                    right.into_any(),
+                    0_i8.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![4_i64]);
+            let left_index = PyArray1::from_vec(py, vec![10_i64]);
+            let right_index = PyArray1::from_vec(py, vec![100_i64, 101, 102, 103]);
+            let result = compare_batch_indices_all(
+                py,
+                &predicates,
+                Some(starts.readonly()),
+                Some(ends.readonly()),
+                left_index,
+                right_index.readonly(),
+            )?
+            .unwrap();
+            assert_eq!(result.0.readonly().as_array().to_vec(), vec![10, 10]);
+            assert_eq!(result.1.readonly().as_array().to_vec(), vec![101, 103]);
             Ok::<(), PyErr>(())
         })
         .unwrap();
