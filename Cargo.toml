@@ -84,6 +84,10 @@ name = "production_match_compare"
 harness = false
 
 [[bench]]
+name = "compare_batch"
+harness = false
+
+[[bench]]
 name = "rev_all_paths"
 harness = false
 

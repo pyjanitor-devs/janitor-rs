@@ -66,6 +66,10 @@ pub mod bench_support {
     pub use crate::bin_search::bin_search_lt::binary_search_lt_core;
     pub use crate::bin_search::bin_search_lt_first::binary_search_lt_first_core;
     pub use crate::compare::comp::{compare_start_end_core, compare_start_end_in_place_core};
+    pub use crate::compare::comp_batch::{
+        compare_batch_indices_all, compare_batch_indices_any, compare_batch_indices_first,
+        compare_batch_indices_last,
+    };
     pub use crate::compare::comp_direct::select_start_end_core;
     pub use crate::compare::comp_ends::{compare_end_allocating_core, compare_end_in_place_core};
     pub use crate::compare::comp_ne::{
@@ -309,7 +313,7 @@ mod registration_tests {
     /// `register`, as of this PR (894 dtype-specialized exports across 90
     /// leaf modules). Bump this alongside any PR that intentionally adds
     /// or removes an export.
-    const EXPECTED_EXPORT_COUNT: usize = 896;
+    const EXPECTED_EXPORT_COUNT: usize = 900;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
