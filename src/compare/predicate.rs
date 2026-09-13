@@ -9,6 +9,11 @@ use pyo3::types::{PyList, PyTuple};
 use super::op::CompareOp;
 use crate::aggs::ensure_equal_lengths;
 
+/// A typed comparison between one left-hand array and one right-hand array.
+///
+/// The enum keeps the concrete NumPy dtype with each predicate so the hot
+/// matching loop can dispatch once per predicate without converting values to
+/// a common representation.
 pub(crate) enum Predicate<'py> {
     I64(
         PyReadonlyArray1<'py, i64>,
@@ -62,6 +67,10 @@ pub(crate) enum Predicate<'py> {
     ),
 }
 
+/// Borrowed, Rust-only view of a [`Predicate`].
+///
+/// This view removes the PyO3 wrapper from the inner comparison loop while
+/// retaining the original typed arrays and comparison operator.
 pub(crate) enum PredicateView<'a> {
     I64(ArrayView1<'a, i64>, ArrayView1<'a, i64>, CompareOp),
     I32(ArrayView1<'a, i32>, ArrayView1<'a, i32>, CompareOp),
@@ -75,13 +84,26 @@ pub(crate) enum PredicateView<'a> {
     F32(ArrayView1<'a, f32>, ArrayView1<'a, f32>, CompareOp),
 }
 
+/// Optional null masks and extension-array semantics for one predicate.
 pub(crate) struct NullMetadata<'py> {
+    /// Boolean mask for the predicate's left-hand array, when null-aware
+    /// comparison is enabled.
     pub(crate) left: Option<PyReadonlyArray1<'py, bool>>,
+    /// Boolean mask for the predicate's right-hand array, when null-aware
+    /// comparison is enabled.
     pub(crate) right: Option<PyReadonlyArray1<'py, bool>>,
+    /// Whether a masked value follows pandas' nullable extension-array
+    /// comparison rules.
     pub(crate) is_extension_array: bool,
 }
 
 impl Predicate<'_> {
+    /// Borrow the typed NumPy arrays as ordinary ndarray views.
+    ///
+    /// # Returns
+    ///
+    /// A [`PredicateView`] borrowing the arrays and comparison operator stored
+    /// in this predicate.
     pub(crate) fn view<'a>(&'a self) -> PredicateView<'a> {
         match self {
             Self::I64(l, r, op) => PredicateView::I64(l.as_array(), r.as_array(), *op),
@@ -97,6 +119,11 @@ impl Predicate<'_> {
         }
     }
 
+    /// Return the number of values in the predicate's left-hand array.
+    ///
+    /// # Returns
+    ///
+    /// The left-hand array length.
     pub(crate) fn left_len(&self) -> usize {
         match self {
             Self::I64(left, _, _) => left.as_array().len(),
@@ -112,6 +139,11 @@ impl Predicate<'_> {
         }
     }
 
+    /// Return the number of values in the predicate's right-hand array.
+    ///
+    /// # Returns
+    ///
+    /// The right-hand array length.
     pub(crate) fn right_len(&self) -> usize {
         match self {
             Self::I64(_, right, _) => right.as_array().len(),
@@ -129,6 +161,17 @@ impl Predicate<'_> {
 }
 
 impl PredicateView<'_> {
+    /// Evaluate this typed predicate for one pair of positional indices.
+    ///
+    /// # Arguments
+    ///
+    /// * `left` - Position in the left-hand array.
+    /// * `right` - Position in the right-hand array.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either index is outside its corresponding array. Callers are
+    /// responsible for validating candidate bounds before matching.
     pub(crate) fn matches(&self, left: usize, right: usize) -> bool {
         macro_rules! compare {
             ($l:expr, $r:expr, $op:expr) => {
@@ -150,9 +193,21 @@ impl PredicateView<'_> {
     }
 }
 
+/// Evaluate every predicate for one candidate without null-mask handling.
+///
 /// ELI5: all judges must approve the same candidate. Ask them in order and
 /// stop at the first rejection, because later judges cannot rescue a failed
 /// AND condition.
+///
+/// # Arguments
+///
+/// * `views` - Borrowed typed predicates to evaluate.
+/// * `left` - Position in each predicate's left-hand array.
+/// * `right` - Position in each predicate's right-hand array.
+///
+/// # Returns
+///
+/// `true` only when every predicate accepts the candidate.
 pub(crate) fn predicates_match(views: &[PredicateView<'_>], left: usize, right: usize) -> bool {
     for predicate in views {
         if !predicate.matches(left, right) {
@@ -162,6 +217,18 @@ pub(crate) fn predicates_match(views: &[PredicateView<'_>], left: usize, right: 
     true
 }
 
+/// Evaluate every predicate for one candidate with null-mask handling.
+///
+/// # Arguments
+///
+/// * `views` - Borrowed typed predicates to evaluate.
+/// * `metadata` - Per-predicate null masks and extension-array semantics.
+/// * `left` - Position in each predicate's left-hand array.
+/// * `right` - Position in each predicate's right-hand array.
+///
+/// # Returns
+///
+/// `true` only when every predicate accepts the candidate.
 pub(crate) fn predicates_match_with_nulls(
     views: &[PredicateView<'_>],
     metadata: &[NullMetadata<'_>],
@@ -189,6 +256,20 @@ pub(crate) fn predicates_match_with_nulls(
     true
 }
 
+/// Dispatch candidate matching to the masked or unmasked implementation.
+///
+/// # Arguments
+///
+/// * `views` - Borrowed typed predicates to evaluate.
+/// * `metadata` - Null metadata for the predicates, or `None` when masks are
+///   not active.
+/// * `left` - Position in each predicate's left-hand array.
+/// * `right` - Position in each predicate's right-hand array.
+///
+/// # Returns
+///
+/// `true` only when the candidate satisfies all applicable predicates and
+/// null semantics.
 #[inline]
 pub(crate) fn predicates_match_dispatch(
     views: &[PredicateView<'_>],
@@ -202,6 +283,21 @@ pub(crate) fn predicates_match_dispatch(
     }
 }
 
+/// Parse Python comparison tuples into typed predicates.
+///
+/// Each item must be a three-element `(left, right, op)` tuple. The left and
+/// right objects must be one-dimensional NumPy arrays with one of the numeric
+/// dtypes supported by this module; `op` is the comparison opcode understood
+/// by [`CompareOp`].
+///
+/// # Arguments
+///
+/// * `predicates` - Python list of `(left, right, op)` comparison tuples.
+///
+/// # Errors
+///
+/// Returns a Python type/value error for malformed tuples, unsupported dtypes,
+/// or invalid comparison opcodes.
 pub(crate) fn parse_predicates<'py>(
     predicates: &Bound<'py, PyList>,
 ) -> PyResult<Vec<Predicate<'py>>> {
@@ -252,6 +348,29 @@ pub(crate) fn parse_predicates<'py>(
     Ok(result)
 }
 
+/// Parse comparison tuples and their optional null-mask metadata.
+///
+/// A three-element tuple has the form `(left, right, op)`. A six-element tuple
+/// has the form `(left, right, op, left_mask, right_mask, is_extension_array)`
+/// and is allowed only for `!=` comparisons. The returned metadata is omitted
+/// when no predicate supplies masks.
+///
+/// # Arguments
+///
+/// * `py` - Python interpreter token used to construct the temporary base
+///   predicate tuples.
+/// * `predicates` - Python list containing three- or six-element comparison
+///   tuples.
+///
+/// # Returns
+///
+/// The parsed typed predicates and optional per-predicate null metadata.
+///
+/// # Errors
+///
+/// Returns a Python type/value error for malformed tuples, invalid opcodes,
+/// unsupported dtypes, invalid extension flags, or mask/array length
+/// mismatches.
 pub(crate) fn parse_predicates_with_nulls<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,

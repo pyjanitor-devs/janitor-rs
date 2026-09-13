@@ -583,4 +583,85 @@ mod tests {
         })
         .unwrap();
     }
+
+    #[test]
+    fn heterogeneous_predicates_match_reference_for_every_selection() {
+        Python::initialize();
+        Python::attach(|py| {
+            let left_region = PyArray1::from_vec(py, vec![3_i64, 4, 4]);
+            let right_region = PyArray1::from_vec(py, vec![1_i64, 2, 3, 4]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 0, 0]);
+            let left_index = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
+            let right_index = PyArray1::from_vec(py, vec![100_i64, 200, 300, 400]);
+
+            let left_i64 = PyArray1::from_vec(py, vec![2_i64, 3, 4]);
+            let right_i64 = PyArray1::from_vec(py, vec![1_i64, 2, 3, 4]);
+            let left_f64 = PyArray1::from_vec(py, vec![1.5_f64, 2.5, 3.5]);
+            let right_f64 = PyArray1::from_vec(py, vec![1.0_f64, 2.0, 3.0, 4.0]);
+            let left_i32 = PyArray1::from_vec(py, vec![0_i32, 0, 0]);
+            let right_i32 = PyArray1::from_vec(py, vec![0_i32, 1, 2, 3]);
+            let left_mask = PyArray1::from_vec(py, vec![false, false, false]);
+            let right_mask = PyArray1::from_vec(py, vec![false, false, true, false]);
+            let predicates = PyList::empty(py);
+
+            // Three different dtypes and operators exercise the heterogeneous
+            // dispatch. The final six-element predicate also exercises
+            // nullable extension-array semantics: right position 2 is masked
+            // and therefore cannot satisfy `!=`.
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    left_i64.into_any(),
+                    right_i64.into_any(),
+                    3_i8.into_pyobject(py).unwrap().into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    left_f64.into_any(),
+                    right_f64.into_any(),
+                    5_i8.into_pyobject(py).unwrap().into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    left_i32.into_any(),
+                    right_i32.into_any(),
+                    5_i8.into_pyobject(py).unwrap().into_any(),
+                    left_mask.into_any(),
+                    right_mask.into_any(),
+                    1_i8.into_pyobject(py).unwrap().into_any(),
+                ],
+            )?)?;
+
+            // Reference: the region leaves positions 2 and 3 for row 0, 3
+            // for row 1, and 3 for row 2. The masked != predicate removes
+            // position 2, leaving one matching right label per left row.
+            let expected_left = vec![10_i64, 20, 30];
+            let expected_right = vec![400_i64, 400, 400];
+            for call in [
+                compare_multi_region_indices_first,
+                compare_multi_region_indices_last,
+                compare_multi_region_indices_any,
+                compare_multi_region_indices_all,
+            ] {
+                let result = call(
+                    py,
+                    &predicates,
+                    left_region.readonly(),
+                    right_region.readonly(),
+                    starts.readonly(),
+                    left_index.clone(),
+                    right_index.readonly(),
+                )?
+                .unwrap();
+                assert_eq!(result.0.readonly().as_array().to_vec(), expected_left);
+                assert_eq!(result.1.readonly().as_array().to_vec(), expected_right);
+            }
+            Ok::<(), PyErr>(())
+        })
+        .unwrap();
+    }
 }
