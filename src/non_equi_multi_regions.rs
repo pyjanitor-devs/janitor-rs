@@ -8,7 +8,7 @@
 //! unique, so duplicate regions use linked position chains while emitted
 //! labels remain unambiguous.
 
-use numpy::ndarray::{Array1, ArrayView1};
+use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -16,48 +16,12 @@ use pyo3::types::PyList;
 use std::collections::BTreeMap;
 
 use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
-use crate::compare::common::{checked_bounds, Selection};
+use crate::compare::common::{add_right_region, checked_bounds, GroupState, Selection};
 use crate::compare::predicate::{
     parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata, Predicate,
 };
 
 type Indices<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
-
-struct GroupState {
-    head: i64,
-    tail: i64,
-}
-
-impl Default for GroupState {
-    fn default() -> Self {
-        Self { head: -1, tail: -1 }
-    }
-}
-
-/// Add the newly exposed right positions to reusable value groups.
-///
-/// ELI5: `starts` moves left as pyjanitor visits its rows. Instead of scanning
-/// the already-seen suffix again to discover candidates, add only the newly
-/// exposed positions to one flat chain per right-region value. Extra
-/// predicates are still evaluated for the current left row when the chains
-/// are traversed, because their result is row-specific.
-fn add_right_region(
-    right_region: ArrayView1<'_, i64>,
-    start: usize,
-    previous_end: usize,
-    next: &mut [i64],
-    groups: &mut BTreeMap<i64, GroupState>,
-) {
-    for right_position in (start..previous_end).rev() {
-        let state = groups.entry(right_region[right_position]).or_default();
-        if state.head == -1 {
-            state.head = right_position as i64;
-        } else {
-            next[state.tail as usize] = right_position as i64;
-        }
-        state.tail = right_position as i64;
-    }
-}
 
 struct ParsedInputs<'py> {
     predicates: Vec<Predicate<'py>>,
@@ -168,6 +132,11 @@ fn selected_core<'py>(
         let Some((start, _)) = checked_bounds(starts[row], right_len as i64, right_len) else {
             continue;
         };
+        if start > previous_end {
+            return Err(PyValueError::new_err(
+                "starts must be monotonically non-increasing",
+            ));
+        }
         debug_assert!(start <= previous_end);
         add_right_region(right_region, start, previous_end, &mut next, &mut groups);
         previous_end = start;
@@ -283,6 +252,11 @@ pub fn compare_multi_region_indices_all<'py>(
         let Some((start, _)) = checked_bounds(starts[row], right_len as i64, right_len) else {
             continue;
         };
+        if start > previous_end {
+            return Err(PyValueError::new_err(
+                "starts must be monotonically non-increasing",
+            ));
+        }
         debug_assert!(start <= previous_end);
         add_right_region(right_region, start, previous_end, &mut next, &mut groups);
         previous_end = start;
@@ -318,6 +292,11 @@ pub fn compare_multi_region_indices_all<'py>(
         let Some((start, _)) = checked_bounds(starts[row], right_len as i64, right_len) else {
             continue;
         };
+        if start > previous_end {
+            return Err(PyValueError::new_err(
+                "starts must be monotonically non-increasing",
+            ));
+        }
         debug_assert!(start <= previous_end);
         add_right_region(right_region, start, previous_end, &mut next, &mut groups);
         previous_end = start;

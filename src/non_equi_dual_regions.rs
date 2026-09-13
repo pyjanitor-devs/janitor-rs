@@ -13,58 +13,10 @@ use pyo3::prelude::*;
 use std::collections::BTreeMap;
 
 use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
-use crate::compare::common::{checked_bounds, Selection};
-
-struct GroupState {
-    head: i64,
-    tail: i64,
-}
-
-impl Default for GroupState {
-    fn default() -> Self {
-        Self { head: -1, tail: -1 }
-    }
-}
+use crate::compare::common::{add_right_region, checked_bounds, GroupState, Selection};
 
 type IndexResult = (Vec<i64>, Vec<i64>);
 type PyIndexResult<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
-
-/// Add the newly exposed part of a right region to the duplicate chains.
-///
-/// ELI5: each right position gets a ticket pointing to the previous position
-/// with the same value. The map stores only the head ticket for each value,
-/// so duplicate positions use one flat allocation instead of one `Vec` per
-/// distinct value. Region values may be duplicated; the original `left_index`
-/// and `right_index` labels supplied by pyjanitor are unique.
-fn add_right_region(
-    right: ArrayView1<'_, i64>,
-    start: usize,
-    previous_end: usize,
-    next: &mut [i64],
-    groups: &mut BTreeMap<i64, GroupState>,
-) {
-    // The regions arrive from pyjanitor in decreasing-start order. For the
-    // first region `[1, 5)` over `right = [1, 3, 3, 7, 9]`, the reverse walk
-    // sees positions `4, 3, 2, 1`. The value-3 chain becomes `2 -> 1 -> -1`.
-    // If the next region is `[0, 1)`, position `0` is added to the value-1
-    // chain, while the existing value-3 chain is left untouched.
-    //
-    // ELI5: `groups` is a table of the first and last ticket for each right
-    // value, and `next` is the one flat roll of arrows between duplicate
-    // tickets. The tail lets us append newly exposed lower positions without
-    // allocating a separate Vec for every value.
-    for right_position in (start..previous_end).rev() {
-        let state = groups.entry(right[right_position]).or_default();
-        if state.head == -1 {
-            state.head = right_position as i64;
-        } else {
-            // Regions are exposed from high to low positions. Appending to
-            // the tail preserves the historical descending candidate order.
-            next[state.tail as usize] = right_position as i64;
-        }
-        state.tail = right_position as i64;
-    }
-}
 
 /// Select one candidate according to the requested label-based policy.
 ///
@@ -177,10 +129,11 @@ fn build_selected_indices_core(
         let Some((start, _)) = checked_bounds(starts[row], right.len() as i64, right.len()) else {
             continue;
         };
-        // Pyjanitor guarantees monotonically non-increasing starts. In a
-        // release build, violating that contract leaves the previously built
-        // chain in place; the release-only regression test documents this
-        // current behavior.
+        // Pyjanitor guarantees monotonically non-increasing starts. Reject a
+        // violation before it can make a previously added chain self-link.
+        if start > previous_end {
+            return Err("starts must be monotonically non-increasing".to_string());
+        }
         debug_assert!(start <= previous_end);
         add_right_region(right, start, previous_end, &mut next, &mut groups);
         previous_end = start;
@@ -249,6 +202,9 @@ fn build_all_indices_core(
         let Some((start, _)) = checked_bounds(starts[row], right.len() as i64, right.len()) else {
             continue;
         };
+        if start > previous_end {
+            return Err("starts must be monotonically non-increasing".to_string());
+        }
         debug_assert!(start <= previous_end);
         add_right_region(right, start, previous_end, &mut next, &mut groups);
         previous_end = start;
@@ -278,6 +234,9 @@ fn build_all_indices_core(
         let Some((start, _)) = checked_bounds(starts[row], right.len() as i64, right.len()) else {
             continue;
         };
+        if start > previous_end {
+            return Err("starts must be monotonically non-increasing".to_string());
+        }
         debug_assert!(start <= previous_end);
         add_right_region(right, start, previous_end, &mut next, &mut groups);
         previous_end = start;
@@ -648,20 +607,17 @@ mod tests {
         assert_eq!(error, "left cannot be empty");
     }
 
-    #[cfg(not(debug_assertions))]
     #[test]
-    fn non_monotonic_starts_keep_the_current_release_chain_behavior() {
-        let left = array![1, 2];
-        let right = array![1, 2, 3];
-        // The second start increases from 1 to 2, violating pyjanitor's
-        // monotonically non-increasing input contract. Release builds omit
-        // the debug assertion and retain the first row's chain, so `Any`
-        // currently returns label 20 for both rows instead of rebuilding the
-        // second row's suffix and returning label 30 there.
-        let starts = array![1, 2];
-        let left_index = array![100, 200];
-        let right_index = array![10, 20, 30];
-        let result = build_selected_indices_core(
+    fn non_monotonic_starts_are_rejected_before_self_linking() {
+        let left = array![0, 0, 0];
+        let right = array![0, 1, 2, 3, 4];
+        // The jump from 2 to 4 must be rejected before it overwrites the
+        // previous boundary. A later retreat to 3 would otherwise re-add an
+        // already-linked position and create a self-loop in `next`.
+        let starts = array![2, 4, 3];
+        let left_index = array![100, 200, 300];
+        let right_index = array![10, 20, 30, 40, 50];
+        let error = build_selected_indices_core(
             left.view(),
             right.view(),
             starts.view(),
@@ -669,9 +625,7 @@ mod tests {
             right_index.view(),
             Selection::Any,
         )
-        .unwrap()
-        .unwrap();
-        assert_eq!(result.0, vec![100, 200]);
-        assert_eq!(result.1, vec![20, 20]);
+        .unwrap_err();
+        assert_eq!(error, "starts must be monotonically non-increasing");
     }
 }

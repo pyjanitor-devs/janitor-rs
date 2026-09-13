@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use super::common::{checked_bounds, Selection};
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 
 type BatchIndices<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
 
@@ -36,6 +36,12 @@ fn parse_and_validate<'py>(
     }
     let left_len = predicates[0].left_len();
     let right_len = predicates[0].right_len();
+    // Batch kernels require real input arrays. Empty inputs are rejected at
+    // this boundary rather than producing an ambiguous no-match result.
+    ensure_nonempty_core("left predicate array", left_len).map_err(PyValueError::new_err)?;
+    ensure_nonempty_core("right predicate array", right_len).map_err(PyValueError::new_err)?;
+    ensure_nonempty_core("left index", left_index.len()?).map_err(PyValueError::new_err)?;
+    ensure_nonempty_core("right index", right_index.len()?).map_err(PyValueError::new_err)?;
     for predicate in predicates.iter().skip(1) {
         ensure_equal_lengths(
             "first left predicate array",
@@ -723,29 +729,88 @@ mod tests {
             assert_eq!(result.0.readonly().as_array().to_vec(), vec![10]);
             assert_eq!(result.1.readonly().as_array().to_vec(), vec![20]);
 
-            // Empty left arrays have no candidate rows and therefore no
-            // output, while still satisfying the parallel-length contract.
-            let empty_left = PyArray1::from_vec(py, Vec::<i64>::new());
-            let empty_right = PyArray1::from_vec(py, Vec::<i64>::new());
-            let empty_predicates = PyList::empty(py);
-            empty_predicates.append(PyTuple::new(
+            // Empty predicate arrays and index arrays are rejected explicitly,
+            // even when their parallel lengths would otherwise agree.
+            let empty = PyArray1::from_vec(py, Vec::<i64>::new());
+            let one = PyArray1::from_vec(py, vec![1_i64]);
+            let empty_left_predicates = PyList::empty(py);
+            empty_left_predicates.append(PyTuple::new(
                 py,
                 [
-                    empty_left.clone().into_any(),
-                    empty_right.clone().into_any(),
+                    empty.clone().into_any(),
+                    one.clone().into_any(),
                     0_i8.into_pyobject(py)?.into_any(),
                 ],
             )?)?;
-            let empty_index = PyArray1::from_vec(py, Vec::<i64>::new());
-            assert!(compare_batch_indices_any(
+            let error = compare_batch_indices_any(
                 py,
-                &empty_predicates,
+                &empty_left_predicates,
                 None,
                 None,
-                empty_index.clone(),
-                empty_index.readonly(),
-            )?
-            .is_none());
+                empty.clone(),
+                one.readonly(),
+            )
+            .expect_err("empty left predicate arrays must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: left predicate array cannot be empty"
+            );
+
+            let empty_right_predicates = PyList::empty(py);
+            empty_right_predicates.append(PyTuple::new(
+                py,
+                [
+                    one.clone().into_any(),
+                    empty.clone().into_any(),
+                    0_i8.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let error = compare_batch_indices_any(
+                py,
+                &empty_right_predicates,
+                None,
+                None,
+                one.clone(),
+                empty.readonly(),
+            )
+            .expect_err("empty right predicate arrays must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: right predicate array cannot be empty"
+            );
+
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    one.clone().into_any(),
+                    one.clone().into_any(),
+                    0_i8.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let empty_left_index = PyArray1::from_vec(py, Vec::<i64>::new());
+            let error = compare_batch_indices_any(
+                py,
+                &predicates,
+                None,
+                None,
+                empty_left_index,
+                one.clone().readonly(),
+            )
+            .expect_err("empty left indices must be rejected");
+            assert_eq!(error.to_string(), "ValueError: left index cannot be empty");
+
+            let empty_right_index = PyArray1::from_vec(py, Vec::<i64>::new());
+            let error = compare_batch_indices_any(
+                py,
+                &predicates,
+                None,
+                None,
+                one.clone(),
+                empty_right_index.readonly(),
+            )
+            .expect_err("empty right indices must be rejected");
+            assert_eq!(error.to_string(), "ValueError: right index cannot be empty");
 
             let no_predicates = PyList::empty(py);
             let error = compare_batch_indices_any(
