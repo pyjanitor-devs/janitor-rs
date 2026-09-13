@@ -3,7 +3,10 @@
 //! The two primary non-equi conditions are supplied as candidate bounds. Any
 //! additional conditions are evaluated only inside those bounds. This keeps
 //! the algorithm local: region construction remains pyjanitor's job, while
-//! this module owns predicate filtering and final index materialisation.
+//! this module owns predicate filtering and final index materialisation. Region
+//! values may repeat; the original `left_index` and `right_index` labels are
+//! unique, so duplicate regions use linked position chains while emitted
+//! labels remain unambiguous.
 
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};

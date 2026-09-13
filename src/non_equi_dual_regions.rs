@@ -34,7 +34,8 @@ type PyIndexResult<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)
 /// ELI5: each right position gets a ticket pointing to the previous position
 /// with the same value. The map stores only the head ticket for each value,
 /// so duplicate positions use one flat allocation instead of one `Vec` per
-/// distinct value.
+/// distinct value. Region values may be duplicated; the original `left_index`
+/// and `right_index` labels supplied by pyjanitor are unique.
 fn add_right_region(
     right: ArrayView1<'_, i64>,
     start: usize,
@@ -72,7 +73,8 @@ fn add_right_region(
 /// `First` and `Last` still inspect all candidates because `right_index` is
 /// not required to be sorted. Pyjanitor resets the right frame to a unique
 /// `RangeIndex` before building these regions, so labels alone determine the
-/// result; no ordinal tie-break is needed.
+/// result; no ordinal tie-break is needed. Region values may repeat, which is
+/// why the duplicate chains are retained.
 fn select_candidate(
     left_value: i64,
     groups: &BTreeMap<i64, GroupState>,
