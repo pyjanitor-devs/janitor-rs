@@ -175,6 +175,10 @@ fn build_selected_indices_core(
         let Some((start, _)) = checked_bounds(starts[row], right.len() as i64, right.len()) else {
             continue;
         };
+        // Pyjanitor guarantees monotonically non-increasing starts. In a
+        // release build, violating that contract leaves the previously built
+        // chain in place; the release-only regression test documents this
+        // current behavior.
         debug_assert!(start <= previous_end);
         add_right_region(right, start, previous_end, &mut next, &mut groups);
         previous_end = start;
@@ -640,5 +644,32 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "left cannot be empty");
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn non_monotonic_starts_keep_the_current_release_chain_behavior() {
+        let left = array![1, 2];
+        let right = array![1, 2, 3];
+        // The second start increases from 1 to 2, violating pyjanitor's
+        // monotonically non-increasing input contract. Release builds omit
+        // the debug assertion and retain the first row's chain, so `Any`
+        // currently returns label 20 for both rows instead of rebuilding the
+        // second row's suffix and returning label 30 there.
+        let starts = array![1, 2];
+        let left_index = array![100, 200];
+        let right_index = array![10, 20, 30];
+        let result = build_selected_indices_core(
+            left.view(),
+            right.view(),
+            starts.view(),
+            left_index.view(),
+            right_index.view(),
+            Selection::Any,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.0, vec![100, 200]);
+        assert_eq!(result.1, vec![20, 20]);
     }
 }
