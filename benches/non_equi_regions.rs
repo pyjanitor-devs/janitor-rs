@@ -510,7 +510,7 @@ fn multi_reference(f: &Fixture, selection: Selection) -> Option<(Vec<i64>, Vec<i
 fn multi_reference_all_two_pass(f: &Fixture, narrow_second_pass: bool) -> Option<Output> {
     let mut total = 0_usize;
     let mut bounds = vec![None; f.left.len()];
-    for row in 0..f.left.len() {
+    for (row, row_bounds) in bounds.iter_mut().enumerate() {
         let start = f.starts[row] as usize;
         for right_position in start..f.right_region.len() {
             if f.left_region[row] > f.right_region[right_position]
@@ -519,7 +519,7 @@ fn multi_reference_all_two_pass(f: &Fixture, narrow_second_pass: bool) -> Option
                 continue;
             }
             let (min_position, max_position) =
-                bounds[row].get_or_insert((right_position, right_position));
+                row_bounds.get_or_insert((right_position, right_position));
             *min_position = (*min_position).min(right_position);
             *max_position = (*max_position).max(right_position);
             total += 1;
@@ -531,11 +531,11 @@ fn multi_reference_all_two_pass(f: &Fixture, narrow_second_pass: bool) -> Option
 
     let mut left_output = Vec::with_capacity(total);
     let mut right_output = Vec::with_capacity(total);
-    for row in 0..f.left.len() {
+    for (row, row_bounds) in bounds.iter().enumerate() {
         let start = f.starts[row] as usize;
         for right_position in start..f.right_region.len() {
             if narrow_second_pass
-                && bounds[row].is_some_and(|(min_position, max_position)| {
+                && row_bounds.is_some_and(|(min_position, max_position)| {
                     right_position < min_position || right_position > max_position
                 })
             {
