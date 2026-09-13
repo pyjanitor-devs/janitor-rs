@@ -94,22 +94,17 @@ fn parse_inputs<'py>(
             left_len,
             "predicate left array",
             predicate.left_len(),
-        )
-        .map_err(PyValueError::new_err)?;
+        )?;
         ensure_equal_lengths(
             "right region",
             right_len,
             "predicate right array",
             predicate.right_len(),
-        )
-        .map_err(PyValueError::new_err)?;
+        )?;
     }
-    ensure_equal_lengths("left region", left_len, "starts", starts.len()?)
-        .map_err(PyValueError::new_err)?;
-    ensure_equal_lengths("left region", left_len, "left index", left_index.len()?)
-        .map_err(PyValueError::new_err)?;
-    ensure_equal_lengths("right region", right_len, "right index", right_index.len()?)
-        .map_err(PyValueError::new_err)?;
+    ensure_equal_lengths("left region", left_len, "starts", starts.len()?)?;
+    ensure_equal_lengths("left region", left_len, "left index", left_index.len()?)?;
+    ensure_equal_lengths("right region", right_len, "right index", right_index.len()?)?;
     Ok(ParsedInputs {
         predicates,
         metadata,
@@ -688,6 +683,39 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(error.to_string(), "ValueError: left_region cannot be empty");
+            Ok::<(), PyErr>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn validation_does_not_double_wrap_length_errors() {
+        Python::initialize();
+        Python::attach(|py| {
+            let left_region = PyArray1::from_vec(py, vec![1_i64, 1]);
+            let right_region = PyArray1::from_vec(py, vec![1_i64]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let left_index = PyArray1::from_vec(py, vec![10_i64, 11]);
+            let right_index = PyArray1::from_vec(py, vec![20_i64]);
+            let left = PyArray1::from_vec(py, vec![1_i64, 1]);
+            let right = PyArray1::from_vec(py, vec![1_i64]);
+            let predicates = predicate_list(py, &left, &right);
+
+            let error = compare_multi_region_indices_any(
+                py,
+                &predicates,
+                left_region.readonly(),
+                right_region.readonly(),
+                starts.readonly(),
+                left_index,
+                right_index.readonly(),
+            )
+            .unwrap_err();
+            let first_argument = error.value(py).getattr("args")?.get_item(0)?;
+            assert_eq!(
+                first_argument.extract::<String>()?,
+                "left region and starts must have equal lengths; got 2 and 1"
+            );
             Ok::<(), PyErr>(())
         })
         .unwrap();
