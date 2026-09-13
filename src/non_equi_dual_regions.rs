@@ -44,9 +44,9 @@ fn add_right_region(
 ) {
     // The regions arrive from pyjanitor in decreasing-start order. For the
     // first region `[1, 5)` over `right = [1, 3, 3, 7, 9]`, the reverse walk
-    // sees positions `4, 3, 2, 1`. The value-3 chain becomes `3 -> 2 -> -1`.
-    // If the next region is `[0, 1)`, position `0` is appended to the chain
-    // for value 1, while the existing value-3 chain is left untouched.
+    // sees positions `4, 3, 2, 1`. The value-3 chain becomes `2 -> 1 -> -1`.
+    // If the next region is `[0, 1)`, position `0` is added to the value-1
+    // chain, while the existing value-3 chain is left untouched.
     //
     // ELI5: `groups` is a table of the first and last ticket for each right
     // value, and `next` is the one flat roll of arrows between duplicate
@@ -199,6 +199,11 @@ fn build_selected_indices_core(
 /// ELI5: the first pass counts the tickets that will be printed. The second
 /// pass rebuilds the chains and writes directly into exactly-sized output
 /// vectors, so no flattened public positions result is retained.
+///
+/// The rebuild is intentional: after pass one, the chains contain the union
+/// of all exposed suffixes. A row in the second pass must instead see the
+/// chain snapshot at that row's `start`; retaining one snapshot per row would
+/// use substantially more memory than rebuilding the compact chain once.
 ///
 /// The output preserves left-row order, then the ordered right-value/ordinal
 /// traversal produced by the region chains.
@@ -616,5 +621,24 @@ mod tests {
             Selection::Any,
         )
         .is_err());
+    }
+
+    #[test]
+    fn validation_reports_the_nonempty_error_exactly() {
+        let empty = Array1::<i64>::zeros(0);
+        let right = array![1];
+        let starts = Array1::<i64>::zeros(0);
+        let left_index = Array1::<i64>::zeros(0);
+        let right_index = array![10];
+        let error = build_selected_indices_core(
+            empty.view(),
+            right.view(),
+            starts.view(),
+            left_index.view(),
+            right_index.view(),
+            Selection::Any,
+        )
+        .unwrap_err();
+        assert_eq!(error, "left cannot be empty");
     }
 }

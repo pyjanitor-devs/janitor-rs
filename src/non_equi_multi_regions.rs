@@ -226,6 +226,12 @@ fn selected_core<'py>(
 /// interval between those successes. Null-aware six-element predicates use the
 /// same semantics as the batch comparison path.
 ///
+/// The region chains are rebuilt for the second pass because the completed
+/// first-pass chains contain the union of every exposed suffix, not the
+/// per-row snapshot needed to reproduce each row's candidate set. Keeping a
+/// snapshot for every row would cost more memory than rebuilding this compact
+/// structure once.
+///
 /// # Arguments
 ///
 /// * `predicates` - Three- or six-element extra-predicate tuples.
@@ -660,6 +666,35 @@ mod tests {
                 assert_eq!(result.0.readonly().as_array().to_vec(), expected_left);
                 assert_eq!(result.1.readonly().as_array().to_vec(), expected_right);
             }
+            Ok::<(), PyErr>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn validation_reports_the_nonempty_error_exactly() {
+        Python::initialize();
+        Python::attach(|py| {
+            let left_region = PyArray1::from_vec(py, Vec::<i64>::new());
+            let right_region = PyArray1::from_vec(py, vec![1_i64]);
+            let starts = PyArray1::from_vec(py, Vec::<i64>::new());
+            let left_index = PyArray1::from_vec(py, Vec::<i64>::new());
+            let right_index = PyArray1::from_vec(py, vec![10_i64]);
+            let left = PyArray1::from_vec(py, Vec::<i64>::new());
+            let right = PyArray1::from_vec(py, vec![1_i64]);
+            let predicates = predicate_list(py, &left, &right);
+
+            let error = compare_multi_region_indices_any(
+                py,
+                &predicates,
+                left_region.readonly(),
+                right_region.readonly(),
+                starts.readonly(),
+                left_index,
+                right_index.readonly(),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "ValueError: left_region cannot be empty");
             Ok::<(), PyErr>(())
         })
         .unwrap();

@@ -63,7 +63,6 @@ struct PyFixture<'py> {
     left_ne_mask: Bound<'py, PyArray1<bool>>,
     right_ne_mask: Bound<'py, PyArray1<bool>>,
     left_len: usize,
-    right_len: usize,
 }
 
 impl<'py> PyFixture<'py> {
@@ -86,7 +85,6 @@ impl<'py> PyFixture<'py> {
             left_ne_mask: PyArray1::from_vec(py, fixture.left_ne_mask.clone()),
             right_ne_mask: PyArray1::from_vec(py, fixture.right_ne_mask.clone()),
             left_len: fixture.left.len(),
-            right_len: fixture.right.len(),
         })
     }
 }
@@ -220,12 +218,23 @@ fn current_regions_output(
     } else {
         fixture.right.readonly()
     };
+    // `region_positions` uses this argument as the largest right-region
+    // value for its tracker array, not as the number of right rows. Passing
+    // the actual maximum keeps the legacy baseline's allocation faithful to
+    // the production contract and avoids relying on this fixture's
+    // value==ordinal coincidence.
+    let max_right = right_region
+        .as_array()
+        .iter()
+        .copied()
+        .max()
+        .expect("benchmark right region is non-empty");
     let (counts, positions, _) = region_positions(
         py,
         left_region,
         right_region,
         fixture.starts.readonly(),
-        fixture.right_len as i64,
+        max_right,
     );
     let counts = counts.readonly();
     let positions = positions.readonly();
