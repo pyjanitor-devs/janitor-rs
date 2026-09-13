@@ -160,6 +160,9 @@ fn selected_core<'py>(
     let mut next = vec![-1_i64; right_len];
     let mut groups = BTreeMap::<i64, GroupState>::new();
     let mut previous_end = right_len;
+    // The output size is unknown and may be zero. Let the vectors allocate
+    // lazily so a no-match call can return `None` without reserving space for
+    // every left row.
     let mut output_left = Vec::new();
     let mut output_right = Vec::new();
 
@@ -305,9 +308,10 @@ pub fn compare_multi_region_indices_all<'py>(
     let left_values = left_index.readonly();
     let left_values = left_values.as_array();
     let right_values = right_index.as_array();
-    let mut output_left = Array1::<i64>::zeros(total);
-    let mut output_right = Array1::<i64>::zeros(total);
-    let mut output_position = 0;
+    // Every output slot is filled exactly once in the second pass. Reserve the
+    // exact size and append instead of zero-initializing two arrays first.
+    let mut output_left = Vec::with_capacity(total);
+    let mut output_right = Vec::with_capacity(total);
     next.fill(-1);
     groups.clear();
     previous_end = right_len;
@@ -324,18 +328,18 @@ pub fn compare_multi_region_indices_all<'py>(
             while position >= 0 {
                 let right_position = position as usize;
                 if predicates_match_dispatch(&views, metadata, row, right_position) {
-                    output_left[output_position] = left_values[row];
-                    output_right[output_position] = right_values[right_position];
-                    output_position += 1;
+                    output_left.push(left_values[row]);
+                    output_right.push(right_values[right_position]);
                 }
                 position = next[right_position];
             }
         }
     }
-    debug_assert_eq!(output_position, total);
+    debug_assert_eq!(output_left.len(), total);
+    debug_assert_eq!(output_right.len(), total);
     Ok(Some((
-        output_left.into_pyarray(py),
-        output_right.into_pyarray(py),
+        Array1::from_vec(output_left).into_pyarray(py),
+        Array1::from_vec(output_right).into_pyarray(py),
     )))
 }
 

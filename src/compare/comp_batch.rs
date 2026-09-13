@@ -172,27 +172,29 @@ fn compare_batch_indices_with_selection<'py>(
         return Ok(None);
     }
 
-    let mut expanded_left = Array1::<i64>::zeros(total);
-    let mut expanded_right = Array1::<i64>::zeros(total);
+    // Each successful left row contributes exactly one selected pair. Reserve
+    // the counted size and append so the output buffers do not need to be
+    // zero-initialized before all slots are overwritten.
+    let mut expanded_left = Vec::with_capacity(total);
+    let mut expanded_right = Vec::with_capacity(total);
     // ELI5: the first binding is the read-only NumPy guard; the second
     // binding shadows it with the lightweight Rust view. The view does not
     // copy the labels, so the guard must remain alive in this scope while the
     // view borrows from the underlying Python array.
     let left_values = left_index.readonly();
     let left_values = left_values.as_array();
-    let mut output_position = 0_usize;
 
     for row in 0..left_len {
         if let Some(right_position) = selected[row] {
-            expanded_left[output_position] = left_values[row];
-            expanded_right[output_position] = right_values[right_position];
-            output_position += 1;
+            expanded_left.push(left_values[row]);
+            expanded_right.push(right_values[right_position]);
         }
     }
-    debug_assert_eq!(output_position, total);
+    debug_assert_eq!(expanded_left.len(), total);
+    debug_assert_eq!(expanded_right.len(), total);
     Ok(Some((
-        expanded_left.into_pyarray(py),
-        expanded_right.into_pyarray(py),
+        Array1::from_vec(expanded_left).into_pyarray(py),
+        Array1::from_vec(expanded_right).into_pyarray(py),
     )))
 }
 
@@ -252,13 +254,14 @@ fn compare_batch_indices_all_two_pass<'py>(
     if total == 0 {
         return Ok(None);
     }
-    let mut expanded_left = Array1::<i64>::zeros(total);
-    let mut expanded_right = Array1::<i64>::zeros(total);
+    // Every successful pair is emitted exactly once in this second pass.
+    // Reserve the counted size and append so the output buffers do not need
+    // to be zero-initialized before all slots are overwritten.
+    let mut expanded_left = Vec::with_capacity(total);
+    let mut expanded_right = Vec::with_capacity(total);
     let left_values = left_index.readonly();
     let left_values = left_values.as_array();
     let right_values = right_index.as_array();
-    let mut output_position = 0_usize;
-
     // ELI5: rescan only from the first win through the last win. This still
     // emits every successful pair, but avoids comparing the known-failing
     // prefix and suffix of a row a second time.
@@ -269,16 +272,16 @@ fn compare_batch_indices_all_two_pass<'py>(
         let end = last_success[row] + 1;
         for right_position in start..end {
             if predicates_match_dispatch(&views, metadata.as_deref(), row, right_position) {
-                expanded_left[output_position] = left_values[row];
-                expanded_right[output_position] = right_values[right_position];
-                output_position += 1;
+                expanded_left.push(left_values[row]);
+                expanded_right.push(right_values[right_position]);
             }
         }
     }
-    debug_assert_eq!(output_position, total);
+    debug_assert_eq!(expanded_left.len(), total);
+    debug_assert_eq!(expanded_right.len(), total);
     Ok(Some((
-        expanded_left.into_pyarray(py),
-        expanded_right.into_pyarray(py),
+        Array1::from_vec(expanded_left).into_pyarray(py),
+        Array1::from_vec(expanded_right).into_pyarray(py),
     )))
 }
 
