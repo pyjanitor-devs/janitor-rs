@@ -344,18 +344,35 @@ fn multi_predicates_match(fixture: &Fixture, row: usize, right: usize) -> bool {
 }
 
 fn fixture(left_len: usize, right_len: usize, shape: usize) -> Fixture {
-    // Make exactly one right position satisfy the region condition for each
-    // valid row. This keeps the `All` output bounded while still exercising
-    // narrow, broad, and mixed candidate-region scans.
+    // The first three shapes keep exactly one right position satisfying the
+    // residual predicates for each valid row. `multi_groups` additionally
+    // gives many right positions the same region value and makes every group
+    // qualify, while the residual predicates still keep the `All` output
+    // bounded. This exercises the BTreeMap range walk and duplicate chains at
+    // scale instead of benchmarking only a single group.
     let left = vec![right_len.saturating_sub(1) as i64; left_len];
     let right = (0..right_len).map(|position| position as i64).collect();
-    let left_region = vec![right_len.saturating_sub(1) as i64; left_len];
-    let right_region = (0..right_len).map(|position| position as i64).collect();
+    let left_region = if shape == 3 {
+        vec![0; left_len]
+    } else {
+        vec![right_len.saturating_sub(1) as i64; left_len]
+    };
+    let group_width = right_len.max(1).div_ceil(64);
+    let right_region = (0..right_len)
+        .map(|position| {
+            if shape == 3 {
+                (position / group_width) as i64
+            } else {
+                position as i64
+            }
+        })
+        .collect();
     let starts = (0..left_len)
         .map(|row| match shape {
             0 => (right_len.saturating_sub(1)) as i64,
             1 => 0,
-            _ => right_len.saturating_sub(row.min(right_len)) as i64,
+            2 => right_len.saturating_sub(row.min(right_len)) as i64,
+            _ => 0,
         })
         .collect();
     let left_index = (0..left_len).map(|row| row as i64).collect();
@@ -556,7 +573,12 @@ fn predicates<'py>(py: Python<'py>, f: &Fixture) -> PyResult<Bound<'py, PyList>>
 fn bench(c: &mut Criterion) {
     Python::initialize();
     let mut group = c.benchmark_group("non_equi_regions");
-    let shapes = [("narrow", 0_usize), ("broad", 1), ("mixed", 2)];
+    let shapes = [
+        ("narrow", 0_usize),
+        ("broad", 1),
+        ("mixed", 2),
+        ("multi_groups", 3),
+    ];
     let sizes = [
         (8, 16, "tiny"),
         (128, 256, "small"),
