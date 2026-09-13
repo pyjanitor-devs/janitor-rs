@@ -475,6 +475,52 @@ fn multi_reference(f: &Fixture, selection: Selection) -> Option<(Vec<i64>, Vec<i
     (!left_output.is_empty()).then_some((left_output, right_output))
 }
 
+fn multi_reference_all_two_pass(f: &Fixture, narrow_second_pass: bool) -> Option<Output> {
+    let mut total = 0_usize;
+    let mut bounds = vec![None; f.left.len()];
+    for row in 0..f.left.len() {
+        let start = f.starts[row] as usize;
+        for right_position in start..f.right_region.len() {
+            if f.left_region[row] > f.right_region[right_position]
+                || !multi_predicates_match(f, row, right_position)
+            {
+                continue;
+            }
+            let (min_position, max_position) =
+                bounds[row].get_or_insert((right_position, right_position));
+            *min_position = (*min_position).min(right_position);
+            *max_position = (*max_position).max(right_position);
+            total += 1;
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+
+    let mut left_output = Vec::with_capacity(total);
+    let mut right_output = Vec::with_capacity(total);
+    for row in 0..f.left.len() {
+        let start = f.starts[row] as usize;
+        for right_position in start..f.right_region.len() {
+            if narrow_second_pass
+                && bounds[row].is_some_and(|(min_position, max_position)| {
+                    right_position < min_position || right_position > max_position
+                })
+            {
+                continue;
+            }
+            if f.left_region[row] <= f.right_region[right_position]
+                && multi_predicates_match(f, row, right_position)
+            {
+                left_output.push(f.left_index[row]);
+                right_output.push(f.right_index[right_position]);
+            }
+        }
+    }
+    debug_assert_eq!(left_output.len(), total);
+    Some((left_output, right_output))
+}
+
 fn predicates<'py>(py: Python<'py>, f: &Fixture) -> PyResult<Bound<'py, PyList>> {
     let predicates = PyList::empty(py);
     predicates.append(PyTuple::new(
@@ -525,6 +571,19 @@ fn bench(c: &mut Criterion) {
         for &(shape, shape_id) in &shapes {
             let f = fixture(left_len, right_len, shape_id);
             let label = format!("{size}/{shape}/left={left_len}/right={right_len}");
+            let with_bounds_allocation =
+                support::count_allocations(|| multi_reference_all_two_pass(&f, true));
+            let without_bounds_allocation =
+                support::count_allocations(|| multi_reference_all_two_pass(&f, false));
+            eprintln!(
+                "{label} reference multi all with_bounds {} bytes/{} allocs/{} peak; without_bounds {} bytes/{} allocs/{} peak",
+                with_bounds_allocation.0,
+                with_bounds_allocation.1,
+                with_bounds_allocation.2,
+                without_bounds_allocation.0,
+                without_bounds_allocation.1,
+                without_bounds_allocation.2,
+            );
             Python::attach(|py| {
                 let py_fixture = PyFixture::new(py, &f).unwrap();
                 for selection in [
@@ -548,6 +607,10 @@ fn bench(c: &mut Criterion) {
                     let current_multi = current_regions_output(py, &py_fixture, selection, true);
                     assert_eq!(proposed_multi, expected_multi);
                     assert_eq!(Some(current_multi), expected_multi);
+                    if matches!(selection, Selection::All) {
+                        assert_eq!(multi_reference_all_two_pass(&f, true), expected_multi);
+                        assert_eq!(multi_reference_all_two_pass(&f, false), expected_multi);
+                    }
                 }
                 for selection in [
                     Selection::First,
@@ -627,6 +690,21 @@ fn bench(c: &mut Criterion) {
                         black_box(multi_reference(black_box(&f), selection));
                     })
                 });
+                if matches!(selection, Selection::All) {
+                    for (name, narrow_second_pass) in
+                        [("with_bounds", true), ("without_bounds", false)]
+                    {
+                        let id = BenchmarkId::new(format!("reference/multi/all/{name}"), &label);
+                        group.bench_function(id, |b| {
+                            b.iter(|| {
+                                black_box(multi_reference_all_two_pass(
+                                    black_box(&f),
+                                    narrow_second_pass,
+                                ));
+                            })
+                        });
+                    }
+                }
                 let id = BenchmarkId::new(format!("wrapper/multi/{selection_name}"), &label);
                 Python::attach(|py| {
                     let py_fixture = PyFixture::new(py, &f).unwrap();

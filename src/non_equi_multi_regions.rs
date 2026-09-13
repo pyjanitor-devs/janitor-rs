@@ -221,16 +221,18 @@ fn selected_core<'py>(
 
 /// Return every matching pair using two passes over each candidate region.
 ///
-/// The first pass records each row's first and last success and counts the
-/// output. The second pass allocates exact-sized arrays and rechecks only the
-/// interval between those successes. Null-aware six-element predicates use the
-/// same semantics as the batch comparison path.
+/// The first pass counts the output. The second pass allocates exact-sized
+/// arrays and rechecks the same
+/// candidate groups. Null-aware six-element predicates use the same semantics
+/// as the batch comparison path.
 ///
 /// The region chains are rebuilt for the second pass because the completed
 /// first-pass chains contain the union of every exposed suffix, not the
 /// per-row snapshot needed to reproduce each row's candidate set. Keeping a
 /// snapshot for every row would cost more memory than rebuilding this compact
-/// structure once.
+/// structure once. We deliberately do not narrow the second pass using the
+/// first and last positions seen: groups are traversed by region value, so
+/// that traversal order is not positional.
 ///
 /// # Arguments
 ///
@@ -274,8 +276,6 @@ pub fn compare_multi_region_indices_all<'py>(
     let mut next = vec![-1_i64; right_len];
     let mut groups = BTreeMap::<i64, GroupState>::new();
     let mut previous_end = right_len;
-    let mut first_success = vec![None; left_len];
-    let mut last_success = vec![0_usize; left_len];
     let mut total = 0_usize;
 
     for row in 0..left_len {
@@ -290,10 +290,6 @@ pub fn compare_multi_region_indices_all<'py>(
             while position >= 0 {
                 let right_position = position as usize;
                 if predicates_match_dispatch(&views, metadata, row, right_position) {
-                    if first_success[row].is_none() {
-                        first_success[row] = Some(right_position);
-                    }
-                    last_success[row] = right_position;
                     total = total.checked_add(1).ok_or_else(|| {
                         PyValueError::new_err("number of output pairs exceeds usize")
                     })?;
@@ -323,20 +319,10 @@ pub fn compare_multi_region_indices_all<'py>(
         debug_assert!(start <= previous_end);
         add_right_region(right_region, start, previous_end, &mut next, &mut groups);
         previous_end = start;
-        // no point checking if there is no match
-        if first_success[row].is_none() {
-            continue;
-        }
-        let first_success = first_success[row].unwrap();
-        let last_success = last_success[row];
         for (_, state) in groups.range(left_region[row]..) {
             let mut position = state.head;
             while position >= 0 {
                 let right_position = position as usize;
-                if right_position < first_success || right_position > last_success {
-                    position = next[right_position];
-                    continue;
-                }
                 if predicates_match_dispatch(&views, metadata, row, right_position) {
                     output_left[output_position] = left_values[row];
                     output_right[output_position] = right_values[right_position];
