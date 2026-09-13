@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+pub(crate) mod common;
 pub mod comp;
 pub mod comp_batch;
 pub mod comp_direct;
@@ -19,6 +20,7 @@ pub mod comp_posns;
 pub mod comp_posns_ne;
 pub mod comp_starts;
 pub mod op;
+pub(crate) mod predicate;
 
 /// Registers every export from this family's submodules with the
 /// PyO3 module.

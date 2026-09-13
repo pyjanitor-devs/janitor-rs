@@ -96,5 +96,9 @@ name = "positions_ordinal"
 harness = false
 
 [[bench]]
+name = "non_equi_regions"
+harness = false
+
+[[bench]]
 name = "forward_sum_compare"
 harness = false
