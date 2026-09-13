@@ -345,28 +345,42 @@ fn multi_predicates_match(fixture: &Fixture, row: usize, right: usize) -> bool {
 
 fn fixture(left_len: usize, right_len: usize, shape: usize) -> Fixture {
     // The first three shapes keep exactly one right position satisfying the
-    // residual predicates for each valid row. `multi_groups` additionally
-    // gives many right positions the same region value and makes every group
-    // qualify, while the residual predicates still keep the `All` output
-    // bounded. This exercises the BTreeMap range walk and duplicate chains at
-    // scale instead of benchmarking only a single group.
-    let left = vec![right_len.saturating_sub(1) as i64; left_len];
-    let right = (0..right_len).map(|position| position as i64).collect();
-    let left_region = if shape == 3 {
-        vec![0; left_len]
-    } else {
-        vec![right_len.saturating_sub(1) as i64; left_len]
-    };
-    let group_width = right_len.max(1).div_ceil(64);
-    let right_region = (0..right_len)
+    // residual predicates for each valid row. `multi_groups` adds one large
+    // duplicate-heavy low-value group and up to 63 singleton upper groups.
+    // Each row qualifies only the top four groups, so this exercises large
+    // BTreeMap/duplicate-chain construction and multi-group traversal without
+    // making every row scan the complete right frame.
+    let group_count = right_len.min(64);
+    let tail_start = right_len.saturating_sub(group_count);
+    let multi_group_threshold = group_count.saturating_sub(4) as i64;
+    let right_region: Vec<i64> = (0..right_len)
         .map(|position| {
             if shape == 3 {
-                (position / group_width) as i64
+                if position < tail_start {
+                    0
+                } else {
+                    (position - tail_start) as i64
+                }
             } else {
                 position as i64
             }
         })
         .collect();
+    let left = if shape == 3 {
+        vec![multi_group_threshold; left_len]
+    } else {
+        vec![right_len.saturating_sub(1) as i64; left_len]
+    };
+    let right = if shape == 3 {
+        right_region.clone()
+    } else {
+        (0..right_len).map(|position| position as i64).collect()
+    };
+    let left_region = if shape == 3 {
+        vec![multi_group_threshold; left_len]
+    } else {
+        vec![right_len.saturating_sub(1) as i64; left_len]
+    };
     let starts = (0..left_len)
         .map(|row| match shape {
             0 => (right_len.saturating_sub(1)) as i64,
