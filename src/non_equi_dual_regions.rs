@@ -18,50 +18,6 @@ use crate::compare::common::{add_right_region, checked_region_start, GroupState,
 type IndexResult = (Array1<i64>, Array1<i64>);
 type PyIndexResult<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
 
-/// Select one candidate according to the requested label-based policy.
-///
-/// The ordered map narrows the candidates to values `>= left_value`; the
-/// linked chains then enumerate every ordinal carrying each qualifying value.
-/// `First` and `Last` still inspect all candidates because `right_index` is
-/// not required to be sorted. Pyjanitor resets the right frame to a unique
-/// `RangeIndex` before building these regions, so labels alone determine the
-/// result; no ordinal tie-break is needed. Region values may repeat, which is
-/// why the duplicate chains are retained.
-fn select_candidate(
-    left_value: i64,
-    groups: &BTreeMap<i64, GroupState>,
-    next: &[i64],
-    right_index: ArrayView1<'_, i64>,
-    selection: Selection,
-) -> Option<usize> {
-    let mut selected = None;
-    for (_, state) in groups.range(left_value..) {
-        let mut position = state.head;
-        while position >= 0 {
-            let current_position = position as usize;
-            match selection {
-                Selection::Any => return Some(current_position),
-                Selection::First => {
-                    if selected
-                        .is_none_or(|current| right_index[current_position] < right_index[current])
-                    {
-                        selected = Some(current_position);
-                    }
-                }
-                Selection::Last => {
-                    if selected
-                        .is_none_or(|current| right_index[current_position] > right_index[current])
-                    {
-                        selected = Some(current_position);
-                    }
-                }
-            }
-            position = next[current_position];
-        }
-    }
-    selected
-}
-
 fn validate_inputs(
     left: ArrayView1<'_, i64>,
     starts: ArrayView1<'_, i64>,
@@ -135,9 +91,35 @@ fn build_selected_indices_core(
         add_right_region(right, start, previous_end, &mut next, &mut groups);
         previous_end = start;
 
-        if let Some(right_position) =
-            select_candidate(left[row], &groups, &next, right_index, selection)
-        {
+        let mut selected_position = None;
+        'candidate_groups: for (_, state) in groups.range(left[row]..) {
+            let mut position = state.head;
+            while position >= 0 {
+                let right_position = position as usize;
+                match selection {
+                    Selection::Any => {
+                        selected_position = Some(right_position);
+                        break 'candidate_groups;
+                    }
+                    Selection::First => {
+                        if selected_position.is_none_or(|current| {
+                            right_index[right_position] < right_index[current]
+                        }) {
+                            selected_position = Some(right_position);
+                        }
+                    }
+                    Selection::Last => {
+                        if selected_position.is_none_or(|current| {
+                            right_index[right_position] > right_index[current]
+                        }) {
+                            selected_position = Some(right_position);
+                        }
+                    }
+                }
+                position = next[right_position];
+            }
+        }
+        if let Some(right_position) = selected_position {
             left_output.push(left_index[row]);
             right_output.push(right_index[right_position]);
         }
