@@ -58,6 +58,29 @@ empty ranges, all-null ranges, duplicate/tied values, NaNs, infinities,
 overflow, non-power-of-two lengths, and extreme sizes as allowed by the
 contract.
 
+### State and ordering invariant audit
+
+For every cached state variable, accumulator, boundary, or variable whose
+name implies an extremum (for example `first`, `last`, `min`, `max`, or
+`success`), write down its exact meaning before accepting the implementation.
+Verify it against the actual traversal, not the variable name or comment:
+
+- distinguish ordinal order, sorted-key order, linked-list order, hash-map
+  order, and output order;
+- establish whether traversal is monotonic in the dimension the state
+  summarizes;
+- test a counterexample where traversal order differs from positional order;
+- verify minimum/maximum state computes a numeric extremum rather than merely
+  recording the first or last observation;
+- for two-pass algorithms, prove that every item excluded by pass two cannot
+  be a valid result, and compare the final count with the number written;
+- treat `debug_assert!` checks as diagnostics only and test release behavior
+  when a counterexample can make state inconsistent.
+
+Do not accept ordering-sensitive `First`/`Last` logic solely because sorted
+fixtures pass. Deliberately permute labels, keys, and candidate positions,
+especially when a map or linked structure is involved.
+
 For aggregation and indexing code, explicitly cover the full shape matrix
 (`starts`, `ends`, and `starts_ends`), forward/reverse or direct/adaptive
 variants, integer and floating-point semantics, null masks, identity values,
@@ -90,6 +113,11 @@ Use this staged loop for non-trivial reviews:
 Do not claim all paths are covered from a green suite alone. State branch
 execution evidence, reference comparisons, performance cases, and unverified
 cells explicitly.
+
+Before reporting “no findings,” perform a final invariant sweep covering state
+meaning, traversal order, boundary semantics, two-pass count/write agreement,
+and release-only behavior. Reproduce plausible findings from other reviewers
+with a minimal example rather than dismissing them based on existing tests.
 
 For a broad or high-risk change, use independent subagents when available and
 authorized to attack distinct risk areas without sharing tentative conclusions;

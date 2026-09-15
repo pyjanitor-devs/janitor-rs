@@ -1,360 +1,19 @@
 //! Python-facing fused wrappers for heterogeneous residual predicates.
 
-use numpy::ndarray::{Array1, ArrayView1};
+use numpy::ndarray::Array1;
 use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::PyList;
 
-use super::op::CompareOp;
-use crate::aggs::{checked_end, ensure_equal_lengths};
-
-enum Predicate<'py> {
-    I64(
-        PyReadonlyArray1<'py, i64>,
-        PyReadonlyArray1<'py, i64>,
-        CompareOp,
-    ),
-    I32(
-        PyReadonlyArray1<'py, i32>,
-        PyReadonlyArray1<'py, i32>,
-        CompareOp,
-    ),
-    I16(
-        PyReadonlyArray1<'py, i16>,
-        PyReadonlyArray1<'py, i16>,
-        CompareOp,
-    ),
-    I8(
-        PyReadonlyArray1<'py, i8>,
-        PyReadonlyArray1<'py, i8>,
-        CompareOp,
-    ),
-    U64(
-        PyReadonlyArray1<'py, u64>,
-        PyReadonlyArray1<'py, u64>,
-        CompareOp,
-    ),
-    U32(
-        PyReadonlyArray1<'py, u32>,
-        PyReadonlyArray1<'py, u32>,
-        CompareOp,
-    ),
-    U16(
-        PyReadonlyArray1<'py, u16>,
-        PyReadonlyArray1<'py, u16>,
-        CompareOp,
-    ),
-    U8(
-        PyReadonlyArray1<'py, u8>,
-        PyReadonlyArray1<'py, u8>,
-        CompareOp,
-    ),
-    F64(
-        PyReadonlyArray1<'py, f64>,
-        PyReadonlyArray1<'py, f64>,
-        CompareOp,
-    ),
-    F32(
-        PyReadonlyArray1<'py, f32>,
-        PyReadonlyArray1<'py, f32>,
-        CompareOp,
-    ),
-}
-
-enum PredicateView<'a> {
-    I64(ArrayView1<'a, i64>, ArrayView1<'a, i64>, CompareOp),
-    I32(ArrayView1<'a, i32>, ArrayView1<'a, i32>, CompareOp),
-    I16(ArrayView1<'a, i16>, ArrayView1<'a, i16>, CompareOp),
-    I8(ArrayView1<'a, i8>, ArrayView1<'a, i8>, CompareOp),
-    U64(ArrayView1<'a, u64>, ArrayView1<'a, u64>, CompareOp),
-    U32(ArrayView1<'a, u32>, ArrayView1<'a, u32>, CompareOp),
-    U16(ArrayView1<'a, u16>, ArrayView1<'a, u16>, CompareOp),
-    U8(ArrayView1<'a, u8>, ArrayView1<'a, u8>, CompareOp),
-    F64(ArrayView1<'a, f64>, ArrayView1<'a, f64>, CompareOp),
-    F32(ArrayView1<'a, f32>, ArrayView1<'a, f32>, CompareOp),
-}
+use super::common::{checked_bounds, Selection};
+use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 
 type BatchIndices<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
 
-struct NullMetadata<'py> {
-    left: Option<PyReadonlyArray1<'py, bool>>,
-    right: Option<PyReadonlyArray1<'py, bool>>,
-    is_extension_array: bool,
-}
-
-impl Predicate<'_> {
-    fn view<'a>(&'a self) -> PredicateView<'a> {
-        match self {
-            Self::I64(l, r, op) => PredicateView::I64(l.as_array(), r.as_array(), *op),
-            Self::I32(l, r, op) => PredicateView::I32(l.as_array(), r.as_array(), *op),
-            Self::I16(l, r, op) => PredicateView::I16(l.as_array(), r.as_array(), *op),
-            Self::I8(l, r, op) => PredicateView::I8(l.as_array(), r.as_array(), *op),
-            Self::U64(l, r, op) => PredicateView::U64(l.as_array(), r.as_array(), *op),
-            Self::U32(l, r, op) => PredicateView::U32(l.as_array(), r.as_array(), *op),
-            Self::U16(l, r, op) => PredicateView::U16(l.as_array(), r.as_array(), *op),
-            Self::U8(l, r, op) => PredicateView::U8(l.as_array(), r.as_array(), *op),
-            Self::F64(l, r, op) => PredicateView::F64(l.as_array(), r.as_array(), *op),
-            Self::F32(l, r, op) => PredicateView::F32(l.as_array(), r.as_array(), *op),
-        }
-    }
-
-    fn left_len(&self) -> usize {
-        match self {
-            Self::I64(left, _, _) => left.as_array().len(),
-            Self::I32(left, _, _) => left.as_array().len(),
-            Self::I16(left, _, _) => left.as_array().len(),
-            Self::I8(left, _, _) => left.as_array().len(),
-            Self::U64(left, _, _) => left.as_array().len(),
-            Self::U32(left, _, _) => left.as_array().len(),
-            Self::U16(left, _, _) => left.as_array().len(),
-            Self::U8(left, _, _) => left.as_array().len(),
-            Self::F64(left, _, _) => left.as_array().len(),
-            Self::F32(left, _, _) => left.as_array().len(),
-        }
-    }
-
-    fn right_len(&self) -> usize {
-        match self {
-            Self::I64(_, right, _) => right.as_array().len(),
-            Self::I32(_, right, _) => right.as_array().len(),
-            Self::I16(_, right, _) => right.as_array().len(),
-            Self::I8(_, right, _) => right.as_array().len(),
-            Self::U64(_, right, _) => right.as_array().len(),
-            Self::U32(_, right, _) => right.as_array().len(),
-            Self::U16(_, right, _) => right.as_array().len(),
-            Self::U8(_, right, _) => right.as_array().len(),
-            Self::F64(_, right, _) => right.as_array().len(),
-            Self::F32(_, right, _) => right.as_array().len(),
-        }
-    }
-}
-
-impl PredicateView<'_> {
-    fn matches(&self, left: usize, right: usize) -> bool {
-        macro_rules! compare {
-            ($l:expr, $r:expr, $op:expr) => {
-                $op.apply(&$l[left], &$r[right])
-            };
-        }
-        match self {
-            Self::I64(l, r, op) => compare!(l, r, op),
-            Self::I32(l, r, op) => compare!(l, r, op),
-            Self::I16(l, r, op) => compare!(l, r, op),
-            Self::I8(l, r, op) => compare!(l, r, op),
-            Self::U64(l, r, op) => compare!(l, r, op),
-            Self::U32(l, r, op) => compare!(l, r, op),
-            Self::U16(l, r, op) => compare!(l, r, op),
-            Self::U8(l, r, op) => compare!(l, r, op),
-            Self::F64(l, r, op) => compare!(l, r, op),
-            Self::F32(l, r, op) => compare!(l, r, op),
-        }
-    }
-}
-
-/// ELI5: all judges must approve the same candidate. Ask them in order and
-/// stop at the first rejection, because later judges cannot rescue a failed
-/// AND condition.
-fn predicates_match(views: &[PredicateView<'_>], left: usize, right: usize) -> bool {
-    // Short-circuit as early as possible.
-    for predicate in views {
-        if !predicate.matches(left, right) {
-            return false;
-        }
-    }
-    true
-}
-
-fn predicates_match_with_nulls(
-    views: &[PredicateView<'_>],
-    metadata: &[NullMetadata<'_>],
-    left: usize,
-    right: usize,
-) -> bool {
-    for position in 0..views.len() {
-        let values = &metadata[position];
-        if let (Some(left_values), Some(right_values)) = (&values.left, &values.right) {
-            let left_boolean = left_values.as_array()[left];
-            let right_boolean = right_values.as_array()[right];
-            // Aligned with pandas Boolean dtype logic:
-            // https://pandas.pydata.org/docs/user_guide/boolean.html#kleene-logical-operations
-            if values.is_extension_array && (left_boolean || right_boolean) {
-                return false;
-            }
-            if left_boolean || right_boolean {
-                continue;
-            }
-        }
-        if !views[position].matches(left, right) {
-            return false;
-        }
-    }
-    true
-}
-
-#[inline]
-fn predicates_match_dispatch(
-    views: &[PredicateView<'_>],
-    metadata: Option<&[NullMetadata<'_>]>,
-    left: usize,
-    right: usize,
-) -> bool {
-    match metadata {
-        Some(metadata) => predicates_match_with_nulls(views, metadata, left, right),
-        None => predicates_match(views, left, right),
-    }
-}
-
-/// Validate one half-open candidate range and convert it to slice indices.
-///
-/// ELI5: a malformed or empty candidate row has no candidates to scan, so it
-/// contributes no output while other rows continue normally. Whole-array
-/// shape errors are still rejected by `parse_and_validate`.
-fn checked_bounds(start: i64, end: i64, right_len: usize) -> Option<(usize, usize)> {
-    let start = usize::try_from(start).ok()?;
-    let end = checked_end(end, right_len)?;
-    if start >= end {
-        return None;
-    }
-    Some((start, end))
-}
-
-fn parse_predicates<'py>(predicates: &Bound<'py, PyList>) -> PyResult<Vec<Predicate<'py>>> {
-    let mut result = Vec::with_capacity(predicates.len());
-    for item in predicates.iter() {
-        let tuple = item
-            .cast::<PyTuple>()
-            .map_err(|_| PyTypeError::new_err("each comparison must be (left, right, op)"))?;
-        if tuple.len() != 3 {
-            return Err(PyValueError::new_err(
-                "each comparison must contain left, right, and op",
-            ));
-        }
-        let left = tuple.get_item(0)?;
-        let right = tuple.get_item(1)?;
-        let op = CompareOp::try_from_code(tuple.get_item(2)?.extract::<i8>()?)?;
-        let dtype = left
-            .getattr("dtype")?
-            .getattr("name")?
-            .extract::<String>()?;
-        macro_rules! typed {
-            ($variant:ident, $ty:ty) => {{
-                result.push(Predicate::$variant(
-                    left.extract::<PyReadonlyArray1<'py, $ty>>()?,
-                    right.extract::<PyReadonlyArray1<'py, $ty>>()?,
-                    op,
-                ));
-            }};
-        }
-        match dtype.as_str() {
-            "int64" => typed!(I64, i64),
-            "int32" => typed!(I32, i32),
-            "int16" => typed!(I16, i16),
-            "int8" => typed!(I8, i8),
-            "uint64" => typed!(U64, u64),
-            "uint32" => typed!(U32, u32),
-            "uint16" => typed!(U16, u16),
-            "uint8" => typed!(U8, u8),
-            "float64" => typed!(F64, f64),
-            "float32" => typed!(F32, f32),
-            other => {
-                return Err(PyTypeError::new_err(format!(
-                    "unsupported comparison dtype: {other}"
-                )))
-            }
-        }
-    }
-    Ok(result)
-}
-
-fn parse_predicates_with_nulls<'py>(
-    py: Python<'py>,
-    predicates: &Bound<'py, PyList>,
-) -> PyResult<(Vec<Predicate<'py>>, Option<Vec<NullMetadata<'py>>>)> {
-    let base_tuples = PyList::empty(py);
-    let mut metadata = Vec::with_capacity(predicates.len());
-    for item in predicates.iter() {
-        let tuple = item
-            .cast::<PyTuple>()
-            .map_err(|_| PyTypeError::new_err("each comparison must be a tuple"))?;
-        if tuple.len() != 3 && tuple.len() != 6 {
-            return Err(PyValueError::new_err(
-                "each comparison must contain 3 or 6 elements",
-            ));
-        }
-        let op = CompareOp::try_from_code(tuple.get_item(2)?.extract::<i8>()?)?;
-        if tuple.len() == 6 && op != CompareOp::Ne {
-            return Err(PyValueError::new_err(
-                "the six-element predicate form is only valid for !=",
-            ));
-        }
-        base_tuples.append(PyTuple::new(
-            py,
-            [tuple.get_item(0)?, tuple.get_item(1)?, tuple.get_item(2)?],
-        )?)?;
-
-        if tuple.len() == 6 {
-            let left = tuple
-                .get_item(3)?
-                .extract::<PyReadonlyArray1<'py, bool>>()?;
-            let right = tuple
-                .get_item(4)?
-                .extract::<PyReadonlyArray1<'py, bool>>()?;
-            let extension_flag = tuple.get_item(5)?.extract::<i8>()?;
-            if extension_flag != 0 && extension_flag != 1 {
-                return Err(PyValueError::new_err("is_extension_array must be 0 or 1"));
-            }
-            metadata.push(NullMetadata {
-                left: Some(left),
-                right: Some(right),
-                is_extension_array: extension_flag == 1,
-            });
-        } else {
-            metadata.push(NullMetadata {
-                left: None,
-                right: None,
-                is_extension_array: false,
-            });
-        }
-    }
-    let parsed = parse_predicates(&base_tuples)?;
-    for position in 0..parsed.len() {
-        let predicate = &parsed[position];
-        let values = &metadata[position];
-        if let Some(left) = &values.left {
-            ensure_equal_lengths(
-                "left boolean mask",
-                left.len()?,
-                "left predicate array",
-                predicate.left_len(),
-            )?;
-        }
-        if let Some(right) = &values.right {
-            ensure_equal_lengths(
-                "right boolean mask",
-                right.len()?,
-                "right predicate array",
-                predicate.right_len(),
-            )?;
-        }
-    }
-    // ELI5: pyjanitor checks for actual nulls before it constructs the
-    // six-element form. A six-element predicate therefore explicitly opts
-    // into mask-aware comparison; do not rescan the masks here just to decide
-    // whether they contain a true value.
-    let metadata = if metadata.iter().any(|values| values.left.is_some()) {
-        Some(metadata)
-    } else {
-        None
-    };
-    Ok((parsed, metadata))
-}
-
-enum Selection {
-    First,
-    Last,
-    Any,
-}
+use super::predicate::{
+    parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata, Predicate,
+};
 
 struct ParsedBatch<'py> {
     predicates: Vec<Predicate<'py>>,
@@ -377,6 +36,12 @@ fn parse_and_validate<'py>(
     }
     let left_len = predicates[0].left_len();
     let right_len = predicates[0].right_len();
+    // Batch kernels require real input arrays. Empty inputs are rejected at
+    // this boundary rather than producing an ambiguous no-match result.
+    ensure_nonempty_core("left predicate array", left_len).map_err(PyValueError::new_err)?;
+    ensure_nonempty_core("right predicate array", right_len).map_err(PyValueError::new_err)?;
+    ensure_nonempty_core("left index", left_index.len()?).map_err(PyValueError::new_err)?;
+    ensure_nonempty_core("right index", right_index.len()?).map_err(PyValueError::new_err)?;
     for predicate in predicates.iter().skip(1) {
         ensure_equal_lengths(
             "first left predicate array",
@@ -513,27 +178,29 @@ fn compare_batch_indices_with_selection<'py>(
         return Ok(None);
     }
 
-    let mut expanded_left = Array1::<i64>::zeros(total);
-    let mut expanded_right = Array1::<i64>::zeros(total);
+    // Each successful left row contributes exactly one selected pair. Reserve
+    // the counted size and append so the output buffers do not need to be
+    // zero-initialized before all slots are overwritten.
+    let mut expanded_left = Vec::with_capacity(total);
+    let mut expanded_right = Vec::with_capacity(total);
     // ELI5: the first binding is the read-only NumPy guard; the second
     // binding shadows it with the lightweight Rust view. The view does not
     // copy the labels, so the guard must remain alive in this scope while the
     // view borrows from the underlying Python array.
     let left_values = left_index.readonly();
     let left_values = left_values.as_array();
-    let mut output_position = 0_usize;
 
     for row in 0..left_len {
         if let Some(right_position) = selected[row] {
-            expanded_left[output_position] = left_values[row];
-            expanded_right[output_position] = right_values[right_position];
-            output_position += 1;
+            expanded_left.push(left_values[row]);
+            expanded_right.push(right_values[right_position]);
         }
     }
-    debug_assert_eq!(output_position, total);
+    debug_assert_eq!(expanded_left.len(), total);
+    debug_assert_eq!(expanded_right.len(), total);
     Ok(Some((
-        expanded_left.into_pyarray(py),
-        expanded_right.into_pyarray(py),
+        Array1::from_vec(expanded_left).into_pyarray(py),
+        Array1::from_vec(expanded_right).into_pyarray(py),
     )))
 }
 
@@ -585,7 +252,9 @@ fn compare_batch_indices_all_two_pass<'py>(
                     first_success[row] = Some(right_position);
                 }
                 last_success[row] = right_position;
-                total += 1;
+                total = total
+                    .checked_add(1)
+                    .ok_or_else(|| PyValueError::new_err("number of output pairs exceeds usize"))?;
             }
         }
     }
@@ -593,13 +262,14 @@ fn compare_batch_indices_all_two_pass<'py>(
     if total == 0 {
         return Ok(None);
     }
-    let mut expanded_left = Array1::<i64>::zeros(total);
-    let mut expanded_right = Array1::<i64>::zeros(total);
+    // Every successful pair is emitted exactly once in this second pass.
+    // Reserve the counted size and append so the output buffers do not need
+    // to be zero-initialized before all slots are overwritten.
+    let mut expanded_left = Vec::with_capacity(total);
+    let mut expanded_right = Vec::with_capacity(total);
     let left_values = left_index.readonly();
     let left_values = left_values.as_array();
     let right_values = right_index.as_array();
-    let mut output_position = 0_usize;
-
     // ELI5: rescan only from the first win through the last win. This still
     // emits every successful pair, but avoids comparing the known-failing
     // prefix and suffix of a row a second time.
@@ -610,16 +280,19 @@ fn compare_batch_indices_all_two_pass<'py>(
         let end = last_success[row] + 1;
         for right_position in start..end {
             if predicates_match_dispatch(&views, metadata.as_deref(), row, right_position) {
-                expanded_left[output_position] = left_values[row];
-                expanded_right[output_position] = right_values[right_position];
-                output_position += 1;
+                expanded_left.push(left_values[row]);
+                expanded_right.push(right_values[right_position]);
             }
         }
     }
-    debug_assert_eq!(output_position, total);
+    if expanded_left.len() != total || expanded_right.len() != total {
+        return Err(PyValueError::new_err(
+            "internal error: two-pass output count changed between passes",
+        ));
+    }
     Ok(Some((
-        expanded_left.into_pyarray(py),
-        expanded_right.into_pyarray(py),
+        Array1::from_vec(expanded_left).into_pyarray(py),
+        Array1::from_vec(expanded_right).into_pyarray(py),
     )))
 }
 
@@ -755,6 +428,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::types::PyTuple;
 
     #[test]
     fn first_indices_return_one_label_per_successful_left_row() {
@@ -1060,29 +734,88 @@ mod tests {
             assert_eq!(result.0.readonly().as_array().to_vec(), vec![10]);
             assert_eq!(result.1.readonly().as_array().to_vec(), vec![20]);
 
-            // Empty left arrays have no candidate rows and therefore no
-            // output, while still satisfying the parallel-length contract.
-            let empty_left = PyArray1::from_vec(py, Vec::<i64>::new());
-            let empty_right = PyArray1::from_vec(py, Vec::<i64>::new());
-            let empty_predicates = PyList::empty(py);
-            empty_predicates.append(PyTuple::new(
+            // Empty predicate arrays and index arrays are rejected explicitly,
+            // even when their parallel lengths would otherwise agree.
+            let empty = PyArray1::from_vec(py, Vec::<i64>::new());
+            let one = PyArray1::from_vec(py, vec![1_i64]);
+            let empty_left_predicates = PyList::empty(py);
+            empty_left_predicates.append(PyTuple::new(
                 py,
                 [
-                    empty_left.clone().into_any(),
-                    empty_right.clone().into_any(),
+                    empty.clone().into_any(),
+                    one.clone().into_any(),
                     0_i8.into_pyobject(py)?.into_any(),
                 ],
             )?)?;
-            let empty_index = PyArray1::from_vec(py, Vec::<i64>::new());
-            assert!(compare_batch_indices_any(
+            let error = compare_batch_indices_any(
                 py,
-                &empty_predicates,
+                &empty_left_predicates,
                 None,
                 None,
-                empty_index.clone(),
-                empty_index.readonly(),
-            )?
-            .is_none());
+                empty.clone(),
+                one.readonly(),
+            )
+            .expect_err("empty left predicate arrays must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: left predicate array cannot be empty"
+            );
+
+            let empty_right_predicates = PyList::empty(py);
+            empty_right_predicates.append(PyTuple::new(
+                py,
+                [
+                    one.clone().into_any(),
+                    empty.clone().into_any(),
+                    0_i8.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let error = compare_batch_indices_any(
+                py,
+                &empty_right_predicates,
+                None,
+                None,
+                one.clone(),
+                empty.readonly(),
+            )
+            .expect_err("empty right predicate arrays must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: right predicate array cannot be empty"
+            );
+
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    one.clone().into_any(),
+                    one.clone().into_any(),
+                    0_i8.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let empty_left_index = PyArray1::from_vec(py, Vec::<i64>::new());
+            let error = compare_batch_indices_any(
+                py,
+                &predicates,
+                None,
+                None,
+                empty_left_index,
+                one.clone().readonly(),
+            )
+            .expect_err("empty left indices must be rejected");
+            assert_eq!(error.to_string(), "ValueError: left index cannot be empty");
+
+            let empty_right_index = PyArray1::from_vec(py, Vec::<i64>::new());
+            let error = compare_batch_indices_any(
+                py,
+                &predicates,
+                None,
+                None,
+                one.clone(),
+                empty_right_index.readonly(),
+            )
+            .expect_err("empty right indices must be rejected");
+            assert_eq!(error.to_string(), "ValueError: right index cannot be empty");
 
             let no_predicates = PyList::empty(py);
             let error = compare_batch_indices_any(
