@@ -16,7 +16,7 @@ use pyo3::types::PyList;
 use std::collections::BTreeMap;
 
 use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
-use crate::compare::common::{add_right_region, checked_bounds, GroupState, Selection};
+use crate::compare::common::{add_right_region, checked_region_start, GroupState, Selection};
 use crate::compare::predicate::{
     parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata, Predicate,
 };
@@ -129,15 +129,14 @@ fn selected_core<'py>(
     let mut output_right = Vec::new();
 
     for row in 0..left_len {
-        let Some((start, _)) = checked_bounds(starts[row], right_len as i64, right_len) else {
+        // Pyjanitor guarantees monotonically non-increasing starts.
+        // `checked_region_start` rejects a violation before it can make a
+        // previously added chain self-link.
+        let Some((start, _)) =
+            checked_region_start(starts[row], right_len, previous_end).map_err(PyValueError::new_err)?
+        else {
             continue;
         };
-        if start > previous_end {
-            return Err(PyValueError::new_err(
-                "starts must be monotonically non-increasing",
-            ));
-        }
-        debug_assert!(start <= previous_end);
         add_right_region(right_region, start, previous_end, &mut next, &mut groups);
         previous_end = start;
 
@@ -249,15 +248,14 @@ pub fn compare_multi_region_indices_all<'py>(
     let mut total = 0_usize;
 
     for row in 0..left_len {
-        let Some((start, _)) = checked_bounds(starts[row], right_len as i64, right_len) else {
+        // Pyjanitor guarantees monotonically non-increasing starts.
+        // `checked_region_start` rejects a violation before it can make a
+        // previously added chain self-link.
+        let Some((start, _)) =
+            checked_region_start(starts[row], right_len, previous_end).map_err(PyValueError::new_err)?
+        else {
             continue;
         };
-        if start > previous_end {
-            return Err(PyValueError::new_err(
-                "starts must be monotonically non-increasing",
-            ));
-        }
-        debug_assert!(start <= previous_end);
         add_right_region(right_region, start, previous_end, &mut next, &mut groups);
         previous_end = start;
         for (_, state) in groups.range(left_region[row]..) {
@@ -289,15 +287,14 @@ pub fn compare_multi_region_indices_all<'py>(
     previous_end = right_len;
 
     for row in 0..left_len {
-        let Some((start, _)) = checked_bounds(starts[row], right_len as i64, right_len) else {
+        // Pyjanitor guarantees monotonically non-increasing starts.
+        // `checked_region_start` rejects a violation before it can make a
+        // previously added chain self-link.
+        let Some((start, _)) =
+            checked_region_start(starts[row], right_len, previous_end).map_err(PyValueError::new_err)?
+        else {
             continue;
         };
-        if start > previous_end {
-            return Err(PyValueError::new_err(
-                "starts must be monotonically non-increasing",
-            ));
-        }
-        debug_assert!(start <= previous_end);
         add_right_region(right_region, start, previous_end, &mut next, &mut groups);
         previous_end = start;
         for (_, state) in groups.range(left_region[row]..) {

@@ -13,7 +13,7 @@ use pyo3::prelude::*;
 use std::collections::BTreeMap;
 
 use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
-use crate::compare::common::{add_right_region, checked_bounds, GroupState, Selection};
+use crate::compare::common::{add_right_region, checked_region_start, GroupState, Selection};
 
 type IndexResult = (Vec<i64>, Vec<i64>);
 type PyIndexResult<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
@@ -126,15 +126,13 @@ fn build_selected_indices_core(
     let mut right_output = Vec::new();
 
     for row in 0..left.len() {
-        let Some((start, _)) = checked_bounds(starts[row], right.len() as i64, right.len()) else {
+        // Pyjanitor guarantees monotonically non-increasing starts.
+        // `checked_region_start` rejects a violation before it can make a
+        // previously added chain self-link.
+        let Some((start, _)) = checked_region_start(starts[row], right.len(), previous_end)?
+        else {
             continue;
         };
-        // Pyjanitor guarantees monotonically non-increasing starts. Reject a
-        // violation before it can make a previously added chain self-link.
-        if start > previous_end {
-            return Err("starts must be monotonically non-increasing".to_string());
-        }
-        debug_assert!(start <= previous_end);
         add_right_region(right, start, previous_end, &mut next, &mut groups);
         previous_end = start;
 
@@ -199,13 +197,10 @@ fn build_all_indices_core(
     let mut previous_end = right.len();
 
     for row in 0..left.len() {
-        let Some((start, _)) = checked_bounds(starts[row], right.len() as i64, right.len()) else {
+        let Some((start, _)) = checked_region_start(starts[row], right.len(), previous_end)?
+        else {
             continue;
         };
-        if start > previous_end {
-            return Err("starts must be monotonically non-increasing".to_string());
-        }
-        debug_assert!(start <= previous_end);
         add_right_region(right, start, previous_end, &mut next, &mut groups);
         previous_end = start;
 
@@ -231,13 +226,10 @@ fn build_all_indices_core(
     previous_end = right.len();
 
     for row in 0..left.len() {
-        let Some((start, _)) = checked_bounds(starts[row], right.len() as i64, right.len()) else {
+        let Some((start, _)) = checked_region_start(starts[row], right.len(), previous_end)?
+        else {
             continue;
         };
-        if start > previous_end {
-            return Err("starts must be monotonically non-increasing".to_string());
-        }
-        debug_assert!(start <= previous_end);
         add_right_region(right, start, previous_end, &mut next, &mut groups);
         previous_end = start;
 
