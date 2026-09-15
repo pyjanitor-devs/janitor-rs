@@ -284,10 +284,7 @@ pub fn build_dual_region_indices_first<'py>(
         Selection::First,
     )
     .map_err(PyValueError::new_err)?;
-    match result {
-        Some((left, right)) => Ok(Some((left.into_pyarray(py), right.into_pyarray(py)))),
-        None => Ok(None),
-    }
+    Ok(result.map(|(left, right)| (left.into_pyarray(py), right.into_pyarray(py))))
 }
 
 /// Select the largest right label for each left row from dual non-equi regions.
@@ -321,10 +318,7 @@ pub fn build_dual_region_indices_last<'py>(
         Selection::Last,
     )
     .map_err(PyValueError::new_err)?;
-    match result {
-        Some((left, right)) => Ok(Some((left.into_pyarray(py), right.into_pyarray(py)))),
-        None => Ok(None),
-    }
+    Ok(result.map(|(left, right)| (left.into_pyarray(py), right.into_pyarray(py))))
 }
 
 /// Select any matching right label for each left row from dual non-equi regions.
@@ -359,10 +353,7 @@ pub fn build_dual_region_indices_any<'py>(
         Selection::Any,
     )
     .map_err(PyValueError::new_err)?;
-    match result {
-        Some((left, right)) => Ok(Some((left.into_pyarray(py), right.into_pyarray(py)))),
-        None => Ok(None),
-    }
+    Ok(result.map(|(left, right)| (left.into_pyarray(py), right.into_pyarray(py))))
 }
 
 /// Build every matching pair from dual non-equi regions.
@@ -396,10 +387,7 @@ pub fn build_dual_region_indices_all<'py>(
         right_index.as_array(),
     )
     .map_err(PyValueError::new_err)?;
-    match result {
-        Some((left, right)) => Ok(Some((left.into_pyarray(py), right.into_pyarray(py)))),
-        None => Ok(None),
-    }
+    Ok(result.map(|(left, right)| (left.into_pyarray(py), right.into_pyarray(py))))
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
