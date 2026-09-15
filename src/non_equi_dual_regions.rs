@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 use crate::compare::common::{add_right_region, checked_region_start, GroupState, Selection};
 
-type IndexResult = (Vec<i64>, Vec<i64>);
+type IndexResult = (Array1<i64>, Array1<i64>);
 type PyIndexResult<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
 
 /// Select one candidate according to the requested label-based policy.
@@ -146,7 +146,10 @@ fn build_selected_indices_core(
     if left_output.is_empty() {
         Ok(None)
     } else {
-        Ok(Some((left_output, right_output)))
+        Ok(Some((
+            Array1::from_vec(left_output),
+            Array1::from_vec(right_output),
+        )))
     }
 }
 
@@ -244,7 +247,10 @@ fn build_all_indices_core(
     if left_output.len() != total || right_output.len() != total {
         return Err("internal error: two-pass output count changed between passes".to_string());
     }
-    Ok(Some((left_output, right_output)))
+    Ok(Some((
+        Array1::from_vec(left_output),
+        Array1::from_vec(right_output),
+    )))
 }
 
 /// Select the smallest right label for each left row from dual non-equi regions.
@@ -278,12 +284,7 @@ pub fn build_dual_region_indices_first<'py>(
         Selection::First,
     )
     .map_err(PyValueError::new_err)?;
-    Ok(result.map(|(left, right)| {
-        (
-            Array1::from_vec(left).into_pyarray(py),
-            Array1::from_vec(right).into_pyarray(py),
-        )
-    }))
+    Ok(result.map(|(left, right)| (left.into_pyarray(py), right.into_pyarray(py))))
 }
 
 /// Select the largest right label for each left row from dual non-equi regions.
@@ -317,12 +318,7 @@ pub fn build_dual_region_indices_last<'py>(
         Selection::Last,
     )
     .map_err(PyValueError::new_err)?;
-    Ok(result.map(|(left, right)| {
-        (
-            Array1::from_vec(left).into_pyarray(py),
-            Array1::from_vec(right).into_pyarray(py),
-        )
-    }))
+    Ok(result.map(|(left, right)| (left.into_pyarray(py), right.into_pyarray(py))))
 }
 
 /// Select any matching right label for each left row from dual non-equi regions.
@@ -357,12 +353,7 @@ pub fn build_dual_region_indices_any<'py>(
         Selection::Any,
     )
     .map_err(PyValueError::new_err)?;
-    Ok(result.map(|(left, right)| {
-        (
-            Array1::from_vec(left).into_pyarray(py),
-            Array1::from_vec(right).into_pyarray(py),
-        )
-    }))
+    Ok(result.map(|(left, right)| (left.into_pyarray(py), right.into_pyarray(py))))
 }
 
 /// Build every matching pair from dual non-equi regions.
@@ -396,12 +387,7 @@ pub fn build_dual_region_indices_all<'py>(
         right_index.as_array(),
     )
     .map_err(PyValueError::new_err)?;
-    Ok(result.map(|(left, right)| {
-        (
-            Array1::from_vec(left).into_pyarray(py),
-            Array1::from_vec(right).into_pyarray(py),
-        )
-    }))
+    Ok(result.map(|(left, right)| (left.into_pyarray(py), right.into_pyarray(py))))
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -448,8 +434,8 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(first.0, vec![100, 200]);
-        assert_eq!(first.1, vec![10, 10]);
+        assert_eq!(first.0.to_vec(), vec![100, 200]);
+        assert_eq!(first.1.to_vec(), vec![10, 10]);
 
         let last = build_selected_indices_core(
             left.view(),
@@ -461,7 +447,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(last.1, vec![30, 30]);
+        assert_eq!(last.1.to_vec(), vec![30, 30]);
 
         let any = build_selected_indices_core(
             left.view(),
@@ -473,7 +459,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(any.1, vec![10, 10]);
+        assert_eq!(any.1.to_vec(), vec![10, 10]);
     }
 
     #[test]
@@ -496,7 +482,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(first.1, vec![10]);
+        assert_eq!(first.1.to_vec(), vec![10]);
 
         let last = build_selected_indices_core(
             left.view(),
@@ -508,7 +494,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(last.1, vec![20]);
+        assert_eq!(last.1.to_vec(), vec![20]);
     }
 
     #[test]
@@ -523,8 +509,8 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(result.0, vec![100, 100, 100, 200, 200, 200]);
-        assert_eq!(result.1, vec![10, 30, 20, 10, 30, 20]);
+        assert_eq!(result.0.to_vec(), vec![100, 100, 100, 200, 200, 200]);
+        assert_eq!(result.1.to_vec(), vec![10, 30, 20, 10, 30, 20]);
     }
 
     #[test]
@@ -574,8 +560,8 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(result.0, vec![11]);
-        assert_eq!(result.1, vec![21]);
+        assert_eq!(result.0.to_vec(), vec![11]);
+        assert_eq!(result.1.to_vec(), vec![21]);
 
         let empty = Array1::<i64>::zeros(0);
         assert!(build_selected_indices_core(
