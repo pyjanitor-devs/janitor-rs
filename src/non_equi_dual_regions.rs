@@ -129,7 +129,7 @@ fn build_selected_indices_core(
         // Pyjanitor guarantees monotonically non-increasing starts.
         // `checked_region_start` rejects a violation before it can make a
         // previously added chain self-link.
-        let Some((start, _)) = checked_region_start(starts[row], right.len(), previous_end)? else {
+        let Some(start) = checked_region_start(starts[row], right.len(), previous_end)? else {
             continue;
         };
         add_right_region(right, start, previous_end, &mut next, &mut groups);
@@ -196,7 +196,7 @@ fn build_all_indices_core(
     let mut previous_end = right.len();
 
     for row in 0..left.len() {
-        let Some((start, _)) = checked_region_start(starts[row], right.len(), previous_end)? else {
+        let Some(start) = checked_region_start(starts[row], right.len(), previous_end)? else {
             continue;
         };
         add_right_region(right, start, previous_end, &mut next, &mut groups);
@@ -224,7 +224,7 @@ fn build_all_indices_core(
     previous_end = right.len();
 
     for row in 0..left.len() {
-        let Some((start, _)) = checked_region_start(starts[row], right.len(), previous_end)? else {
+        let Some(start) = checked_region_start(starts[row], right.len(), previous_end)? else {
             continue;
         };
         add_right_region(right, start, previous_end, &mut next, &mut groups);
@@ -241,8 +241,9 @@ fn build_all_indices_core(
         }
     }
 
-    debug_assert_eq!(left_output.len(), total);
-    debug_assert_eq!(right_output.len(), total);
+    if left_output.len() != total || right_output.len() != total {
+        return Err("internal error: two-pass output count changed between passes".to_string());
+    }
     Ok(Some((left_output, right_output)))
 }
 

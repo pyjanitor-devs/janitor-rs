@@ -8,7 +8,7 @@
 //! unique, so duplicate regions use linked position chains while emitted
 //! labels remain unambiguous.
 
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{IntoPyArray, PyArray1, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -22,6 +22,7 @@ use crate::compare::predicate::{
 };
 
 type Indices<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
+type IndexResult = (Vec<i64>, Vec<i64>);
 
 struct ParsedInputs<'py> {
     predicates: Vec<Predicate<'py>>,
@@ -83,42 +84,25 @@ fn predicate_views<'a>(
     predicates.iter().map(Predicate::view).collect()
 }
 
-// Keep the inputs explicit at this boundary: each array has a distinct role
-// in the pyjanitor region contract, and bundling them would make call sites
-// less readable.
+/// Select one matching right position per left row from validated region data.
+///
+/// This core function is deliberately independent of PyO3. The Python-facing
+/// wrapper parses and validates objects, then converts them to borrowed ndarray
+/// views before entering this hot loop.
 #[allow(clippy::too_many_arguments)]
-fn selected_core<'py>(
-    py: Python<'py>,
-    predicates: &Bound<'py, PyList>,
-    left_region: PyReadonlyArray1<'py, i64>,
-    right_region: PyReadonlyArray1<'py, i64>,
-    starts: PyReadonlyArray1<'py, i64>,
-    left_index: Bound<'py, PyArray1<i64>>,
-    right_index: PyReadonlyArray1<'py, i64>,
+fn selected_core(
+    left_region: ArrayView1<'_, i64>,
+    right_region: ArrayView1<'_, i64>,
+    starts: ArrayView1<'_, i64>,
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    views: &[crate::compare::predicate::PredicateView<'_>],
+    metadata: Option<&[NullMetadata<'_>]>,
     selection: Selection,
-) -> PyResult<Option<Indices<'py>>> {
-    let ParsedInputs {
-        predicates,
-        metadata,
-        left_len,
-        right_len,
-    } = parse_inputs(
-        py,
-        predicates,
-        &left_region,
-        &right_region,
-        &starts,
-        &left_index,
-        &right_index,
-    )?;
-    let left_region = left_region.as_array();
-    let right_region = right_region.as_array();
-    let views = predicate_views(&predicates);
-    let metadata = metadata.as_deref();
-    let starts = starts.as_array();
-    let right_values = right_index.as_array();
-    let left_values = left_index.readonly();
-    let left_values = left_values.as_array();
+) -> Result<Option<IndexResult>, String> {
+    let left_len = left_region.len();
+    let right_len = right_region.len();
+    let right_values = right_index;
     let mut next = vec![-1_i64; right_len];
     let mut groups = BTreeMap::<i64, GroupState>::new();
     let mut previous_end = right_len;
@@ -132,9 +116,7 @@ fn selected_core<'py>(
         // Pyjanitor guarantees monotonically non-increasing starts.
         // `checked_region_start` rejects a violation before it can make a
         // previously added chain self-link.
-        let Some((start, _)) = checked_region_start(starts[row], right_len, previous_end)
-            .map_err(PyValueError::new_err)?
-        else {
+        let Some(start) = checked_region_start(starts[row], right_len, previous_end)? else {
             continue;
         };
         add_right_region(right_region, start, previous_end, &mut next, &mut groups);
@@ -145,7 +127,7 @@ fn selected_core<'py>(
             let mut position = state.head;
             while position >= 0 {
                 let right_position = position as usize;
-                if !predicates_match_dispatch(&views, metadata, row, right_position) {
+                if !predicates_match_dispatch(views, metadata, row, right_position) {
                     position = next[right_position];
                     continue;
                 }
@@ -173,7 +155,7 @@ fn selected_core<'py>(
             }
         }
         if let Some(right_position) = selected_position {
-            output_left.push(left_values[row]);
+            output_left.push(left_index[row]);
             output_right.push(right_values[right_position]);
         }
     }
@@ -181,11 +163,54 @@ fn selected_core<'py>(
     if output_left.is_empty() {
         Ok(None)
     } else {
-        Ok(Some((
-            Array1::from_vec(output_left).into_pyarray(py),
-            Array1::from_vec(output_right).into_pyarray(py),
-        )))
+        Ok(Some((output_left, output_right)))
     }
+}
+
+// Keep Python parsing and output conversion at the wrapper boundary; the
+// aggregation core above operates only on ndarray views and Rust vectors.
+#[allow(clippy::too_many_arguments)]
+fn selected_wrapper<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    left_region: PyReadonlyArray1<'py, i64>,
+    right_region: PyReadonlyArray1<'py, i64>,
+    starts: PyReadonlyArray1<'py, i64>,
+    left_index: Bound<'py, PyArray1<i64>>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    selection: Selection,
+) -> PyResult<Option<Indices<'py>>> {
+    let ParsedInputs {
+        predicates,
+        metadata,
+        ..
+    } = parse_inputs(
+        py,
+        predicates,
+        &left_region,
+        &right_region,
+        &starts,
+        &left_index,
+        &right_index,
+    )?;
+    let views = predicate_views(&predicates);
+    let result = selected_core(
+        left_region.as_array(),
+        right_region.as_array(),
+        starts.as_array(),
+        left_index.readonly().as_array(),
+        right_index.as_array(),
+        &views,
+        metadata.as_deref(),
+        selection,
+    )
+    .map_err(PyValueError::new_err)?;
+    Ok(result.map(|(left, right)| {
+        (
+            Array1::from_vec(left).into_pyarray(py),
+            Array1::from_vec(right).into_pyarray(py),
+        )
+    }))
 }
 
 /// Return every matching pair using two passes over each candidate region.
@@ -251,7 +276,7 @@ pub fn compare_multi_region_indices_all<'py>(
         // Pyjanitor guarantees monotonically non-increasing starts.
         // `checked_region_start` rejects a violation before it can make a
         // previously added chain self-link.
-        let Some((start, _)) = checked_region_start(starts[row], right_len, previous_end)
+        let Some(start) = checked_region_start(starts[row], right_len, previous_end)
             .map_err(PyValueError::new_err)?
         else {
             continue;
@@ -290,7 +315,7 @@ pub fn compare_multi_region_indices_all<'py>(
         // Pyjanitor guarantees monotonically non-increasing starts.
         // `checked_region_start` rejects a violation before it can make a
         // previously added chain self-link.
-        let Some((start, _)) = checked_region_start(starts[row], right_len, previous_end)
+        let Some(start) = checked_region_start(starts[row], right_len, previous_end)
             .map_err(PyValueError::new_err)?
         else {
             continue;
@@ -309,8 +334,11 @@ pub fn compare_multi_region_indices_all<'py>(
             }
         }
     }
-    debug_assert_eq!(output_left.len(), total);
-    debug_assert_eq!(output_right.len(), total);
+    if output_left.len() != total || output_right.len() != total {
+        return Err(PyValueError::new_err(
+            "internal error: two-pass output count changed between passes",
+        ));
+    }
     Ok(Some((
         Array1::from_vec(output_left).into_pyarray(py),
         Array1::from_vec(output_right).into_pyarray(py),
@@ -338,7 +366,7 @@ pub fn compare_multi_region_indices_first<'py>(
     left_index: Bound<'py, PyArray1<i64>>,
     right_index: PyReadonlyArray1<'py, i64>,
 ) -> PyResult<Option<Indices<'py>>> {
-    selected_core(
+    selected_wrapper(
         py,
         predicates,
         left_region,
@@ -371,7 +399,7 @@ pub fn compare_multi_region_indices_last<'py>(
     left_index: Bound<'py, PyArray1<i64>>,
     right_index: PyReadonlyArray1<'py, i64>,
 ) -> PyResult<Option<Indices<'py>>> {
-    selected_core(
+    selected_wrapper(
         py,
         predicates,
         left_region,
@@ -404,7 +432,7 @@ pub fn compare_multi_region_indices_any<'py>(
     left_index: Bound<'py, PyArray1<i64>>,
     right_index: PyReadonlyArray1<'py, i64>,
 ) -> PyResult<Option<Indices<'py>>> {
-    selected_core(
+    selected_wrapper(
         py,
         predicates,
         left_region,

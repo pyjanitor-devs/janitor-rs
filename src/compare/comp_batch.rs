@@ -252,7 +252,9 @@ fn compare_batch_indices_all_two_pass<'py>(
                     first_success[row] = Some(right_position);
                 }
                 last_success[row] = right_position;
-                total += 1;
+                total = total
+                    .checked_add(1)
+                    .ok_or_else(|| PyValueError::new_err("number of output pairs exceeds usize"))?;
             }
         }
     }
@@ -283,8 +285,11 @@ fn compare_batch_indices_all_two_pass<'py>(
             }
         }
     }
-    debug_assert_eq!(expanded_left.len(), total);
-    debug_assert_eq!(expanded_right.len(), total);
+    if expanded_left.len() != total || expanded_right.len() != total {
+        return Err(PyValueError::new_err(
+            "internal error: two-pass output count changed between passes",
+        ));
+    }
     Ok(Some((
         Array1::from_vec(expanded_left).into_pyarray(py),
         Array1::from_vec(expanded_right).into_pyarray(py),

@@ -96,11 +96,11 @@ pub(crate) fn checked_region_start(
     start: i64,
     right_len: usize,
     previous_end: usize,
-) -> Result<Option<(usize, usize)>, String> {
+) -> Result<Option<usize>, String> {
     if start > previous_end as i64 {
         return Err("starts must be monotonically non-increasing".to_string());
     }
-    Ok(checked_bounds(start, right_len as i64, right_len))
+    Ok(checked_bounds(start, right_len as i64, right_len).map(|(start, _)| start))
 }
 
 #[cfg(test)]
