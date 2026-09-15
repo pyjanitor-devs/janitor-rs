@@ -133,7 +133,13 @@ mod tests {
         // implementation would treat it as monotonically fine -- but 50 is
         // still nonsense relative to `right`'s real length of 5.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            add_right_region(right.view(), 50, corrupted_previous_end, &mut next, &mut groups);
+            add_right_region(
+                right.view(),
+                50,
+                corrupted_previous_end,
+                &mut next,
+                &mut groups,
+            );
         }));
         assert!(
             result.is_err(),

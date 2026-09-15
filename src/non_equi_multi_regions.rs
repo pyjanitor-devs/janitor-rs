@@ -132,8 +132,8 @@ fn selected_core<'py>(
         // Pyjanitor guarantees monotonically non-increasing starts.
         // `checked_region_start` rejects a violation before it can make a
         // previously added chain self-link.
-        let Some((start, _)) =
-            checked_region_start(starts[row], right_len, previous_end).map_err(PyValueError::new_err)?
+        let Some((start, _)) = checked_region_start(starts[row], right_len, previous_end)
+            .map_err(PyValueError::new_err)?
         else {
             continue;
         };
@@ -251,8 +251,8 @@ pub fn compare_multi_region_indices_all<'py>(
         // Pyjanitor guarantees monotonically non-increasing starts.
         // `checked_region_start` rejects a violation before it can make a
         // previously added chain self-link.
-        let Some((start, _)) =
-            checked_region_start(starts[row], right_len, previous_end).map_err(PyValueError::new_err)?
+        let Some((start, _)) = checked_region_start(starts[row], right_len, previous_end)
+            .map_err(PyValueError::new_err)?
         else {
             continue;
         };
@@ -290,8 +290,8 @@ pub fn compare_multi_region_indices_all<'py>(
         // Pyjanitor guarantees monotonically non-increasing starts.
         // `checked_region_start` rejects a violation before it can make a
         // previously added chain self-link.
-        let Some((start, _)) =
-            checked_region_start(starts[row], right_len, previous_end).map_err(PyValueError::new_err)?
+        let Some((start, _)) = checked_region_start(starts[row], right_len, previous_end)
+            .map_err(PyValueError::new_err)?
         else {
             continue;
         };
