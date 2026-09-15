@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
 use crate::compare::common::{add_right_region, checked_region_start, GroupState, Selection};
 
-type IndexResult = (Array1<i64>, Array1<i64>);
+type IndexResult = (Vec<i64>, Vec<i64>);
 type PyIndexResult<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
 
 fn validate_inputs(
@@ -128,10 +128,7 @@ fn build_selected_indices_core(
     if left_output.is_empty() {
         Ok(None)
     } else {
-        Ok(Some((
-            Array1::from_vec(left_output),
-            Array1::from_vec(right_output),
-        )))
+        Ok(Some((left_output, right_output)))
     }
 }
 
@@ -229,10 +226,7 @@ fn build_all_indices_core(
     if left_output.len() != total || right_output.len() != total {
         return Err("internal error: two-pass output count changed between passes".to_string());
     }
-    Ok(Some((
-        Array1::from_vec(left_output),
-        Array1::from_vec(right_output),
-    )))
+    Ok(Some((left_output, right_output)))
 }
 
 /// Select the smallest right label for each left row from dual non-equi regions.
@@ -266,7 +260,12 @@ pub fn build_dual_region_indices_first<'py>(
         Selection::First,
     )
     .map_err(PyValueError::new_err)?;
-    Ok(result.map(|(left, right)| (left.into_pyarray(py), right.into_pyarray(py))))
+    Ok(result.map(|(left, right)| {
+        (
+            Array1::from_vec(left).into_pyarray(py),
+            Array1::from_vec(right).into_pyarray(py),
+        )
+    }))
 }
 
 /// Select the largest right label for each left row from dual non-equi regions.
@@ -300,7 +299,12 @@ pub fn build_dual_region_indices_last<'py>(
         Selection::Last,
     )
     .map_err(PyValueError::new_err)?;
-    Ok(result.map(|(left, right)| (left.into_pyarray(py), right.into_pyarray(py))))
+    Ok(result.map(|(left, right)| {
+        (
+            Array1::from_vec(left).into_pyarray(py),
+            Array1::from_vec(right).into_pyarray(py),
+        )
+    }))
 }
 
 /// Select any matching right label for each left row from dual non-equi regions.
@@ -335,7 +339,12 @@ pub fn build_dual_region_indices_any<'py>(
         Selection::Any,
     )
     .map_err(PyValueError::new_err)?;
-    Ok(result.map(|(left, right)| (left.into_pyarray(py), right.into_pyarray(py))))
+    Ok(result.map(|(left, right)| {
+        (
+            Array1::from_vec(left).into_pyarray(py),
+            Array1::from_vec(right).into_pyarray(py),
+        )
+    }))
 }
 
 /// Build every matching pair from dual non-equi regions.
@@ -369,7 +378,12 @@ pub fn build_dual_region_indices_all<'py>(
         right_index.as_array(),
     )
     .map_err(PyValueError::new_err)?;
-    Ok(result.map(|(left, right)| (left.into_pyarray(py), right.into_pyarray(py))))
+    Ok(result.map(|(left, right)| {
+        (
+            Array1::from_vec(left).into_pyarray(py),
+            Array1::from_vec(right).into_pyarray(py),
+        )
+    }))
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
