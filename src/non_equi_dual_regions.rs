@@ -247,15 +247,6 @@ fn build_all_indices_core(
     Ok(Some((left_output, right_output)))
 }
 
-fn into_py_result<'py>(py: Python<'py>, result: Option<IndexResult>) -> Option<PyIndexResult<'py>> {
-    result.map(|(left, right)| {
-        (
-            Array1::from_vec(left).into_pyarray(py),
-            Array1::from_vec(right).into_pyarray(py),
-        )
-    })
-}
-
 /// Select the smallest right label for each left row from dual non-equi regions.
 ///
 /// `starts` must be monotonically non-increasing, as guaranteed by pyjanitor's
@@ -278,7 +269,7 @@ pub fn build_dual_region_indices_first<'py>(
     left_index: PyReadonlyArray1<'py, i64>,
     right_index: PyReadonlyArray1<'py, i64>,
 ) -> PyResult<Option<PyIndexResult<'py>>> {
-    build_selected_indices_core(
+    let result = build_selected_indices_core(
         left.as_array(),
         right.as_array(),
         starts.as_array(),
@@ -286,8 +277,13 @@ pub fn build_dual_region_indices_first<'py>(
         right_index.as_array(),
         Selection::First,
     )
-    .map_err(PyValueError::new_err)
-    .map(|result| into_py_result(py, result))
+    .map_err(PyValueError::new_err)?;
+    Ok(result.map(|(left, right)| {
+        (
+            Array1::from_vec(left).into_pyarray(py),
+            Array1::from_vec(right).into_pyarray(py),
+        )
+    }))
 }
 
 /// Select the largest right label for each left row from dual non-equi regions.
@@ -312,7 +308,7 @@ pub fn build_dual_region_indices_last<'py>(
     left_index: PyReadonlyArray1<'py, i64>,
     right_index: PyReadonlyArray1<'py, i64>,
 ) -> PyResult<Option<PyIndexResult<'py>>> {
-    build_selected_indices_core(
+    let result = build_selected_indices_core(
         left.as_array(),
         right.as_array(),
         starts.as_array(),
@@ -320,8 +316,13 @@ pub fn build_dual_region_indices_last<'py>(
         right_index.as_array(),
         Selection::Last,
     )
-    .map_err(PyValueError::new_err)
-    .map(|result| into_py_result(py, result))
+    .map_err(PyValueError::new_err)?;
+    Ok(result.map(|(left, right)| {
+        (
+            Array1::from_vec(left).into_pyarray(py),
+            Array1::from_vec(right).into_pyarray(py),
+        )
+    }))
 }
 
 /// Select any matching right label for each left row from dual non-equi regions.
@@ -347,7 +348,7 @@ pub fn build_dual_region_indices_any<'py>(
     left_index: PyReadonlyArray1<'py, i64>,
     right_index: PyReadonlyArray1<'py, i64>,
 ) -> PyResult<Option<PyIndexResult<'py>>> {
-    build_selected_indices_core(
+    let result = build_selected_indices_core(
         left.as_array(),
         right.as_array(),
         starts.as_array(),
@@ -355,8 +356,13 @@ pub fn build_dual_region_indices_any<'py>(
         right_index.as_array(),
         Selection::Any,
     )
-    .map_err(PyValueError::new_err)
-    .map(|result| into_py_result(py, result))
+    .map_err(PyValueError::new_err)?;
+    Ok(result.map(|(left, right)| {
+        (
+            Array1::from_vec(left).into_pyarray(py),
+            Array1::from_vec(right).into_pyarray(py),
+        )
+    }))
 }
 
 /// Build every matching pair from dual non-equi regions.
@@ -382,15 +388,20 @@ pub fn build_dual_region_indices_all<'py>(
     left_index: PyReadonlyArray1<'py, i64>,
     right_index: PyReadonlyArray1<'py, i64>,
 ) -> PyResult<Option<PyIndexResult<'py>>> {
-    build_all_indices_core(
+    let result = build_all_indices_core(
         left.as_array(),
         right.as_array(),
         starts.as_array(),
         left_index.as_array(),
         right_index.as_array(),
     )
-    .map_err(PyValueError::new_err)
-    .map(|result| into_py_result(py, result))
+    .map_err(PyValueError::new_err)?;
+    Ok(result.map(|(left, right)| {
+        (
+            Array1::from_vec(left).into_pyarray(py),
+            Array1::from_vec(right).into_pyarray(py),
+        )
+    }))
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
