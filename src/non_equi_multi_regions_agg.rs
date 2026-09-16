@@ -27,9 +27,10 @@ use crate::compare::predicate::{
 /// * `right_region` - Right-side region labels, indexed by candidate position.
 /// * `starts` - Non-increasing right-side start boundary for each left row.
 /// * `aggregations` - Non-empty list of `(array, null_mask, operation)` tuples
-///   whose arrays are indexed by right-side candidate position. The mask is
-///   authoritative: `true` marks a null for value-based operations and
-///   `false` marks a valid value; nullness is not inferred from the value.
+///   whose arrays are indexed by right-side candidate position. The value
+///   arrays must be null-free. The mask is the sole null-tracking mechanism:
+///   `true` marks a null for value-based operations and `false` asserts a valid
+///   value. The caller is responsible for keeping each array and mask aligned.
 ///
 /// # Returns
 ///

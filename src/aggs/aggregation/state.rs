@@ -35,11 +35,12 @@ enum Values<'a> {
 
 /// The source values and their null metadata for one requested aggregation.
 ///
-/// A null entry is represented by `true` in `nulls`; a `false` entry means the
-/// value is valid. The mask is authoritative: this code does not inspect a
-/// value and does not infer nullness from special values such as floating-point
-/// NaN. Null metadata is used by value-based operations (`sum`, `product`,
-/// `min`, and `max`), while `count` intentionally counts the comparison event
+/// The value array is expected to be null-free; null tracking is supplied
+/// separately by `nulls`. A `true` entry means the corresponding value is
+/// null, while `false` means it is valid. The mask is authoritative: this code
+/// does not inspect a value or infer nullness from sentinels or special values.
+/// Null metadata is used by value-based operations (`sum`, `product`, `min`,
+/// and `max`), while `count` intentionally counts the comparison event
 /// regardless of this mask.
 struct View<'a> {
     values: Values<'a>,
@@ -184,8 +185,9 @@ impl<'a> AggregationSet<'a> {
     ///
     /// Count deliberately ignores null metadata and therefore counts every
     /// successful comparison. Other operations skip a candidate whose mask is
-    /// `true`. A `false` mask is treated as an assertion that the value is
-    /// valid; no additional null inference or NaN filtering is performed.
+    /// `true`. A `false` mask is treated as an assertion that the value array is
+    /// null-free and the value is valid; no additional null inference or
+    /// sentinel filtering is performed.
     /// Out-of-range output rows are ignored defensively; candidate bounds are
     /// guaranteed by construction and validation in the comparison callers.
     ///

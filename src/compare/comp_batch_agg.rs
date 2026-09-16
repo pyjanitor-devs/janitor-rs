@@ -37,10 +37,11 @@ use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 ///   omitted, every row ends at the right-array length.
 /// * `aggregations` - Non-empty list of `(array, null_mask, operation)` tuples.
 ///   Every value array and mask must have the same length as the predicate
-///   right arrays. The mask is authoritative: `true` marks a null to skip for
-///   value-based operations, while `false` marks a value as valid. NaNs are
-///   not inferred as nulls; callers, principally pyjanitor, must provide the
-///   correct mask.
+///   right arrays. The value arrays must be null-free. The mask is the sole
+///   null-tracking mechanism: `true` marks a null to skip for value-based
+///   operations, while `false` asserts that the corresponding value is valid.
+///   Callers, principally pyjanitor, are responsible for supplying the aligned
+///   array and correct mask; this function does not infer nulls from values.
 ///
 /// # Returns
 ///

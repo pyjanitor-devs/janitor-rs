@@ -5,11 +5,13 @@
 //! The handles must remain alive while the views are used; this is why parsing
 //! and state construction happen in the same Python call.
 //!
-//! The null mask is an explicit part of the low-level contract. A `true` mask
-//! entry means that the corresponding value is null and must be skipped by
-//! value-based aggregations; a `false` entry means that the value is valid.
-//! This layer does not inspect values to infer nullness. In particular, a
-//! floating-point NaN is not automatically treated as null.
+//! The null mask is an explicit part of the low-level contract. The caller is
+//! responsible for supplying a null-free value array: nulls must not be
+//! encoded inside the numeric array. A `true` mask entry means that the
+//! corresponding value is null and must be skipped by value-based
+//! aggregations; a `false` entry means that the value is valid. This layer
+//! does not inspect values to infer nullness. Null tracking belongs entirely
+//! in the boolean mask, and the caller must keep the array and mask aligned.
 
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyTypeError, PyValueError};
@@ -84,8 +86,10 @@ pub(crate) enum AggregationInput<'py> {
 /// # Arguments
 ///
 /// * `inputs` - Python list of aggregation tuples. Value arrays must be
-///   one-dimensional and use one of the supported signed, unsigned, or float
-///   NumPy dtypes. Null masks must be one-dimensional boolean arrays.
+///   one-dimensional, null-free, and use one of the supported signed,
+///   unsigned, or float NumPy dtypes. Null masks must be one-dimensional
+///   boolean arrays aligned with their value arrays. The caller owns null
+///   tracking: a mask entry of `true` is the only null marker recognized here.
 ///
 /// # Returns
 ///
