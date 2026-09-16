@@ -5,7 +5,9 @@ mod compare;
 mod index_builder;
 mod left_le_right;
 mod non_equi_dual_regions;
+mod non_equi_dual_regions_agg;
 mod non_equi_multi_regions;
+mod non_equi_multi_regions_agg;
 
 /// Narrow Rust-only surface used by `benches/kernels.rs`.
 ///
@@ -277,7 +279,9 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     index_builder::register(m)?;
     left_le_right::register(m)?;
     non_equi_dual_regions::register(m)?;
+    non_equi_dual_regions_agg::register(m)?;
     non_equi_multi_regions::register(m)?;
+    non_equi_multi_regions_agg::register(m)?;
     aggs::register(m)?;
     Ok(())
 }
@@ -326,10 +330,10 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (909 exports across 94 leaf modules). Bump
+    /// `register`, as of this PR (912 exports across 97 leaf modules). Bump
     /// this alongside any PR that intentionally adds
     /// or removes an export.
-    const EXPECTED_EXPORT_COUNT: usize = 909;
+    const EXPECTED_EXPORT_COUNT: usize = 912;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would

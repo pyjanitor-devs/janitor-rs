@@ -1,0 +1,124 @@
+//! Typed aggregation input parsing and dtype dispatch.
+//!
+//! `PyReadonlyArray1` owns the Python/NumPy borrow for the duration of the
+//! call. `AggregationSet` later turns those handles into cheap ndarray views.
+//! The handles must remain alive while the views are used; this is why parsing
+//! and state construction happen in the same Python call.
+
+use numpy::PyReadonlyArray1;
+use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::{PyList, PyTuple};
+
+use super::op::AggregationOp;
+
+pub(crate) enum AggregationInput<'py> {
+    // Each variant preserves the original NumPy dtype. The output dtype is
+    // an operation contract, not a consequence of whichever dtype happened
+    // to be supplied by the caller.
+    I64(
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, bool>,
+        AggregationOp,
+    ),
+    I32(
+        PyReadonlyArray1<'py, i32>,
+        PyReadonlyArray1<'py, bool>,
+        AggregationOp,
+    ),
+    I16(
+        PyReadonlyArray1<'py, i16>,
+        PyReadonlyArray1<'py, bool>,
+        AggregationOp,
+    ),
+    I8(
+        PyReadonlyArray1<'py, i8>,
+        PyReadonlyArray1<'py, bool>,
+        AggregationOp,
+    ),
+    U64(
+        PyReadonlyArray1<'py, u64>,
+        PyReadonlyArray1<'py, bool>,
+        AggregationOp,
+    ),
+    U32(
+        PyReadonlyArray1<'py, u32>,
+        PyReadonlyArray1<'py, bool>,
+        AggregationOp,
+    ),
+    U16(
+        PyReadonlyArray1<'py, u16>,
+        PyReadonlyArray1<'py, bool>,
+        AggregationOp,
+    ),
+    U8(
+        PyReadonlyArray1<'py, u8>,
+        PyReadonlyArray1<'py, bool>,
+        AggregationOp,
+    ),
+    F64(
+        PyReadonlyArray1<'py, f64>,
+        PyReadonlyArray1<'py, bool>,
+        AggregationOp,
+    ),
+    F32(
+        PyReadonlyArray1<'py, f32>,
+        PyReadonlyArray1<'py, bool>,
+        AggregationOp,
+    ),
+}
+
+pub(crate) fn parse_inputs<'py>(
+    inputs: &Bound<'py, PyList>,
+) -> PyResult<Vec<AggregationInput<'py>>> {
+    let mut result = Vec::with_capacity(inputs.len());
+    for item in inputs.iter() {
+        let tuple = item.cast::<PyTuple>().map_err(|_| {
+            PyTypeError::new_err("each aggregation must be (array, null_mask, aggregation)")
+        })?;
+        if tuple.len() != 3 {
+            return Err(PyValueError::new_err(
+                "each aggregation must contain array, null_mask, and aggregation",
+            ));
+        }
+        let array = tuple.get_item(0)?;
+        let mask = tuple
+            .get_item(1)?
+            .extract::<PyReadonlyArray1<'py, bool>>()?;
+        let op = AggregationOp::parse(&tuple.get_item(2)?)?;
+        let dtype = array
+            .getattr("dtype")?
+            .getattr("name")?
+            .extract::<String>()?;
+        // The macro keeps all dtype branches structurally identical. Rust
+        // still monomorphizes each branch, so the eventual candidate update
+        // does not need a boxed numeric value or a conversion through Python.
+        macro_rules! typed {
+            ($variant:ident, $ty:ty) => {
+                result.push(AggregationInput::$variant(
+                    array.extract::<PyReadonlyArray1<'py, $ty>>()?,
+                    mask,
+                    op,
+                ))
+            };
+        }
+        match dtype.as_str() {
+            "int64" => typed!(I64, i64),
+            "int32" => typed!(I32, i32),
+            "int16" => typed!(I16, i16),
+            "int8" => typed!(I8, i8),
+            "uint64" => typed!(U64, u64),
+            "uint32" => typed!(U32, u32),
+            "uint16" => typed!(U16, u16),
+            "uint8" => typed!(U8, u8),
+            "float64" => typed!(F64, f64),
+            "float32" => typed!(F32, f32),
+            other => {
+                return Err(PyTypeError::new_err(format!(
+                    "unsupported aggregation dtype: {other}"
+                )))
+            }
+        }
+    }
+    Ok(result)
+}
