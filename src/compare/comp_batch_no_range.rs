@@ -121,14 +121,13 @@ pub fn compare_batch_no_range<'py>(
 
 /// Compare aligned candidate positions and materialize only successful labels.
 ///
-/// ELI5: the first pass puts a red cross on every failed candidate and counts
-/// the winners. The second pass reads only the winners and copies their labels
-/// into exactly-sized output vectors; it never asks the predicates the same
-/// question twice.
+/// ELI5: each row brings one candidate. Check it once and immediately append
+/// both labels when it wins; there is no intermediate positions buffer and no
+/// second traversal just to materialize the output.
 ///
 /// `positions` is borrowed as read-only because the caller's NumPy array must
-/// remain untouched. The local survivor buffer is the mutable copy used by
-/// both passes.
+/// remain untouched. Invalid positions are skipped in the same pass as the
+/// predicate check, so one malformed candidate cannot affect other rows.
 fn compare_batch_no_range_core<F>(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
@@ -140,35 +139,25 @@ where
 {
     ensure_equal_lengths_core("left index", left_index.len(), "positions", positions.len())?;
 
-    let mut positions = positions.to_vec();
-    let mut total = 0_usize;
-    for (row, position) in positions.iter_mut().enumerate() {
-        let Some(right_position) = checked_index(*position, right_index.len()) else {
-            *position = -1;
-            continue;
-        };
-        if matches(row, right_position) {
-            total += 1;
-        } else {
-            *position = -1;
-        }
-    }
-
-    if total == 0 {
-        return Ok(None);
-    }
-
-    let mut output_left = Vec::with_capacity(total);
-    let mut output_right = Vec::with_capacity(total);
+    // At most one pair can be emitted for each left row. Reserving the input
+    // length avoids repeated reallocations for the common dense/all-survive
+    // case. Sparse or invalid inputs may leave capacity unused, but they still
+    // pay only one traversal and no temporary copy of `positions`.
+    let mut output_left = Vec::with_capacity(positions.len());
+    let mut output_right = Vec::with_capacity(positions.len());
     for (row, position) in positions.iter().enumerate() {
         let Some(right_position) = checked_index(*position, right_index.len()) else {
             continue;
         };
-        output_left.push(left_index[row]);
-        output_right.push(right_index[right_position]);
+        if matches(row, right_position) {
+            output_left.push(left_index[row]);
+            output_right.push(right_index[right_position]);
+        }
     }
-    debug_assert_eq!(output_left.len(), total);
-    debug_assert_eq!(output_right.len(), total);
+
+    if output_left.is_empty() {
+        return Ok(None);
+    }
     Ok(Some((output_left, output_right)))
 }
 
