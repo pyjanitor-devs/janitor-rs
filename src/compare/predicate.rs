@@ -97,6 +97,56 @@ pub(crate) struct NullMetadata<'py> {
     pub(crate) is_extension_array: bool,
 }
 
+/// Borrowed Rust-only view of one predicate's null metadata.
+///
+/// `NullMetadata` owns PyO3's `PyReadonlyArray1` handles because those handles
+/// are needed while parsing Python arguments. The matching kernels do not need
+/// the handles themselves; they only need ordinary Rust/ndarray views into the
+/// boolean masks. Keeping this smaller view type separate makes that boundary
+/// explicit.
+///
+/// A caller creates one of these views per predicate, once per function call,
+/// before entering the candidate loop. That matters because a single left row
+/// can inspect many right candidates, and the same mask is consulted for every
+/// one of them. Repeatedly calling `as_array()` or carrying PyO3-backed values
+/// through that hot loop would add unnecessary wrapper and borrow work without
+/// changing the result.
+pub(crate) struct NullMetadataView<'a> {
+    pub(crate) left: Option<ArrayView1<'a, bool>>,
+    pub(crate) right: Option<ArrayView1<'a, bool>>,
+    pub(crate) is_extension_array: bool,
+}
+
+impl NullMetadata<'_> {
+    /// Borrow the null masks once for reuse by a matching loop.
+    ///
+    /// The returned views do not copy mask data. They borrow the NumPy buffers,
+    /// so this conversion costs only a small per-predicate view description and
+    /// leaves the actual boolean storage in place. The owning `NullMetadata`
+    /// values remain alive for the entire call, which makes the borrowed views
+    /// valid while the Rust kernel evaluates candidates.
+    pub(crate) fn view<'a>(&'a self) -> NullMetadataView<'a> {
+        NullMetadataView {
+            left: self.left.as_ref().map(|values| values.as_array()),
+            right: self.right.as_ref().map(|values| values.as_array()),
+            is_extension_array: self.is_extension_array,
+        }
+    }
+}
+
+/// Create borrowed views for all parsed null metadata once per call.
+///
+/// Keeping this conversion in one helper makes it harder for a caller to
+/// accidentally put PyO3-backed mask access back into a candidate loop. The
+/// returned vector contains only lightweight view descriptors; it does not
+/// duplicate either boolean mask. `metadata` must remain alive while the
+/// returned views are used.
+pub(crate) fn null_metadata_views<'a>(
+    metadata: &'a [NullMetadata<'a>],
+) -> Vec<NullMetadataView<'a>> {
+    metadata.iter().map(NullMetadata::view).collect()
+}
+
 impl Predicate<'_> {
     /// Borrow the typed NumPy arrays as ordinary ndarray views.
     ///
@@ -231,15 +281,15 @@ pub(crate) fn predicates_match(views: &[PredicateView<'_>], left: usize, right: 
 /// `true` only when every predicate accepts the candidate.
 pub(crate) fn predicates_match_with_nulls(
     views: &[PredicateView<'_>],
-    metadata: &[NullMetadata<'_>],
+    metadata: &[NullMetadataView<'_>],
     left: usize,
     right: usize,
 ) -> bool {
     for position in 0..views.len() {
         let values = &metadata[position];
         if let (Some(left_values), Some(right_values)) = (&values.left, &values.right) {
-            let left_boolean = left_values.as_array()[left];
-            let right_boolean = right_values.as_array()[right];
+            let left_boolean = left_values[left];
+            let right_boolean = right_values[right];
             // Aligned with pandas Boolean dtype logic:
             // https://pandas.pydata.org/docs/user_guide/boolean.html#kleene-logical-operations
             if values.is_extension_array && (left_boolean || right_boolean) {
@@ -273,7 +323,7 @@ pub(crate) fn predicates_match_with_nulls(
 #[inline]
 pub(crate) fn predicates_match_dispatch(
     views: &[PredicateView<'_>],
-    metadata: Option<&[NullMetadata<'_>]>,
+    metadata: Option<&[NullMetadataView<'_>]>,
     left: usize,
     right: usize,
 ) -> bool {

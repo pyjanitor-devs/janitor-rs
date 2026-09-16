@@ -18,7 +18,8 @@ use std::collections::BTreeMap;
 use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 use crate::compare::common::{add_right_region, checked_region_start, GroupState, Selection};
 use crate::compare::predicate::{
-    parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata, Predicate,
+    null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata,
+    Predicate,
 };
 
 type Indices<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
@@ -97,7 +98,7 @@ fn selected_core(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     views: &[crate::compare::predicate::PredicateView<'_>],
-    metadata: Option<&[NullMetadata<'_>]>,
+    metadata: Option<&[crate::compare::predicate::NullMetadataView<'_>]>,
     selection: Selection,
 ) -> Result<Option<IndexResult>, String> {
     let left_len = left_region.len();
@@ -194,6 +195,12 @@ fn selected_wrapper<'py>(
         &right_index,
     )?;
     let views = predicate_views(&predicates);
+    // `selected_core` can visit many right positions for one left row. Create
+    // the lightweight Rust views once before that traversal instead of
+    // repeatedly extracting ndarray views from PyO3-backed mask objects in the
+    // hot predicate loop. The conversion borrows the existing buffers, so it
+    // has no mask-data copy and preserves the null-aware comparison contract.
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
     let result = selected_core(
         left_region.as_array(),
         right_region.as_array(),
@@ -201,7 +208,7 @@ fn selected_wrapper<'py>(
         left_index.readonly().as_array(),
         right_index.as_array(),
         &views,
-        metadata.as_deref(),
+        metadata_views.as_deref(),
         selection,
     )
     .map_err(PyValueError::new_err)?;
@@ -265,7 +272,11 @@ pub fn compare_multi_region_indices_all<'py>(
     let left_region = left_region.as_array();
     let right_region = right_region.as_array();
     let views = predicate_views(&predicates);
-    let metadata = metadata.as_deref();
+    // The all-selection implementation has a matching first pass and an
+    // output-materialization pass. Both reuse this one set of borrowed mask
+    // views. `metadata` remains in scope to keep the Python/NumPy owners alive;
+    // only the small view descriptors are allocated here.
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
     let starts = starts.as_array();
     let mut next = vec![-1_i64; right_len];
     let mut groups = BTreeMap::<i64, GroupState>::new();
@@ -287,7 +298,8 @@ pub fn compare_multi_region_indices_all<'py>(
             let mut position = state.head;
             while position >= 0 {
                 let right_position = position as usize;
-                if predicates_match_dispatch(&views, metadata, row, right_position) {
+                if predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position)
+                {
                     total = total.checked_add(1).ok_or_else(|| {
                         PyValueError::new_err("number of output pairs exceeds usize")
                     })?;
@@ -326,7 +338,8 @@ pub fn compare_multi_region_indices_all<'py>(
             let mut position = state.head;
             while position >= 0 {
                 let right_position = position as usize;
-                if predicates_match_dispatch(&views, metadata, row, right_position) {
+                if predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position)
+                {
                     output_left.push(left_values[row]);
                     output_right.push(right_values[right_position]);
                 }

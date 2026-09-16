@@ -102,3 +102,7 @@ harness = false
 [[bench]]
 name = "forward_sum_compare"
 harness = false
+
+[[bench]]
+name = "comp_batch_no_range"
+harness = false

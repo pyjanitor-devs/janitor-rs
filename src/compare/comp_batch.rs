@@ -12,7 +12,8 @@ use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 type BatchIndices<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
 
 use super::predicate::{
-    parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata, Predicate,
+    null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata,
+    Predicate,
 };
 
 struct ParsedBatch<'py> {
@@ -108,6 +109,16 @@ fn compare_batch_indices_with_selection<'py>(
     for predicate in &predicates {
         views.push(predicate.view());
     }
+    // `metadata` contains PyO3-backed read-only arrays because it came from
+    // Python argument parsing. Convert those handles to plain ndarray views
+    // once, outside the row/candidate loops. A batch may inspect the same mask
+    // thousands or millions of times; rebuilding a view during each match
+    // would add overhead without copying or changing any data.
+    //
+    // This is only a view conversion: `metadata` continues to own the Python
+    // array handles, and therefore keeps the borrowed buffers alive. `None`
+    // remains `None` so the ordinary non-null matching path pays no mask work.
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
     let starts_view = starts.as_ref().map(|values| values.as_array());
     let ends_view = ends.as_ref().map(|values| values.as_array());
     let right_values = right_index.as_array();
@@ -142,7 +153,7 @@ fn compare_batch_indices_with_selection<'py>(
 
         let mut selected_position = None;
         for right_position in start..end {
-            if predicates_match_dispatch(&views, metadata.as_deref(), row, right_position) {
+            if predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position) {
                 match &selection {
                     Selection::First => {
                         if selected_position.is_none()
@@ -229,6 +240,15 @@ fn compare_batch_indices_all_two_pass<'py>(
     for predicate in &predicates {
         views.push(predicate.view());
     }
+    // Build borrowed mask views once for both passes. The first pass discovers
+    // each row's successful bookends and the second pass materializes the
+    // selected labels; neither pass should repeatedly cross the PyO3/ndarray
+    // boundary for the same null masks.
+    //
+    // The views borrow `metadata`, rather than copying its boolean arrays. This
+    // preserves the existing null and extension-array semantics while keeping
+    // the candidate loop to ordinary Rust slice-like indexing.
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
     let starts_view = starts.as_ref().map(|values| values.as_array());
     let ends_view = ends.as_ref().map(|values| values.as_array());
     let mut first_success = vec![None; left_len];
@@ -247,7 +267,7 @@ fn compare_batch_indices_all_two_pass<'py>(
             continue;
         };
         for right_position in start..end {
-            if predicates_match_dispatch(&views, metadata.as_deref(), row, right_position) {
+            if predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position) {
                 if first_success[row].is_none() {
                     first_success[row] = Some(right_position);
                 }
@@ -279,7 +299,7 @@ fn compare_batch_indices_all_two_pass<'py>(
         };
         let end = last_success[row] + 1;
         for right_position in start..end {
-            if predicates_match_dispatch(&views, metadata.as_deref(), row, right_position) {
+            if predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position) {
                 expanded_left.push(left_values[row]);
                 expanded_right.push(right_values[right_position]);
             }
