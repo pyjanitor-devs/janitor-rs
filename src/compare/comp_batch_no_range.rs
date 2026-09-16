@@ -94,6 +94,12 @@ pub fn compare_batch_no_range<'py>(
     )?;
 
     let views: Vec<_> = predicates.iter().map(Predicate::view).collect();
+    // Keep the Python-facing metadata handles in `metadata`, but hand the core
+    // only borrowed ndarray views. This conversion happens once per call. It
+    // avoids asking PyO3 for a mask view for every candidate while preserving
+    // the exact null-aware predicate rules used by the range-based batch path.
+    // The boolean buffers are not copied; `metadata` owns the handles for the
+    // duration of this call and keeps the borrowed views valid.
     let metadata_views: Option<Vec<_>> = metadata
         .as_ref()
         .map(|values| values.iter().map(NullMetadata::view).collect());

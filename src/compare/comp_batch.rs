@@ -108,6 +108,15 @@ fn compare_batch_indices_with_selection<'py>(
     for predicate in &predicates {
         views.push(predicate.view());
     }
+    // `metadata` contains PyO3-backed read-only arrays because it came from
+    // Python argument parsing. Convert those handles to plain ndarray views
+    // once, outside the row/candidate loops. A batch may inspect the same mask
+    // thousands or millions of times; rebuilding a view during each match
+    // would add overhead without copying or changing any data.
+    //
+    // This is only a view conversion: `metadata` continues to own the Python
+    // array handles, and therefore keeps the borrowed buffers alive. `None`
+    // remains `None` so the ordinary non-null matching path pays no mask work.
     let metadata_views = metadata
         .as_ref()
         .map(|values| values.iter().map(NullMetadata::view).collect::<Vec<_>>());
@@ -232,6 +241,14 @@ fn compare_batch_indices_all_two_pass<'py>(
     for predicate in &predicates {
         views.push(predicate.view());
     }
+    // Build borrowed mask views once for both passes. The first pass discovers
+    // each row's successful bookends and the second pass materializes the
+    // selected labels; neither pass should repeatedly cross the PyO3/ndarray
+    // boundary for the same null masks.
+    //
+    // The views borrow `metadata`, rather than copying its boolean arrays. This
+    // preserves the existing null and extension-array semantics while keeping
+    // the candidate loop to ordinary Rust slice-like indexing.
     let metadata_views = metadata
         .as_ref()
         .map(|values| values.iter().map(NullMetadata::view).collect::<Vec<_>>());

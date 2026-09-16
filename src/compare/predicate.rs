@@ -99,8 +99,18 @@ pub(crate) struct NullMetadata<'py> {
 
 /// Borrowed Rust-only view of one predicate's null metadata.
 ///
-/// Keeping these views outside the candidate loop avoids repeatedly asking
-/// PyO3 for an ndarray view for the same mask arrays.
+/// `NullMetadata` owns PyO3's `PyReadonlyArray1` handles because those handles
+/// are needed while parsing Python arguments. The matching kernels do not need
+/// the handles themselves; they only need ordinary Rust/ndarray views into the
+/// boolean masks. Keeping this smaller view type separate makes that boundary
+/// explicit.
+///
+/// A caller creates one of these views per predicate, once per function call,
+/// before entering the candidate loop. That matters because a single left row
+/// can inspect many right candidates, and the same mask is consulted for every
+/// one of them. Repeatedly calling `as_array()` or carrying PyO3-backed values
+/// through that hot loop would add unnecessary wrapper and borrow work without
+/// changing the result.
 pub(crate) struct NullMetadataView<'a> {
     pub(crate) left: Option<ArrayView1<'a, bool>>,
     pub(crate) right: Option<ArrayView1<'a, bool>>,
@@ -109,6 +119,12 @@ pub(crate) struct NullMetadataView<'a> {
 
 impl NullMetadata<'_> {
     /// Borrow the null masks once for reuse by a matching loop.
+    ///
+    /// The returned views do not copy mask data. They borrow the NumPy buffers,
+    /// so this conversion costs only a small per-predicate view description and
+    /// leaves the actual boolean storage in place. The owning `NullMetadata`
+    /// values remain alive for the entire call, which makes the borrowed views
+    /// valid while the Rust kernel evaluates candidates.
     pub(crate) fn view<'a>(&'a self) -> NullMetadataView<'a> {
         NullMetadataView {
             left: self.left.as_ref().map(|values| values.as_array()),

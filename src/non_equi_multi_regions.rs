@@ -194,6 +194,11 @@ fn selected_wrapper<'py>(
         &right_index,
     )?;
     let views = predicate_views(&predicates);
+    // `selected_core` can visit many right positions for one left row. Create
+    // the lightweight Rust views once before that traversal instead of
+    // repeatedly extracting ndarray views from PyO3-backed mask objects in the
+    // hot predicate loop. The conversion borrows the existing buffers, so it
+    // has no mask-data copy and preserves the null-aware comparison contract.
     let metadata_views = metadata
         .as_ref()
         .map(|values| values.iter().map(NullMetadata::view).collect::<Vec<_>>());
@@ -268,6 +273,10 @@ pub fn compare_multi_region_indices_all<'py>(
     let left_region = left_region.as_array();
     let right_region = right_region.as_array();
     let views = predicate_views(&predicates);
+    // The all-selection implementation has a matching first pass and an
+    // output-materialization pass. Both reuse this one set of borrowed mask
+    // views. `metadata` remains in scope to keep the Python/NumPy owners alive;
+    // only the small view descriptors are allocated here.
     let metadata_views = metadata
         .as_ref()
         .map(|values| values.iter().map(NullMetadata::view).collect::<Vec<_>>());
