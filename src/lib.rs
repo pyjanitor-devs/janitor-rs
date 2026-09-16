@@ -72,6 +72,7 @@ pub mod bench_support {
         compare_batch_indices_all, compare_batch_indices_any, compare_batch_indices_first,
         compare_batch_indices_last,
     };
+    pub use crate::compare::comp_batch_no_range::compare_batch_no_range;
     pub use crate::compare::comp_direct::select_start_end_core;
     pub use crate::compare::comp_ends::{compare_end_allocating_core, compare_end_in_place_core};
     pub use crate::compare::comp_ne::{
@@ -83,6 +84,8 @@ pub mod bench_support {
     pub use crate::compare::comp_ne_starts::{
         compare_ne_start_allocating_core, compare_ne_start_in_place_core,
     };
+    pub use crate::compare::comp_no_range::{compare_no_range_f64, compare_no_range_int64};
+    pub use crate::compare::comp_no_range_ne::compare_no_range_ne_int64;
     pub use crate::compare::comp_starts::{
         compare_start_allocating_core, compare_start_in_place_core,
     };
@@ -326,7 +329,7 @@ mod registration_tests {
     /// `register`, as of this PR (908 exports across 93 leaf modules). Bump
     /// this alongside any PR that intentionally adds
     /// or removes an export.
-    const EXPECTED_EXPORT_COUNT: usize = 908;
+    const EXPECTED_EXPORT_COUNT: usize = 909;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
