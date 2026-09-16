@@ -68,6 +68,27 @@ pub(crate) enum AggregationInput<'py> {
     ),
 }
 
+/// Parse Python aggregation requests and preserve their concrete NumPy dtypes.
+///
+/// Each list item must be a three-element tuple:
+/// `(values, null_mask, operation)`. The values and mask are borrowed rather
+/// than copied, so their Python owners must remain alive while the returned
+/// inputs are used by [`super::state::AggregationSet`].
+///
+/// # Arguments
+///
+/// * `inputs` - Python list of aggregation tuples. Value arrays must be
+///   one-dimensional and use one of the supported signed, unsigned, or float
+///   NumPy dtypes. Null masks must be one-dimensional boolean arrays.
+///
+/// # Returns
+///
+/// Parsed, typed requests in the same order as the Python list.
+///
+/// # Errors
+///
+/// Returns a Python exception if an item is not a tuple, has the wrong number
+/// of fields, uses an unsupported operation or dtype, or has an invalid mask.
 pub(crate) fn parse_inputs<'py>(
     inputs: &Bound<'py, PyList>,
 ) -> PyResult<Vec<AggregationInput<'py>>> {

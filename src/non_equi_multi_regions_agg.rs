@@ -16,6 +16,30 @@ use crate::compare::predicate::{
 /// Aggregate candidates from region bounds after applying all residual
 /// predicates. The function owns its comparison loop and never calls the
 /// existing index-producing multi-region functions.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token used to borrow arrays and create
+///   NumPy results.
+/// * `predicates` - Non-empty list of residual comparison tuples. Their left
+///   and right arrays must align with the region arrays.
+/// * `left_region` - Left-side region labels, one label per output row.
+/// * `right_region` - Right-side region labels, indexed by candidate position.
+/// * `starts` - Non-increasing right-side start boundary for each left row.
+/// * `aggregations` - Non-empty list of `(array, null_mask, operation)` tuples
+///   whose arrays are indexed by right-side candidate position.
+///
+/// # Returns
+///
+/// `Some(list)` of aggregation result arrays, in the same order as the input
+/// requests, or `None` when no candidate passes both the region and residual
+/// predicate checks.
+///
+/// # Errors
+///
+/// Returns a Python exception for empty or mismatched inputs, invalid region
+/// boundaries, unsupported predicate/aggregation dtypes or operations, or
+/// invalid masks.
 #[pyfunction]
 pub fn aggregate_multi_regions<'py>(
     py: Python<'py>,

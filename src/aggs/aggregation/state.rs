@@ -11,8 +11,15 @@ use numpy::ndarray::{Array1, ArrayView1};
 use numpy::IntoPyArray;
 use pyo3::prelude::*;
 
+use super::ops::{count, extreme, product, sum};
 use crate::aggs::ensure_equal_lengths;
 
+/// A borrowed view of one supported NumPy dtype.
+///
+/// The enum is the Rust equivalent of a tagged union: the tag records which
+/// concrete numeric type is present, and the matching branch lets the hot
+/// comparison loop read values without allocating or converting through
+/// Python. The source array remains borrowed for the lifetime of the view.
 enum Values<'a> {
     I64(ArrayView1<'a, i64>),
     I32(ArrayView1<'a, i32>),
@@ -26,11 +33,21 @@ enum Values<'a> {
     F32(ArrayView1<'a, f32>),
 }
 
+/// The source values and their null metadata for one requested aggregation.
+///
+/// A null entry is represented by `true` in `nulls`. Null metadata is used by
+/// value-based operations (`sum`, `product`, `min`, and `max`), while `count`
+/// intentionally counts the comparison event regardless of this mask.
 struct View<'a> {
     values: Values<'a>,
     nulls: ArrayView1<'a, bool>,
 }
 
+/// Runtime state for one operation, including its output buffer.
+///
+/// Each variant has a fixed output type dictated by the aggregation contract:
+/// signed values use `i64`, `u64` stays `u64`, floating-point values use
+/// `f64`, and positions/counts use `i64`.
 enum State<'a> {
     // A state variant stores both the typed source view and the output
     // buffer. Keeping them together prevents an update from accidentally
@@ -47,12 +64,36 @@ enum State<'a> {
 }
 
 pub(crate) struct AggregationSet<'a> {
+    /// One independent accumulator for every requested `(array, mask, op)`.
     states: Vec<State<'a>>,
+    /// Number of rows produced by the comparison side of the join.
     output_len: usize,
+    /// Whether at least one valid comparison has succeeded.
     successful: bool,
 }
 
 impl<'a> AggregationSet<'a> {
+    /// Build accumulator state for all requested aggregations.
+    ///
+    /// This function performs all shape validation before the comparison loop
+    /// starts. Doing that once is important: `update` is deliberately a small
+    /// hot-path function and should not repeatedly inspect Python objects or
+    /// rediscover malformed input.
+    ///
+    /// # Arguments
+    ///
+    /// * `output_len` - Number of left/comparison rows. Every output array has
+    ///   this length.
+    /// * `expected_candidate_len` - Number of candidate positions in each
+    ///   aggregation value array.
+    /// * `inputs` - Parsed aggregation requests. Every request contains a
+    ///   typed candidate array, a boolean null mask, and an operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Python exception if aggregation arrays or null masks have
+    /// inconsistent lengths, or if an input cannot be represented by the
+    /// internal typed state.
     pub(crate) fn new(
         output_len: usize,
         expected_candidate_len: usize,
@@ -131,6 +172,22 @@ impl<'a> AggregationSet<'a> {
         })
     }
 
+    /// Apply one successful comparison to every requested aggregation.
+    ///
+    /// `output_row` identifies the left row whose result should be updated;
+    /// `candidate` identifies the matching position in each right-side
+    /// aggregation array. The comparison modules call this once per
+    /// successful candidate, so multiple aggregations share one traversal.
+    ///
+    /// Count deliberately ignores null metadata and therefore counts every
+    /// successful comparison. Other operations skip a candidate marked null.
+    /// Out-of-range output rows are ignored defensively; candidate bounds are
+    /// guaranteed by construction and validation in the comparison callers.
+    ///
+    /// # Arguments
+    ///
+    /// * `output_row` - Zero-based output row to update.
+    /// * `candidate` - Zero-based candidate position in the source arrays.
     pub(crate) fn update(&mut self, output_row: usize, candidate: usize) {
         if output_row >= self.output_len {
             return;
@@ -143,22 +200,20 @@ impl<'a> AggregationSet<'a> {
         // that traversal.
         for state in &mut self.states {
             match state {
-                State::Count(values) => values[output_row] += 1,
+                State::Count(values) => count::increment(&mut values[output_row]),
                 State::Sum(view, values) => {
                     if !view.nulls[candidate] {
-                        values[output_row] =
-                            values[output_row].wrapping_add(as_i64(&view.values, candidate));
+                        sum::add_i64(&mut values[output_row], as_i64(&view.values, candidate));
                     }
                 }
                 State::SumU64(view, values) => {
                     if !view.nulls[candidate] {
-                        values[output_row] =
-                            values[output_row].wrapping_add(as_u64(&view.values, candidate));
+                        sum::add_u64(&mut values[output_row], as_u64(&view.values, candidate));
                     }
                 }
                 State::SumF64(view, values, compensation) => {
                     if !view.nulls[candidate] {
-                        kahan_add(
+                        sum::add_f64(
                             &mut values[output_row],
                             &mut compensation[output_row],
                             as_f64(&view.values, candidate),
@@ -167,34 +222,60 @@ impl<'a> AggregationSet<'a> {
                 }
                 State::Product(view, values) => {
                     if !view.nulls[candidate] {
-                        values[output_row] =
-                            values[output_row].wrapping_mul(as_i64(&view.values, candidate));
+                        product::multiply_i64(
+                            &mut values[output_row],
+                            as_i64(&view.values, candidate),
+                        );
                     }
                 }
                 State::ProductU64(view, values) => {
                     if !view.nulls[candidate] {
-                        values[output_row] =
-                            values[output_row].wrapping_mul(as_u64(&view.values, candidate));
+                        product::multiply_u64(
+                            &mut values[output_row],
+                            as_u64(&view.values, candidate),
+                        );
                     }
                 }
                 State::ProductF64(view, values) => {
                     if !view.nulls[candidate] {
-                        values[output_row] *= as_f64(&view.values, candidate);
+                        product::multiply_f64(
+                            &mut values[output_row],
+                            as_f64(&view.values, candidate),
+                        );
                     }
                 }
                 State::Min(view, positions) => {
-                    update_extreme(view, positions, output_row, candidate, true)
+                    update_extreme_position(view, positions, output_row, candidate, true)
                 }
                 State::Max(view, positions) => {
-                    update_extreme(view, positions, output_row, candidate, false)
+                    update_extreme_position(view, positions, output_row, candidate, false)
                 }
             }
         }
     }
 
+    /// Return whether no successful comparison has been observed.
+    ///
+    /// The comparison wrappers use this to return Python `None` instead of a
+    /// collection of identity-filled arrays when no candidate matched.
     pub(crate) fn is_empty(&self) -> bool {
         !self.successful
     }
+
+    /// Convert all accumulator buffers into NumPy arrays.
+    ///
+    /// The result order is exactly the input aggregation order. This method
+    /// consumes the set because the internal buffers can be moved directly
+    /// into NumPy-owned arrays without cloning them.
+    ///
+    /// # Arguments
+    ///
+    /// * `py` - The active Python interpreter token required to create NumPy
+    ///   objects safely.
+    ///
+    /// # Returns
+    ///
+    /// A vector containing one NumPy array per requested aggregation.
     pub(crate) fn into_results(self, py: Python<'_>) -> Vec<Py<PyAny>> {
         self.states
             .into_iter()
@@ -219,19 +300,6 @@ impl<'a> AggregationSet<'a> {
             })
             .collect()
     }
-}
-
-/// Add one value using the Kahan-style compensation used by the existing
-/// forward float-sum kernels.
-///
-/// ELI5: `compensation` remembers the tiny rounding error lost by the last
-/// addition and feeds it into the next addition. The public result remains
-/// `total`, matching the established aggregation contract.
-fn kahan_add(total: &mut f64, compensation: &mut f64, value: f64) {
-    let difference = value - *compensation;
-    let increment = *total + difference;
-    *compensation = (increment - *total) - difference;
-    *total = increment;
 }
 
 fn as_i64(values: &Values<'_>, n: usize) -> i64 {
@@ -276,7 +344,12 @@ fn as_f64(values: &Values<'_>, n: usize) -> f64 {
         Values::U8(v) => v[n] as f64,
     }
 }
-fn update_extreme(
+/// Update a min/max aggregation with a candidate position.
+///
+/// The aggregation API returns positions rather than values, so this helper
+/// owns the stateful part of the operation: null handling, the `-1` sentinel,
+/// comparison against the current winner, and storing the winning position.
+fn update_extreme_position(
     view: &View<'_>,
     positions: &mut [i64],
     row: usize,
@@ -289,9 +362,9 @@ fn update_extreme(
     let current = positions[row];
     if current < 0
         || if minimum {
-            compare(view, candidate, current as usize) == std::cmp::Ordering::Less
+            extreme::improves(compare(view, candidate, current as usize), true)
         } else {
-            compare(view, candidate, current as usize) == std::cmp::Ordering::Greater
+            extreme::improves(compare(view, candidate, current as usize), false)
         }
     {
         positions[row] = candidate as i64;

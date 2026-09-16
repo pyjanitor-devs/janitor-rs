@@ -23,6 +23,32 @@ use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 /// are indexed by candidate position and must therefore all have the same
 /// length. Results have one slot per left predicate row. A completely empty
 /// match result is represented by `None`.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token used to borrow arrays and create
+///   result objects.
+/// * `predicates` - Non-empty list of comparison tuples. Each tuple contains
+///   a left array, right array, and comparison operation. All tuples must have
+///   matching left and right lengths.
+/// * `starts` - Optional inclusive right-side start bound for each left row.
+///   When omitted, every row starts at zero.
+/// * `ends` - Optional exclusive right-side end bound for each left row. When
+///   omitted, every row ends at the right-array length.
+/// * `aggregations` - Non-empty list of `(array, null_mask, operation)` tuples.
+///   Every value array and mask must have the same length as the predicate
+///   right arrays.
+///
+/// # Returns
+///
+/// `Some(list)` containing one output NumPy array per requested aggregation,
+/// in input order. Every output has one slot per left row. Returns `None` when
+/// no candidate passes the comparisons.
+///
+/// # Errors
+///
+/// Returns a Python exception for empty inputs, unsupported dtypes/operations,
+/// mismatched lengths, or invalid bounds.
 #[pyfunction]
 pub fn compare_batch_aggregate<'py>(
     py: Python<'py>,

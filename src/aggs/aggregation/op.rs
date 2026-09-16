@@ -18,6 +18,18 @@ pub(crate) enum AggregationOp {
 }
 
 impl AggregationOp {
+    /// Parse one Python operation name into the internal operation enum.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - Python object expected to contain a string such as `"sum"`,
+    ///   `"count"`, `"prod"`, `"min"`, or `"max"`. `"size"` is accepted as
+    ///   an alias for `"count"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TypeError` for a non-string object and `ValueError` for an
+    /// unsupported operation name.
     pub(crate) fn parse(value: &Bound<'_, PyAny>) -> PyResult<Self> {
         let name = value.extract::<String>().map_err(|_| {
             PyTypeError::new_err("aggregation must be one of sum, count, prod, min, or max")

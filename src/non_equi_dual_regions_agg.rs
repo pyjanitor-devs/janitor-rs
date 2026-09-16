@@ -12,6 +12,25 @@ use crate::compare::common::{add_right_region, checked_region_start, GroupState}
 
 /// Aggregate successful candidates from the dual-region traversal without
 /// materialising the intermediate index arrays.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token used to create NumPy results.
+/// * `left_region` - Left-side region labels, one label per output row.
+/// * `right_region` - Right-side region labels, indexed by candidate position.
+/// * `starts` - Non-increasing right-side start boundary for each left row.
+/// * `aggregations` - Non-empty list of `(array, null_mask, operation)` tuples
+///   whose arrays are indexed by right-side candidate position.
+///
+/// # Returns
+///
+/// `Some(list)` of aggregation result arrays, each with `left_region.len()`
+/// entries, or `None` when no region comparison succeeds.
+///
+/// # Errors
+///
+/// Returns a Python exception for empty or mismatched inputs, invalid region
+/// boundaries, unsupported aggregation dtypes/operations, or invalid masks.
 #[pyfunction]
 pub fn aggregate_dual_regions<'py>(
     py: Python<'py>,
