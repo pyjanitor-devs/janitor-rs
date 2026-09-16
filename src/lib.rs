@@ -4,6 +4,8 @@ mod bin_search;
 mod compare;
 mod index_builder;
 mod left_le_right;
+mod non_equi_dual_regions;
+mod non_equi_multi_regions;
 
 /// Narrow Rust-only surface used by `benches/kernels.rs`.
 ///
@@ -86,6 +88,15 @@ pub mod bench_support {
     };
     pub use crate::compare::op::CompareOp;
     pub use crate::index_builder::{repeat_index_core, trim_index_core};
+    pub use crate::left_le_right::region_positions;
+    pub use crate::non_equi_dual_regions::{
+        build_dual_region_indices_all, build_dual_region_indices_any,
+        build_dual_region_indices_first, build_dual_region_indices_last,
+    };
+    pub use crate::non_equi_multi_regions::{
+        compare_multi_region_indices_all, compare_multi_region_indices_any,
+        compare_multi_region_indices_first, compare_multi_region_indices_last,
+    };
 
     pub fn sum_rev_start_end_i64(
         arr: ArrayView1<'_, i64>,
@@ -262,6 +273,8 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     compare::register(m)?;
     index_builder::register(m)?;
     left_le_right::register(m)?;
+    non_equi_dual_regions::register(m)?;
+    non_equi_multi_regions::register(m)?;
     aggs::register(m)?;
     Ok(())
 }
@@ -310,10 +323,10 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (894 dtype-specialized exports across 90
-    /// leaf modules). Bump this alongside any PR that intentionally adds
+    /// `register`, as of this PR (908 exports across 93 leaf modules). Bump
+    /// this alongside any PR that intentionally adds
     /// or removes an export.
-    const EXPECTED_EXPORT_COUNT: usize = 900;
+    const EXPECTED_EXPORT_COUNT: usize = 908;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
@@ -323,7 +336,7 @@ mod registration_tests {
     /// module must be one of our own exports (Python/PyO3 module
     /// machinery -- `__name__`, `__all__`, etc. -- all use `__`-wrapped
     /// names), so counting just those catches a missing or duplicate
-    /// export without spelling out all 894 names here.
+    /// export without spelling out all 908 names here.
     #[test]
     fn total_registered_export_count_matches_expected() {
         Python::initialize();
