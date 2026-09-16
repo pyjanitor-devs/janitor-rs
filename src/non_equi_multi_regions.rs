@@ -18,7 +18,8 @@ use std::collections::BTreeMap;
 use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 use crate::compare::common::{add_right_region, checked_region_start, GroupState, Selection};
 use crate::compare::predicate::{
-    parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata, Predicate,
+    null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata,
+    Predicate,
 };
 
 type Indices<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
@@ -199,9 +200,7 @@ fn selected_wrapper<'py>(
     // repeatedly extracting ndarray views from PyO3-backed mask objects in the
     // hot predicate loop. The conversion borrows the existing buffers, so it
     // has no mask-data copy and preserves the null-aware comparison contract.
-    let metadata_views = metadata
-        .as_ref()
-        .map(|values| values.iter().map(NullMetadata::view).collect::<Vec<_>>());
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
     let result = selected_core(
         left_region.as_array(),
         right_region.as_array(),
@@ -277,9 +276,7 @@ pub fn compare_multi_region_indices_all<'py>(
     // output-materialization pass. Both reuse this one set of borrowed mask
     // views. `metadata` remains in scope to keep the Python/NumPy owners alive;
     // only the small view descriptors are allocated here.
-    let metadata_views = metadata
-        .as_ref()
-        .map(|values| values.iter().map(NullMetadata::view).collect::<Vec<_>>());
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
     let starts = starts.as_array();
     let mut next = vec![-1_i64; right_len];
     let mut groups = BTreeMap::<i64, GroupState>::new();

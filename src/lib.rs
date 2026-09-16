@@ -326,7 +326,7 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (908 exports across 93 leaf modules). Bump
+    /// `register`, as of this PR (909 exports across 94 leaf modules). Bump
     /// this alongside any PR that intentionally adds
     /// or removes an export.
     const EXPECTED_EXPORT_COUNT: usize = 909;

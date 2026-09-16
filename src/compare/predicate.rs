@@ -134,6 +134,19 @@ impl NullMetadata<'_> {
     }
 }
 
+/// Create borrowed views for all parsed null metadata once per call.
+///
+/// Keeping this conversion in one helper makes it harder for a caller to
+/// accidentally put PyO3-backed mask access back into a candidate loop. The
+/// returned vector contains only lightweight view descriptors; it does not
+/// duplicate either boolean mask. `metadata` must remain alive while the
+/// returned views are used.
+pub(crate) fn null_metadata_views<'a>(
+    metadata: &'a [NullMetadata<'a>],
+) -> Vec<NullMetadataView<'a>> {
+    metadata.iter().map(NullMetadata::view).collect()
+}
+
 impl Predicate<'_> {
     /// Borrow the typed NumPy arrays as ordinary ndarray views.
     ///

@@ -12,7 +12,8 @@ use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 type BatchIndices<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
 
 use super::predicate::{
-    parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata, Predicate,
+    null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata,
+    Predicate,
 };
 
 struct ParsedBatch<'py> {
@@ -117,9 +118,7 @@ fn compare_batch_indices_with_selection<'py>(
     // This is only a view conversion: `metadata` continues to own the Python
     // array handles, and therefore keeps the borrowed buffers alive. `None`
     // remains `None` so the ordinary non-null matching path pays no mask work.
-    let metadata_views = metadata
-        .as_ref()
-        .map(|values| values.iter().map(NullMetadata::view).collect::<Vec<_>>());
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
     let starts_view = starts.as_ref().map(|values| values.as_array());
     let ends_view = ends.as_ref().map(|values| values.as_array());
     let right_values = right_index.as_array();
@@ -249,9 +248,7 @@ fn compare_batch_indices_all_two_pass<'py>(
     // The views borrow `metadata`, rather than copying its boolean arrays. This
     // preserves the existing null and extension-array semantics while keeping
     // the candidate loop to ordinary Rust slice-like indexing.
-    let metadata_views = metadata
-        .as_ref()
-        .map(|values| values.iter().map(NullMetadata::view).collect::<Vec<_>>());
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
     let starts_view = starts.as_ref().map(|values| values.as_array());
     let ends_view = ends.as_ref().map(|values| values.as_array());
     let mut first_success = vec![None; left_len];

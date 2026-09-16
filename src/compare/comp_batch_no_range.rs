@@ -7,10 +7,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use super::predicate::{
-    parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata, Predicate,
+    null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch, Predicate,
 };
 use crate::aggs::checked_index;
-use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core};
+use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core};
 
 type BatchIndices<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
 type CoreIndices = (Vec<i64>, Vec<i64>);
@@ -100,9 +100,7 @@ pub fn compare_batch_no_range<'py>(
     // the exact null-aware predicate rules used by the range-based batch path.
     // The boolean buffers are not copied; `metadata` owns the handles for the
     // duration of this call and keeps the borrowed views valid.
-    let metadata_views: Option<Vec<_>> = metadata
-        .as_ref()
-        .map(|values| values.iter().map(NullMetadata::view).collect());
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
     let result = compare_batch_no_range_core(
         left_index.as_array(),
         right_index.as_array(),
@@ -137,6 +135,9 @@ fn compare_batch_no_range_core<F>(
 where
     F: FnMut(usize, usize) -> bool,
 {
+    ensure_nonempty_core("left index", left_index.len())?;
+    ensure_nonempty_core("right index", right_index.len())?;
+    ensure_nonempty_core("positions", positions.len())?;
     ensure_equal_lengths_core("left index", left_index.len(), "positions", positions.len())?;
 
     // At most one pair can be emitted for each left row. Reserving the input
@@ -197,6 +198,17 @@ mod tests {
             compare_batch_no_range_core(left.view(), right.view(), positions.view(), |_, _| false)
                 .unwrap();
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn rejects_empty_core_inputs_before_length_validation() {
+        let left = array![];
+        let right = array![];
+        let positions = array![];
+        let error =
+            compare_batch_no_range_core(left.view(), right.view(), positions.view(), |_, _| true)
+                .unwrap_err();
+        assert_eq!(error, "left index cannot be empty");
     }
 
     #[test]
