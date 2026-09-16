@@ -108,6 +108,9 @@ fn compare_batch_indices_with_selection<'py>(
     for predicate in &predicates {
         views.push(predicate.view());
     }
+    let metadata_views = metadata
+        .as_ref()
+        .map(|values| values.iter().map(NullMetadata::view).collect::<Vec<_>>());
     let starts_view = starts.as_ref().map(|values| values.as_array());
     let ends_view = ends.as_ref().map(|values| values.as_array());
     let right_values = right_index.as_array();
@@ -142,7 +145,7 @@ fn compare_batch_indices_with_selection<'py>(
 
         let mut selected_position = None;
         for right_position in start..end {
-            if predicates_match_dispatch(&views, metadata.as_deref(), row, right_position) {
+            if predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position) {
                 match &selection {
                     Selection::First => {
                         if selected_position.is_none()
@@ -229,6 +232,9 @@ fn compare_batch_indices_all_two_pass<'py>(
     for predicate in &predicates {
         views.push(predicate.view());
     }
+    let metadata_views = metadata
+        .as_ref()
+        .map(|values| values.iter().map(NullMetadata::view).collect::<Vec<_>>());
     let starts_view = starts.as_ref().map(|values| values.as_array());
     let ends_view = ends.as_ref().map(|values| values.as_array());
     let mut first_success = vec![None; left_len];
@@ -247,7 +253,7 @@ fn compare_batch_indices_all_two_pass<'py>(
             continue;
         };
         for right_position in start..end {
-            if predicates_match_dispatch(&views, metadata.as_deref(), row, right_position) {
+            if predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position) {
                 if first_success[row].is_none() {
                     first_success[row] = Some(right_position);
                 }
@@ -279,7 +285,7 @@ fn compare_batch_indices_all_two_pass<'py>(
         };
         let end = last_success[row] + 1;
         for right_position in start..end {
-            if predicates_match_dispatch(&views, metadata.as_deref(), row, right_position) {
+            if predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position) {
                 expanded_left.push(left_values[row]);
                 expanded_right.push(right_values[right_position]);
             }

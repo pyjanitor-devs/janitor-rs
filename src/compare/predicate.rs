@@ -250,7 +250,7 @@ pub(crate) fn predicates_match(views: &[PredicateView<'_>], left: usize, right: 
 /// # Returns
 ///
 /// `true` only when every predicate accepts the candidate.
-pub(crate) fn predicates_match_with_null_views(
+pub(crate) fn predicates_match_with_nulls(
     views: &[PredicateView<'_>],
     metadata: &[NullMetadataView<'_>],
     left: usize,
@@ -292,51 +292,9 @@ pub(crate) fn predicates_match_with_null_views(
 /// `true` only when the candidate satisfies all applicable predicates and
 /// null semantics.
 #[inline]
-pub(crate) fn predicates_match_dispatch_views(
-    views: &[PredicateView<'_>],
-    metadata: Option<&[NullMetadataView<'_>]>,
-    left: usize,
-    right: usize,
-) -> bool {
-    match metadata {
-        Some(metadata) => predicates_match_with_null_views(views, metadata, left, right),
-        None => predicates_match(views, left, right),
-    }
-}
-
-/// Evaluate predicates with PyO3-backed null metadata.
-///
-/// Existing range callers use this compatibility entry point. New hot loops
-/// should convert metadata once and call [`predicates_match_dispatch_views`].
-pub(crate) fn predicates_match_with_nulls(
-    views: &[PredicateView<'_>],
-    metadata: &[NullMetadata<'_>],
-    left: usize,
-    right: usize,
-) -> bool {
-    for position in 0..views.len() {
-        let values = &metadata[position];
-        if let (Some(left_values), Some(right_values)) = (&values.left, &values.right) {
-            let left_boolean = left_values.as_array()[left];
-            let right_boolean = right_values.as_array()[right];
-            if values.is_extension_array && (left_boolean || right_boolean) {
-                return false;
-            }
-            if left_boolean || right_boolean {
-                continue;
-            }
-        }
-        if !views[position].matches(left, right) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Dispatch matching while retaining the original PyO3 metadata contract.
 pub(crate) fn predicates_match_dispatch(
     views: &[PredicateView<'_>],
-    metadata: Option<&[NullMetadata<'_>]>,
+    metadata: Option<&[NullMetadataView<'_>]>,
     left: usize,
     right: usize,
 ) -> bool {

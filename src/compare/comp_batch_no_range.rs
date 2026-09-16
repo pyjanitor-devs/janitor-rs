@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use super::predicate::{
-    parse_predicates_with_nulls, predicates_match_dispatch_views, NullMetadata, Predicate,
+    parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata, Predicate,
 };
 use crate::aggs::checked_index;
 use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core};
@@ -101,9 +101,7 @@ pub fn compare_batch_no_range<'py>(
         left_index.as_array(),
         right_index.as_array(),
         positions.as_array(),
-        |left, right| {
-            predicates_match_dispatch_views(&views, metadata_views.as_deref(), left, right)
-        },
+        |left, right| predicates_match_dispatch(&views, metadata_views.as_deref(), left, right),
     )
     .map_err(PyValueError::new_err)?;
 

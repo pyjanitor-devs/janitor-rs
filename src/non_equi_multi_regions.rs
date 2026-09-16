@@ -97,7 +97,7 @@ fn selected_core(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     views: &[crate::compare::predicate::PredicateView<'_>],
-    metadata: Option<&[NullMetadata<'_>]>,
+    metadata: Option<&[crate::compare::predicate::NullMetadataView<'_>]>,
     selection: Selection,
 ) -> Result<Option<IndexResult>, String> {
     let left_len = left_region.len();
@@ -194,6 +194,9 @@ fn selected_wrapper<'py>(
         &right_index,
     )?;
     let views = predicate_views(&predicates);
+    let metadata_views = metadata
+        .as_ref()
+        .map(|values| values.iter().map(NullMetadata::view).collect::<Vec<_>>());
     let result = selected_core(
         left_region.as_array(),
         right_region.as_array(),
@@ -201,7 +204,7 @@ fn selected_wrapper<'py>(
         left_index.readonly().as_array(),
         right_index.as_array(),
         &views,
-        metadata.as_deref(),
+        metadata_views.as_deref(),
         selection,
     )
     .map_err(PyValueError::new_err)?;
@@ -265,7 +268,9 @@ pub fn compare_multi_region_indices_all<'py>(
     let left_region = left_region.as_array();
     let right_region = right_region.as_array();
     let views = predicate_views(&predicates);
-    let metadata = metadata.as_deref();
+    let metadata_views = metadata
+        .as_ref()
+        .map(|values| values.iter().map(NullMetadata::view).collect::<Vec<_>>());
     let starts = starts.as_array();
     let mut next = vec![-1_i64; right_len];
     let mut groups = BTreeMap::<i64, GroupState>::new();
@@ -287,7 +292,8 @@ pub fn compare_multi_region_indices_all<'py>(
             let mut position = state.head;
             while position >= 0 {
                 let right_position = position as usize;
-                if predicates_match_dispatch(&views, metadata, row, right_position) {
+                if predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position)
+                {
                     total = total.checked_add(1).ok_or_else(|| {
                         PyValueError::new_err("number of output pairs exceeds usize")
                     })?;
@@ -326,7 +332,8 @@ pub fn compare_multi_region_indices_all<'py>(
             let mut position = state.head;
             while position >= 0 {
                 let right_position = position as usize;
-                if predicates_match_dispatch(&views, metadata, row, right_position) {
+                if predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position)
+                {
                     output_left.push(left_values[row]);
                     output_right.push(right_values[right_position]);
                 }
