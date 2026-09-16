@@ -35,9 +35,12 @@ enum Values<'a> {
 
 /// The source values and their null metadata for one requested aggregation.
 ///
-/// A null entry is represented by `true` in `nulls`. Null metadata is used by
-/// value-based operations (`sum`, `product`, `min`, and `max`), while `count`
-/// intentionally counts the comparison event regardless of this mask.
+/// A null entry is represented by `true` in `nulls`; a `false` entry means the
+/// value is valid. The mask is authoritative: this code does not inspect a
+/// value and does not infer nullness from special values such as floating-point
+/// NaN. Null metadata is used by value-based operations (`sum`, `product`,
+/// `min`, and `max`), while `count` intentionally counts the comparison event
+/// regardless of this mask.
 struct View<'a> {
     values: Values<'a>,
     nulls: ArrayView1<'a, bool>,
@@ -180,7 +183,9 @@ impl<'a> AggregationSet<'a> {
     /// successful candidate, so multiple aggregations share one traversal.
     ///
     /// Count deliberately ignores null metadata and therefore counts every
-    /// successful comparison. Other operations skip a candidate marked null.
+    /// successful comparison. Other operations skip a candidate whose mask is
+    /// `true`. A `false` mask is treated as an assertion that the value is
+    /// valid; no additional null inference or NaN filtering is performed.
     /// Out-of-range output rows are ignored defensively; candidate bounds are
     /// guaranteed by construction and validation in the comparison callers.
     ///
@@ -361,59 +366,27 @@ fn update_extreme_position(
     }
     let current = positions[row];
     if current < 0
-        || extreme::improves(compare(view, candidate, current as usize, minimum), minimum)
+        || if minimum {
+            extreme::improves(compare(view, candidate, current as usize), true)
+        } else {
+            extreme::improves(compare(view, candidate, current as usize), false)
+        }
     {
         positions[row] = candidate as i64;
     }
 }
-/// Compare two candidate values using the min/max ordering contract.
-///
-/// `partial_cmp` returns `None` for NaN. Treating that result as an ordinary
-/// ordering would allow an unmasked NaN to become the winner and then poison
-/// every later comparison. Existing aggregation kernels treat NaN as an
-/// invalid extreme candidate when a real value is available, so this helper
-/// applies that rule explicitly while still allowing a first/all-NaN value to
-/// remain the deterministic position when no real value exists.
-fn compare(view: &View<'_>, a: usize, b: usize, minimum: bool) -> std::cmp::Ordering {
+fn compare(view: &View<'_>, a: usize, b: usize) -> std::cmp::Ordering {
     match &view.values {
-        Values::I64(v) => v[a].cmp(&v[b]),
-        Values::I32(v) => v[a].cmp(&v[b]),
-        Values::I16(v) => v[a].cmp(&v[b]),
-        Values::I8(v) => v[a].cmp(&v[b]),
-        Values::U64(v) => v[a].cmp(&v[b]),
-        Values::U32(v) => v[a].cmp(&v[b]),
-        Values::U16(v) => v[a].cmp(&v[b]),
-        Values::U8(v) => v[a].cmp(&v[b]),
-        Values::F64(v) => compare_float(v[a], v[b], minimum),
-        Values::F32(v) => compare_float(v[a], v[b], minimum),
+        Values::I64(v) => v[a].partial_cmp(&v[b]),
+        Values::I32(v) => v[a].partial_cmp(&v[b]),
+        Values::I16(v) => v[a].partial_cmp(&v[b]),
+        Values::I8(v) => v[a].partial_cmp(&v[b]),
+        Values::U64(v) => v[a].partial_cmp(&v[b]),
+        Values::U32(v) => v[a].partial_cmp(&v[b]),
+        Values::U16(v) => v[a].partial_cmp(&v[b]),
+        Values::U8(v) => v[a].partial_cmp(&v[b]),
+        Values::F64(v) => v[a].partial_cmp(&v[b]),
+        Values::F32(v) => v[a].partial_cmp(&v[b]),
     }
-}
-
-/// Compare floating-point values while making NaN lose to every real value.
-///
-/// The direction depends on the requested operation because `a` is the new
-/// candidate: a NaN candidate must be worse for both min and max, whereas a
-/// real candidate must replace a NaN winner. Two NaNs compare equal so the
-/// first position wins the tie.
-fn compare_float<T: Into<f64> + Copy>(a: T, b: T, minimum: bool) -> std::cmp::Ordering {
-    let a = a.into();
-    let b = b.into();
-    match (a.is_nan(), b.is_nan()) {
-        (true, true) => std::cmp::Ordering::Equal,
-        (true, false) => {
-            if minimum {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Less
-            }
-        }
-        (false, true) => {
-            if minimum {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            }
-        }
-        (false, false) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
-    }
+    .unwrap_or(std::cmp::Ordering::Greater)
 }

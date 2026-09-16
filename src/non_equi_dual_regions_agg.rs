@@ -20,7 +20,9 @@ use crate::compare::common::{add_right_region, checked_region_start, GroupState}
 /// * `right_region` - Right-side region labels, indexed by candidate position.
 /// * `starts` - Non-increasing right-side start boundary for each left row.
 /// * `aggregations` - Non-empty list of `(array, null_mask, operation)` tuples
-///   whose arrays are indexed by right-side candidate position.
+///   whose arrays are indexed by right-side candidate position. The mask is
+///   authoritative: `true` marks a null for value-based operations and
+///   `false` marks a valid value; nullness is not inferred from the value.
 ///
 /// # Returns
 ///

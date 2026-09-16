@@ -4,6 +4,12 @@
 //! call. `AggregationSet` later turns those handles into cheap ndarray views.
 //! The handles must remain alive while the views are used; this is why parsing
 //! and state construction happen in the same Python call.
+//!
+//! The null mask is an explicit part of the low-level contract. A `true` mask
+//! entry means that the corresponding value is null and must be skipped by
+//! value-based aggregations; a `false` entry means that the value is valid.
+//! This layer does not inspect values to infer nullness. In particular, a
+//! floating-point NaN is not automatically treated as null.
 
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyTypeError, PyValueError};
