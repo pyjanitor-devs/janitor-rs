@@ -55,11 +55,11 @@ enum State<'a> {
     // buffer. Keeping them together prevents an update from accidentally
     // pairing an operation with a source array of the wrong dtype.
     Sum(View<'a>, Vec<i64>),
-    SumU64(View<'a>, Vec<u64>),
+    SumU64(ArrayView1<'a, u64>, ArrayView1<'a, bool>, Vec<u64>),
     SumF64(View<'a>, Vec<f64>, Vec<f64>),
     Count(Vec<i64>),
     Product(View<'a>, Vec<i64>),
-    ProductU64(View<'a>, Vec<u64>),
+    ProductU64(ArrayView1<'a, u64>, ArrayView1<'a, bool>, Vec<u64>),
     ProductF64(View<'a>, Vec<f64>),
     Min(View<'a>, Vec<i64>),
     Max(View<'a>, Vec<i64>),
@@ -145,25 +145,26 @@ impl<'a> AggregationSet<'a> {
                 length,
             )?;
             ensure_equal_lengths("aggregation array", length, "null mask", nulls.len())?;
-            let view = View { values, nulls };
             let state = match op {
-                AggregationOp::Sum => match &view.values {
-                    Values::U64(_) => State::SumU64(view, vec![0; output_len]),
-                    Values::F64(_) | Values::F32(_) => {
-                        State::SumF64(view, vec![0.; output_len], vec![0.; output_len])
-                    }
-                    _ => State::Sum(view, vec![0; output_len]),
+                AggregationOp::Sum => match &values {
+                    Values::U64(values) => State::SumU64(*values, nulls, vec![0; output_len]),
+                    Values::F64(_) | Values::F32(_) => State::SumF64(
+                        View { values, nulls },
+                        vec![0.; output_len],
+                        vec![0.; output_len],
+                    ),
+                    _ => State::Sum(View { values, nulls }, vec![0; output_len]),
                 },
                 AggregationOp::Count => State::Count(vec![0; output_len]),
-                AggregationOp::Product => match &view.values {
-                    Values::U64(_) => State::ProductU64(view, vec![1; output_len]),
+                AggregationOp::Product => match &values {
+                    Values::U64(values) => State::ProductU64(*values, nulls, vec![1; output_len]),
                     Values::F64(_) | Values::F32(_) => {
-                        State::ProductF64(view, vec![1.; output_len])
+                        State::ProductF64(View { values, nulls }, vec![1.; output_len])
                     }
-                    _ => State::Product(view, vec![1; output_len]),
+                    _ => State::Product(View { values, nulls }, vec![1; output_len]),
                 },
-                AggregationOp::Min => State::Min(view, vec![-1; output_len]),
-                AggregationOp::Max => State::Max(view, vec![-1; output_len]),
+                AggregationOp::Min => State::Min(View { values, nulls }, vec![-1; output_len]),
+                AggregationOp::Max => State::Max(View { values, nulls }, vec![-1; output_len]),
             };
             states.push(state);
         }
@@ -212,13 +213,9 @@ impl<'a> AggregationSet<'a> {
                             values[output_row].wrapping_add(as_i64(&view.values, candidate));
                     }
                 }
-                State::SumU64(view, values) => {
-                    if !view.nulls[candidate] {
-                        let value = match &view.values {
-                            Values::U64(values) => values[candidate],
-                            _ => unreachable!("u64 sum state must contain u64 values"),
-                        };
-                        values[output_row] = values[output_row].wrapping_add(value);
+                State::SumU64(source, nulls, values) => {
+                    if !nulls[candidate] {
+                        values[output_row] = values[output_row].wrapping_add(source[candidate]);
                     }
                 }
                 State::SumF64(view, values, compensation) => {
@@ -236,13 +233,9 @@ impl<'a> AggregationSet<'a> {
                             values[output_row].wrapping_mul(as_i64(&view.values, candidate));
                     }
                 }
-                State::ProductU64(view, values) => {
-                    if !view.nulls[candidate] {
-                        let value = match &view.values {
-                            Values::U64(values) => values[candidate],
-                            _ => unreachable!("u64 product state must contain u64 values"),
-                        };
-                        values[output_row] = values[output_row].wrapping_mul(value);
+                State::ProductU64(source, nulls, values) => {
+                    if !nulls[candidate] {
+                        values[output_row] = values[output_row].wrapping_mul(source[candidate]);
                     }
                 }
                 State::ProductF64(view, values) => {
@@ -251,10 +244,26 @@ impl<'a> AggregationSet<'a> {
                     }
                 }
                 State::Min(view, positions) => {
-                    update_extreme_position(view, positions, output_row, candidate, true)
+                    if !view.nulls[candidate] {
+                        let current = positions[output_row];
+                        if current < 0
+                            || compare(view, candidate, current as usize)
+                                == std::cmp::Ordering::Less
+                        {
+                            positions[output_row] = candidate as i64;
+                        }
+                    }
                 }
                 State::Max(view, positions) => {
-                    update_extreme_position(view, positions, output_row, candidate, false)
+                    if !view.nulls[candidate] {
+                        let current = positions[output_row];
+                        if current < 0
+                            || compare(view, candidate, current as usize)
+                                == std::cmp::Ordering::Greater
+                        {
+                            positions[output_row] = candidate as i64;
+                        }
+                    }
                 }
             }
         }
@@ -289,7 +298,7 @@ impl<'a> AggregationSet<'a> {
                 State::Sum(_, v) | State::Product(_, v) => {
                     Array1::from_vec(v).into_pyarray(py).unbind().into_any()
                 }
-                State::SumU64(_, v) | State::ProductU64(_, v) => {
+                State::SumU64(_, _, v) | State::ProductU64(_, _, v) => {
                     Array1::from_vec(v).into_pyarray(py).unbind().into_any()
                 }
                 State::SumF64(_, v, _compensation) => {
@@ -349,32 +358,6 @@ fn kahan_add(total: &mut f64, compensation: &mut f64, value: f64) {
     *compensation = (increment - *total) - difference;
     *total = increment;
 }
-/// Update a min/max aggregation with a candidate position.
-///
-/// The aggregation API returns positions rather than values, so this helper
-/// owns the stateful part of the operation: null handling, the `-1` sentinel,
-/// comparison against the current winner, and storing the winning position.
-fn update_extreme_position(
-    view: &View<'_>,
-    positions: &mut [i64],
-    row: usize,
-    candidate: usize,
-    minimum: bool,
-) {
-    if view.nulls[candidate] {
-        return;
-    }
-    let current = positions[row];
-    if current < 0
-        || if minimum {
-            improves_extreme(compare(view, candidate, current as usize), true)
-        } else {
-            improves_extreme(compare(view, candidate, current as usize), false)
-        }
-    {
-        positions[row] = candidate as i64;
-    }
-}
 fn compare(view: &View<'_>, a: usize, b: usize) -> std::cmp::Ordering {
     match &view.values {
         Values::I64(v) => v[a].partial_cmp(&v[b]),
@@ -389,17 +372,4 @@ fn compare(view: &View<'_>, a: usize, b: usize) -> std::cmp::Ordering {
         Values::F32(v) => v[a].partial_cmp(&v[b]),
     }
     .unwrap_or(std::cmp::Ordering::Greater)
-}
-
-/// Return whether a candidate strictly improves the current min/max winner.
-///
-/// Equality is deliberately not an improvement, so the first encountered
-/// position wins ties. The caller handles the `-1` sentinel before invoking
-/// this helper for the first non-null candidate.
-fn improves_extreme(ordering: std::cmp::Ordering, minimum: bool) -> bool {
-    if minimum {
-        ordering == std::cmp::Ordering::Less
-    } else {
-        ordering == std::cmp::Ordering::Greater
-    }
 }
