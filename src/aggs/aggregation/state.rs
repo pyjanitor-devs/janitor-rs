@@ -5,13 +5,11 @@
 //! one accumulator per requested operation and emits one result per output
 //! row.
 
-use super::input::AggregationInput;
-use super::op::AggregationOp;
+use super::input::{AggregationInput, AggregationOp};
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::IntoPyArray;
 use pyo3::prelude::*;
 
-use super::ops::{count, extreme, product, sum};
 use crate::aggs::ensure_equal_lengths;
 
 /// A borrowed view of one supported NumPy dtype.
@@ -207,20 +205,25 @@ impl<'a> AggregationSet<'a> {
         // that traversal.
         for state in &mut self.states {
             match state {
-                State::Count(values) => count::increment(&mut values[output_row]),
+                State::Count(values) => values[output_row] += 1,
                 State::Sum(view, values) => {
                     if !view.nulls[candidate] {
-                        sum::add_i64(&mut values[output_row], as_i64(&view.values, candidate));
+                        values[output_row] =
+                            values[output_row].wrapping_add(as_i64(&view.values, candidate));
                     }
                 }
                 State::SumU64(view, values) => {
                     if !view.nulls[candidate] {
-                        sum::add_u64(&mut values[output_row], as_u64(&view.values, candidate));
+                        let value = match &view.values {
+                            Values::U64(values) => values[candidate],
+                            _ => unreachable!("u64 sum state must contain u64 values"),
+                        };
+                        values[output_row] = values[output_row].wrapping_add(value);
                     }
                 }
                 State::SumF64(view, values, compensation) => {
                     if !view.nulls[candidate] {
-                        sum::add_f64(
+                        kahan_add(
                             &mut values[output_row],
                             &mut compensation[output_row],
                             as_f64(&view.values, candidate),
@@ -229,26 +232,22 @@ impl<'a> AggregationSet<'a> {
                 }
                 State::Product(view, values) => {
                     if !view.nulls[candidate] {
-                        product::multiply_i64(
-                            &mut values[output_row],
-                            as_i64(&view.values, candidate),
-                        );
+                        values[output_row] =
+                            values[output_row].wrapping_mul(as_i64(&view.values, candidate));
                     }
                 }
                 State::ProductU64(view, values) => {
                     if !view.nulls[candidate] {
-                        product::multiply_u64(
-                            &mut values[output_row],
-                            as_u64(&view.values, candidate),
-                        );
+                        let value = match &view.values {
+                            Values::U64(values) => values[candidate],
+                            _ => unreachable!("u64 product state must contain u64 values"),
+                        };
+                        values[output_row] = values[output_row].wrapping_mul(value);
                     }
                 }
                 State::ProductF64(view, values) => {
                     if !view.nulls[candidate] {
-                        product::multiply_f64(
-                            &mut values[output_row],
-                            as_f64(&view.values, candidate),
-                        );
+                        values[output_row] *= as_f64(&view.values, candidate);
                     }
                 }
                 State::Min(view, positions) => {
@@ -309,47 +308,46 @@ impl<'a> AggregationSet<'a> {
     }
 }
 
+/// Read an integer that is valid for an `i64` accumulator.
+///
+/// State construction guarantees that this helper is never called for `u64`
+/// or floating-point input. The unreachable branch makes that invariant
+/// visible to readers and prevents accidental narrowing conversions from
+/// being added silently later.
 fn as_i64(values: &Values<'_>, n: usize) -> i64 {
     match values {
         Values::I64(v) => v[n],
         Values::I32(v) => v[n] as i64,
         Values::I16(v) => v[n] as i64,
         Values::I8(v) => v[n] as i64,
-        Values::U64(v) => v[n] as i64,
         Values::U32(v) => v[n] as i64,
         Values::U16(v) => v[n] as i64,
         Values::U8(v) => v[n] as i64,
-        Values::F64(v) => v[n] as i64,
-        Values::F32(v) => v[n] as i64,
+        Values::U64(_) | Values::F64(_) | Values::F32(_) => {
+            unreachable!("signed integer state must contain non-u64 integer values")
+        }
     }
 }
-fn as_u64(values: &Values<'_>, n: usize) -> u64 {
-    match values {
-        Values::U64(v) => v[n],
-        Values::I64(v) => v[n] as u64,
-        Values::I32(v) => v[n] as u64,
-        Values::I16(v) => v[n] as u64,
-        Values::I8(v) => v[n] as u64,
-        Values::U32(v) => v[n] as u64,
-        Values::U16(v) => v[n] as u64,
-        Values::U8(v) => v[n] as u64,
-        Values::F64(v) => v[n] as u64,
-        Values::F32(v) => v[n] as u64,
-    }
-}
+/// Read a floating-point value for an `f64` accumulator.
+///
+/// Only `f32` requires widening. `f64` is already in the output type, and all
+/// integer conversions are intentionally excluded from this helper.
 fn as_f64(values: &Values<'_>, n: usize) -> f64 {
     match values {
         Values::F64(v) => v[n],
         Values::F32(v) => v[n] as f64,
-        Values::I64(v) => v[n] as f64,
-        Values::I32(v) => v[n] as f64,
-        Values::I16(v) => v[n] as f64,
-        Values::I8(v) => v[n] as f64,
-        Values::U64(v) => v[n] as f64,
-        Values::U32(v) => v[n] as f64,
-        Values::U16(v) => v[n] as f64,
-        Values::U8(v) => v[n] as f64,
+        _ => unreachable!("floating-point state must contain f32 or f64 values"),
     }
+}
+
+/// Add one float using the Kahan-style compensation used by existing forward
+/// kernels. The running total is the public result; compensation only carries
+/// rounding information into the next update.
+fn kahan_add(total: &mut f64, compensation: &mut f64, value: f64) {
+    let difference = value - *compensation;
+    let increment = *total + difference;
+    *compensation = (increment - *total) - difference;
+    *total = increment;
 }
 /// Update a min/max aggregation with a candidate position.
 ///
@@ -369,9 +367,9 @@ fn update_extreme_position(
     let current = positions[row];
     if current < 0
         || if minimum {
-            extreme::improves(compare(view, candidate, current as usize), true)
+            improves_extreme(compare(view, candidate, current as usize), true)
         } else {
-            extreme::improves(compare(view, candidate, current as usize), false)
+            improves_extreme(compare(view, candidate, current as usize), false)
         }
     {
         positions[row] = candidate as i64;
@@ -391,4 +389,17 @@ fn compare(view: &View<'_>, a: usize, b: usize) -> std::cmp::Ordering {
         Values::F32(v) => v[a].partial_cmp(&v[b]),
     }
     .unwrap_or(std::cmp::Ordering::Greater)
+}
+
+/// Return whether a candidate strictly improves the current min/max winner.
+///
+/// Equality is deliberately not an improvement, so the first encountered
+/// position wins ties. The caller handles the `-1` sentinel before invoking
+/// this helper for the first non-null candidate.
+fn improves_extreme(ordering: std::cmp::Ordering, minimum: bool) -> bool {
+    if minimum {
+        ordering == std::cmp::Ordering::Less
+    } else {
+        ordering == std::cmp::Ordering::Greater
+    }
 }

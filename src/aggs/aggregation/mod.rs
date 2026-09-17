@@ -1,19 +1,17 @@
 //! Forward aggregation building blocks for fused comparison kernels.
 //!
-//! This module separates three concerns:
+//! This module separates the Python input boundary from the accumulator
+//! implementation:
 //!
-//! 1. [`input`] parses Python tuples and dispatches supported NumPy dtypes.
-//! 2. [`op`] turns operation names into a small Rust enum.
-//! 3. [`state`] owns accumulator buffers, while [`ops`] contains the numerical
-//!    rule for each operation.
+//! 1. [`input`] parses Python tuples, operation names, and supported dtypes.
+//! 2. [`state`] owns the complete accumulator state and all update rules.
 //!
-//! Keeping those concerns separate gives contributors a clear extension point:
-//! a new operation name is added to `op.rs`, its update policy to the matching
-//! file in `ops/`, and its state/output handling to `state.rs`.
+//! Keeping the numerical behavior in one state module makes the operation
+//! contracts easy to review together. A contributor adding an operation can
+//! update the enum and parser in `input.rs`, then add its state and update
+//! behavior in `state.rs`.
 
 mod input;
-mod op;
-mod ops;
 mod state;
 
 // The parent module exposes only the two entry points needed by comparison

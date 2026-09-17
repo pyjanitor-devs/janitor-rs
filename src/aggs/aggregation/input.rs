@@ -18,7 +18,46 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
-use super::op::AggregationOp;
+/// Operation requested for one aggregation input.
+///
+/// The parser converts Python strings into this enum once at the API
+/// boundary. `state.rs` then consumes the enum while constructing the typed
+/// accumulator, so the comparison hot loop never examines Python strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AggregationOp {
+    Sum,
+    Count,
+    Product,
+    Min,
+    Max,
+}
+
+impl AggregationOp {
+    /// Parse a Python operation name.
+    ///
+    /// `size` is accepted as the pandas-compatible alias for `count`, and
+    /// `prod` is accepted as the short alias for `product`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TypeError` for a non-string value and `ValueError` for an
+    /// unsupported operation name.
+    fn parse(value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let name = value.extract::<String>().map_err(|_| {
+            PyTypeError::new_err("aggregation must be one of sum, count, prod, min, or max")
+        })?;
+        match name.as_str() {
+            "sum" => Ok(Self::Sum),
+            "count" | "size" => Ok(Self::Count),
+            "prod" | "product" => Ok(Self::Product),
+            "min" => Ok(Self::Min),
+            "max" => Ok(Self::Max),
+            _ => Err(PyValueError::new_err(format!(
+                "unsupported aggregation: {name}"
+            ))),
+        }
+    }
+}
 
 pub(crate) enum AggregationInput<'py> {
     // Each variant preserves the original NumPy dtype. The output dtype is
