@@ -272,4 +272,57 @@ mod tests {
             assert_eq!(values, vec![0.0]);
         });
     }
+
+    #[test]
+    fn fused_float_sum_preserves_positive_and_negative_infinity() {
+        Python::initialize();
+        Python::attach(|py| {
+            let left = PyArray1::from_vec(py, vec![0_i64]);
+            let right = PyArray1::from_vec(py, vec![0_i64, 0]);
+            let predicate = PyTuple::new(
+                py,
+                [
+                    left.into_any(),
+                    right.into_any(),
+                    4_i8.into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap();
+            let predicates = PyList::new(py, [predicate]).unwrap();
+            let mask = PyArray1::from_vec(py, vec![false, false]);
+
+            // Both aggregations receive an infinity first and then a finite
+            // value. The mask is entirely false: this checks floating-point
+            // compensation state, not null inference.
+            let positive = PyArray1::from_vec(py, vec![f64::INFINITY, 1.0]);
+            let negative = PyArray1::from_vec(py, vec![f64::NEG_INFINITY, 1.0]);
+            let positive_sum = PyTuple::new(
+                py,
+                [
+                    positive.into_any(),
+                    mask.clone().into_any(),
+                    "sum".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap();
+            let negative_sum = PyTuple::new(
+                py,
+                [
+                    negative.into_any(),
+                    mask.into_any(),
+                    "sum".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap();
+            let aggregations = PyList::new(py, [positive_sum, negative_sum]).unwrap();
+
+            let result = compare_batch_aggregate(py, &predicates, None, None, &aggregations)
+                .unwrap()
+                .unwrap();
+            let positive_result = result.get_item(0).unwrap().extract::<Vec<f64>>().unwrap();
+            let negative_result = result.get_item(1).unwrap().extract::<Vec<f64>>().unwrap();
+            assert!(positive_result[0].is_infinite() && positive_result[0].is_sign_positive());
+            assert!(negative_result[0].is_infinite() && negative_result[0].is_sign_negative());
+        });
+    }
 }
