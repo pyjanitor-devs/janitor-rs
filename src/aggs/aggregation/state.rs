@@ -246,10 +246,7 @@ impl<'a> AggregationSet<'a> {
                 State::Min(view, positions) => {
                     if !view.nulls[candidate] {
                         let current = positions[output_row];
-                        if current < 0
-                            || compare(view, candidate, current as usize)
-                                == std::cmp::Ordering::Less
-                        {
+                        if current < 0 || is_less(view, candidate, current as usize) {
                             positions[output_row] = candidate as i64;
                         }
                     }
@@ -257,10 +254,7 @@ impl<'a> AggregationSet<'a> {
                 State::Max(view, positions) => {
                     if !view.nulls[candidate] {
                         let current = positions[output_row];
-                        if current < 0
-                            || compare(view, candidate, current as usize)
-                                == std::cmp::Ordering::Greater
-                        {
+                        if current < 0 || is_greater(view, candidate, current as usize) {
                             positions[output_row] = candidate as i64;
                         }
                     }
@@ -358,18 +352,44 @@ fn kahan_add(total: &mut f64, compensation: &mut f64, value: f64) {
     *compensation = (increment - *total) - difference;
     *total = increment;
 }
-fn compare(view: &View<'_>, a: usize, b: usize) -> std::cmp::Ordering {
+/// Return whether the candidate at `a` is strictly less than the current
+/// winner at `b`.
+///
+/// The comparison is explicit for every supported dtype. This keeps min's
+/// behavior visible and avoids routing a simple boolean decision through
+/// `std::cmp::Ordering` and a fallback for values that are not totally ordered.
+fn is_less(view: &View<'_>, a: usize, b: usize) -> bool {
     match &view.values {
-        Values::I64(v) => v[a].partial_cmp(&v[b]),
-        Values::I32(v) => v[a].partial_cmp(&v[b]),
-        Values::I16(v) => v[a].partial_cmp(&v[b]),
-        Values::I8(v) => v[a].partial_cmp(&v[b]),
-        Values::U64(v) => v[a].partial_cmp(&v[b]),
-        Values::U32(v) => v[a].partial_cmp(&v[b]),
-        Values::U16(v) => v[a].partial_cmp(&v[b]),
-        Values::U8(v) => v[a].partial_cmp(&v[b]),
-        Values::F64(v) => v[a].partial_cmp(&v[b]),
-        Values::F32(v) => v[a].partial_cmp(&v[b]),
+        Values::I64(v) => v[a] < v[b],
+        Values::I32(v) => v[a] < v[b],
+        Values::I16(v) => v[a] < v[b],
+        Values::I8(v) => v[a] < v[b],
+        Values::U64(v) => v[a] < v[b],
+        Values::U32(v) => v[a] < v[b],
+        Values::U16(v) => v[a] < v[b],
+        Values::U8(v) => v[a] < v[b],
+        Values::F64(v) => v[a] < v[b],
+        Values::F32(v) => v[a] < v[b],
     }
-    .unwrap_or(std::cmp::Ordering::Greater)
+}
+
+/// Return whether the candidate at `a` is strictly greater than the current
+/// winner at `b`.
+///
+/// Equality is intentionally false, which preserves the first encountered
+/// position when min/max values tie. Null handling and the `-1` sentinel are
+/// handled by the surrounding state branches before this helper is called.
+fn is_greater(view: &View<'_>, a: usize, b: usize) -> bool {
+    match &view.values {
+        Values::I64(v) => v[a] > v[b],
+        Values::I32(v) => v[a] > v[b],
+        Values::I16(v) => v[a] > v[b],
+        Values::I8(v) => v[a] > v[b],
+        Values::U64(v) => v[a] > v[b],
+        Values::U32(v) => v[a] > v[b],
+        Values::U16(v) => v[a] > v[b],
+        Values::U8(v) => v[a] > v[b],
+        Values::F64(v) => v[a] > v[b],
+        Values::F32(v) => v[a] > v[b],
+    }
 }
