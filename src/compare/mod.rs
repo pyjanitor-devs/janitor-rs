@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 pub(crate) mod common;
 pub mod comp;
 pub mod comp_batch;
+pub mod comp_batch_agg;
 pub mod comp_batch_no_range;
 pub mod comp_direct;
 pub mod comp_ends;
@@ -32,6 +33,7 @@ pub(crate) mod predicate;
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     comp::register(m)?;
     comp_batch::register(m)?;
+    comp_batch_agg::register(m)?;
     comp_batch_no_range::register(m)?;
     comp_direct::register(m)?;
     comp_ends::register(m)?;

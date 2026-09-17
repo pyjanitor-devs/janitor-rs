@@ -20,6 +20,7 @@ use numpy::ndarray::ArrayView1;
 use pyo3::prelude::*;
 
 pub(crate) mod adaptive;
+pub(crate) mod aggregation;
 pub mod min;
 
 pub mod prod;
