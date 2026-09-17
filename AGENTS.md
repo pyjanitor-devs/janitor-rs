@@ -973,3 +973,14 @@ different from older local validators.
 explicitly requires legacy error precedence; document and test any intentional
 ordering difference rather than replacing the helpers with duplicated local
 checks.
+
+### [2026-09-17] Fused aggregation null masks are authoritative
+
+**Context**: Reviewing PR #200's fused forward aggregation input contract.
+**Learning**: The boolean null mask is the source of truth. `true` marks a
+value as null and `false` marks it as valid; aggregation code must not infer
+nullness from the value itself, including floating-point `NaN`.
+**Recommendation**: Keep this rule explicit in public documentation and
+reviews. If an operation such as `min` or `max` needs a separate policy for a
+valid NaN because it is not totally ordered, specify that as ordering behavior
+rather than silently treating the value as null.
