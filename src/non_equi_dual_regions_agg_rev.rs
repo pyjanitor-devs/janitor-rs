@@ -21,7 +21,12 @@ use crate::compare::common::{add_right_region, checked_region_start, GroupState}
 /// * `right_index` - Unique right labels in output order; labels may be
 ///   unordered, but output slot `n` corresponds to `right_index[n]`.
 /// * `aggregations` - Non-empty `(array, null_mask, operation)` tuples aligned
-///   to left rows.
+///   to left rows. The mask is authoritative: `true` means the corresponding
+///   value is null and is skipped by `sum`, `product`, `min`, and `max`;
+///   `false` means the value is valid. Nullness is never inferred from the
+///   value array, including from `NaN`. `count` intentionally ignores this
+///   mask and counts every successful comparison, matching pandas-style
+///   `size` semantics.
 ///
 /// # Returns
 ///

@@ -31,7 +31,12 @@ use pyo3::types::PyList;
 /// * `right_index` - Unique right labels in output-position order. Labels may
 ///   be unordered; slot `n` corresponds to `right_index[n]`.
 /// * `aggregations` - Non-empty `(array, null_mask, operation)` tuples. Value
-///   arrays and masks must be aligned to the left predicate rows.
+///   arrays and masks must be aligned to the left predicate rows. The mask is
+///   authoritative: `true` means the corresponding value is null and is
+///   skipped by `sum`, `product`, `min`, and `max`; `false` means the value is
+///   valid. Nullness is never inferred from the value array, including from
+///   `NaN`. `count` intentionally ignores this mask and counts every
+///   successful comparison, matching pandas-style `size` semantics.
 ///
 /// # Returns
 ///
