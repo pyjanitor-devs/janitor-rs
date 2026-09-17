@@ -374,13 +374,24 @@ fn as_f64(values: &Values<'_>, n: usize) -> f64 {
     }
 }
 
-/// Add one float using the Kahan-style compensation used by existing forward
-/// kernels. The running total is the public result; compensation only carries
-/// rounding information into the next update.
+/// Add one float using the Kahan-style compensation used by the existing
+/// aggregation kernels.
+///
+/// The running total is the public result; compensation only carries rounding
+/// information into the next update. IEEE-754 infinities need one special
+/// safeguard: adding an infinity can make the internal compensation `NaN`
+/// even though the running total is correctly infinite. Resetting only the
+/// compensation preserves that valid infinity and prevents the next finite
+/// value from being poisoned by stale non-finite correction state. A genuine
+/// `+infinity + -infinity` still produces `NaN` in the running total, as it
+/// should.
 fn kahan_add(total: &mut f64, compensation: &mut f64, value: f64) {
     let difference = value - *compensation;
     let increment = *total + difference;
     *compensation = (increment - *total) - difference;
+    if !compensation.is_finite() {
+        *compensation = 0.;
+    }
     *total = increment;
 }
 /// Return whether the candidate at `a` is strictly less than the current
