@@ -112,7 +112,7 @@ pub fn compare_batch_aggregate<'py>(
         };
         for candidate in start..end {
             if predicates_match_dispatch(&views, metadata_views.as_deref(), row, candidate) {
-                set.update(row, candidate);
+                set.update(candidate, row);
             }
         }
     }

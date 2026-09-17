@@ -6,8 +6,10 @@ mod index_builder;
 mod left_le_right;
 mod non_equi_dual_regions;
 mod non_equi_dual_regions_agg;
+mod non_equi_dual_regions_agg_rev;
 mod non_equi_multi_regions;
 mod non_equi_multi_regions_agg;
+mod non_equi_multi_regions_agg_rev;
 
 /// Narrow Rust-only surface used by `benches/kernels.rs`.
 ///
@@ -280,8 +282,10 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     left_le_right::register(m)?;
     non_equi_dual_regions::register(m)?;
     non_equi_dual_regions_agg::register(m)?;
+    non_equi_dual_regions_agg_rev::register(m)?;
     non_equi_multi_regions::register(m)?;
     non_equi_multi_regions_agg::register(m)?;
+    non_equi_multi_regions_agg_rev::register(m)?;
     aggs::register(m)?;
     Ok(())
 }
@@ -307,6 +311,8 @@ mod registration_tests {
             let representative_exports = [
                 "binary_search_lt_int64",            // bin_search
                 "compare_start_end_int64",           // compare
+                "aggregate_batch_reverse",           // reverse fused compare
+                "aggregate_batch_no_range_reverse",  // reverse no-range compare
                 "repeat_index",                      // index_builder
                 "get_positions_where_left_le_right", // left_le_right
                 "compute_sum_start_int64",           // aggs::sum
@@ -318,6 +324,8 @@ mod registration_tests {
                 "compute_prod_start_int64",          // aggs::prod
                 "compute_prod_rev_start_int64",      // aggs::prod_rev
                 "compute_size_rev_start",            // aggs::size_rev
+                "aggregate_dual_regions_reverse",    // reverse dual regions
+                "aggregate_multi_regions_reverse",   // reverse multi regions
             ];
 
             for name in representative_exports {
@@ -333,7 +341,7 @@ mod registration_tests {
     /// `register`, as of this PR (912 exports across 97 leaf modules). Bump
     /// this alongside any PR that intentionally adds
     /// or removes an export.
-    const EXPECTED_EXPORT_COUNT: usize = 912;
+    const EXPECTED_EXPORT_COUNT: usize = 916;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would

@@ -1,9 +1,16 @@
-//! Shared forward aggregation state for fused conditional-join comparisons.
+//! Shared aggregation state for fused conditional-join comparisons.
 //!
-//! The comparison kernels own candidate traversal.  They report successful
-//! `(output_row, candidate_position)` pairs to [`AggregationSet`], which keeps
-//! one accumulator per requested operation and emits one result per output
-//! row.
+//! The comparison kernels own candidate traversal. They report successful
+//! `(source_position, output_position)` pairs to [`AggregationSet`], which
+//! keeps one accumulator per requested operation and emits one result per
+//! output position.
+//!
+//! The state is deliberately unaware of whether a comparison is forward or
+//! reverse. In a forward join, the source is a right-side candidate and the
+//! output is a left-side row. In a reverse join, the source is a left-side row
+//! and the output is a right-side position. Keeping that distinction in the
+//! comparison-path files avoids duplicating dtype dispatch and operation
+//! semantics here.
 
 use super::input::{AggregationInput, AggregationOp};
 use numpy::ndarray::{Array1, ArrayView1};
@@ -65,11 +72,21 @@ enum State<'a> {
     Max(View<'a>, Vec<i64>),
 }
 
+/// Collection of independent accumulators for one fused comparison pass.
+///
+/// A set preserves the caller's aggregation order. For example, if the input
+/// requests are `[(values_a, mask_a, "sum"), (values_b, mask_b, "max")]`,
+/// [`into_results`](Self::into_results) returns the sum array first and the
+/// max-position array second. The set owns only its output buffers; input
+/// arrays and masks remain borrowed views into the NumPy objects supplied by
+/// the caller.
 pub(crate) struct AggregationSet<'a> {
     /// One independent accumulator for every requested `(array, mask, op)`.
     states: Vec<State<'a>>,
-    /// Number of rows produced by the comparison side of the join.
+    /// Number of positions in each result array.
     output_len: usize,
+    /// Number of positions available in every source aggregation array.
+    source_len: usize,
     /// Whether at least one valid comparison has succeeded.
     successful: bool,
 }
@@ -84,12 +101,17 @@ impl<'a> AggregationSet<'a> {
     ///
     /// # Arguments
     ///
-    /// * `output_len` - Number of left/comparison rows. Every output array has
-    ///   this length.
-    /// * `expected_candidate_len` - Number of candidate positions in each
-    ///   aggregation value array.
+    /// * `output_len` - Number of output positions. Every result array has
+    ///   this length. Forward callers pass the left-side length; reverse
+    ///   callers pass the right-side length.
+    /// * `source_len` - Number of source positions in each aggregation value
+    ///   array. Forward callers pass the right-side length; reverse callers
+    ///   pass the left-side length.
     /// * `inputs` - Parsed aggregation requests. Every request contains a
-    ///   typed candidate array, a boolean null mask, and an operation.
+    ///   typed source array, a boolean null mask, and an operation. The
+    ///   comparison-path wrapper is responsible for deciding which side of
+    ///   the join is the source and passing that side's length as
+    ///   `source_len`.
     ///
     /// # Errors
     ///
@@ -98,7 +120,7 @@ impl<'a> AggregationSet<'a> {
     /// internal typed state.
     pub(crate) fn new(
         output_len: usize,
-        expected_candidate_len: usize,
+        source_len: usize,
         inputs: &'a [AggregationInput<'_>],
     ) -> PyResult<Self> {
         let mut states = Vec::with_capacity(inputs.len());
@@ -116,6 +138,10 @@ impl<'a> AggregationSet<'a> {
                 AggregationInput::F64(a, m, o) => (Values::F64(a.as_array()), m.as_array(), *o),
                 AggregationInput::F32(a, m, o) => (Values::F32(a.as_array()), m.as_array(), *o),
             };
+            // `Values` retains the concrete dtype, so its length must be
+            // obtained by matching each variant. This does not inspect or
+            // copy any element; it only asks the borrowed ndarray view for
+            // its shape.
             let length = match &values {
                 Values::I64(v) => v.len(),
                 Values::I32(v) => v.len(),
@@ -139,8 +165,8 @@ impl<'a> AggregationSet<'a> {
                 candidate_len = Some(length);
             }
             ensure_equal_lengths(
-                "comparison right array",
-                expected_candidate_len,
+                "comparison source array",
+                source_len,
                 "aggregation array",
                 length,
             )?;
@@ -171,31 +197,34 @@ impl<'a> AggregationSet<'a> {
         Ok(Self {
             states,
             output_len,
+            source_len,
             successful: false,
         })
     }
 
     /// Apply one successful comparison to every requested aggregation.
     ///
-    /// `output_row` identifies the left row whose result should be updated;
-    /// `candidate` identifies the matching position in each right-side
-    /// aggregation array. The comparison modules call this once per
-    /// successful candidate, so multiple aggregations share one traversal.
+    /// `source_position` identifies the value and mask to read;
+    /// `output_position` identifies the result slot to update. The comparison
+    /// modules call this once per successful pair, so multiple aggregations
+    /// share one traversal.
     ///
     /// Count deliberately ignores null metadata and therefore counts every
-    /// successful comparison. Other operations skip a candidate whose mask is
+    /// successful comparison. Other operations skip a source value whose mask is
     /// `true`. A `false` mask is treated as an assertion that the value array is
     /// null-free and the value is valid; no additional null inference or
     /// sentinel filtering is performed.
-    /// Out-of-range output rows are ignored defensively; candidate bounds are
-    /// guaranteed by construction and validation in the comparison callers.
+    /// Both positions are checked defensively. Normal callers have already
+    /// validated these bounds, but retaining the check here makes the shared
+    /// state safe when a future comparison path is added.
     ///
     /// # Arguments
     ///
-    /// * `output_row` - Zero-based output row to update.
-    /// * `candidate` - Zero-based candidate position in the source arrays.
-    pub(crate) fn update(&mut self, output_row: usize, candidate: usize) {
-        if output_row >= self.output_len {
+    /// * `source_position` - Zero-based position in the aggregation input
+    ///   arrays.
+    /// * `output_position` - Zero-based position in every output array.
+    pub(crate) fn update(&mut self, source_position: usize, output_position: usize) {
+        if source_position >= self.source_len || output_position >= self.output_len {
             return;
         }
         self.successful = true;
@@ -206,56 +235,58 @@ impl<'a> AggregationSet<'a> {
         // that traversal.
         for state in &mut self.states {
             match state {
-                State::Count(values) => values[output_row] += 1,
+                State::Count(values) => values[output_position] += 1,
                 State::Sum(view, values) => {
-                    if !view.nulls[candidate] {
-                        values[output_row] =
-                            values[output_row].wrapping_add(as_i64(&view.values, candidate));
+                    if !view.nulls[source_position] {
+                        values[output_position] = values[output_position]
+                            .wrapping_add(as_i64(&view.values, source_position));
                     }
                 }
                 State::SumU64(source, nulls, values) => {
-                    if !nulls[candidate] {
-                        values[output_row] = values[output_row].wrapping_add(source[candidate]);
+                    if !nulls[source_position] {
+                        values[output_position] =
+                            values[output_position].wrapping_add(source[source_position]);
                     }
                 }
                 State::SumF64(view, values, compensation) => {
-                    if !view.nulls[candidate] {
+                    if !view.nulls[source_position] {
                         kahan_add(
-                            &mut values[output_row],
-                            &mut compensation[output_row],
-                            as_f64(&view.values, candidate),
+                            &mut values[output_position],
+                            &mut compensation[output_position],
+                            as_f64(&view.values, source_position),
                         );
                     }
                 }
                 State::Product(view, values) => {
-                    if !view.nulls[candidate] {
-                        values[output_row] =
-                            values[output_row].wrapping_mul(as_i64(&view.values, candidate));
+                    if !view.nulls[source_position] {
+                        values[output_position] = values[output_position]
+                            .wrapping_mul(as_i64(&view.values, source_position));
                     }
                 }
                 State::ProductU64(source, nulls, values) => {
-                    if !nulls[candidate] {
-                        values[output_row] = values[output_row].wrapping_mul(source[candidate]);
+                    if !nulls[source_position] {
+                        values[output_position] =
+                            values[output_position].wrapping_mul(source[source_position]);
                     }
                 }
                 State::ProductF64(view, values) => {
-                    if !view.nulls[candidate] {
-                        values[output_row] *= as_f64(&view.values, candidate);
+                    if !view.nulls[source_position] {
+                        values[output_position] *= as_f64(&view.values, source_position);
                     }
                 }
                 State::Min(view, positions) => {
-                    if !view.nulls[candidate] {
-                        let current = positions[output_row];
-                        if current < 0 || is_less(view, candidate, current as usize) {
-                            positions[output_row] = candidate as i64;
+                    if !view.nulls[source_position] {
+                        let current = positions[output_position];
+                        if current < 0 || is_less(view, source_position, current as usize) {
+                            positions[output_position] = source_position as i64;
                         }
                     }
                 }
                 State::Max(view, positions) => {
-                    if !view.nulls[candidate] {
-                        let current = positions[output_row];
-                        if current < 0 || is_greater(view, candidate, current as usize) {
-                            positions[output_row] = candidate as i64;
+                    if !view.nulls[source_position] {
+                        let current = positions[output_position];
+                        if current < 0 || is_greater(view, source_position, current as usize) {
+                            positions[output_position] = source_position as i64;
                         }
                     }
                 }

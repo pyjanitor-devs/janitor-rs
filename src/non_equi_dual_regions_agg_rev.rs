@@ -1,4 +1,4 @@
-//! Fused forward aggregation for dual non-equi regions.
+//! Fused reverse aggregation for dual non-equi regions.
 
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
@@ -7,54 +7,61 @@ use pyo3::types::PyList;
 use std::collections::BTreeMap;
 
 use crate::aggs::aggregation::{parse_inputs, AggregationSet};
-use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
+use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core, ensure_unique_index};
 use crate::compare::common::{add_right_region, checked_region_start, GroupState};
 
-/// Aggregate successful candidates from the dual-region traversal without
-/// materialising the intermediate index arrays.
+/// Aggregate successful dual-region candidates into right-position slots.
 ///
 /// # Arguments
 ///
-/// * `py` - Active Python interpreter token used to create NumPy results.
-/// * `left_region` - Left-side region labels, one label per output row.
-/// * `right_region` - Right-side region labels, indexed by candidate position.
-/// * `starts` - Non-increasing right-side start boundary for each left row.
-/// * `aggregations` - Non-empty list of `(array, null_mask, operation)` tuples
-///   whose arrays are indexed by right-side candidate position. The value
-///   arrays must be null-free. The mask is the sole null-tracking mechanism:
-///   `true` marks a null for value-based operations and `false` asserts a valid
-///   value. The caller is responsible for keeping each array and mask aligned.
+/// * `py` - Active Python interpreter token used to create NumPy outputs.
+/// * `left_region` - Left region values, one per source row.
+/// * `right_region` - Right region values, one per candidate position.
+/// * `starts` - Non-increasing right-position suffix start per left row.
+/// * `right_index` - Unique right labels in output order; labels may be
+///   unordered, but output slot `n` corresponds to `right_index[n]`.
+/// * `aggregations` - Non-empty `(array, null_mask, operation)` tuples aligned
+///   to left rows.
 ///
 /// # Returns
 ///
-/// `Some(list)` of aggregation result arrays, each with `left_region.len()`
-/// entries, or `None` when no region comparison succeeds.
+/// Right-aligned aggregation arrays, or `None` when no region comparison
+/// succeeds. Unmatched slots retain identities or `-1` for min/max.
 ///
 /// # Errors
 ///
-/// Returns a Python exception for empty or mismatched inputs, invalid region
-/// boundaries, unsupported aggregation dtypes/operations, or invalid masks.
+/// Returns an exception for empty/mismatched inputs, duplicate right labels,
+/// invalid boundaries, or invalid aggregation inputs.
 #[pyfunction]
-pub fn aggregate_dual_regions<'py>(
+pub fn aggregate_dual_regions_reverse<'py>(
     py: Python<'py>,
     left_region: PyReadonlyArray1<'py, i64>,
     right_region: PyReadonlyArray1<'py, i64>,
     starts: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
     aggregations: &Bound<'py, PyList>,
 ) -> PyResult<Option<Bound<'py, PyList>>> {
     let left = left_region.as_array();
     let right = right_region.as_array();
     let starts = starts.as_array();
+    let right_index = right_index.as_array();
     ensure_nonempty_core("left_region", left.len()).map_err(PyValueError::new_err)?;
     ensure_nonempty_core("right_region", right.len()).map_err(PyValueError::new_err)?;
     ensure_equal_lengths("left region", left.len(), "starts", starts.len())?;
+    ensure_equal_lengths(
+        "right region",
+        right.len(),
+        "right index",
+        right_index.len(),
+    )?;
+    ensure_unique_index("right index", right_index)?;
     let inputs = parse_inputs(aggregations)?;
     if inputs.is_empty() {
         return Err(PyValueError::new_err(
             "at least one aggregation is required",
         ));
     }
-    let mut set = AggregationSet::new(left.len(), right.len(), &inputs)?;
+    let mut set = AggregationSet::new(right.len(), left.len(), &inputs)?;
     let mut next = vec![-1_i64; right.len()];
     let mut groups = BTreeMap::<i64, GroupState>::new();
     let mut previous_end = right.len();
@@ -69,7 +76,7 @@ pub fn aggregate_dual_regions<'py>(
         for (_, state) in groups.range(left[row]..) {
             let mut position = state.head;
             while position >= 0 {
-                set.update(position as usize, row);
+                set.update(row, position as usize);
                 position = next[position as usize];
             }
         }
@@ -81,7 +88,7 @@ pub fn aggregate_dual_regions<'py>(
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(aggregate_dual_regions, m)?)?;
+    m.add_function(wrap_pyfunction!(aggregate_dual_regions_reverse, m)?)?;
     Ok(())
 }
 
@@ -92,36 +99,38 @@ mod tests {
     use pyo3::types::PyTuple;
 
     #[test]
-    fn maps_each_successful_region_candidate_to_its_left_output_row() {
+    fn writes_region_matches_to_right_positions() {
         Python::initialize();
         Python::attach(|py| {
-            let left = PyArray1::from_vec(py, vec![2_i64, 3]);
-            let right = PyArray1::from_vec(py, vec![1_i64, 2, 4]);
-            let starts = PyArray1::from_vec(py, vec![0_i64, 0]);
-            let values = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
-            let mask = PyArray1::from_vec(py, vec![false, false, false]);
+            let left_region = PyArray1::from_vec(py, vec![2_i64]);
+            let right_region = PyArray1::from_vec(py, vec![1_i64, 2, 3]);
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let right_index = PyArray1::from_vec(py, vec![30_i64, 10, 20]);
+            let values = PyArray1::from_vec(py, vec![7_i64]);
+            let mask = PyArray1::from_vec(py, vec![false]);
             let aggregation = PyTuple::new(
                 py,
                 [
                     values.into_any(),
                     mask.into_any(),
-                    "count".into_pyobject(py).unwrap().into_any(),
+                    "sum".into_pyobject(py).unwrap().into_any(),
                 ],
             )
             .unwrap();
             let aggregations = PyList::new(py, [aggregation]).unwrap();
-            let result = aggregate_dual_regions(
+            let result = aggregate_dual_regions_reverse(
                 py,
-                left.readonly(),
-                right.readonly(),
+                left_region.readonly(),
+                right_region.readonly(),
                 starts.readonly(),
+                right_index.readonly(),
                 &aggregations,
             )
             .unwrap()
             .unwrap();
             assert_eq!(
                 result.get_item(0).unwrap().extract::<Vec<i64>>().unwrap(),
-                vec![2, 1]
+                vec![0, 7, 7]
             );
         });
     }
