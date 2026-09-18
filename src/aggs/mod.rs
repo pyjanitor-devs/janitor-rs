@@ -18,6 +18,7 @@
 
 use numpy::ndarray::ArrayView1;
 use pyo3::prelude::*;
+use std::collections::HashSet;
 
 pub(crate) mod adaptive;
 pub(crate) mod aggregation;
@@ -106,6 +107,19 @@ pub(crate) fn ensure_equal_lengths_core(
             "{left_name} and {right_name} must have equal lengths; got {left_len} and {right_len}"
         ))
     }
+}
+
+/// Validate the unique-label contract for a right-side index.
+pub(crate) fn ensure_unique_index(name: &str, index: ArrayView1<'_, i64>) -> PyResult<()> {
+    let mut seen = HashSet::with_capacity(index.len());
+    for label in index {
+        if !seen.insert(*label) {
+            return Err(PyValueError::new_err(format!(
+                "{name} must contain unique labels"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Choose dense ordinal state only when the covered domain is large enough to

@@ -1,9 +1,16 @@
-//! Shared forward aggregation state for fused conditional-join comparisons.
+//! Shared aggregation state for fused conditional-join comparisons.
 //!
-//! The comparison kernels own candidate traversal.  They report successful
-//! `(output_row, candidate_position)` pairs to [`AggregationSet`], which keeps
-//! one accumulator per requested operation and emits one result per output
-//! row.
+//! The comparison kernels own candidate traversal. They report successful
+//! `(source_position, output_position)` pairs to [`AggregationSet`], which
+//! keeps one accumulator per requested operation and emits one result per
+//! output position.
+//!
+//! The state is deliberately unaware of whether a comparison is forward or
+//! reverse. In a forward join, the source is a right-side candidate and the
+//! output is a left-side row. In a reverse join, the source is a left-side row
+//! and the output is a right-side position. Keeping that distinction in the
+//! comparison-path files avoids duplicating dtype dispatch and operation
+//! semantics here.
 
 use super::input::{AggregationInput, AggregationOp};
 use numpy::ndarray::{Array1, ArrayView1};
@@ -38,8 +45,8 @@ enum Values<'a> {
 /// null, while `false` means it is valid. The mask is authoritative: this code
 /// does not inspect a value or infer nullness from sentinels or special values.
 /// Null metadata is used by value-based operations (`sum`, `product`, `min`,
-/// and `max`), while `count` intentionally counts the comparison event
-/// regardless of this mask.
+/// `max`, and column-based `count`). Count-all/`size` intentionally counts
+/// the comparison event regardless of this mask.
 struct View<'a> {
     values: Values<'a>,
     nulls: ArrayView1<'a, bool>,
@@ -57,7 +64,12 @@ enum State<'a> {
     Sum(View<'a>, Vec<i64>),
     SumU64(ArrayView1<'a, u64>, ArrayView1<'a, bool>, Vec<u64>),
     SumF64(View<'a>, Vec<f64>, Vec<f64>),
-    Count(Vec<i64>),
+    /// Reference the set-level count-all buffer; no value array or mask is
+    /// needed. The buffer is shared so repeated count-all requests are
+    /// computed once and materialized per request only when results are built.
+    CountAll,
+    /// Count only successful comparisons whose source mask marks a value valid.
+    CountNonNull(View<'a>, Vec<i64>),
     Product(View<'a>, Vec<i64>),
     ProductU64(ArrayView1<'a, u64>, ArrayView1<'a, bool>, Vec<u64>),
     ProductF64(View<'a>, Vec<f64>),
@@ -65,11 +77,27 @@ enum State<'a> {
     Max(View<'a>, Vec<i64>),
 }
 
+/// Collection of independent accumulators for one fused comparison pass.
+///
+/// A set preserves the caller's aggregation order. For example, if the input
+/// requests are `[(values_a, mask_a, "sum"), (values_b, mask_b, "max")]`,
+/// [`into_results`](Self::into_results) returns the sum array first and the
+/// max-position array second. The set owns only its output buffers; input
+/// arrays and masks remain borrowed views into the NumPy objects supplied by
+/// the caller.
 pub(crate) struct AggregationSet<'a> {
     /// One independent accumulator for every requested `(array, mask, op)`.
     states: Vec<State<'a>>,
-    /// Number of rows produced by the comparison side of the join.
+    /// Number of positions in each result array.
     output_len: usize,
+    /// Number of positions available in every source aggregation array.
+    source_len: usize,
+    /// Optional count-all accumulator shared by every `CountAll` request.
+    /// It is allocated only when at least one count-all request is present.
+    count_all: Option<Vec<i64>>,
+    /// Whether each output position received at least one successful match.
+    /// This is independent of null masks and aggregation identities.
+    matched: Vec<bool>,
     /// Whether at least one valid comparison has succeeded.
     successful: bool,
 }
@@ -84,12 +112,17 @@ impl<'a> AggregationSet<'a> {
     ///
     /// # Arguments
     ///
-    /// * `output_len` - Number of left/comparison rows. Every output array has
-    ///   this length.
-    /// * `expected_candidate_len` - Number of candidate positions in each
-    ///   aggregation value array.
+    /// * `output_len` - Number of output positions. Every result array has
+    ///   this length. Forward callers pass the left-side length; reverse
+    ///   callers pass the right-side length.
+    /// * `source_len` - Number of source positions in each aggregation value
+    ///   array. Forward callers pass the right-side length; reverse callers
+    ///   pass the left-side length.
     /// * `inputs` - Parsed aggregation requests. Every request contains a
-    ///   typed candidate array, a boolean null mask, and an operation.
+    ///   typed source array, a boolean null mask, and an operation. The
+    ///   comparison-path wrapper is responsible for deciding which side of
+    ///   the join is the source and passing that side's length as
+    ///   `source_len`.
     ///
     /// # Errors
     ///
@@ -98,13 +131,17 @@ impl<'a> AggregationSet<'a> {
     /// internal typed state.
     pub(crate) fn new(
         output_len: usize,
-        expected_candidate_len: usize,
+        source_len: usize,
         inputs: &'a [AggregationInput<'_>],
     ) -> PyResult<Self> {
         let mut states = Vec::with_capacity(inputs.len());
         let mut candidate_len = None;
         for input in inputs {
             let (values, nulls, op) = match input {
+                AggregationInput::CountAll => {
+                    states.push(State::CountAll);
+                    continue;
+                }
                 AggregationInput::I64(a, m, o) => (Values::I64(a.as_array()), m.as_array(), *o),
                 AggregationInput::I32(a, m, o) => (Values::I32(a.as_array()), m.as_array(), *o),
                 AggregationInput::I16(a, m, o) => (Values::I16(a.as_array()), m.as_array(), *o),
@@ -116,6 +153,10 @@ impl<'a> AggregationSet<'a> {
                 AggregationInput::F64(a, m, o) => (Values::F64(a.as_array()), m.as_array(), *o),
                 AggregationInput::F32(a, m, o) => (Values::F32(a.as_array()), m.as_array(), *o),
             };
+            // `Values` retains the concrete dtype, so its length must be
+            // obtained by matching each variant. This does not inspect or
+            // copy any element; it only asks the borrowed ndarray view for
+            // its shape.
             let length = match &values {
                 Values::I64(v) => v.len(),
                 Values::I32(v) => v.len(),
@@ -139,8 +180,8 @@ impl<'a> AggregationSet<'a> {
                 candidate_len = Some(length);
             }
             ensure_equal_lengths(
-                "comparison right array",
-                expected_candidate_len,
+                "comparison source array",
+                source_len,
                 "aggregation array",
                 length,
             )?;
@@ -155,7 +196,10 @@ impl<'a> AggregationSet<'a> {
                     ),
                     _ => State::Sum(View { values, nulls }, vec![0; output_len]),
                 },
-                AggregationOp::Count => State::Count(vec![0; output_len]),
+                AggregationOp::CountAll => State::CountAll,
+                AggregationOp::CountNonNull => {
+                    State::CountNonNull(View { values, nulls }, vec![0; output_len])
+                }
                 AggregationOp::Product => match &values {
                     Values::U64(values) => State::ProductU64(*values, nulls, vec![1; output_len]),
                     Values::F64(_) | Values::F32(_) => {
@@ -168,37 +212,49 @@ impl<'a> AggregationSet<'a> {
             };
             states.push(state);
         }
+        let has_count_all = states.iter().any(|state| matches!(state, State::CountAll));
         Ok(Self {
             states,
             output_len,
+            source_len,
+            count_all: if has_count_all {
+                Some(vec![0; output_len])
+            } else {
+                None
+            },
+            matched: vec![false; output_len],
             successful: false,
         })
     }
 
     /// Apply one successful comparison to every requested aggregation.
     ///
-    /// `output_row` identifies the left row whose result should be updated;
-    /// `candidate` identifies the matching position in each right-side
-    /// aggregation array. The comparison modules call this once per
-    /// successful candidate, so multiple aggregations share one traversal.
+    /// `source_position` identifies the value and mask to read;
+    /// `output_position` identifies the result slot to update. The comparison
+    /// modules call this once per successful pair, so multiple aggregations
+    /// share one traversal.
     ///
-    /// Count deliberately ignores null metadata and therefore counts every
-    /// successful comparison. Other operations skip a candidate whose mask is
-    /// `true`. A `false` mask is treated as an assertion that the value array is
-    /// null-free and the value is valid; no additional null inference or
-    /// sentinel filtering is performed.
-    /// Out-of-range output rows are ignored defensively; candidate bounds are
-    /// guaranteed by construction and validation in the comparison callers.
+    /// `CountAll` deliberately ignores null metadata and therefore counts
+    /// every successful comparison. `CountNonNull` and other value-based
+    /// operations skip a source value whose mask is `true`. A `false` mask is
+    /// treated as an assertion that the value array is null-free and the value
+    /// is valid; no additional null inference or sentinel filtering is
+    /// performed.
+    /// Both positions are checked defensively. Normal callers have already
+    /// validated these bounds, but retaining the check here makes the shared
+    /// state safe when a future comparison path is added.
     ///
     /// # Arguments
     ///
-    /// * `output_row` - Zero-based output row to update.
-    /// * `candidate` - Zero-based candidate position in the source arrays.
-    pub(crate) fn update(&mut self, output_row: usize, candidate: usize) {
-        if output_row >= self.output_len {
+    /// * `source_position` - Zero-based position in the aggregation input
+    ///   arrays.
+    /// * `output_position` - Zero-based position in every output array.
+    pub(crate) fn update(&mut self, source_position: usize, output_position: usize) {
+        if source_position >= self.source_len || output_position >= self.output_len {
             return;
         }
         self.successful = true;
+        self.matched[output_position] = true;
         // One successful comparison is one event. Broadcast that event to
         // every requested aggregation before moving to the next candidate.
         // This is the central multi-aggregation benefit: predicates and
@@ -206,72 +262,96 @@ impl<'a> AggregationSet<'a> {
         // that traversal.
         for state in &mut self.states {
             match state {
-                State::Count(values) => values[output_row] += 1,
+                State::CountAll => {
+                    // The count-all buffer is shared across all count-all
+                    // requests. This branch only signals that the request
+                    // exists; the actual increment happens once below.
+                }
+                State::CountNonNull(view, values) => {
+                    if !view.nulls[source_position] {
+                        values[output_position] += 1;
+                    }
+                }
                 State::Sum(view, values) => {
-                    if !view.nulls[candidate] {
-                        values[output_row] =
-                            values[output_row].wrapping_add(as_i64(&view.values, candidate));
+                    if !view.nulls[source_position] {
+                        values[output_position] = values[output_position]
+                            .wrapping_add(as_i64(&view.values, source_position));
                     }
                 }
                 State::SumU64(source, nulls, values) => {
-                    if !nulls[candidate] {
-                        values[output_row] = values[output_row].wrapping_add(source[candidate]);
+                    if !nulls[source_position] {
+                        values[output_position] =
+                            values[output_position].wrapping_add(source[source_position]);
                     }
                 }
                 State::SumF64(view, values, compensation) => {
-                    if !view.nulls[candidate] {
+                    if !view.nulls[source_position] {
                         kahan_add(
-                            &mut values[output_row],
-                            &mut compensation[output_row],
-                            as_f64(&view.values, candidate),
+                            &mut values[output_position],
+                            &mut compensation[output_position],
+                            as_f64(&view.values, source_position),
                         );
                     }
                 }
                 State::Product(view, values) => {
-                    if !view.nulls[candidate] {
-                        values[output_row] =
-                            values[output_row].wrapping_mul(as_i64(&view.values, candidate));
+                    if !view.nulls[source_position] {
+                        values[output_position] = values[output_position]
+                            .wrapping_mul(as_i64(&view.values, source_position));
                     }
                 }
                 State::ProductU64(source, nulls, values) => {
-                    if !nulls[candidate] {
-                        values[output_row] = values[output_row].wrapping_mul(source[candidate]);
+                    if !nulls[source_position] {
+                        values[output_position] =
+                            values[output_position].wrapping_mul(source[source_position]);
                     }
                 }
                 State::ProductF64(view, values) => {
-                    if !view.nulls[candidate] {
-                        values[output_row] *= as_f64(&view.values, candidate);
+                    if !view.nulls[source_position] {
+                        values[output_position] *= as_f64(&view.values, source_position);
                     }
                 }
                 State::Min(view, positions) => {
-                    if !view.nulls[candidate] {
-                        let current = positions[output_row];
-                        if current < 0 || is_less(view, candidate, current as usize) {
-                            positions[output_row] = candidate as i64;
+                    if !view.nulls[source_position] {
+                        let current = positions[output_position];
+                        if current < 0 || is_less(view, source_position, current as usize) {
+                            positions[output_position] = source_position as i64;
                         }
                     }
                 }
                 State::Max(view, positions) => {
-                    if !view.nulls[candidate] {
-                        let current = positions[output_row];
-                        if current < 0 || is_greater(view, candidate, current as usize) {
-                            positions[output_row] = candidate as i64;
+                    if !view.nulls[source_position] {
+                        let current = positions[output_position];
+                        if current < 0 || is_greater(view, source_position, current as usize) {
+                            positions[output_position] = source_position as i64;
                         }
                     }
                 }
             }
         }
+        if let Some(values) = &mut self.count_all {
+            values[output_position] += 1;
+        }
     }
 
-    /// Return whether no successful comparison has been observed.
+    /// Return whether this comparison pass observed no successful comparison.
     ///
-    /// The comparison wrappers use this to return Python `None` instead of a
-    /// collection of identity-filled arrays when no candidate matched.
+    /// This flag describes comparison success, not aggregation success. In
+    /// particular, it remains `true` when a comparison matched but every
+    /// source value was marked null. In that case value-based operations keep
+    /// their identity or sentinel (`0` for sum, `1` for product, and `-1` for
+    /// min/max), while `matched` still identifies the output position as a
+    /// real match. Count-all and count-non-null can likewise produce different
+    /// values for the same matched position.
+    ///
+    /// The Python wrappers call this after traversal. They return `None` only
+    /// when the entire pass had no successful comparisons; otherwise they
+    /// return `(matched, aggregation_arrays)`, including positions whose
+    /// aggregation values remain at their identities.
     pub(crate) fn is_empty(&self) -> bool {
         !self.successful
     }
 
-    /// Convert all accumulator buffers into NumPy arrays.
+    /// Convert the match indicator and accumulator buffers into Python values.
     ///
     /// The result order is exactly the input aggregation order. This method
     /// consumes the set because the internal buffers can be moved directly
@@ -284,9 +364,17 @@ impl<'a> AggregationSet<'a> {
     ///
     /// # Returns
     ///
-    /// A vector containing one NumPy array per requested aggregation.
-    pub(crate) fn into_results(self, py: Python<'_>) -> Vec<Py<PyAny>> {
-        self.states
+    /// A pair containing the boolean match indicator followed by one NumPy
+    /// array per requested aggregation. The caller wraps this pair in the
+    /// public `(matched, aggregation_arrays)` tuple.
+    pub(crate) fn into_results(self, py: Python<'_>) -> (Py<PyAny>, Vec<Py<PyAny>>) {
+        let matched = Array1::from_vec(self.matched)
+            .into_pyarray(py)
+            .unbind()
+            .into_any();
+        let count_all = self.count_all;
+        let results = self
+            .states
             .into_iter()
             .map(|state| match state {
                 State::Sum(_, v) | State::Product(_, v) => {
@@ -303,11 +391,21 @@ impl<'a> AggregationSet<'a> {
                     Array1::from_vec(v).into_pyarray(py).unbind().into_any()
                 }
                 State::ProductF64(_, v) => Array1::from_vec(v).into_pyarray(py).unbind().into_any(),
-                State::Count(v) | State::Min(_, v) | State::Max(_, v) => {
+                State::CountAll => Array1::from_vec(
+                    count_all
+                        .as_ref()
+                        .expect("count-all state requires a shared count-all buffer")
+                        .clone(),
+                )
+                .into_pyarray(py)
+                .unbind()
+                .into_any(),
+                State::CountNonNull(_, v) | State::Min(_, v) | State::Max(_, v) => {
                     Array1::from_vec(v).into_pyarray(py).unbind().into_any()
                 }
             })
-            .collect()
+            .collect();
+        (matched, results)
     }
 }
 
@@ -343,13 +441,24 @@ fn as_f64(values: &Values<'_>, n: usize) -> f64 {
     }
 }
 
-/// Add one float using the Kahan-style compensation used by existing forward
-/// kernels. The running total is the public result; compensation only carries
-/// rounding information into the next update.
+/// Add one float using the Kahan-style compensation used by the existing
+/// aggregation kernels.
+///
+/// The running total is the public result; compensation only carries rounding
+/// information into the next update. IEEE-754 infinities need one special
+/// safeguard: adding an infinity can make the internal compensation `NaN`
+/// even though the running total is correctly infinite. Resetting only the
+/// compensation preserves that valid infinity and prevents the next finite
+/// value from being poisoned by stale non-finite correction state. A genuine
+/// `+infinity + -infinity` still produces `NaN` in the running total, as it
+/// should.
 fn kahan_add(total: &mut f64, compensation: &mut f64, value: f64) {
     let difference = value - *compensation;
     let increment = *total + difference;
     *compensation = (increment - *total) - difference;
+    if !compensation.is_finite() {
+        *compensation = 0.;
+    }
     *total = increment;
 }
 /// Return whether the candidate at `a` is strictly less than the current

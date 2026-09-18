@@ -3,10 +3,10 @@
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyList, PyTuple};
 use std::collections::BTreeMap;
 
-use crate::aggs::aggregation::{parse_inputs, AggregationSet};
+use crate::aggs::aggregation::{make_results, parse_inputs, AggregationSet};
 use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 use crate::compare::common::{add_right_region, checked_region_start, GroupState};
 
@@ -24,11 +24,16 @@ use crate::compare::common::{add_right_region, checked_region_start, GroupState}
 ///   arrays must be null-free. The mask is the sole null-tracking mechanism:
 ///   `true` marks a null for value-based operations and `false` asserts a valid
 ///   value. The caller is responsible for keeping each array and mask aligned.
+///   A three-element `count` request counts non-null values; `size` or the
+///   two-element `("*", "count")` shorthand counts every successful
+///   comparison without requiring a value column.
 ///
 /// # Returns
 ///
-/// `Some(list)` of aggregation result arrays, each with `left_region.len()`
-/// entries, or `None` when no region comparison succeeds.
+/// `Some((matched, list))`, where `matched` is a boolean array aligned to the
+/// left rows and `list` contains aggregation result arrays, each with
+/// `left_region.len()` entries. Returns `None` when no region comparison
+/// succeeds.
 ///
 /// # Errors
 ///
@@ -41,7 +46,7 @@ pub fn aggregate_dual_regions<'py>(
     right_region: PyReadonlyArray1<'py, i64>,
     starts: PyReadonlyArray1<'py, i64>,
     aggregations: &Bound<'py, PyList>,
-) -> PyResult<Option<Bound<'py, PyList>>> {
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let left = left_region.as_array();
     let right = right_region.as_array();
     let starts = starts.as_array();
@@ -69,15 +74,19 @@ pub fn aggregate_dual_regions<'py>(
         for (_, state) in groups.range(left[row]..) {
             let mut position = state.head;
             while position >= 0 {
-                set.update(row, position as usize);
+                set.update(position as usize, row);
                 position = next[position as usize];
             }
         }
     }
+    // Do not infer match status from identities such as sum=0 or product=1.
+    // The state tracks comparison success separately and exposes it through
+    // the `matched` array in the returned `(matched, aggregation_arrays)`
+    // tuple.
     if set.is_empty() {
         return Ok(None);
     }
-    Ok(Some(PyList::new(py, set.into_results(py))?))
+    Ok(Some(make_results(py, set)?))
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -119,6 +128,8 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+            let result_list = result.get_item(1).unwrap();
+            let result = result_list.cast::<PyList>().unwrap();
             assert_eq!(
                 result.get_item(0).unwrap().extract::<Vec<i64>>().unwrap(),
                 vec![2, 1]
