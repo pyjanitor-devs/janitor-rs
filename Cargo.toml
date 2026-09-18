@@ -104,5 +104,13 @@ name = "forward_sum_compare"
 harness = false
 
 [[bench]]
+name = "forward_fused_range_aggregations"
+harness = false
+
+[[bench]]
 name = "comp_batch_no_range"
+harness = false
+
+[[bench]]
+name = "reverse_fused_range_aggregations"
 harness = false

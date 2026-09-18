@@ -511,6 +511,7 @@ pub(crate) type PositionsFn<T, R> =
 /// child registration functions add exports but do not replace the module.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     aggregation::register(m)?;
+    aggregation::register_reverse(m)?;
     min::register(m)?;
     prod::register(m)?;
     max::register(m)?;

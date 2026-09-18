@@ -17,8 +17,11 @@ use pyo3::types::{PyList, PyTuple};
 mod input;
 mod state;
 pub(crate) mod states_ends;
+pub(crate) mod states_ends_rev;
 pub(crate) mod states_starts;
 pub(crate) mod states_starts_ends;
+pub(crate) mod states_starts_ends_rev;
+pub(crate) mod states_starts_rev;
 
 // The parent module exposes the input parser, shared state, and three
 // range-shaped entry points needed by the forward aggregation paths.
@@ -26,6 +29,14 @@ pub(crate) mod states_starts_ends;
 // adding a dtype does not enlarge the crate's public API.
 pub(crate) use input::parse_inputs;
 pub(crate) use state::AggregationSet;
+
+/// Register reverse range-only fused aggregation entry points.
+pub(crate) fn register_reverse(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    states_ends_rev::register(m)?;
+    states_starts_rev::register(m)?;
+    states_starts_ends_rev::register(m)?;
+    Ok(())
+}
 
 /// Register the three forward range-only aggregation entry points.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
