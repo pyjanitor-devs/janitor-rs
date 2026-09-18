@@ -2,7 +2,7 @@
 
 use crate::aggs::aggregation::{make_results, parse_inputs, AggregationSet};
 use crate::aggs::{checked_index, ensure_equal_lengths, ensure_nonempty_core, ensure_unique_index};
-use crate::compare::predicate::{
+use crate::multi_join_indices::predicate::{
     null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch,
 };
 use numpy::PyReadonlyArray1;

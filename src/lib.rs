@@ -1,15 +1,8 @@
 use pyo3::prelude::*;
 mod aggs;
 mod bin_search;
-mod compare;
 mod index_builder;
-mod left_le_right;
-mod non_equi_dual_regions;
-mod non_equi_dual_regions_agg;
-mod non_equi_dual_regions_agg_rev;
-mod non_equi_multi_regions;
-mod non_equi_multi_regions_agg;
-mod non_equi_multi_regions_agg_rev;
+mod multi_join_indices;
 
 /// Narrow Rust-only surface used by `benches/kernels.rs`.
 ///
@@ -71,39 +64,21 @@ pub mod bench_support {
     pub use crate::bin_search::bin_search_le_first::binary_search_le_first_core;
     pub use crate::bin_search::bin_search_lt::binary_search_lt_core;
     pub use crate::bin_search::bin_search_lt_first::binary_search_lt_first_core;
-    pub use crate::compare::comp::{compare_start_end_core, compare_start_end_in_place_core};
-    pub use crate::compare::comp_batch::{
+    pub use crate::index_builder::{repeat_index_core, trim_index_core};
+    pub use crate::multi_join_indices::batch_indices::{
         compare_batch_indices_all, compare_batch_indices_any, compare_batch_indices_first,
         compare_batch_indices_last,
     };
-    pub use crate::compare::comp_batch_no_range::compare_batch_no_range;
-    pub use crate::compare::comp_direct::select_start_end_core;
-    pub use crate::compare::comp_ends::{compare_end_allocating_core, compare_end_in_place_core};
-    pub use crate::compare::comp_ne::{
-        compare_ne_start_end_allocating_core, compare_ne_start_end_in_place_core,
-    };
-    pub use crate::compare::comp_ne_ends::{
-        compare_ne_end_allocating_core, compare_ne_end_in_place_core,
-    };
-    pub use crate::compare::comp_ne_starts::{
-        compare_ne_start_allocating_core, compare_ne_start_in_place_core,
-    };
-    pub use crate::compare::comp_no_range::{compare_no_range_f64, compare_no_range_int64};
-    pub use crate::compare::comp_no_range_ne::compare_no_range_ne_int64;
-    pub use crate::compare::comp_starts::{
-        compare_start_allocating_core, compare_start_in_place_core,
-    };
-    pub use crate::compare::op::CompareOp;
-    pub use crate::index_builder::{repeat_index_core, trim_index_core};
-    pub use crate::left_le_right::region_positions;
-    pub use crate::non_equi_dual_regions::{
+    pub use crate::multi_join_indices::batch_no_range_indices::compare_batch_no_range;
+    pub use crate::multi_join_indices::dual_regions::{
         build_dual_region_indices_all, build_dual_region_indices_any,
         build_dual_region_indices_first, build_dual_region_indices_last,
     };
-    pub use crate::non_equi_multi_regions::{
+    pub use crate::multi_join_indices::multi_regions::{
         compare_multi_region_indices_all, compare_multi_region_indices_any,
         compare_multi_region_indices_first, compare_multi_region_indices_last,
     };
+    pub use crate::multi_join_indices::op::CompareOp;
 
     pub fn sum_rev_start_end_i64(
         arr: ArrayView1<'_, i64>,
@@ -277,15 +252,8 @@ pub mod bench_support {
 #[pymodule]
 fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     bin_search::register(m)?;
-    compare::register(m)?;
+    multi_join_indices::register(m)?;
     index_builder::register(m)?;
-    left_le_right::register(m)?;
-    non_equi_dual_regions::register(m)?;
-    non_equi_dual_regions_agg::register(m)?;
-    non_equi_dual_regions_agg_rev::register(m)?;
-    non_equi_multi_regions::register(m)?;
-    non_equi_multi_regions_agg::register(m)?;
-    non_equi_multi_regions_agg_rev::register(m)?;
     aggs::register(m)?;
     Ok(())
 }
@@ -309,26 +277,25 @@ mod registration_tests {
             janitor_rs(&module).expect("registration must not fail");
 
             let representative_exports = [
-                "binary_search_lt_int64",            // bin_search
-                "compare_start_end_int64",           // compare
-                "aggregate_batch_reverse",           // reverse fused compare
-                "aggregate_batch_no_range_reverse",  // reverse no-range compare
-                "repeat_index",                      // index_builder
-                "get_positions_where_left_le_right", // left_le_right
-                "compute_sum_start_int64",           // aggs::sum
-                "compute_sum_rev_start_int64",       // aggs::sum_rev
-                "compute_min_start_int64",           // aggs::min
-                "compute_min_rev_start_int64",       // aggs::min_rev
-                "compute_max_start_int64",           // aggs::max
-                "compute_max_rev_start_int64",       // aggs::max_rev
-                "compute_prod_start_int64",          // aggs::prod
-                "compute_prod_rev_start_int64",      // aggs::prod_rev
-                "compute_size_rev_start",            // aggs::size_rev
-                "aggregate_dual_regions_reverse",    // reverse dual regions
-                "aggregate_multi_regions_reverse",   // reverse multi regions
-                "aggregate_starts_reverse",          // reverse starts ranges
-                "aggregate_ends_reverse",            // reverse ends ranges
-                "aggregate_starts_ends_reverse",     // reverse starts/ends ranges
+                "binary_search_lt_int64",           // bin_search
+                "compare_batch_indices_first",      // fused batch comparison
+                "aggregate_batch_reverse",          // reverse fused compare
+                "aggregate_batch_no_range_reverse", // reverse no-range compare
+                "repeat_index",                     // index_builder
+                "compute_sum_start_int64",          // aggs::sum
+                "compute_sum_rev_start_int64",      // aggs::sum_rev
+                "compute_min_start_int64",          // aggs::min
+                "compute_min_rev_start_int64",      // aggs::min_rev
+                "compute_max_start_int64",          // aggs::max
+                "compute_max_rev_start_int64",      // aggs::max_rev
+                "compute_prod_start_int64",         // aggs::prod
+                "compute_prod_rev_start_int64",     // aggs::prod_rev
+                "compute_size_rev_start",           // aggs::size_rev
+                "aggregate_dual_regions_reverse",   // reverse dual regions
+                "aggregate_multi_regions_reverse",  // reverse multi regions
+                "aggregate_starts_reverse",         // reverse starts ranges
+                "aggregate_ends_reverse",           // reverse ends ranges
+                "aggregate_starts_ends_reverse",    // reverse starts/ends ranges
             ];
 
             for name in representative_exports {
@@ -341,10 +308,11 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (922 exports across 107 leaf modules). Bump
-    /// this alongside any PR that intentionally adds
-    /// or removes an export.
-    const EXPECTED_EXPORT_COUNT: usize = 922;
+    /// `register`, as of this PR (751 exports across the retained leaf
+    /// modules).
+    /// Bump this alongside any PR that intentionally adds or removes an
+    /// export.
+    const EXPECTED_EXPORT_COUNT: usize = 751;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
@@ -354,7 +322,7 @@ mod registration_tests {
     /// module must be one of our own exports (Python/PyO3 module
     /// machinery -- `__name__`, `__all__`, etc. -- all use `__`-wrapped
     /// names), so counting just those catches a missing or duplicate
-    /// export without spelling out all 908 names here.
+    /// export without spelling out all 751 names here.
     #[test]
     fn total_registered_export_count_matches_expected() {
         Python::initialize();

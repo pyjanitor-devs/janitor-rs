@@ -16,8 +16,10 @@ use pyo3::types::PyList;
 use std::collections::BTreeMap;
 
 use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
-use crate::compare::common::{add_right_region, checked_region_start, GroupState, Selection};
-use crate::compare::predicate::{
+use crate::multi_join_indices::common::{
+    add_right_region, checked_region_start, GroupState, Selection,
+};
+use crate::multi_join_indices::predicate::{
     null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata,
     Predicate,
 };
@@ -81,7 +83,7 @@ fn parse_inputs<'py>(
 
 fn predicate_views<'a>(
     predicates: &'a [Predicate<'_>],
-) -> Vec<crate::compare::predicate::PredicateView<'a>> {
+) -> Vec<crate::multi_join_indices::predicate::PredicateView<'a>> {
     predicates.iter().map(Predicate::view).collect()
 }
 
@@ -97,8 +99,8 @@ fn selected_core(
     starts: ArrayView1<'_, i64>,
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
-    views: &[crate::compare::predicate::PredicateView<'_>],
-    metadata: Option<&[crate::compare::predicate::NullMetadataView<'_>]>,
+    views: &[crate::multi_join_indices::predicate::PredicateView<'_>],
+    metadata: Option<&[crate::multi_join_indices::predicate::NullMetadataView<'_>]>,
     selection: Selection,
 ) -> Result<Option<IndexResult>, String> {
     let left_len = left_region.len();

@@ -84,7 +84,7 @@ name = "production_match_compare"
 harness = false
 
 [[bench]]
-name = "compare_batch"
+name = "batch_indices"
 harness = false
 
 [[bench]]
@@ -108,7 +108,7 @@ name = "forward_fused_range_aggregations"
 harness = false
 
 [[bench]]
-name = "comp_batch_no_range"
+name = "batch_no_range_indices"
 harness = false
 
 [[bench]]

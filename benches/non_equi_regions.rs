@@ -9,7 +9,7 @@ use janitor_rs::bench_support::{
     build_dual_region_indices_all, build_dual_region_indices_any, build_dual_region_indices_first,
     build_dual_region_indices_last, compare_multi_region_indices_all,
     compare_multi_region_indices_any, compare_multi_region_indices_first,
-    compare_multi_region_indices_last, region_positions,
+    compare_multi_region_indices_last,
 };
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
@@ -54,15 +54,6 @@ struct PyFixture<'py> {
     left_index: Bound<'py, PyArray1<i64>>,
     right_index: Bound<'py, PyArray1<i64>>,
     predicates: Bound<'py, PyList>,
-    left_extra: Bound<'py, PyArray1<i64>>,
-    right_extra: Bound<'py, PyArray1<i64>>,
-    left_float: Bound<'py, PyArray1<f64>>,
-    right_float: Bound<'py, PyArray1<f64>>,
-    left_ne: Bound<'py, PyArray1<i32>>,
-    right_ne: Bound<'py, PyArray1<i32>>,
-    left_ne_mask: Bound<'py, PyArray1<bool>>,
-    right_ne_mask: Bound<'py, PyArray1<bool>>,
-    left_len: usize,
 }
 
 impl<'py> PyFixture<'py> {
@@ -76,15 +67,6 @@ impl<'py> PyFixture<'py> {
             left_index: PyArray1::from_vec(py, fixture.left_index.clone()),
             right_index: PyArray1::from_vec(py, fixture.right_index.clone()),
             predicates: predicates(py, fixture)?,
-            left_extra: PyArray1::from_vec(py, fixture.left_extra.clone()),
-            right_extra: PyArray1::from_vec(py, fixture.right_extra.clone()),
-            left_float: PyArray1::from_vec(py, fixture.left_float.clone()),
-            right_float: PyArray1::from_vec(py, fixture.right_float.clone()),
-            left_ne: PyArray1::from_vec(py, fixture.left_ne.clone()),
-            right_ne: PyArray1::from_vec(py, fixture.right_ne.clone()),
-            left_ne_mask: PyArray1::from_vec(py, fixture.left_ne_mask.clone()),
-            right_ne_mask: PyArray1::from_vec(py, fixture.right_ne_mask.clone()),
-            left_len: fixture.left.len(),
         })
     }
 }
@@ -197,133 +179,6 @@ fn multi_output(
 
 fn run_multi(py: Python<'_>, fixture: &PyFixture<'_>, selection: Selection) {
     black_box(multi_output(py, fixture, selection).unwrap());
-}
-
-fn current_regions_output(
-    py: Python<'_>,
-    fixture: &PyFixture<'_>,
-    selection: Selection,
-    with_extra_predicate: bool,
-) -> Output {
-    // Legacy regions flow: first materialize the flattened candidate positions
-    // and per-left-row counts, then walk those candidates again to apply the
-    // selection and (for multi) the residual predicate list.
-    let left_region = if with_extra_predicate {
-        fixture.left_region.readonly()
-    } else {
-        fixture.left.readonly()
-    };
-    let right_region = if with_extra_predicate {
-        fixture.right_region.readonly()
-    } else {
-        fixture.right.readonly()
-    };
-    // `region_positions` uses this argument as the largest right-region
-    // value for its tracker array, not as the number of right rows. Passing
-    // the actual maximum keeps the legacy baseline's allocation faithful to
-    // the production contract and avoids relying on this fixture's
-    // value==ordinal coincidence.
-    let max_right = right_region
-        .as_array()
-        .iter()
-        .copied()
-        .max()
-        .expect("benchmark right region is non-empty");
-    let (counts, positions, _) = region_positions(
-        py,
-        left_region,
-        right_region,
-        fixture.starts.readonly(),
-        max_right,
-    );
-    let counts = counts.readonly();
-    let positions = positions.readonly();
-    let counts = counts.as_array();
-    let positions = positions.as_array();
-    let left_index = fixture.left_index.readonly();
-    let left_index = left_index.as_array();
-    let right_index = fixture.right_index.readonly();
-    let right_index = right_index.as_array();
-    let mut left_output = Vec::new();
-    let mut right_output = Vec::new();
-    let mut flat_position = 0_usize;
-
-    let left_extra = fixture.left_extra.readonly();
-    let left_extra = left_extra.as_array();
-    let right_extra = fixture.right_extra.readonly();
-    let right_extra = right_extra.as_array();
-    let left_float = fixture.left_float.readonly();
-    let left_float = left_float.as_array();
-    let right_float = fixture.right_float.readonly();
-    let right_float = right_float.as_array();
-    let left_ne = fixture.left_ne.readonly();
-    let left_ne = left_ne.as_array();
-    let right_ne = fixture.right_ne.readonly();
-    let right_ne = right_ne.as_array();
-    let left_ne_mask = fixture.left_ne_mask.readonly();
-    let left_ne_mask = left_ne_mask.as_array();
-    let right_ne_mask = fixture.right_ne_mask.readonly();
-    let right_ne_mask = right_ne_mask.as_array();
-    for row in 0..fixture.left_len {
-        let row_count = counts[row].max(0) as usize;
-        let mut selected = None;
-        for candidate in positions.iter().skip(flat_position).take(row_count) {
-            let right_position = *candidate as usize;
-            if with_extra_predicate
-                && (left_extra[row] != right_extra[right_position]
-                    || left_float[row] > right_float[right_position]
-                    || left_ne_mask[row]
-                    || right_ne_mask[right_position]
-                    || left_ne[row] == right_ne[right_position])
-            {
-                continue;
-            }
-            match selection {
-                Selection::Any => {
-                    selected = Some(right_position);
-                    break;
-                }
-                Selection::First => {
-                    if selected
-                        .is_none_or(|current| right_index[right_position] < right_index[current])
-                    {
-                        selected = Some(right_position);
-                    }
-                }
-                Selection::Last => {
-                    if selected
-                        .is_none_or(|current| right_index[right_position] > right_index[current])
-                    {
-                        selected = Some(right_position);
-                    }
-                }
-                Selection::All => {
-                    left_output.push(left_index[row]);
-                    right_output.push(right_index[right_position]);
-                }
-            }
-        }
-        if let Some(right_position) = selected {
-            left_output.push(left_index[row]);
-            right_output.push(right_index[right_position]);
-        }
-        flat_position += row_count;
-    }
-    (left_output, right_output)
-}
-
-fn run_current_regions(
-    py: Python<'_>,
-    fixture: &PyFixture<'_>,
-    selection: Selection,
-    with_extra_predicate: bool,
-) {
-    black_box(current_regions_output(
-        py,
-        fixture,
-        selection,
-        with_extra_predicate,
-    ));
 }
 
 fn multi_predicates_match(fixture: &Fixture, row: usize, right: usize) -> bool {
@@ -631,19 +486,14 @@ fn bench(c: &mut Criterion) {
                 ] {
                     // Validate semantics before entering Criterion's timed
                     // closures. A fast result is not useful if it differs
-                    // from either a simple reference or the legacy regions
-                    // pipeline.
+                    // from the direct reference implementation.
                     let expected_dual = dual_reference(&f, selection);
                     let proposed_dual = dual_output(py, &py_fixture, selection).unwrap();
-                    let current_dual = current_regions_output(py, &py_fixture, selection, false);
                     assert_eq!(proposed_dual, expected_dual);
-                    assert_eq!(Some(current_dual), expected_dual);
 
                     let expected_multi = multi_reference(&f, selection);
                     let proposed_multi = multi_output(py, &py_fixture, selection).unwrap();
-                    let current_multi = current_regions_output(py, &py_fixture, selection, true);
                     assert_eq!(proposed_multi, expected_multi);
-                    assert_eq!(Some(current_multi), expected_multi);
                     if matches!(selection, Selection::All) {
                         assert_eq!(multi_reference_all_two_pass(&f, true), expected_multi);
                         assert_eq!(multi_reference_all_two_pass(&f, false), expected_multi);
@@ -665,26 +515,14 @@ fn bench(c: &mut Criterion) {
                         support::count_allocations(|| run_dual(py, &py_fixture, selection));
                     let multi_allocation =
                         support::count_allocations(|| run_multi(py, &py_fixture, selection));
-                    let current_dual_allocation = support::count_allocations(|| {
-                        run_current_regions(py, &py_fixture, selection, false)
-                    });
-                    let current_multi_allocation = support::count_allocations(|| {
-                        run_current_regions(py, &py_fixture, selection, true)
-                    });
                     eprintln!(
-                        "{label} {selection_name}: proposed dual {} bytes/{} allocs/{} peak; proposed multi {} bytes/{} allocs/{} peak; current dual {} bytes/{} allocs/{} peak; current multi {} bytes/{} allocs/{} peak",
+                        "{label} {selection_name}: dual {} bytes/{} allocs/{} peak; multi {} bytes/{} allocs/{} peak",
                         dual_allocation.0,
                         dual_allocation.1,
                         dual_allocation.2,
                         multi_allocation.0,
                         multi_allocation.1,
                         multi_allocation.2,
-                        current_dual_allocation.0,
-                        current_dual_allocation.1,
-                        current_dual_allocation.2,
-                        current_multi_allocation.0,
-                        current_multi_allocation.1,
-                        current_multi_allocation.2,
                     );
                 }
             });
@@ -714,13 +552,6 @@ fn bench(c: &mut Criterion) {
                         b.iter(|| run_dual(py, &py_fixture, selection));
                     });
                 });
-                let id = BenchmarkId::new(format!("current/regions/dual/{selection_name}"), &label);
-                Python::attach(|py| {
-                    let py_fixture = PyFixture::new(py, &f).unwrap();
-                    group.bench_function(id, |b| {
-                        b.iter(|| run_current_regions(py, &py_fixture, selection, false));
-                    });
-                });
                 let id = BenchmarkId::new(format!("multi/{selection_name}"), &label);
                 group.bench_function(id, |b| {
                     b.iter(|| {
@@ -747,14 +578,6 @@ fn bench(c: &mut Criterion) {
                     let py_fixture = PyFixture::new(py, &f).unwrap();
                     group.bench_function(id, |b| {
                         b.iter(|| run_multi(py, &py_fixture, selection));
-                    });
-                });
-                let id =
-                    BenchmarkId::new(format!("current/regions/multi/{selection_name}"), &label);
-                Python::attach(|py| {
-                    let py_fixture = PyFixture::new(py, &f).unwrap();
-                    group.bench_function(id, |b| {
-                        b.iter(|| run_current_regions(py, &py_fixture, selection, true));
                     });
                 });
             }

@@ -9,12 +9,12 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
-use super::common::checked_bounds;
-use super::predicate::{
-    null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch,
-};
 use crate::aggs::aggregation::{make_results, parse_inputs, AggregationSet};
 use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
+use crate::multi_join_indices::common::checked_bounds;
+use crate::multi_join_indices::predicate::{
+    null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch,
+};
 
 /// Compare heterogeneous predicates over optional per-row bounds and update
 /// all requested forward aggregations in the same traversal.

@@ -13,7 +13,9 @@ use pyo3::prelude::*;
 use std::collections::BTreeMap;
 
 use crate::aggs::{ensure_equal_lengths_core, ensure_nonempty_core};
-use crate::compare::common::{add_right_region, checked_region_start, GroupState, Selection};
+use crate::multi_join_indices::common::{
+    add_right_region, checked_region_start, GroupState, Selection,
+};
 
 type IndexResult = (Vec<i64>, Vec<i64>);
 type PyIndexResult<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
