@@ -79,6 +79,10 @@ pub fn aggregate_dual_regions<'py>(
             }
         }
     }
+    // Do not infer match status from identities such as sum=0 or product=1.
+    // The state tracks comparison success separately and exposes it through
+    // the `matched` array in the returned `(matched, aggregation_arrays)`
+    // tuple.
     if set.is_empty() {
         return Ok(None);
     }

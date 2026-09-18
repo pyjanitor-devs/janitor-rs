@@ -122,6 +122,9 @@ pub fn aggregate_multi_regions_reverse<'py>(
             }
         }
     }
+    // Keep comparison success separate from aggregation values. This is
+    // essential for reverse slots whose sum/product remains at its identity
+    // or whose min/max remains -1 because all contributing values were null.
     if set.is_empty() {
         return Ok(None);
     }

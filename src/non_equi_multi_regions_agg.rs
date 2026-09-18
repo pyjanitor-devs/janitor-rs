@@ -114,6 +114,9 @@ pub fn aggregate_multi_regions<'py>(
             }
         }
     }
+    // Region traversal may produce output positions with identities when no
+    // value survives its mask. Only a pass with zero successful comparisons
+    // returns `None`; otherwise `matched` carries the per-left-row status.
     if set.is_empty() {
         return Ok(None);
     }

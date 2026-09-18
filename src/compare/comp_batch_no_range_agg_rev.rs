@@ -102,6 +102,9 @@ pub fn aggregate_batch_no_range_reverse<'py>(
             set.update(row, candidate);
         }
     }
+    // Invalid positions and failed predicates do not set the shared success
+    // flag. Once any aligned candidate succeeds, however, return the full
+    // right-aligned tuple so `matched` can identify which slots were touched.
     if set.is_empty() {
         return Ok(None);
     }

@@ -119,6 +119,10 @@ pub fn aggregate_batch_reverse<'py>(
             }
         }
     }
+    // `None` is reserved for a completely unsuccessful comparison pass. A
+    // right slot may still receive an identity or `-1` when it was not
+    // matched, so consumers must use the first tuple item, `matched`, for
+    // per-slot match information.
     if set.is_empty() {
         return Ok(None);
     }

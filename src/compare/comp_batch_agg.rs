@@ -121,6 +121,10 @@ pub fn compare_batch_aggregate<'py>(
             }
         }
     }
+    // `is_empty` refers to the comparison pass, not to the aggregation
+    // buffers. A successful match whose value is null still makes this call
+    // return a result tuple; the caller can inspect `matched` to distinguish
+    // that position from a position that was never matched.
     if set.is_empty() {
         return Ok(None);
     }

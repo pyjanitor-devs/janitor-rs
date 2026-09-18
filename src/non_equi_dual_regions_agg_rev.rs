@@ -89,6 +89,9 @@ pub fn aggregate_dual_regions_reverse<'py>(
             }
         }
     }
+    // Reverse output is indexed by right position. A slot that was never
+    // reached is distinguishable from a matched slot with an identity result
+    // only through the tuple's `matched` boolean array.
     if set.is_empty() {
         return Ok(None);
     }

@@ -333,10 +333,20 @@ impl<'a> AggregationSet<'a> {
         }
     }
 
-    /// Return whether no successful comparison has been observed.
+    /// Return whether this comparison pass observed no successful comparison.
     ///
-    /// The comparison wrappers use this to return Python `None` instead of a
-    /// collection of identity-filled arrays when no candidate matched.
+    /// This flag describes comparison success, not aggregation success. In
+    /// particular, it remains `true` when a comparison matched but every
+    /// source value was marked null. In that case value-based operations keep
+    /// their identity or sentinel (`0` for sum, `1` for product, and `-1` for
+    /// min/max), while `matched` still identifies the output position as a
+    /// real match. Count-all and count-non-null can likewise produce different
+    /// values for the same matched position.
+    ///
+    /// The Python wrappers call this after traversal. They return `None` only
+    /// when the entire pass had no successful comparisons; otherwise they
+    /// return `(matched, aggregation_arrays)`, including positions whose
+    /// aggregation values remain at their identities.
     pub(crate) fn is_empty(&self) -> bool {
         !self.successful
     }
