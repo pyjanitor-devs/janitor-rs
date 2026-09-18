@@ -16,12 +16,24 @@ use pyo3::types::{PyList, PyTuple};
 
 mod input;
 mod state;
+pub(crate) mod states_ends;
+pub(crate) mod states_starts;
+pub(crate) mod states_starts_ends;
 
-// The parent module exposes only the two entry points needed by comparison
-// kernels. The concrete input and operation types stay private to this
-// directory, so adding a dtype does not enlarge the crate's public API.
+// The parent module exposes the input parser, shared state, and three
+// range-shaped entry points needed by the forward aggregation paths.
+// The concrete input and operation types stay private to this directory, so
+// adding a dtype does not enlarge the crate's public API.
 pub(crate) use input::parse_inputs;
 pub(crate) use state::AggregationSet;
+
+/// Register the three forward range-only aggregation entry points.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    states_ends::register(m)?;
+    states_starts::register(m)?;
+    states_starts_ends::register(m)?;
+    Ok(())
+}
 
 /// Build the common Python result shape for fused aggregations.
 ///

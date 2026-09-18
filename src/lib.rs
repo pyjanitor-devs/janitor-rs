@@ -338,10 +338,10 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (916 exports across 101 leaf modules). Bump
+    /// `register`, as of this PR (919 exports across 104 leaf modules). Bump
     /// this alongside any PR that intentionally adds
     /// or removes an export.
-    const EXPECTED_EXPORT_COUNT: usize = 916;
+    const EXPECTED_EXPORT_COUNT: usize = 919;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
