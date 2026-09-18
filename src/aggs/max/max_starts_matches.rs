@@ -9,7 +9,7 @@ use crate::aggs::ensure_tape_width;
 /// For every `starts[i]`, find the position (not the value) of the
 /// largest element in `arr[starts[i]..]` among positions the caller has
 /// flagged live in `matches` (a flat tape covering every row's candidate
-/// range back to back -- see `compare_start_end_core` for the tape
+/// range back to back -- see the fused region aggregation paths for the tape
 /// convention). Returns `-1` when the range is empty/invalid (including
 /// a negative sentinel `start`), when the row has zero matches, or when
 /// every candidate is skipped/null.

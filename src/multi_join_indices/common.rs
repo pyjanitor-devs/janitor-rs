@@ -82,7 +82,7 @@ pub(crate) fn checked_bounds(start: i64, end: i64, right_len: usize) -> Option<(
 /// depends on.
 ///
 /// ELI5: this is `checked_bounds` plus one more guard specific to the
-/// region-chain kernels (`non_equi_dual_regions`/`non_equi_multi_regions`).
+/// region-chain kernels (`dual_regions`/`multi_regions`).
 /// `checked_bounds` alone keeps `start` within `[0, right_len)`, which is
 /// necessary but not sufficient here: `add_right_region` also assumes `start`
 /// never moves past `previous_end`, the low-water mark of what has already
@@ -90,7 +90,7 @@ pub(crate) fn checked_bounds(start: i64, end: i64, right_len: usize) -> Option<(
 /// but greater than `previous_end` would still corrupt the chains (or, once
 /// a later row's `start` retreats back onto an already-linked position,
 /// create a self-referencing node -- see the crate's own regression test for
-/// that failure mode). `checked_bounds`'s own callers (e.g. `comp_batch.rs`)
+/// that failure mode). `checked_bounds`'s own callers (e.g. `batch_indices.rs`)
 /// have no such `previous_end` state, so that check does not belong there.
 pub(crate) fn checked_region_start(
     start: i64,

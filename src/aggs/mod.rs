@@ -22,7 +22,14 @@ use std::collections::HashSet;
 
 pub(crate) mod adaptive;
 pub(crate) mod aggregation;
+pub(crate) mod batch_aggregate;
+pub(crate) mod batch_aggregate_reverse;
+pub(crate) mod batch_no_range_aggregate_reverse;
+pub(crate) mod dual_regions;
+pub(crate) mod dual_regions_reverse;
 pub mod min;
+pub(crate) mod multi_regions;
+pub(crate) mod multi_regions_reverse;
 
 pub mod prod;
 
@@ -512,7 +519,14 @@ pub(crate) type PositionsFn<T, R> =
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     aggregation::register(m)?;
     aggregation::register_reverse(m)?;
+    batch_aggregate::register(m)?;
+    batch_aggregate_reverse::register(m)?;
+    batch_no_range_aggregate_reverse::register(m)?;
+    dual_regions::register(m)?;
+    dual_regions_reverse::register(m)?;
     min::register(m)?;
+    multi_regions::register(m)?;
+    multi_regions_reverse::register(m)?;
     prod::register(m)?;
     max::register(m)?;
     max_rev::register(m)?;
@@ -699,7 +713,7 @@ mod adversarial_bounds_tests {
             // check, silently truncating to the shorter array on a
             // mismatch instead of raising -- unlike the `ensure_equal_lengths`
             // guard this same PR added for the analogous `right`/
-            // `right_booleans` case in `comp_no_range_ne.rs`.
+            // `right_booleans` case in the fused no-range predicate path.
             let index = PyArray1::from_vec(py, vec![0_i64, 1, 2]);
             let starts = PyArray1::from_vec(py, vec![0_i64, 1]);
             let ends = PyArray1::from_vec(py, vec![3_i64]); // mismatched: len 1 vs starts' len 2
@@ -982,45 +996,6 @@ mod adversarial_bounds_tests {
                 booleans.readonly(),
             );
             assert!(result.is_err(), "invalid left_index must be rejected");
-
-            // Adversarial-review finding folded into #38: `comp_no_range.rs`
-            // only guarded the `-1` sentinel, never the upper bound, before
-            // indexing `right[*right_pos as usize]`.
-            let left = PyArray1::from_vec(py, vec![3_i64]);
-            let right = PyArray1::from_vec(py, vec![1_i64, 2]);
-            let positions = PyArray1::from_vec(py, vec![99_i64]); // out of bounds, not -1
-            let (result, total) = super::super::compare::comp_no_range::compare_no_range_int64(
-                py,
-                left.readonly(),
-                right.readonly(),
-                positions.readonly(),
-                0, // op: >
-            )
-            .expect("a valid op code with an out-of-bounds position must still succeed");
-            assert_eq!(result.readonly().as_array().to_vec(), vec![-1_i64]);
-            assert_eq!(total, 0);
-
-            // Same finding, `comp_no_range_ne.rs`: also gains an
-            // `ensure_equal_lengths("right", ..., "right_booleans", ...)`
-            // whole-call check, since both are indexed by the same
-            // `right_pos`.
-            let left = PyArray1::from_vec(py, vec![3_i64]);
-            let right = PyArray1::from_vec(py, vec![1_i64, 2]);
-            let right_booleans = PyArray1::from_vec(py, vec![false]); // mismatched length
-            let positions = PyArray1::from_vec(py, vec![0_i64]);
-            let left_booleans = PyArray1::from_vec(py, vec![false]);
-            let error = super::super::compare::comp_no_range_ne::compare_no_range_ne_int64(
-                py,
-                left.readonly(),
-                right.readonly(),
-                positions.readonly(),
-                left_booleans.readonly(),
-                right_booleans.readonly(),
-                false,
-                0,
-            )
-            .expect_err("mismatched right/right_booleans lengths must be rejected");
-            assert!(error.is_instance_of::<PyValueError>(py));
 
             // Adversarial-review finding folded into #38:
             // `index_builder::build_positional_index` only guarded

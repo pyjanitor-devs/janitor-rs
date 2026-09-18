@@ -2,7 +2,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::PyResult;
 
 /// One clear name for each of the six ways two values can be compared,
-/// shared by every file under `compare/` instead of each keeping its own
+/// shared by every file under `multi_join_indices/` instead of each keeping its own
 /// copy of a numeric-code `match`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
@@ -38,7 +38,7 @@ impl CompareOp {
     /// ELI5: an indirect function-pointer call can't be inlined, so
     /// picking a `fn(&T, &T) -> bool` once outside the loop measured
     /// *slower* than matching every iteration (25-46% slower at n=100 and
-    /// n=100,000 in `bench_compare_start_end` -- an indirect call defeats
+    /// n=100,000 in the scalar benchmark -- an indirect call defeats
     /// the inlining/branch-prediction the compiler gets for free from a
     /// `match` on a small `Copy` enum, which is exactly as cheap per
     /// iteration as the `i8` match every file used to carry its own copy

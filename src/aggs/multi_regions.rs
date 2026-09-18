@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use crate::aggs::aggregation::{make_results, parse_inputs, AggregationSet};
 use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
-use crate::compare::common::{add_right_region, checked_region_start, GroupState};
-use crate::compare::predicate::{
+use crate::multi_join_indices::common::{add_right_region, checked_region_start, GroupState};
+use crate::multi_join_indices::predicate::{
     null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch,
 };
 
