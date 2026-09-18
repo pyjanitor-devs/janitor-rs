@@ -326,6 +326,9 @@ mod registration_tests {
                 "compute_size_rev_start",            // aggs::size_rev
                 "aggregate_dual_regions_reverse",    // reverse dual regions
                 "aggregate_multi_regions_reverse",   // reverse multi regions
+                "aggregate_starts_reverse",          // reverse starts ranges
+                "aggregate_ends_reverse",            // reverse ends ranges
+                "aggregate_starts_ends_reverse",     // reverse starts/ends ranges
             ];
 
             for name in representative_exports {
@@ -338,10 +341,10 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (919 exports across 104 leaf modules). Bump
+    /// `register`, as of this PR (922 exports across 107 leaf modules). Bump
     /// this alongside any PR that intentionally adds
     /// or removes an export.
-    const EXPECTED_EXPORT_COUNT: usize = 919;
+    const EXPECTED_EXPORT_COUNT: usize = 922;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would

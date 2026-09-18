@@ -11,6 +11,15 @@
 //! and the output is a right-side position. Keeping that distinction in the
 //! comparison-path files avoids duplicating dtype dispatch and operation
 //! semantics here.
+//!
+//! The three reverse range-only methods near the middle of this file are a
+//! slightly different entry point. Their comparison work has already been
+//! completed by the caller, so they receive one boundary (or one pair of
+//! boundaries) per source row and write directly into dense right-side slots.
+//! Keeping those methods here is intentional: the dtype dispatch, null-mask
+//! contract, identities, and Kahan compensation are the same state concerns
+//! used by the comparison-driven methods, while the traversal strategy is
+//! specific to starts-only, ends-only, or starts/ends ranges.
 
 use super::input::{AggregationInput, AggregationOp};
 use numpy::ndarray::{Array1, ArrayView1};
@@ -946,6 +955,729 @@ impl<'a> AggregationSet<'a> {
         }
     }
 
+    /// Aggregate reverse suffix ranges into dense right-side output slots.
+    ///
+    /// `values[row]` is the left-side value associated with `starts[row]` and
+    /// `nulls[row]` is its authoritative null flag. A source row contributes
+    /// to every dense right ordinal in `start[row]..right_len`; it does not
+    /// contribute the right label itself. The caller has already converted
+    /// the comparison result into these ordinal boundaries.
+    ///
+    /// Integer reductions and counts use boundary events followed by a
+    /// left-to-right sweep when that is cheaper than visiting all covered
+    /// suffixes directly. Floating reductions always use direct suffix
+    /// updates so source-row encounter order is preserved. Min/max boundary
+    /// events store source positions; ties may retain either valid position
+    /// because only the extreme value matters.
+    ///
+    /// # Worked example
+    ///
+    /// With four right positions, the source arrays are:
+    ///
+    /// ```text
+    /// values = [2, 3]                 // one value per left/source row
+    /// nulls  = [false, false]         // neither source value is null
+    /// starts = [1, 0]                 // inclusive right ordinals
+    /// right  = [r0, r1, r2, r3]       // output slots, labels omitted here
+    /// ```
+    ///
+    /// Source row zero contributes `2` to `right[1..4]`; source row one
+    /// contributes `3` to `right[0..4]`:
+    ///
+    /// ```text
+    /// contribution     [ -, 2, 2, 2 ]
+    /// contribution     [ 3,  3, 3, 3 ]
+    /// sum               [ 3,  5, 5, 5 ]
+    /// product           [ 3,  6, 6, 6 ]
+    /// count-all         [ 1,  2, 2, 2 ]
+    /// ```
+    ///
+    /// For the integer sum, the implementation generates a boundary-event
+    /// array and then performs a running sweep:
+    ///
+    /// ```text
+    /// sum events by start = [3, 2, 0, 0]
+    /// running sum         = [3, 5, 5, 5]
+    ///
+    /// product events      = [3, 2, 1, 1]   // identity is 1
+    /// running product     = [3, 6, 6, 6]
+    /// ```
+    ///
+    /// This avoids revisiting source row zero separately for positions 1, 2,
+    /// and 3. If the batch is small or sparse, `use_running_tables` selects
+    /// direct range updates instead: it applies `2` to the slice `1..4` and
+    /// `3` to `0..4`. Both routes produce the same integer results. Floating
+    /// sums do not use the event rewrite because changing addition order can
+    /// change the rounded `f64`; they visit each suffix in source-row order.
+    pub(crate) fn aggregate_reverse_starts(&mut self, starts: ArrayView1<'_, i64>) {
+        let mut valid_starts = Vec::with_capacity(starts.len());
+        for start in starts {
+            let range = match usize::try_from(*start) {
+                Ok(start) if start < self.output_len => Some(start),
+                _ => None,
+            };
+            valid_starts.push(range);
+        }
+        self.mark_reverse_suffixes(&valid_starts);
+        // A boundary sweep touches every dense output slot. For a small or
+        // sparse batch, direct suffix updates touch fewer slots and are the
+        // better route. This is the reverse analogue of the adaptive running
+        // suffix-table choice used by the forward aggregation path.
+        let mut total_width = 0_usize;
+        for start in valid_starts.iter().flatten() {
+            total_width = total_width.saturating_add(self.output_len - *start);
+        }
+        let use_sweep = use_running_tables(starts.len(), total_width, self.output_len);
+        let suffix_ranges: Vec<_> = valid_starts
+            .iter()
+            .map(|start| start.map(|start| (start, self.output_len)))
+            .collect();
+
+        // Every state gets the same already-validated boundaries. The match
+        // below is the dtype/op dispatch: after construction, no Python
+        // objects or operation strings are inspected in this hot loop.
+        for state in &mut self.states {
+            match state {
+                State::CountAll => {}
+                State::CountNonNull(view, output) => {
+                    if !use_sweep {
+                        update_count_ranges(view, output, &suffix_ranges);
+                        continue;
+                    }
+                    // `events[p]` means: add this row's contribution when the
+                    // sweep reaches right position `p`. A suffix beginning
+                    // at `p` affects `p` and every position to its right.
+                    let mut events = vec![0_i64; self.output_len];
+                    for (row, start) in valid_starts.iter().enumerate() {
+                        if let Some(start) = start {
+                            if !view.nulls[row] {
+                                events[*start] += 1;
+                            }
+                        }
+                    }
+                    // Once the boundary event has been applied, its value is
+                    // active for the rest of the suffix sweep.
+                    let mut running = 0_i64;
+                    for position in 0..self.output_len {
+                        running += events[position];
+                        output[position] = running;
+                    }
+                }
+                State::Sum(view, output) => {
+                    if !use_sweep {
+                        update_reverse_signed_ranges(view, output, &suffix_ranges, false);
+                        continue;
+                    }
+                    let mut events = vec![0_i64; self.output_len];
+                    // Direct updates are deliberate for floating sums. The
+                    // source-row order is part of the numerical contract, so
+                    // an event table must not reorder additions.
+                    for (row, start) in valid_starts.iter().enumerate() {
+                        if let Some(start) = start {
+                            if !view.nulls[row] {
+                                events[*start] =
+                                    events[*start].wrapping_add(as_i64(&view.values, row));
+                            }
+                        }
+                    }
+                    let mut running = 0_i64;
+                    for position in 0..self.output_len {
+                        running = running.wrapping_add(events[position]);
+                        output[position] = running;
+                    }
+                }
+                State::SumU64(values, nulls, output) => {
+                    if !use_sweep {
+                        update_reverse_u64_ranges(values, nulls, output, &suffix_ranges, false);
+                        continue;
+                    }
+                    let mut events = vec![0_u64; self.output_len];
+                    for (row, start) in valid_starts.iter().enumerate() {
+                        if let Some(start) = start {
+                            if !nulls[row] {
+                                events[*start] = events[*start].wrapping_add(values[row]);
+                            }
+                        }
+                    }
+                    let mut running = 0_u64;
+                    for position in 0..self.output_len {
+                        running = running.wrapping_add(events[position]);
+                        output[position] = running;
+                    }
+                }
+                State::SumF64(view, output, compensation) => {
+                    for (row, start) in valid_starts.iter().enumerate() {
+                        if let Some(start) = start {
+                            if !view.nulls[row] {
+                                for position in *start..self.output_len {
+                                    kahan_add(
+                                        &mut output[position],
+                                        &mut compensation[position],
+                                        as_f64(&view.values, row),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                State::Product(view, output) => {
+                    if !use_sweep {
+                        update_reverse_signed_ranges(view, output, &suffix_ranges, true);
+                        continue;
+                    }
+                    let mut events = vec![1_i64; self.output_len];
+                    for (row, start) in valid_starts.iter().enumerate() {
+                        if let Some(start) = start {
+                            if !view.nulls[row] {
+                                events[*start] =
+                                    events[*start].wrapping_mul(as_i64(&view.values, row));
+                            }
+                        }
+                    }
+                    let mut running = 1_i64;
+                    for position in 0..self.output_len {
+                        running = running.wrapping_mul(events[position]);
+                        output[position] = running;
+                    }
+                }
+                State::ProductU64(values, nulls, output) => {
+                    if !use_sweep {
+                        update_reverse_u64_ranges(values, nulls, output, &suffix_ranges, true);
+                        continue;
+                    }
+                    let mut events = vec![1_u64; self.output_len];
+                    for (row, start) in valid_starts.iter().enumerate() {
+                        if let Some(start) = start {
+                            if !nulls[row] {
+                                events[*start] = events[*start].wrapping_mul(values[row]);
+                            }
+                        }
+                    }
+                    let mut running = 1_u64;
+                    for position in 0..self.output_len {
+                        running = running.wrapping_mul(events[position]);
+                        output[position] = running;
+                    }
+                }
+                State::ProductF64(view, output) => {
+                    for (row, start) in valid_starts.iter().enumerate() {
+                        if let Some(start) = start {
+                            if !view.nulls[row] {
+                                let value = as_f64(&view.values, row);
+                                for slot in &mut output[*start..self.output_len] {
+                                    *slot *= value;
+                                }
+                            }
+                        }
+                    }
+                }
+                State::Min(view, output) => {
+                    if use_sweep {
+                        update_reverse_boundary_extreme(view, output, &valid_starts, true, false);
+                    } else {
+                        update_reverse_range_extreme(view, output, &suffix_ranges, true);
+                    }
+                }
+                State::Max(view, output) => {
+                    if use_sweep {
+                        update_reverse_boundary_extreme(view, output, &valid_starts, false, false);
+                    } else {
+                        update_reverse_range_extreme(view, output, &suffix_ranges, false);
+                    }
+                }
+            }
+        }
+        self.write_reverse_count_all_suffixes(&valid_starts, use_sweep);
+    }
+
+    /// Aggregate reverse prefix ranges into dense right-side output slots.
+    ///
+    /// `values[row]` is the left-side value associated with `ends[row]` and
+    /// `nulls[row]` is its authoritative null flag. Each non-null source row
+    /// contributes to every dense right ordinal in `0..end[row]`; the caller
+    /// has already converted comparison results into these exclusive prefix
+    /// boundaries.
+    ///
+    /// Integer/count operations use end-boundary events and a right-to-left
+    /// sweep when that is cheaper than visiting every covered prefix slot.
+    /// Sparse or small batches use direct prefix updates. Float operations
+    /// always update each prefix directly in source-row order.
+    ///
+    /// # Worked example
+    ///
+    /// With four right positions, the source arrays are:
+    ///
+    /// ```text
+    /// values = [2, 3]                 // one value per left/source row
+    /// nulls  = [false, false]         // neither source value is null
+    /// ends   = [3, 1]                 // exclusive right ordinals
+    /// right  = [r0, r1, r2, r3]       // output slots, labels omitted here
+    /// ```
+    ///
+    /// The first source row contributes `2` to `right[0..3]`; the second
+    /// contributes `3` to `right[0..1]`:
+    ///
+    /// ```text
+    /// contribution     [ 2, 2, 2, - ]
+    /// contribution     [ 3, -, -,  - ]
+    /// sum               [ 5, 2, 2,  0 ]
+    /// count-all         [ 2, 1, 1,  0 ]
+    /// ```
+    ///
+    /// For integer sums, `2` is recorded at event slot `2` and `3` at event
+    /// slot `0`:
+    ///
+    /// ```text
+    /// sum events by end - 1 = [3, 0, 2, 0]
+    /// right-to-left running = [5, 2, 2, 0]
+    ///
+    /// product events         = [3, 1, 2, 1]
+    /// right-to-left running  = [6, 2, 2, 1]
+    /// ```
+    ///
+    /// A small or sparse batch instead applies `2` to `0..3` and `3` to
+    /// `0..1` directly. A zero-width or out-of-bounds end contributes no
+    /// event and no direct slice, so it cannot make an output position
+    /// matched. Count-all follows the same selected traversal and ignores
+    /// the null mask.
+    pub(crate) fn aggregate_reverse_ends(&mut self, ends: ArrayView1<'_, i64>) {
+        let mut valid_ends = Vec::with_capacity(ends.len());
+        for end in ends {
+            let range = match usize::try_from(*end) {
+                Ok(end) if end > 0 && end <= self.output_len => Some(end),
+                _ => None,
+            };
+            valid_ends.push(range);
+        }
+        self.mark_reverse_prefixes(&valid_ends);
+        // A prefix boundary sweep costs one pass over every dense output
+        // position. Direct prefix updates are preferable when the total
+        // covered width is small, using the same adaptive cost comparison as
+        // the forward ends-only aggregation path.
+        let mut total_width = 0_usize;
+        for end in valid_ends.iter().flatten() {
+            total_width = total_width.saturating_add(*end);
+        }
+        let use_sweep = use_running_tables(ends.len(), total_width, self.output_len);
+        let prefix_ranges: Vec<_> = valid_ends
+            .iter()
+            .map(|end| end.map(|end| (0, end)))
+            .collect();
+
+        // Prefix traversal is separate from suffix traversal because the
+        // same boundary-event idea requires the opposite sweep direction.
+        for state in &mut self.states {
+            match state {
+                State::CountAll => {}
+                State::CountNonNull(view, output) => {
+                    if !use_sweep {
+                        update_count_ranges(view, output, &prefix_ranges);
+                        continue;
+                    }
+                    let mut events = vec![0_i64; self.output_len];
+                    for (row, end) in valid_ends.iter().enumerate() {
+                        if let Some(end) = end {
+                            if !view.nulls[row] {
+                                events[*end - 1] += 1;
+                            }
+                        }
+                    }
+                    let mut running = 0_i64;
+                    for position in (0..self.output_len).rev() {
+                        running += events[position];
+                        output[position] = running;
+                    }
+                }
+                State::Sum(view, output) => {
+                    if !use_sweep {
+                        update_reverse_signed_ranges(view, output, &prefix_ranges, false);
+                        continue;
+                    }
+                    let mut events = vec![0_i64; self.output_len];
+                    for (row, end) in valid_ends.iter().enumerate() {
+                        if let Some(end) = end {
+                            if !view.nulls[row] {
+                                events[*end - 1] =
+                                    events[*end - 1].wrapping_add(as_i64(&view.values, row));
+                            }
+                        }
+                    }
+                    let mut running = 0_i64;
+                    for position in (0..self.output_len).rev() {
+                        running = running.wrapping_add(events[position]);
+                        output[position] = running;
+                    }
+                }
+                State::SumU64(values, nulls, output) => {
+                    if !use_sweep {
+                        update_reverse_u64_ranges(values, nulls, output, &prefix_ranges, false);
+                        continue;
+                    }
+                    let mut events = vec![0_u64; self.output_len];
+                    for (row, end) in valid_ends.iter().enumerate() {
+                        if let Some(end) = end {
+                            if !nulls[row] {
+                                events[*end - 1] = events[*end - 1].wrapping_add(values[row]);
+                            }
+                        }
+                    }
+                    let mut running = 0_u64;
+                    for position in (0..self.output_len).rev() {
+                        running = running.wrapping_add(events[position]);
+                        output[position] = running;
+                    }
+                }
+                State::SumF64(view, output, compensation) => {
+                    for (row, end) in valid_ends.iter().enumerate() {
+                        if let Some(end) = end {
+                            if !view.nulls[row] {
+                                for position in 0..*end {
+                                    kahan_add(
+                                        &mut output[position],
+                                        &mut compensation[position],
+                                        as_f64(&view.values, row),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                State::Product(view, output) => {
+                    if !use_sweep {
+                        update_reverse_signed_ranges(view, output, &prefix_ranges, true);
+                        continue;
+                    }
+                    let mut events = vec![1_i64; self.output_len];
+                    for (row, end) in valid_ends.iter().enumerate() {
+                        if let Some(end) = end {
+                            if !view.nulls[row] {
+                                events[*end - 1] =
+                                    events[*end - 1].wrapping_mul(as_i64(&view.values, row));
+                            }
+                        }
+                    }
+                    let mut running = 1_i64;
+                    for position in (0..self.output_len).rev() {
+                        running = running.wrapping_mul(events[position]);
+                        output[position] = running;
+                    }
+                }
+                State::ProductU64(values, nulls, output) => {
+                    if !use_sweep {
+                        update_reverse_u64_ranges(values, nulls, output, &prefix_ranges, true);
+                        continue;
+                    }
+                    let mut events = vec![1_u64; self.output_len];
+                    for (row, end) in valid_ends.iter().enumerate() {
+                        if let Some(end) = end {
+                            if !nulls[row] {
+                                events[*end - 1] = events[*end - 1].wrapping_mul(values[row]);
+                            }
+                        }
+                    }
+                    let mut running = 1_u64;
+                    for position in (0..self.output_len).rev() {
+                        running = running.wrapping_mul(events[position]);
+                        output[position] = running;
+                    }
+                }
+                State::ProductF64(view, output) => {
+                    for (row, end) in valid_ends.iter().enumerate() {
+                        if let Some(end) = end {
+                            if !view.nulls[row] {
+                                let value = as_f64(&view.values, row);
+                                for slot in &mut output[..*end] {
+                                    *slot *= value;
+                                }
+                            }
+                        }
+                    }
+                }
+                State::Min(view, output) => {
+                    if use_sweep {
+                        update_reverse_boundary_extreme(view, output, &valid_ends, true, true);
+                    } else {
+                        update_reverse_range_extreme(view, output, &prefix_ranges, true);
+                    }
+                }
+                State::Max(view, output) => {
+                    if use_sweep {
+                        update_reverse_boundary_extreme(view, output, &valid_ends, false, true);
+                    } else {
+                        update_reverse_range_extreme(view, output, &prefix_ranges, false);
+                    }
+                }
+            }
+        }
+        self.write_reverse_count_all_prefixes(&valid_ends, use_sweep);
+    }
+
+    /// Aggregate arbitrary reverse half-open ranges using dense output slots.
+    ///
+    /// `values[row]` is the left-side value associated with the half-open
+    /// interval `starts[row]..ends[row]`; `nulls[row]` is its authoritative
+    /// null flag. The method writes to dense right ordinals, not to the label
+    /// values in `right_index`.
+    ///
+    /// This method intentionally does not use a `HashMap`: every right ordinal
+    /// has a required result slot, so direct positional writes are both simpler
+    /// and compatible with the fused API's full-length output contract. The
+    /// existing reverse starts/ends kernels use a dense-array route for broad
+    /// batches and a map route for compact sparse outputs. The fused API cannot
+    /// use that compact map route because it must return identity/sentinel
+    /// values for every right slot, including untouched slots.
+    ///
+    /// # Worked example
+    ///
+    /// For four right positions, the source arrays are:
+    ///
+    /// ```text
+    /// values = [2, 3]
+    /// nulls  = [false, false]
+    /// starts = [1, 0]                 // inclusive
+    /// ends   = [4, 2]                 // exclusive
+    /// ```
+    ///
+    /// Thus source row zero updates `right[1..4]`, and source row one updates
+    /// `right[0..2]`:
+    ///
+    /// ```text
+    /// contribution     [ -, 2, 2, 2 ]
+    /// contribution     [ 3,  3, -, - ]
+    /// sum               [ 3,  5, 2, 2 ]
+    /// matched           [ T,  T, T, T ]
+    /// ```
+    ///
+    /// The direct range loop is the natural dense reverse-update algorithm:
+    /// each valid source row walks exactly the slots it covers. For example,
+    /// the integer sum performs:
+    ///
+    /// ```text
+    /// output starts at [0, 0, 0, 0]
+    /// apply row 0 value 2 to slots 1..4 -> [0, 2, 2, 2]
+    /// apply row 1 value 3 to slots 0..2 -> [3, 5, 2, 2]
+    /// ```
+    ///
+    /// A forward segment tree is useful when many output queries ask for
+    /// source-range summaries. This reverse path has the opposite shape:
+    /// source rows apply updates to output ranges. A segment tree would need a
+    /// separate lazy range-update implementation for each operation, would
+    /// not help floating sums whose encounter order is significant, and would
+    /// still need a full output materialization. Direct dense slices therefore
+    /// preserve the existing reverse kernel's optimized dense route. Invalid,
+    /// inverted, or zero-width ranges are discarded before the loop, so they
+    /// affect neither `matched` nor any aggregation.
+    pub(crate) fn aggregate_reverse_starts_ends(
+        &mut self,
+        starts: ArrayView1<'_, i64>,
+        ends: ArrayView1<'_, i64>,
+    ) {
+        let mut ranges = Vec::with_capacity(starts.len());
+        for row in 0..starts.len() {
+            let range = match (usize::try_from(starts[row]), usize::try_from(ends[row])) {
+                (Ok(start), Ok(end)) if start < end && end <= self.output_len => Some((start, end)),
+                _ => None,
+            };
+            ranges.push(range);
+        }
+        self.mark_reverse_ranges(&ranges);
+
+        // Unlike starts-only and ends-only, arbitrary intervals do not share a
+        // single boundary sweep. The dense slice is therefore updated directly
+        // for each valid source range.
+        for state in &mut self.states {
+            match state {
+                State::CountAll => {}
+                State::CountNonNull(view, output) => {
+                    // Count-non-null uses the mask; count-all is written once
+                    // below and intentionally does not inspect any mask.
+                    for (row, range) in ranges.iter().enumerate() {
+                        if let Some((start, end)) = range {
+                            if !view.nulls[row] {
+                                for slot in &mut output[*start..*end] {
+                                    *slot += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                State::Sum(view, output) => {
+                    for (row, range) in ranges.iter().enumerate() {
+                        if let Some((start, end)) = range {
+                            if !view.nulls[row] {
+                                let value = as_i64(&view.values, row);
+                                for slot in &mut output[*start..*end] {
+                                    *slot = slot.wrapping_add(value);
+                                }
+                            }
+                        }
+                    }
+                }
+                State::SumU64(values, nulls, output) => {
+                    for (row, range) in ranges.iter().enumerate() {
+                        if let Some((start, end)) = range {
+                            if !nulls[row] {
+                                for slot in &mut output[*start..*end] {
+                                    *slot = slot.wrapping_add(values[row]);
+                                }
+                            }
+                        }
+                    }
+                }
+                State::SumF64(view, output, compensation) => {
+                    for (row, range) in ranges.iter().enumerate() {
+                        if let Some((start, end)) = range {
+                            if !view.nulls[row] {
+                                let value = as_f64(&view.values, row);
+                                for position in *start..*end {
+                                    kahan_add(
+                                        &mut output[position],
+                                        &mut compensation[position],
+                                        value,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                State::Product(view, output) => {
+                    for (row, range) in ranges.iter().enumerate() {
+                        if let Some((start, end)) = range {
+                            if !view.nulls[row] {
+                                let value = as_i64(&view.values, row);
+                                for slot in &mut output[*start..*end] {
+                                    *slot = slot.wrapping_mul(value);
+                                }
+                            }
+                        }
+                    }
+                }
+                State::ProductU64(values, nulls, output) => {
+                    for (row, range) in ranges.iter().enumerate() {
+                        if let Some((start, end)) = range {
+                            if !nulls[row] {
+                                for slot in &mut output[*start..*end] {
+                                    *slot = slot.wrapping_mul(values[row]);
+                                }
+                            }
+                        }
+                    }
+                }
+                State::ProductF64(view, output) => {
+                    for (row, range) in ranges.iter().enumerate() {
+                        if let Some((start, end)) = range {
+                            if !view.nulls[row] {
+                                let value = as_f64(&view.values, row);
+                                for slot in &mut output[*start..*end] {
+                                    *slot *= value;
+                                }
+                            }
+                        }
+                    }
+                }
+                State::Min(view, output) => {
+                    update_reverse_range_extreme(view, output, &ranges, true);
+                }
+                State::Max(view, output) => {
+                    update_reverse_range_extreme(view, output, &ranges, false);
+                }
+            }
+        }
+        self.write_reverse_count_all_ranges(&ranges);
+    }
+
+    /// Mark every right position covered by at least one valid suffix.
+    fn mark_reverse_suffixes(&mut self, starts: &[Option<usize>]) {
+        for start in starts.iter().flatten() {
+            self.matched[*start..].fill(true);
+            self.successful = true;
+        }
+    }
+
+    /// Mark every right position covered by at least one valid prefix.
+    fn mark_reverse_prefixes(&mut self, ends: &[Option<usize>]) {
+        for end in ends.iter().flatten() {
+            self.matched[..*end].fill(true);
+            self.successful = true;
+        }
+    }
+
+    /// Mark every right position covered by an arbitrary valid interval.
+    fn mark_reverse_ranges(&mut self, ranges: &[Option<(usize, usize)>]) {
+        for (start, end) in ranges.iter().flatten() {
+            self.matched[*start..*end].fill(true);
+            self.successful = true;
+        }
+    }
+
+    /// Compute count-all for reverse suffixes.
+    ///
+    /// The sweep route reuses the same boundary events as integer sum/count.
+    /// The direct route is selected for sparse batches and visits only the
+    /// suffix slots that are actually covered.
+    fn write_reverse_count_all_suffixes(&mut self, starts: &[Option<usize>], use_sweep: bool) {
+        let Some(output) = &mut self.count_all else {
+            return;
+        };
+        if !use_sweep {
+            for start in starts.iter().flatten() {
+                for slot in &mut output[*start..] {
+                    *slot += 1;
+                }
+            }
+            return;
+        }
+        let mut events = vec![0_i64; self.output_len];
+        for start in starts.iter().flatten() {
+            events[*start] += 1;
+        }
+        let mut running = 0_i64;
+        for position in 0..self.output_len {
+            running += events[position];
+            output[position] = running;
+        }
+    }
+
+    /// Compute count-all for reverse prefixes.
+    ///
+    /// Sparse batches use direct dense slice increments; broad batches use
+    /// end-boundary events and sweep toward the beginning of the output.
+    fn write_reverse_count_all_prefixes(&mut self, ends: &[Option<usize>], use_sweep: bool) {
+        let Some(output) = &mut self.count_all else {
+            return;
+        };
+        if !use_sweep {
+            for end in ends.iter().flatten() {
+                for slot in &mut output[..*end] {
+                    *slot += 1;
+                }
+            }
+            return;
+        }
+        let mut events = vec![0_i64; self.output_len];
+        for end in ends.iter().flatten() {
+            events[*end - 1] += 1;
+        }
+        let mut running = 0_i64;
+        for position in (0..self.output_len).rev() {
+            running += events[position];
+            output[position] = running;
+        }
+    }
+
+    /// Compute count-all for arbitrary reverse intervals using dense output
+    /// slots. Null masks are intentionally irrelevant here.
+    fn write_reverse_count_all_ranges(&mut self, ranges: &[Option<(usize, usize)>]) {
+        let Some(output) = &mut self.count_all else {
+            return;
+        };
+        for (start, end) in ranges.iter().flatten() {
+            for slot in &mut output[*start..*end] {
+                *slot += 1;
+            }
+        }
+    }
+
     /// Return whether this comparison pass observed no successful comparison.
     ///
     /// This flag describes comparison success, not aggregation success. In
@@ -1474,6 +2206,201 @@ fn update_extreme_ranges(
             }
         }
         output[row] = winner;
+    }
+}
+
+/// Apply boundary-event min/max logic to reverse suffix or prefix ranges.
+///
+/// `boundaries` contains either a suffix start or a prefix end for each source
+/// row. A source row is first selected as the best event at its boundary, then
+/// those events are swept across the dense right-side output. This avoids
+/// comparing the same source row independently against every covered slot.
+/// `prefix` selects the right-to-left prefix sweep; suffixes sweep left to
+/// right.
+///
+/// The two-stage structure mirrors the sum/product event algorithm:
+///
+/// ```text
+/// suffix starts: boundary 1 -> candidate is active at [1..]
+///                boundary 0 -> candidate is active at [0..]
+/// sweep:         winner[0], winner[1], winner[2], ...
+///
+/// prefix ends:   end 3 -> candidate is active at [..3]
+///                end 1 -> candidate is active at [..1]
+/// sweep:         ..., winner[2], winner[1], winner[0]
+/// ```
+///
+/// A boundary slot keeps only the best candidate that begins or ends there;
+/// the sweep then compares winners from different boundaries. Equality does
+/// not replace the current winner. The API does not promise which tied source
+/// position is returned, only that a returned position contains the true
+/// minimum or maximum value.
+fn update_reverse_boundary_extreme(
+    view: &View<'_>,
+    output: &mut [i64],
+    boundaries: &[Option<usize>],
+    min: bool,
+    prefix: bool,
+) {
+    let mut events = vec![-1_i64; output.len()];
+    for (row, boundary) in boundaries.iter().enumerate() {
+        let Some(boundary) = boundary else { continue };
+        if view.nulls[row] {
+            continue;
+        }
+        let slot = if prefix { *boundary - 1 } else { *boundary };
+        let current = events[slot];
+        if current < 0
+            || if min {
+                is_less(view, row, current as usize)
+            } else {
+                is_greater(view, row, current as usize)
+            }
+        {
+            events[slot] = row as i64;
+        }
+    }
+
+    let mut winner = -1_i64;
+    if prefix {
+        for position in (0..output.len()).rev() {
+            winner = merge_extreme_positions(view, winner, events[position], min);
+            output[position] = winner;
+        }
+    } else {
+        for position in 0..output.len() {
+            winner = merge_extreme_positions(view, winner, events[position], min);
+            output[position] = winner;
+        }
+    }
+}
+
+/// Merge a source-row position into an existing min/max winner. `-1` is the
+/// no-winner sentinel and is ignored whenever a valid candidate exists.
+fn merge_extreme_positions(view: &View<'_>, left: i64, right: i64, min: bool) -> i64 {
+    if left < 0 {
+        return right;
+    }
+    if right < 0 {
+        return left;
+    }
+    let right_wins = if min {
+        is_less(view, right as usize, left as usize)
+    } else {
+        is_greater(view, right as usize, left as usize)
+    };
+    if right_wins {
+        right
+    } else {
+        left
+    }
+}
+
+/// Count valid values across dense reverse ranges.
+///
+/// This is the direct fallback for sparse starts-only and ends-only batches.
+/// The mask is authoritative: a `true` entry marks the source value null and
+/// contributes nothing; a `false` entry contributes one to every output slot
+/// covered by that source row. Count-all is intentionally handled by its
+/// separate writer because it must ignore this mask.
+fn update_count_ranges(view: &View<'_>, output: &mut [i64], ranges: &[Option<(usize, usize)>]) {
+    for (row, range) in ranges.iter().enumerate() {
+        let Some((start, end)) = range else { continue };
+        if view.nulls[row] {
+            continue;
+        }
+        for slot in &mut output[*start..*end] {
+            *slot += 1;
+        }
+    }
+}
+
+/// Apply one source-row integer value to every covered dense reverse output
+/// slot. This differs from `update_signed_ranges`: forward ranges select a
+/// source slice for each output row, while reverse ranges use one source row
+/// to update an output slice. Keeping the helpers separate prevents the
+/// boundary indices from being accidentally used to index the source array.
+fn update_reverse_signed_ranges(
+    view: &View<'_>,
+    output: &mut [i64],
+    ranges: &[Option<(usize, usize)>],
+    product: bool,
+) {
+    for (row, range) in ranges.iter().enumerate() {
+        let Some((start, end)) = range else { continue };
+        if view.nulls[row] {
+            continue;
+        }
+        let value = as_i64(&view.values, row);
+        for slot in &mut output[*start..*end] {
+            *slot = if product {
+                slot.wrapping_mul(value)
+            } else {
+                slot.wrapping_add(value)
+            };
+        }
+    }
+}
+
+/// `u64` counterpart to [`update_reverse_signed_ranges`]. The separate
+/// helper preserves the required `u64` accumulator without narrowing values
+/// through `i64`.
+fn update_reverse_u64_ranges(
+    values: &ArrayView1<'_, u64>,
+    nulls: &ArrayView1<'_, bool>,
+    output: &mut [u64],
+    ranges: &[Option<(usize, usize)>],
+    product: bool,
+) {
+    for (row, range) in ranges.iter().enumerate() {
+        let Some((start, end)) = range else { continue };
+        if nulls[row] {
+            continue;
+        }
+        let value = values[row];
+        for slot in &mut output[*start..*end] {
+            *slot = if product {
+                slot.wrapping_mul(value)
+            } else {
+                slot.wrapping_add(value)
+            };
+        }
+    }
+}
+
+/// Apply min/max directly to dense arbitrary reverse intervals. The output
+/// position stores the source row that owns the winning value; ties may keep
+/// either valid position.
+///
+/// Unlike the boundary cases, an arbitrary interval has two independent
+/// boundaries and cannot be represented by one monotonic event sweep. The
+/// dense slice update is therefore both straightforward and appropriate:
+/// for each valid source row, compare its value with the current winner in
+/// every covered output slot. Because output is already dense and aligned to
+/// `right_index`, a map would only add hashing and a later reorder step.
+fn update_reverse_range_extreme(
+    view: &View<'_>,
+    output: &mut [i64],
+    ranges: &[Option<(usize, usize)>],
+    min: bool,
+) {
+    for (row, range) in ranges.iter().enumerate() {
+        let Some((start, end)) = range else { continue };
+        if view.nulls[row] {
+            continue;
+        }
+        for slot in &mut output[*start..*end] {
+            let current = *slot;
+            if current < 0
+                || if min {
+                    is_less(view, row, current as usize)
+                } else {
+                    is_greater(view, row, current as usize)
+                }
+            {
+                *slot = row as i64;
+            }
+        }
     }
 }
 
