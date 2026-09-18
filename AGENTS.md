@@ -153,17 +153,23 @@ janitor-rs/
 │   │                        # per-function add_function calls live here
 │   ├── bin_search/          # binary search kernels (lt, gt, ge, le, ...
 │   │                        # x first/regions variants)
-│   ├── compare/              # ragged comparison kernels (op-coded: 0=`>`
-│   │                         # 1=`>=` 2=`<` 3=`<=` 4=`==` 5=`!=`)
 │   ├── index_builder.rs      # index-building helpers (repeat_index,
 │   │                         # trim_index, build_positional_index, ...)
-│   ├── left_le_right.rs      # positions where left region <= right region
+│   ├── multi_join_indices/  # fused batch/dual-region/multi-region index
+│   │                        # builders retained from the old `compare/`
+│   │                        # and top-level `non_equi_*` files when the
+│   │                        # per-op comparison-kernel family was removed
+│   │                        # (issue #193)
 │   └── aggs/
 │       ├── sum/ sum_rev/     # forward and reverse sum kernels
 │       ├── min/ min_rev/     # ditto for min
 │       ├── max/ max_rev/     # ditto for max
 │       ├── prod/ prod_rev/   # ditto for prod
-│       └── size_rev/         # size (count) kernels, reverse-only
+│       ├── size_rev/         # size (count) kernels, reverse-only
+│       └── batch_aggregate.rs, dual_regions.rs, multi_regions.rs, ...
+│                             # fused predicate-driven aggregation, also
+│                             # retained from `compare/`/`non_equi_*`
+│                             # (issue #193)
 ├── benches/kernels.rs        # criterion benchmarks for the extracted
 │                             # `*_core` functions (see below)
 ├── clippy.toml                # documents the default Clippy argument policy
@@ -232,19 +238,22 @@ register(m: &Bound<'_, PyModule>) -> PyResult<()>`:
    per dtype variant it defines, same names/order as before -- just moved
    out of `lib.rs` into the file that owns the functions.
 2. **Family `mod.rs`** (e.g. `aggs/sum/mod.rs`, `bin_search/mod.rs`,
-   `compare/mod.rs`): calls `child::register(m)?;` once per `pub mod`
-   child declared in that file.
+   `multi_join_indices/mod.rs`): calls `child::register(m)?;` once per
+   `pub mod` child declared in that file.
 3. **`aggs/mod.rs`**: an extra layer above (2) for the aggregation
    family specifically, since it has sum/sum_rev/min/min_rev/max/max_rev/
    prod/prod_rev/size_rev as its own `pub mod` children, each of which is
-   itself a directory following (2).
+   itself a directory following (2), plus the flat fused-aggregation files
+   (`batch_aggregate.rs`, `dual_regions.rs`, `multi_regions.rs`, ...)
+   retained from `compare/`/`non_equi_*` by issue #193.
 
-`src/lib.rs`'s `#[pymodule] fn janitor_rs` only calls the five top-level
-family registers (`bin_search`, `compare`, `index_builder`, `left_le_right`,
+`src/lib.rs`'s `#[pymodule] fn janitor_rs` only calls the four top-level
+family registers (`bin_search`, `multi_join_indices`, `index_builder`,
 `aggs`) -- it never names an individual dtype-specialized function.
-`index_builder.rs` and `left_le_right.rs` are single files (not
-directories), so their `register` lives directly in that file with no
-extra layer.
+`index_builder.rs` is a single file (not a directory), so its `register`
+lives directly in that file with no extra layer. (`compare/` and the
+single-file `left_le_right.rs` were removed by issue #193; the fused paths
+they held now live under `multi_join_indices/` and `aggs/`.)
 
 When adding a brand-new leaf file (a new kernel shape, not just a new
 dtype instantiation of an existing one), remember to also add its
