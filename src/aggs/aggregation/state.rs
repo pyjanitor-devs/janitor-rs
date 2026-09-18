@@ -45,8 +45,8 @@ enum Values<'a> {
 /// null, while `false` means it is valid. The mask is authoritative: this code
 /// does not inspect a value or infer nullness from sentinels or special values.
 /// Null metadata is used by value-based operations (`sum`, `product`, `min`,
-/// and `max`), while `count` intentionally counts the comparison event
-/// regardless of this mask.
+/// `max`, and column-based `count`). Count-all/`size` intentionally counts
+/// the comparison event regardless of this mask.
 struct View<'a> {
     values: Values<'a>,
     nulls: ArrayView1<'a, bool>,
@@ -64,7 +64,12 @@ enum State<'a> {
     Sum(View<'a>, Vec<i64>),
     SumU64(ArrayView1<'a, u64>, ArrayView1<'a, bool>, Vec<u64>),
     SumF64(View<'a>, Vec<f64>, Vec<f64>),
-    Count(Vec<i64>),
+    /// Reference the set-level count-all buffer; no value array or mask is
+    /// needed. The buffer is shared so repeated count-all requests are
+    /// computed once and materialized per request only when results are built.
+    CountAll,
+    /// Count only successful comparisons whose source mask marks a value valid.
+    CountNonNull(View<'a>, Vec<i64>),
     Product(View<'a>, Vec<i64>),
     ProductU64(ArrayView1<'a, u64>, ArrayView1<'a, bool>, Vec<u64>),
     ProductF64(View<'a>, Vec<f64>),
@@ -87,6 +92,12 @@ pub(crate) struct AggregationSet<'a> {
     output_len: usize,
     /// Number of positions available in every source aggregation array.
     source_len: usize,
+    /// Optional count-all accumulator shared by every `CountAll` request.
+    /// It is allocated only when at least one count-all request is present.
+    count_all: Option<Vec<i64>>,
+    /// Whether each output position received at least one successful match.
+    /// This is independent of null masks and aggregation identities.
+    matched: Vec<bool>,
     /// Whether at least one valid comparison has succeeded.
     successful: bool,
 }
@@ -127,6 +138,10 @@ impl<'a> AggregationSet<'a> {
         let mut candidate_len = None;
         for input in inputs {
             let (values, nulls, op) = match input {
+                AggregationInput::CountAll => {
+                    states.push(State::CountAll);
+                    continue;
+                }
                 AggregationInput::I64(a, m, o) => (Values::I64(a.as_array()), m.as_array(), *o),
                 AggregationInput::I32(a, m, o) => (Values::I32(a.as_array()), m.as_array(), *o),
                 AggregationInput::I16(a, m, o) => (Values::I16(a.as_array()), m.as_array(), *o),
@@ -181,7 +196,10 @@ impl<'a> AggregationSet<'a> {
                     ),
                     _ => State::Sum(View { values, nulls }, vec![0; output_len]),
                 },
-                AggregationOp::Count => State::Count(vec![0; output_len]),
+                AggregationOp::CountAll => State::CountAll,
+                AggregationOp::CountNonNull => {
+                    State::CountNonNull(View { values, nulls }, vec![0; output_len])
+                }
                 AggregationOp::Product => match &values {
                     Values::U64(values) => State::ProductU64(*values, nulls, vec![1; output_len]),
                     Values::F64(_) | Values::F32(_) => {
@@ -194,10 +212,17 @@ impl<'a> AggregationSet<'a> {
             };
             states.push(state);
         }
+        let has_count_all = states.iter().any(|state| matches!(state, State::CountAll));
         Ok(Self {
             states,
             output_len,
             source_len,
+            count_all: if has_count_all {
+                Some(vec![0; output_len])
+            } else {
+                None
+            },
+            matched: vec![false; output_len],
             successful: false,
         })
     }
@@ -209,11 +234,12 @@ impl<'a> AggregationSet<'a> {
     /// modules call this once per successful pair, so multiple aggregations
     /// share one traversal.
     ///
-    /// Count deliberately ignores null metadata and therefore counts every
-    /// successful comparison. Other operations skip a source value whose mask is
-    /// `true`. A `false` mask is treated as an assertion that the value array is
-    /// null-free and the value is valid; no additional null inference or
-    /// sentinel filtering is performed.
+    /// `CountAll` deliberately ignores null metadata and therefore counts
+    /// every successful comparison. `CountNonNull` and other value-based
+    /// operations skip a source value whose mask is `true`. A `false` mask is
+    /// treated as an assertion that the value array is null-free and the value
+    /// is valid; no additional null inference or sentinel filtering is
+    /// performed.
     /// Both positions are checked defensively. Normal callers have already
     /// validated these bounds, but retaining the check here makes the shared
     /// state safe when a future comparison path is added.
@@ -228,6 +254,7 @@ impl<'a> AggregationSet<'a> {
             return;
         }
         self.successful = true;
+        self.matched[output_position] = true;
         // One successful comparison is one event. Broadcast that event to
         // every requested aggregation before moving to the next candidate.
         // This is the central multi-aggregation benefit: predicates and
@@ -235,7 +262,16 @@ impl<'a> AggregationSet<'a> {
         // that traversal.
         for state in &mut self.states {
             match state {
-                State::Count(values) => values[output_position] += 1,
+                State::CountAll => {
+                    // The count-all buffer is shared across all count-all
+                    // requests. This branch only signals that the request
+                    // exists; the actual increment happens once below.
+                }
+                State::CountNonNull(view, values) => {
+                    if !view.nulls[source_position] {
+                        values[output_position] += 1;
+                    }
+                }
                 State::Sum(view, values) => {
                     if !view.nulls[source_position] {
                         values[output_position] = values[output_position]
@@ -292,6 +328,9 @@ impl<'a> AggregationSet<'a> {
                 }
             }
         }
+        if let Some(values) = &mut self.count_all {
+            values[output_position] += 1;
+        }
     }
 
     /// Return whether no successful comparison has been observed.
@@ -302,7 +341,7 @@ impl<'a> AggregationSet<'a> {
         !self.successful
     }
 
-    /// Convert all accumulator buffers into NumPy arrays.
+    /// Convert the match indicator and accumulator buffers into Python values.
     ///
     /// The result order is exactly the input aggregation order. This method
     /// consumes the set because the internal buffers can be moved directly
@@ -315,9 +354,17 @@ impl<'a> AggregationSet<'a> {
     ///
     /// # Returns
     ///
-    /// A vector containing one NumPy array per requested aggregation.
-    pub(crate) fn into_results(self, py: Python<'_>) -> Vec<Py<PyAny>> {
-        self.states
+    /// A pair containing the boolean match indicator followed by one NumPy
+    /// array per requested aggregation. The caller wraps this pair in the
+    /// public `(matched, aggregation_arrays)` tuple.
+    pub(crate) fn into_results(self, py: Python<'_>) -> (Py<PyAny>, Vec<Py<PyAny>>) {
+        let matched = Array1::from_vec(self.matched)
+            .into_pyarray(py)
+            .unbind()
+            .into_any();
+        let count_all = self.count_all;
+        let results = self
+            .states
             .into_iter()
             .map(|state| match state {
                 State::Sum(_, v) | State::Product(_, v) => {
@@ -334,11 +381,21 @@ impl<'a> AggregationSet<'a> {
                     Array1::from_vec(v).into_pyarray(py).unbind().into_any()
                 }
                 State::ProductF64(_, v) => Array1::from_vec(v).into_pyarray(py).unbind().into_any(),
-                State::Count(v) | State::Min(_, v) | State::Max(_, v) => {
+                State::CountAll => Array1::from_vec(
+                    count_all
+                        .as_ref()
+                        .expect("count-all state requires a shared count-all buffer")
+                        .clone(),
+                )
+                .into_pyarray(py)
+                .unbind()
+                .into_any(),
+                State::CountNonNull(_, v) | State::Min(_, v) | State::Max(_, v) => {
                     Array1::from_vec(v).into_pyarray(py).unbind().into_any()
                 }
             })
-            .collect()
+            .collect();
+        (matched, results)
     }
 }
 

@@ -7,13 +7,13 @@
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyList, PyTuple};
 
 use super::common::checked_bounds;
 use super::predicate::{
     null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch,
 };
-use crate::aggs::aggregation::{parse_inputs, AggregationSet};
+use crate::aggs::aggregation::{make_results, parse_inputs, AggregationSet};
 use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 
 /// Compare heterogeneous predicates over optional per-row bounds and update
@@ -42,12 +42,17 @@ use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 ///   operations, while `false` asserts that the corresponding value is valid.
 ///   Callers, principally pyjanitor, are responsible for supplying the aligned
 ///   array and correct mask; this function does not infer nulls from values.
+///   A three-element `count` request counts non-null values; `size` or the
+///   two-element `("*", "count")` shorthand counts every successful
+///   comparison without requiring a value column.
 ///
 /// # Returns
 ///
-/// `Some(list)` containing one output NumPy array per requested aggregation,
-/// in input order. Every output has one slot per left row. Returns `None` when
-/// no candidate passes the comparisons.
+/// `Some((matched, list))`, where `matched` is a boolean array with one slot
+/// per left row and `list` contains one output NumPy array per requested
+/// aggregation in input order. `matched[row]` is true when at least one
+/// candidate passed the comparisons, regardless of aggregation nullness.
+/// Returns `None` when no candidate passes the comparisons anywhere.
 ///
 /// # Errors
 ///
@@ -60,7 +65,7 @@ pub fn compare_batch_aggregate<'py>(
     starts: Option<PyReadonlyArray1<'py, i64>>,
     ends: Option<PyReadonlyArray1<'py, i64>>,
     aggregations: &Bound<'py, PyList>,
-) -> PyResult<Option<Bound<'py, PyList>>> {
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let (predicates, metadata) = parse_predicates_with_nulls(py, predicates)?;
     if predicates.is_empty() {
         return Err(PyValueError::new_err("at least one comparison is required"));
@@ -119,8 +124,7 @@ pub fn compare_batch_aggregate<'py>(
     if set.is_empty() {
         return Ok(None);
     }
-    let results = set.into_results(py);
-    Ok(Some(PyList::new(py, results)?))
+    Ok(Some(make_results(py, set)?))
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -177,6 +181,12 @@ mod tests {
             let result = compare_batch_aggregate(py, &predicates, None, None, &aggregations)
                 .unwrap()
                 .unwrap();
+            assert_eq!(
+                result.get_item(0).unwrap().extract::<Vec<bool>>().unwrap(),
+                vec![true, true]
+            );
+            let result_list = result.get_item(1).unwrap();
+            let result = result_list.cast::<PyList>().unwrap();
             assert_eq!(result.len(), 5);
             assert_eq!(
                 result.get_item(0).unwrap().extract::<Vec<i64>>().unwrap(),
@@ -268,6 +278,8 @@ mod tests {
             let result = compare_batch_aggregate(py, &predicates, None, None, &aggregations)
                 .unwrap()
                 .unwrap();
+            let result_list = result.get_item(1).unwrap();
+            let result = result_list.cast::<PyList>().unwrap();
             let values = result.get_item(0).unwrap().extract::<Vec<f64>>().unwrap();
             assert_eq!(values, vec![0.0]);
         });
@@ -319,6 +331,8 @@ mod tests {
             let result = compare_batch_aggregate(py, &predicates, None, None, &aggregations)
                 .unwrap()
                 .unwrap();
+            let result_list = result.get_item(1).unwrap();
+            let result = result_list.cast::<PyList>().unwrap();
             let positive_result = result.get_item(0).unwrap().extract::<Vec<f64>>().unwrap();
             let negative_result = result.get_item(1).unwrap().extract::<Vec<f64>>().unwrap();
             assert!(positive_result[0].is_infinite() && positive_result[0].is_sign_positive());

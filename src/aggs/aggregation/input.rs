@@ -26,7 +26,8 @@ use pyo3::types::{PyList, PyTuple};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AggregationOp {
     Sum,
-    Count,
+    CountAll,
+    CountNonNull,
     Product,
     Min,
     Max,
@@ -35,8 +36,9 @@ pub(crate) enum AggregationOp {
 impl AggregationOp {
     /// Parse a Python operation name.
     ///
-    /// `size` is accepted as the pandas-compatible alias for `count`, and
-    /// `prod` is accepted as the short alias for `product`.
+    /// `size` requests count-all, while `count` requests a non-null count for
+    /// a specific value column. `prod` is accepted as the short alias for
+    /// `product`.
     ///
     /// # Errors
     ///
@@ -44,11 +46,12 @@ impl AggregationOp {
     /// unsupported operation name.
     fn parse(value: &Bound<'_, PyAny>) -> PyResult<Self> {
         let name = value.extract::<String>().map_err(|_| {
-            PyTypeError::new_err("aggregation must be one of sum, count, prod, min, or max")
+            PyTypeError::new_err("aggregation must be one of sum, count, size, prod, min, or max")
         })?;
         match name.as_str() {
             "sum" => Ok(Self::Sum),
-            "count" | "size" => Ok(Self::Count),
+            "count" => Ok(Self::CountNonNull),
+            "size" => Ok(Self::CountAll),
             "prod" | "product" => Ok(Self::Product),
             "min" => Ok(Self::Min),
             "max" => Ok(Self::Max),
@@ -60,6 +63,8 @@ impl AggregationOp {
 }
 
 pub(crate) enum AggregationInput<'py> {
+    /// Count every successful comparison without reading a value column.
+    CountAll,
     // Each variant preserves the original NumPy dtype. The output dtype is
     // an operation contract, not a consequence of whichever dtype happened
     // to be supplied by the caller.
@@ -117,10 +122,11 @@ pub(crate) enum AggregationInput<'py> {
 
 /// Parse Python aggregation requests and preserve their concrete NumPy dtypes.
 ///
-/// Each list item must be a three-element tuple:
-/// `(values, null_mask, operation)`. The values and mask are borrowed rather
-/// than copied, so their Python owners must remain alive while the returned
-/// inputs are used by [`super::state::AggregationSet`].
+/// Each list item is either a three-element tuple
+/// `(values, null_mask, operation)` or the two-element count-all shorthand
+/// `("*", "count")`; `("*", "size")` is also accepted. The values and mask
+/// are borrowed rather than copied, so their Python owners must remain alive
+/// while the returned inputs are used by [`super::state::AggregationSet`].
 ///
 /// # Arguments
 ///
@@ -129,6 +135,9 @@ pub(crate) enum AggregationInput<'py> {
 ///   unsigned, or float NumPy dtypes. Null masks must be one-dimensional
 ///   boolean arrays aligned with their value arrays. The caller owns null
 ///   tracking: a mask entry of `true` is the only null marker recognized here.
+///   A wildcard count-all request does not need a value array or mask. A
+///   three-element `count` request counts non-null values; `size` requests
+///   count-all.
 ///
 /// # Returns
 ///
@@ -144,11 +153,33 @@ pub(crate) fn parse_inputs<'py>(
     let mut result = Vec::with_capacity(inputs.len());
     for item in inputs.iter() {
         let tuple = item.cast::<PyTuple>().map_err(|_| {
-            PyTypeError::new_err("each aggregation must be (array, null_mask, aggregation)")
+            PyTypeError::new_err(
+                "each aggregation must be (array, null_mask, aggregation) or ('*', aggregation)",
+            )
         })?;
+        if tuple.len() == 2 {
+            let wildcard = tuple.get_item(0)?.extract::<String>().map_err(|_| {
+                PyTypeError::new_err("two-element aggregations must be ('*', 'count')")
+            })?;
+            if wildcard != "*" {
+                return Err(PyValueError::new_err(
+                    "two-element aggregations must use '*' as the first value",
+                ));
+            }
+            let operation = tuple.get_item(1)?.extract::<String>().map_err(|_| {
+                PyTypeError::new_err("two-element aggregations must be ('*', 'count')")
+            })?;
+            if operation != "count" && operation != "size" {
+                return Err(PyValueError::new_err(
+                    "'*' may only be used with count or size",
+                ));
+            }
+            result.push(AggregationInput::CountAll);
+            continue;
+        }
         if tuple.len() != 3 {
             return Err(PyValueError::new_err(
-                "each aggregation must contain array, null_mask, and aggregation",
+                "each aggregation must contain array, null_mask, and aggregation, or be ('*', aggregation)",
             ));
         }
         let array = tuple.get_item(0)?;

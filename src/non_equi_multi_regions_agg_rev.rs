@@ -3,10 +3,10 @@
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyList, PyTuple};
 use std::collections::BTreeMap;
 
-use crate::aggs::aggregation::{parse_inputs, AggregationSet};
+use crate::aggs::aggregation::{make_results, parse_inputs, AggregationSet};
 use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core, ensure_unique_index};
 use crate::compare::common::{add_right_region, checked_region_start, GroupState};
 use crate::compare::predicate::{
@@ -30,14 +30,17 @@ use crate::compare::predicate::{
 ///   to left rows. The mask is authoritative: `true` means the corresponding
 ///   value is null and is skipped by `sum`, `product`, `min`, and `max`;
 ///   `false` means the value is valid. Nullness is never inferred from the
-///   value array, including from `NaN`. `count` intentionally ignores this
-///   mask and counts every successful comparison, matching pandas-style
-///   `size` semantics.
+///   value array, including from `NaN`. A three-element `count` request counts
+///   only non-null source values; `size` or the two-element `("*", "count")`
+///   shorthand counts every successful comparison without requiring a value
+///   column.
 ///
 /// # Returns
 ///
-/// A list of right-aligned aggregation arrays, or `None` if no candidate
-/// passes both the region and residual predicate checks.
+/// `Some((matched, list))`, where `matched` is a boolean array aligned to the
+/// right positions and `list` contains right-aligned aggregation arrays in
+/// request order. Returns `None` if no candidate passes both the region and
+/// residual predicate checks.
 ///
 /// # Errors
 ///
@@ -52,7 +55,7 @@ pub fn aggregate_multi_regions_reverse<'py>(
     starts: PyReadonlyArray1<'py, i64>,
     right_index: PyReadonlyArray1<'py, i64>,
     aggregations: &Bound<'py, PyList>,
-) -> PyResult<Option<Bound<'py, PyList>>> {
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let (predicates, metadata) = parse_predicates_with_nulls(py, predicates)?;
     if predicates.is_empty() {
         return Err(PyValueError::new_err("at least one predicate is required"));
@@ -122,7 +125,7 @@ pub fn aggregate_multi_regions_reverse<'py>(
     if set.is_empty() {
         return Ok(None);
     }
-    Ok(Some(PyList::new(py, set.into_results(py))?))
+    Ok(Some(make_results(py, set)?))
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -179,6 +182,12 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+            assert_eq!(
+                result.get_item(0).unwrap().extract::<Vec<bool>>().unwrap(),
+                vec![false, true, true]
+            );
+            let result_list = result.get_item(1).unwrap();
+            let result = result_list.cast::<PyList>().unwrap();
             assert_eq!(
                 result.get_item(0).unwrap().extract::<Vec<i64>>().unwrap(),
                 vec![0, 1, 1]

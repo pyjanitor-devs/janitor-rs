@@ -1,6 +1,6 @@
 //! Fused reverse aggregation for aligned no-range candidates.
 
-use crate::aggs::aggregation::{parse_inputs, AggregationSet};
+use crate::aggs::aggregation::{make_results, parse_inputs, AggregationSet};
 use crate::aggs::{checked_index, ensure_equal_lengths, ensure_nonempty_core, ensure_unique_index};
 use crate::compare::predicate::{
     null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch,
@@ -8,7 +8,7 @@ use crate::compare::predicate::{
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyList, PyTuple};
 
 /// Compare one aligned candidate per left row and aggregate into right slots.
 ///
@@ -25,13 +25,15 @@ use pyo3::types::PyList;
 ///   to the left rows. The mask is authoritative: `true` means the
 ///   corresponding value is null and is skipped by `sum`, `product`, `min`,
 ///   and `max`; `false` means the value is valid. Nullness is never inferred
-///   from the value array, including from `NaN`. `count` intentionally ignores
-///   this mask and counts every successful comparison, matching pandas-style
-///   `size` semantics.
+///   from the value array, including from `NaN`. A three-element `count`
+///   request counts only non-null source values; `size` and the two-element
+///   `("*", "count")` shorthand count every successful comparison.
 ///
 /// # Returns
 ///
-/// `Some(list)` of right-aligned arrays, or `None` when no candidate succeeds.
+/// `Some((matched, list))`, where `matched` is a boolean array aligned to the
+/// right positions and `list` contains right-aligned arrays in request order.
+/// Returns `None` when no candidate succeeds anywhere.
 ///
 /// # Errors
 ///
@@ -44,7 +46,7 @@ pub fn aggregate_batch_no_range_reverse<'py>(
     positions: PyReadonlyArray1<'py, i64>,
     right_index: PyReadonlyArray1<'py, i64>,
     aggregations: &Bound<'py, PyList>,
-) -> PyResult<Option<Bound<'py, PyList>>> {
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let (predicates, metadata) = parse_predicates_with_nulls(py, predicates)?;
     if predicates.is_empty() {
         return Err(PyValueError::new_err("at least one comparison is required"));
@@ -103,7 +105,7 @@ pub fn aggregate_batch_no_range_reverse<'py>(
     if set.is_empty() {
         return Ok(None);
     }
-    Ok(Some(PyList::new(py, set.into_results(py))?))
+    Ok(Some(make_results(py, set)?))
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -155,7 +157,26 @@ mod tests {
                 ],
             )
             .unwrap();
-            let aggregations = PyList::new(py, [sum, count]).unwrap();
+            // These two requests deliberately exercise the shared
+            // count-all accumulator. They should produce identical arrays,
+            // while the column-based count below must honor the null mask.
+            let count_all = PyTuple::new(
+                py,
+                [
+                    "*".into_pyobject(py).unwrap().into_any(),
+                    "count".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap();
+            let size_all = PyTuple::new(
+                py,
+                [
+                    "*".into_pyobject(py).unwrap().into_any(),
+                    "size".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap();
+            let aggregations = PyList::new(py, [sum, count, count_all, size_all]).unwrap();
             let result = aggregate_batch_no_range_reverse(
                 py,
                 &predicates,
@@ -166,11 +187,25 @@ mod tests {
             .unwrap()
             .unwrap();
             assert_eq!(
+                result.get_item(0).unwrap().extract::<Vec<bool>>().unwrap(),
+                vec![true, true, false]
+            );
+            let result_list = result.get_item(1).unwrap();
+            let result = result_list.cast::<PyList>().unwrap();
+            assert_eq!(
                 result.get_item(0).unwrap().extract::<Vec<i64>>().unwrap(),
                 vec![5, 0, 0]
             );
             assert_eq!(
                 result.get_item(1).unwrap().extract::<Vec<i64>>().unwrap(),
+                vec![1, 0, 0]
+            );
+            assert_eq!(
+                result.get_item(2).unwrap().extract::<Vec<i64>>().unwrap(),
+                vec![1, 1, 0]
+            );
+            assert_eq!(
+                result.get_item(3).unwrap().extract::<Vec<i64>>().unwrap(),
                 vec![1, 1, 0]
             );
         });

@@ -11,6 +11,9 @@
 //! update the enum and parser in `input.rs`, then add its state and update
 //! behavior in `state.rs`.
 
+use pyo3::prelude::*;
+use pyo3::types::{PyList, PyTuple};
+
 mod input;
 mod state;
 
@@ -19,3 +22,18 @@ mod state;
 // directory, so adding a dtype does not enlarge the crate's public API.
 pub(crate) use input::parse_inputs;
 pub(crate) use state::AggregationSet;
+
+/// Build the common Python result shape for fused aggregations.
+///
+/// The first tuple item is a boolean array indicating which output positions
+/// received at least one successful comparison. The second item is the list
+/// of requested aggregation arrays, in request order. Keeping this assembly
+/// here ensures forward and reverse wrappers expose exactly the same shape.
+pub(crate) fn make_results<'py>(
+    py: Python<'py>,
+    set: AggregationSet<'_>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let (matched, results) = set.into_results(py);
+    let results = PyList::new(py, results)?;
+    PyTuple::new(py, [matched, results.into_any().unbind()])
+}

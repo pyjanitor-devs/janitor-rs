@@ -1,6 +1,6 @@
 //! Fused reverse batch comparison and aggregation.
 
-use crate::aggs::aggregation::{parse_inputs, AggregationSet};
+use crate::aggs::aggregation::{make_results, parse_inputs, AggregationSet};
 use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core, ensure_unique_index};
 use crate::compare::common::checked_bounds;
 use crate::compare::predicate::{
@@ -9,7 +9,7 @@ use crate::compare::predicate::{
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyList, PyTuple};
 
 /// Compare bounded candidate ranges and aggregate successful pairs into the
 /// corresponding right-side output positions.
@@ -35,13 +35,15 @@ use pyo3::types::PyList;
 ///   authoritative: `true` means the corresponding value is null and is
 ///   skipped by `sum`, `product`, `min`, and `max`; `false` means the value is
 ///   valid. Nullness is never inferred from the value array, including from
-///   `NaN`. `count` intentionally ignores this mask and counts every
-///   successful comparison, matching pandas-style `size` semantics.
+///   `NaN`. A three-element `count` request counts only non-null source
+///   values; `size` and the two-element `("*", "count")` shorthand count
+///   every successful comparison.
 ///
 /// # Returns
 ///
-/// `Some(list)` of arrays, one per requested aggregation, each with
-/// `right_index.len()` entries. Returns `None` when no comparison succeeds.
+/// `Some((matched, list))`, where `matched` is a boolean array with
+/// `right_index.len()` entries and `list` contains one right-aligned array per
+/// requested aggregation. Returns `None` when no comparison succeeds anywhere.
 ///
 /// # Errors
 ///
@@ -55,7 +57,7 @@ pub fn aggregate_batch_reverse<'py>(
     ends: Option<PyReadonlyArray1<'py, i64>>,
     right_index: PyReadonlyArray1<'py, i64>,
     aggregations: &Bound<'py, PyList>,
-) -> PyResult<Option<Bound<'py, PyList>>> {
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let (predicates, metadata) = parse_predicates_with_nulls(py, predicates)?;
     if predicates.is_empty() {
         return Err(PyValueError::new_err("at least one comparison is required"));
@@ -120,7 +122,7 @@ pub fn aggregate_batch_reverse<'py>(
     if set.is_empty() {
         return Ok(None);
     }
-    Ok(Some(PyList::new(py, set.into_results(py))?))
+    Ok(Some(make_results(py, set)?))
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -186,6 +188,12 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+            assert_eq!(
+                result.get_item(0).unwrap().extract::<Vec<bool>>().unwrap(),
+                vec![true, true, true]
+            );
+            let result_list = result.get_item(1).unwrap();
+            let result = result_list.cast::<PyList>().unwrap();
 
             // The first row contributes 5 to slots 0, 1, and 2. The second
             // row contributes 7 only to slots 1 and 2 because its range is
@@ -256,6 +264,12 @@ mod tests {
             .unwrap()
             .unwrap();
 
+            assert_eq!(
+                result.get_item(0).unwrap().extract::<Vec<bool>>().unwrap(),
+                vec![true]
+            );
+            let result_list = result.get_item(1).unwrap();
+            let result = result_list.cast::<PyList>().unwrap();
             let positive_result = result.get_item(0).unwrap().extract::<Vec<f64>>().unwrap();
             let negative_result = result.get_item(1).unwrap().extract::<Vec<f64>>().unwrap();
             assert!(positive_result[0].is_infinite() && positive_result[0].is_sign_positive());
