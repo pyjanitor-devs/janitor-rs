@@ -510,6 +510,7 @@ pub(crate) type PositionsFn<T, R> =
 /// The module handle is borrowed while child registrations are performed; the
 /// child registration functions add exports but do not replace the module.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    aggregation::register(m)?;
     min::register(m)?;
     prod::register(m)?;
     max::register(m)?;
