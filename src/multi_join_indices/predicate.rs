@@ -6,8 +6,8 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
-use super::op::CompareOp;
 use crate::aggs::ensure_equal_lengths;
+use crate::op::CompareOp;
 
 /// A typed comparison between one left-hand array and one right-hand array.
 ///
