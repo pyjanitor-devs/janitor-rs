@@ -10,6 +10,7 @@ mod non_equi_dual_regions_agg_rev;
 mod non_equi_multi_regions;
 mod non_equi_multi_regions_agg;
 mod non_equi_multi_regions_agg_rev;
+mod single_join;
 
 /// Narrow Rust-only surface used by `benches/kernels.rs`.
 ///
@@ -286,6 +287,7 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     non_equi_multi_regions::register(m)?;
     non_equi_multi_regions_agg::register(m)?;
     non_equi_multi_regions_agg_rev::register(m)?;
+    single_join::register(m)?;
     aggs::register(m)?;
     Ok(())
 }
@@ -329,6 +331,7 @@ mod registration_tests {
                 "aggregate_starts_reverse",          // reverse starts ranges
                 "aggregate_ends_reverse",            // reverse ends ranges
                 "aggregate_starts_ends_reverse",     // reverse starts/ends ranges
+                "single_join_indices_int64",         // single-predicate join
             ];
 
             for name in representative_exports {
@@ -341,10 +344,10 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (922 exports across 107 leaf modules). Bump
+    /// `register`, as of this PR (932 exports across 108 leaf modules). Bump
     /// this alongside any PR that intentionally adds
     /// or removes an export.
-    const EXPECTED_EXPORT_COUNT: usize = 922;
+    const EXPECTED_EXPORT_COUNT: usize = 932;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
