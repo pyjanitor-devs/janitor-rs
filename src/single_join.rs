@@ -45,7 +45,7 @@ impl Keep {
     /// Keeping this conversion at the Python boundary means the core
     /// functions can work with a closed enum and cannot silently accept a
     /// misspelled selection mode.
-    fn parse(value: &str) -> PyResult<Self> {
+    pub(crate) fn parse(value: &str) -> PyResult<Self> {
         match value {
             "first" => Ok(Self::First),
             "last" => Ok(Self::Last),
@@ -60,6 +60,8 @@ impl Keep {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SingleJoinResult {
+    /// Physical left positions corresponding to `left_index`.
+    pub(crate) left_positions: Vec<usize>,
     /// Original left index labels for rows with a non-empty match window.
     pub left_index: Vec<i64>,
     /// The complete original right index-label array, in sorted-value order.
@@ -268,6 +270,7 @@ pub fn build_range_core<T: PartialOrd + Copy>(
             continue;
         }
         result.left_index.push(left_index[left_position]);
+        result.left_positions.push(left_position);
         result.starts.push(start);
         result.ends.push(end);
     }

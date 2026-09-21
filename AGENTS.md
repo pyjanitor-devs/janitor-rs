@@ -993,3 +993,16 @@ nullness from the value itself, including floating-point `NaN`.
 reviews. If an operation such as `min` or `max` needs a separate policy for a
 valid NaN because it is not totally ordered, specify that as ordering behavior
 rather than silently treating the value as null.
+
+### [2026-09-22] Extended joins are range-led and building blocks are flat
+
+**Context**: Designing the multi-predicate extension to the single conditional
+join kernel.
+**Learning**: The extended Rust path requires a range predicate first and
+returns flat materialized pairs. `return_building_blocks` is a pyjanitor-level
+request that maps to `keep="all"`; it is not an argument to the extended Rust
+kernel. All-`!=` multiple joins remain in pyjanitor because their filtered
+non-null and full-null layouts do not share the range kernel's coordinate space.
+**Recommendation**: Keep `single_join.rs` as the one-predicate path, use
+`single_join_extended.rs` only for range-led multiple predicates, and apply
+`keep` after all residual predicates have passed.

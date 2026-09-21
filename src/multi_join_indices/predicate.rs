@@ -398,6 +398,147 @@ pub(crate) fn parse_predicates<'py>(
     Ok(result)
 }
 
+/// Parse string-based comparison tuples for the extended single-join API.
+///
+/// The retained legacy batch wrappers use numeric opcodes. The extended
+/// wrapper follows the public single-join contract and accepts readable
+/// comparator strings instead.
+pub(crate) fn parse_predicates_strings<'py>(
+    predicates: &Bound<'py, PyList>,
+) -> PyResult<Vec<Predicate<'py>>> {
+    let mut result = Vec::with_capacity(predicates.len());
+    for item in predicates.iter() {
+        let tuple = item
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("each comparison must be (left, right, op)"))?;
+        if tuple.len() != 3 {
+            return Err(PyValueError::new_err(
+                "each comparison must contain left, right, and op",
+            ));
+        }
+        let op = CompareOp::try_from_str(tuple.get_item(2)?.extract::<&str>()?)?;
+        let left = tuple.get_item(0)?;
+        let right = tuple.get_item(1)?;
+        let dtype = left
+            .getattr("dtype")?
+            .getattr("name")?
+            .extract::<String>()?;
+        macro_rules! typed {
+            ($variant:ident, $ty:ty) => {{
+                result.push(Predicate::$variant(
+                    left.extract::<PyReadonlyArray1<'py, $ty>>()?,
+                    right.extract::<PyReadonlyArray1<'py, $ty>>()?,
+                    op,
+                ));
+            }};
+        }
+        match dtype.as_str() {
+            "int64" => typed!(I64, i64),
+            "int32" => typed!(I32, i32),
+            "int16" => typed!(I16, i16),
+            "int8" => typed!(I8, i8),
+            "uint64" => typed!(U64, u64),
+            "uint32" => typed!(U32, u32),
+            "uint16" => typed!(U16, u16),
+            "uint8" => typed!(U8, u8),
+            "float64" => typed!(F64, f64),
+            "float32" => typed!(F32, f32),
+            other => {
+                return Err(PyTypeError::new_err(format!(
+                    "unsupported comparison dtype: {other}"
+                )))
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Parse the string-based residual predicate form used by
+/// `single_join_extended.rs`.
+///
+/// Ordinary residual predicates are `(left, right, op)`. A null-aware `!=`
+/// predicate is `(left, left_nulls, right, right_nulls,
+/// is_extension_array, op)`.
+pub(crate) fn parse_predicates_with_nulls_strings<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+) -> PyResult<(Vec<Predicate<'py>>, Option<Vec<NullMetadata<'py>>>)> {
+    let base_tuples = PyList::empty(py);
+    let mut metadata = Vec::with_capacity(predicates.len());
+    for item in predicates.iter() {
+        let tuple = item
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("each residual comparison must be a tuple"))?;
+        if tuple.len() != 3 && tuple.len() != 6 {
+            return Err(PyValueError::new_err(
+                "each residual comparison must contain 3 or 6 elements",
+            ));
+        }
+        let op_position = if tuple.len() == 3 { 2 } else { 5 };
+        let op = CompareOp::try_from_str(tuple.get_item(op_position)?.extract::<&str>()?)?;
+        if tuple.len() == 6 && op != CompareOp::Ne {
+            return Err(PyValueError::new_err(
+                "the six-element residual form is only valid for !=",
+            ));
+        }
+        if tuple.len() == 3 {
+            base_tuples.append(PyTuple::new(
+                py,
+                [tuple.get_item(0)?, tuple.get_item(1)?, tuple.get_item(2)?],
+            )?)?;
+            metadata.push(NullMetadata {
+                left: None,
+                right: None,
+                is_extension_array: false,
+            });
+            continue;
+        }
+        let left_mask = tuple
+            .get_item(1)?
+            .extract::<PyReadonlyArray1<'py, bool>>()?;
+        let right_mask = tuple
+            .get_item(3)?
+            .extract::<PyReadonlyArray1<'py, bool>>()?;
+        let extension_flag = tuple.get_item(4)?.extract::<bool>()?;
+        base_tuples.append(PyTuple::new(
+            py,
+            [tuple.get_item(0)?, tuple.get_item(2)?, tuple.get_item(5)?],
+        )?)?;
+        metadata.push(NullMetadata {
+            left: Some(left_mask),
+            right: Some(right_mask),
+            is_extension_array: extension_flag,
+        });
+    }
+    let parsed = parse_predicates_strings(&base_tuples)?;
+    for position in 0..parsed.len() {
+        let predicate = &parsed[position];
+        let values = &metadata[position];
+        if let Some(left) = &values.left {
+            ensure_equal_lengths(
+                "left boolean mask",
+                left.len()?,
+                "left predicate array",
+                predicate.left_len(),
+            )?;
+        }
+        if let Some(right) = &values.right {
+            ensure_equal_lengths(
+                "right boolean mask",
+                right.len()?,
+                "right predicate array",
+                predicate.right_len(),
+            )?;
+        }
+    }
+    let metadata = if metadata.iter().any(|values| values.left.is_some()) {
+        Some(metadata)
+    } else {
+        None
+    };
+    Ok((parsed, metadata))
+}
+
 /// Parse comparison tuples and their optional null-mask metadata.
 ///
 /// A three-element tuple has the form `(left, right, op)`. A six-element tuple
