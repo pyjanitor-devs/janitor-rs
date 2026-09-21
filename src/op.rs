@@ -1,9 +1,11 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::PyResult;
 
-/// One clear name for each of the six ways two values can be compared,
-/// shared by every file under `multi_join_indices/` instead of each keeping its own
-/// copy of a numeric-code `match`.
+/// One clear name for each of the six ways two values can be compared.
+///
+/// This is shared by the multi-predicate and single-predicate join kernels.
+/// Keeping the enum at the crate root avoids making the shared comparator
+/// implementation appear to belong only to `multi_join_indices`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
     Gt,
@@ -15,6 +17,24 @@ pub enum CompareOp {
 }
 
 impl CompareOp {
+    /// Decode the public string spelling used by the single-join API.
+    ///
+    /// ELI5: the Python boundary translates a readable operator once, then
+    /// the hot loops carry the same small enum used by the older kernels.
+    pub fn try_from_str(op: &str) -> PyResult<Self> {
+        match op {
+            ">" => Ok(Self::Gt),
+            ">=" => Ok(Self::Ge),
+            "<" => Ok(Self::Lt),
+            "<=" => Ok(Self::Le),
+            "==" => Ok(Self::Eq),
+            "!=" => Ok(Self::Ne),
+            other => Err(PyValueError::new_err(format!(
+                "invalid comparison operator: {other} (expected one of >, >=, <, <=, ==, !=)"
+            ))),
+        }
+    }
+
     /// ELI5: turns the small numeric code pyjanitor's Python side passes in
     /// into one of six known comparisons, or a clear error -- an
     /// unrecognized code used to silently fall back to `!=` instead of
@@ -62,6 +82,7 @@ impl CompareOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pyo3::Python;
 
     #[test]
     fn each_code_decodes_to_its_operator() {
@@ -82,6 +103,28 @@ mod tests {
         }
         // i8 codes decode the same way, without a manual cast at the call site.
         assert_eq!(CompareOp::try_from_code(2_i8).unwrap(), CompareOp::Lt);
+    }
+
+    #[test]
+    fn each_string_decodes_to_its_operator() {
+        let cases = [
+            (">", CompareOp::Gt),
+            (">=", CompareOp::Ge),
+            ("<", CompareOp::Lt),
+            ("<=", CompareOp::Le),
+            ("==", CompareOp::Eq),
+            ("!=", CompareOp::Ne),
+        ];
+        for (operator, expected) in cases {
+            assert_eq!(CompareOp::try_from_str(operator).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn invalid_strings_are_rejected() {
+        Python::initialize();
+        let error = CompareOp::try_from_str("like").unwrap_err().to_string();
+        assert!(error.contains("invalid comparison operator"));
     }
 
     #[test]
@@ -111,6 +154,7 @@ mod tests {
 
     #[test]
     fn invalid_codes_are_rejected_not_silently_treated_as_ne() {
+        Python::initialize();
         for code in [-1_i64, 6, 100, i64::MIN, i64::MAX] {
             let error = CompareOp::try_from_code(code).unwrap_err().to_string();
             assert!(

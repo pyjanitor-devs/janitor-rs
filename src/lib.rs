@@ -3,6 +3,8 @@ mod aggs;
 mod bin_search;
 mod index_builder;
 mod multi_join_indices;
+mod op;
+mod single_join;
 
 /// Narrow Rust-only surface used by `benches/kernels.rs`.
 ///
@@ -78,7 +80,7 @@ pub mod bench_support {
         compare_multi_region_indices_all, compare_multi_region_indices_any,
         compare_multi_region_indices_first, compare_multi_region_indices_last,
     };
-    pub use crate::multi_join_indices::op::CompareOp;
+    pub use crate::op::CompareOp;
 
     pub fn sum_rev_start_end_i64(
         arr: ArrayView1<'_, i64>,
@@ -254,6 +256,7 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     bin_search::register(m)?;
     multi_join_indices::register(m)?;
     index_builder::register(m)?;
+    single_join::register(m)?;
     aggs::register(m)?;
     Ok(())
 }
@@ -296,6 +299,7 @@ mod registration_tests {
                 "aggregate_starts_reverse",         // reverse starts ranges
                 "aggregate_ends_reverse",           // reverse ends ranges
                 "aggregate_starts_ends_reverse",    // reverse starts/ends ranges
+                "single_join_indices_int64",        // single-predicate join
             ];
 
             for name in representative_exports {
@@ -308,11 +312,11 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (751 exports across the retained leaf
+    /// `register`, as of this PR (761 exports across the retained leaf
     /// modules).
     /// Bump this alongside any PR that intentionally adds or removes an
     /// export.
-    const EXPECTED_EXPORT_COUNT: usize = 751;
+    const EXPECTED_EXPORT_COUNT: usize = 761;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
