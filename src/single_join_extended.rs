@@ -17,16 +17,16 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::aggs::ensure_equal_lengths_core;
-use crate::multi_join_indices::predicate::{
+use crate::op::CompareOp;
+use crate::predicate::{
     null_metadata_views, parse_predicates_with_nulls_strings, predicates_match_dispatch,
     NullMetadata, Predicate,
 };
-use crate::op::CompareOp;
 use crate::single_join::{
     build_not_equal_positions_core, build_range_core, Keep, SingleJoinResult,
 };
 
-fn materialize_windows(
+fn materialize_windows_for_non_ne(
     windows: &SingleJoinResult,
     predicates: &[Predicate<'_>],
     metadata: Option<&[NullMetadata<'_>]>,
@@ -214,7 +214,7 @@ fn materialize_windows(
 /// second allocates that exact size and writes the labels. The selected modes
 /// retain at most one pair per left row and therefore reserve the full left
 /// index length as an upper bound.
-fn materialize_pairs(
+fn materialize_pairs_for_ne(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     left_positions: &[usize],
@@ -491,7 +491,7 @@ fn extended_not_equal_join<'py, T: numpy::Element + PartialOrd + Copy>(
         return Ok(None);
     }
 
-    let (out_left, out_right) = materialize_pairs(
+    let (out_left, out_right) = materialize_pairs_for_ne(
         left_index,
         right_index,
         &left_positions,
@@ -575,8 +575,9 @@ fn extended_join<'py, T: numpy::Element + PartialOrd + Copy>(
     if windows.left_index.is_empty() {
         return Ok(None);
     }
-    let (out_left, out_right) = materialize_windows(&windows, &parsed, metadata.as_deref(), keep)
-        .map_err(PyValueError::new_err)?;
+    let (out_left, out_right) =
+        materialize_windows_for_non_ne(&windows, &parsed, metadata.as_deref(), keep)
+            .map_err(PyValueError::new_err)?;
     if out_left.is_empty() {
         return Ok(None);
     }

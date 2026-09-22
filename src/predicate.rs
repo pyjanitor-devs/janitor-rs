@@ -1,4 +1,4 @@
-//! Typed predicate parsing and matching shared by batch comparison paths.
+//! Typed predicate parsing and matching shared by join and aggregation paths.
 
 use numpy::ndarray::ArrayView1;
 use numpy::PyReadonlyArray1;

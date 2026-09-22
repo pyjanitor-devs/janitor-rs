@@ -4,6 +4,7 @@ mod bin_search;
 mod index_builder;
 mod multi_join_indices;
 mod op;
+mod predicate;
 mod single_join;
 mod single_join_extended;
 
