@@ -166,6 +166,15 @@ fn range_bounds<T: PartialOrd + Copy>(
 /// The result at position `i` summarizes the inclusive range `0..=i`.
 /// This helper returns labels, not positions, and is used by the range-join
 /// selection path.
+///
+/// # Arguments
+///
+/// * `values` - Right-index labels in logical right-array order.
+/// * `minimum` - `true` for a running minimum; `false` for a running maximum.
+///
+/// # Returns
+///
+/// A label vector with one inclusive-prefix result for each input label.
 fn prefix_extreme<I>(values: I, minimum: bool) -> Vec<i64>
 where
     I: Iterator<Item = i64>,
@@ -200,6 +209,15 @@ where
 /// The result at position `i` summarizes the inclusive range `i..=last`.
 /// This helper returns labels, not positions, and is used by the range-join
 /// selection path.
+///
+/// # Arguments
+///
+/// * `values` - Right-index labels in logical right-array order.
+/// * `minimum` - `true` for a running minimum; `false` for a running maximum.
+///
+/// # Returns
+///
+/// A label vector with one inclusive-suffix result for each input label.
 fn suffix_extreme<I>(values: I, minimum: bool) -> Vec<i64>
 where
     I: DoubleEndedIterator<Item = i64> + ExactSizeIterator,
@@ -236,6 +254,16 @@ where
 /// ```
 ///
 /// The returned values are offsets into `labels`, not public index labels.
+///
+/// # Arguments
+///
+/// * `labels` - Right-index labels in the value-sorted right layout.
+///
+/// # Returns
+///
+/// For each prefix ending at `i`, the filtered-layout offset of its smallest
+/// label. The caller maps that offset through the right position map before
+/// indexing the full right-index array.
 fn prefix_min_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = Vec::with_capacity(labels.len());
     let mut current = None;
@@ -262,6 +290,16 @@ fn prefix_min_positions(labels: &[i64]) -> Vec<usize> {
 /// ```
 ///
 /// The returned values are offsets into `labels`, not public index labels.
+///
+/// # Arguments
+///
+/// * `labels` - Right-index labels in the value-sorted right layout.
+///
+/// # Returns
+///
+/// For each prefix ending at `i`, the filtered-layout offset of its largest
+/// label. The caller maps that offset through the right position map before
+/// indexing the full right-index array.
 fn prefix_max_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = Vec::with_capacity(labels.len());
     let mut current = None;
@@ -289,6 +327,16 @@ fn prefix_max_positions(labels: &[i64]) -> Vec<usize> {
 /// ```
 ///
 /// The returned values are offsets into `labels`, not public index labels.
+///
+/// # Arguments
+///
+/// * `labels` - Right-index labels in the value-sorted right layout.
+///
+/// # Returns
+///
+/// For each suffix beginning at `i`, the filtered-layout offset of its
+/// smallest label. The caller maps that offset through the right position map
+/// before indexing the full right-index array.
 fn suffix_min_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = vec![0_usize; labels.len()];
     let mut current = None;
@@ -317,6 +365,16 @@ fn suffix_min_positions(labels: &[i64]) -> Vec<usize> {
 /// ```
 ///
 /// The returned values are offsets into `labels`, not public index labels.
+///
+/// # Arguments
+///
+/// * `labels` - Right-index labels in the value-sorted right layout.
+///
+/// # Returns
+///
+/// For each suffix beginning at `i`, the filtered-layout offset of its largest
+/// label. The caller maps that offset through the right position map before
+/// indexing the full right-index array.
 fn suffix_max_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = vec![0_usize; labels.len()];
     let mut current = None;
