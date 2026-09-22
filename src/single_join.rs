@@ -197,15 +197,12 @@ where
     result
 }
 
-/// Return the physical position of the running label minimum or maximum for
-/// every prefix of a right-label sequence.
-fn prefix_extreme_positions(labels: &[i64], minimum: bool) -> Vec<usize> {
+/// Return the physical position of the smallest label for every prefix.
+fn prefix_min_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = Vec::with_capacity(labels.len());
     let mut current = None;
     for (position, &label) in labels.iter().enumerate() {
-        if current.is_none_or(|selected| {
-            (minimum && label < labels[selected]) || (!minimum && label > labels[selected])
-        }) {
+        if current.is_none_or(|selected| label < labels[selected]) {
             current = Some(position);
         }
         result.push(current.expect("a prefix position exists after iteration"));
@@ -213,16 +210,40 @@ fn prefix_extreme_positions(labels: &[i64], minimum: bool) -> Vec<usize> {
     result
 }
 
-/// Return the physical position of the running label minimum or maximum for
-/// every suffix of a right-label sequence.
-fn suffix_extreme_positions(labels: &[i64], minimum: bool) -> Vec<usize> {
+/// Return the physical position of the largest label for every prefix.
+fn prefix_max_positions(labels: &[i64]) -> Vec<usize> {
+    let mut result = Vec::with_capacity(labels.len());
+    let mut current = None;
+    for (position, &label) in labels.iter().enumerate() {
+        if current.is_none_or(|selected| label > labels[selected]) {
+            current = Some(position);
+        }
+        result.push(current.expect("a prefix position exists after iteration"));
+    }
+    result
+}
+
+/// Return the physical position of the smallest label for every suffix.
+fn suffix_min_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = vec![0_usize; labels.len()];
     let mut current = None;
     for position in (0..labels.len()).rev() {
         let label = labels[position];
-        if current.is_none_or(|selected| {
-            (minimum && label < labels[selected]) || (!minimum && label > labels[selected])
-        }) {
+        if current.is_none_or(|selected| label < labels[selected]) {
+            current = Some(position);
+        }
+        result[position] = current.expect("a suffix position exists after iteration");
+    }
+    result
+}
+
+/// Return the physical position of the largest label for every suffix.
+fn suffix_max_positions(labels: &[i64]) -> Vec<usize> {
+    let mut result = vec![0_usize; labels.len()];
+    let mut current = None;
+    for position in (0..labels.len()).rev() {
+        let label = labels[position];
+        if current.is_none_or(|selected| label > labels[selected]) {
             current = Some(position);
         }
         result[position] = current.expect("a suffix position exists after iteration");
@@ -636,13 +657,13 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
 
     let need_unordered_extrema = !left.is_empty() && !right_index_is_ordered;
     let prefix_min = (need_unordered_extrema && keep == Keep::First)
-        .then(|| prefix_extreme_positions(&right_labels, true));
-    let prefix_max = (need_unordered_extrema && keep == Keep::Last)
-        .then(|| prefix_extreme_positions(&right_labels, false));
+        .then(|| prefix_min_positions(&right_labels));
+    let prefix_max =
+        (need_unordered_extrema && keep == Keep::Last).then(|| prefix_max_positions(&right_labels));
     let suffix_min = (need_unordered_extrema && keep == Keep::First)
-        .then(|| suffix_extreme_positions(&right_labels, true));
-    let suffix_max = (need_unordered_extrema && keep == Keep::Last)
-        .then(|| suffix_extreme_positions(&right_labels, false));
+        .then(|| suffix_min_positions(&right_labels));
+    let suffix_max =
+        (need_unordered_extrema && keep == Keep::Last).then(|| suffix_max_positions(&right_labels));
     let right_null_extreme = match keep {
         Keep::First if !is_extension_array => right_null_positions
             .iter()
