@@ -636,25 +636,15 @@ fn validate_position_partition(
 /// Compute a checked output-capacity bound for the `!=` kernel.
 ///
 /// `all` can emit several pairs for one left row, so its capacity is computed
-/// from the two strict binary-search regions plus the right-null labels. The
-/// selected modes emit at most one pair for each non-null or null left row,
-/// so `left.len() + left_null_count` is a sufficient bound for them.
+/// from the two strict binary-search regions plus the right-null labels.
 fn not_equal_output_capacity<T: PartialOrd + Copy>(
     left: ArrayView1<'_, T>,
     right: ArrayView1<'_, T>,
     left_null_count: usize,
     right_null_count: usize,
     is_extension_array: bool,
-    keep: Keep,
 ) -> Result<usize, &'static str> {
     const CAPACITY_ERROR: &str = "single join result size exceeds platform capacity";
-
-    if keep != Keep::All {
-        return left
-            .len()
-            .checked_add(left_null_count)
-            .ok_or(CAPACITY_ERROR);
-    }
 
     let right_row_width = if is_extension_array {
         right.len()
@@ -774,15 +764,21 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
         .iter()
         .map(|&position| right_index[position])
         .collect();
-    let output_capacity = not_equal_output_capacity(
-        left,
-        right,
-        left_null_positions.len(),
-        right_null_positions.len(),
-        is_extension_array,
-        keep,
-    )
-    .map_err(str::to_owned)?;
+    let output_capacity = if keep == Keep::All {
+        not_equal_output_capacity(
+            left,
+            right,
+            left_null_positions.len(),
+            right_null_positions.len(),
+            is_extension_array,
+        )
+        .map_err(str::to_owned)?
+    } else {
+        // Every selected mode emits at most one pair per left row. The actual
+        // result may be shorter when a left row has no unequal match, but the
+        // full left-index length is a simple safe upper bound.
+        left_index.len()
+    };
     let mut output_left = Vec::new();
     output_left
         .try_reserve_exact(output_capacity)
