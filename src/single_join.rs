@@ -646,6 +646,34 @@ fn not_equal_output_capacity<T: PartialOrd + Copy>(
 ) -> Result<usize, &'static str> {
     const CAPACITY_ERROR: &str = "single join result size exceeds platform capacity";
 
+    // Null comparisons are excluded for extension arrays. Therefore, if one
+    // filtered side is empty, there cannot be any `!=` output in that mode.
+    if is_extension_array && (left.is_empty() || right.is_empty()) {
+        return Ok(0);
+    }
+
+    // NumPy nulls compare unequal to every value, including other nulls. If
+    // a filtered side is empty, all remaining pairs come from the null rows,
+    // so the exact capacity can be calculated without any binary searches.
+    let right_count = right
+        .len()
+        .checked_add(right_null_count)
+        .ok_or(CAPACITY_ERROR)?;
+    if left.is_empty() {
+        return left_null_count
+            .checked_mul(right_count)
+            .ok_or(CAPACITY_ERROR);
+    }
+    if right.is_empty() {
+        let left_count = left
+            .len()
+            .checked_add(left_null_count)
+            .ok_or(CAPACITY_ERROR)?;
+        return left_count
+            .checked_mul(right_null_count)
+            .ok_or(CAPACITY_ERROR);
+    }
+
     let right_row_width = if is_extension_array {
         right.len()
     } else {
