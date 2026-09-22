@@ -756,6 +756,10 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
     is_extension_array: bool,
     keep: Keep,
 ) -> Result<(Vec<usize>, Vec<usize>), String> {
+    // `left` and `right` contain only non-null values. Their companion
+    // position arrays tell us where those filtered values came from in the
+    // original, full arrays. For example, a filtered value at offset `1`
+    // might have original physical position `4`.
     ensure_equal_lengths_core(
         "left values",
         left.len(),
@@ -768,8 +772,17 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
         "right positions",
         right_positions.len(),
     )?;
+
+    // Convert the Python-facing int64 positions into Rust `usize` positions
+    // once. These positions are used for indexing the full index arrays and
+    // are also what this core returns to the wrapper.
     let left_positions = physical_positions("left", left_positions)?;
     let right_positions = physical_positions("right", right_positions)?;
+
+    // Null positions are optional because pyjanitor passes `None` when that
+    // side contains no nulls. `map` converts each supplied array, while
+    // `transpose` changes `Option<Result<...>>` into `Result<Option<...>>`,
+    // allowing a malformed negative/out-of-range position to return an error.
     let left_null_positions = left_null_positions
         .map(|positions| physical_positions("left null", positions))
         .transpose()?;
@@ -779,6 +792,10 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
     let empty = Vec::new();
     let left_null_positions = left_null_positions.as_deref().unwrap_or(&empty);
     let right_null_positions = right_null_positions.as_deref().unwrap_or(&empty);
+
+    // The filtered non-null positions and the null positions must together
+    // describe every physical row exactly once. This catches missing,
+    // duplicated, and out-of-range positions before any output is built.
     validate_position_partition(
         "left index",
         left_index.len(),
@@ -791,16 +808,28 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
         &right_positions,
         right_null_positions,
     )?;
+
+    // There is nothing to match when a side has no non-null values and no
+    // null positions either. In particular, this avoids invoking binary
+    // search for an actually empty input.
     if (left.is_empty() && left_null_positions.is_empty())
         || (right.is_empty() && right_null_positions.is_empty())
     {
         return Ok((Vec::new(), Vec::new()));
     }
 
+    // Binary search works on the sorted, filtered values. Selection and
+    // output, however, use the original right-index labels. Build the label
+    // vector in the same filtered order so an offset returned by an extrema
+    // table can be translated back to a physical right position.
     let right_labels: Vec<i64> = right_positions
         .iter()
         .map(|&position| right_index[position])
         .collect();
+
+    // `all` can emit many pairs per left row, so it gets an exact checked
+    // capacity estimate. The selected modes emit at most one pair per left
+    // row, so the full left-index length is a sufficient upper bound.
     let output_capacity = if keep == Keep::All {
         not_equal_output_capacity(
             left,
@@ -825,6 +854,10 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
         .try_reserve_exact(output_capacity)
         .map_err(|_| "single join result allocation failed".to_owned())?;
 
+    // If the right labels are not ordered, selecting the smallest (`first`)
+    // or largest (`last`) label from a prefix/suffix would otherwise require
+    // scanning that region for every left row. These tables store the best
+    // physical position seen so far, so each window can select in O(1).
     let need_unordered_extrema = !left.is_empty() && !right_index_is_ordered;
     let prefix_min = if need_unordered_extrema && keep == Keep::First {
         Some(prefix_min_positions(&right_labels))
@@ -846,6 +879,10 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
     } else {
         None
     };
+
+    // Nulls are candidates in NumPy mode, but not in extension-array mode.
+    // For first/last, precompute the best null label once instead of scanning
+    // every right-null position for every left row.
     let right_null_extreme = match keep {
         Keep::First if !is_extension_array => right_null_positions
             .iter()
@@ -858,11 +895,23 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
         _ => None,
     };
 
+    // Process each filtered non-null left value. `left_offset` indexes the
+    // filtered value/position arrays; `left_position` is the corresponding
+    // physical position in the original left array.
     for (left_offset, left_value) in left.iter().enumerate() {
         let left_position = left_positions[left_offset];
+
+        // The sorted right values are divided into three regions:
+        //   right[..lt_end]   contains values strictly less than the left;
+        //   right[lt_end..gt_start] contains values equal to the left;
+        //   right[gt_start..] contains values strictly greater than the left.
+        // `!=` emits only the first and third regions.
         let gt_start = partition_point(right, |value| value <= *left_value);
         let lt_end = partition_point(right, |value| value < *left_value);
         if keep == Keep::All {
+            // Materialize every strict-less and strict-greater pair. Equal
+            // values are deliberately skipped, and NumPy nulls are appended
+            // because they compare unequal to this non-null value.
             for &right_position in &right_positions[..lt_end] {
                 output_left.push(left_position);
                 output_right.push(right_position);
@@ -880,6 +929,9 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
             continue;
         }
         if keep == Keep::Any {
+            // Any match is sufficient. Prefer the first available strict
+            // region, then a right-null candidate in NumPy mode. This avoids
+            // scanning or building all matching pairs.
             let candidate = if lt_end > 0 {
                 right_positions.first().copied()
             } else if gt_start < right.len() {
@@ -896,6 +948,10 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
             continue;
         }
 
+        // For `first` and `last`, combine at most one candidate from each
+        // possible source: the strict-less prefix, the strict-greater suffix,
+        // and the right-null positions. `minimum` tells the closure whether
+        // the smallest or largest public right-index label wins.
         let minimum = keep == Keep::First;
         let mut candidate = None;
         let mut combine = |position: usize| {
@@ -910,6 +966,8 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
             }));
         };
         if lt_end > 0 {
+            // The prefix is non-empty. If labels are ordered, its boundary
+            // position is enough; otherwise use the precomputed prefix table.
             combine(if right_index_is_ordered {
                 if minimum {
                     right_positions[0]
@@ -923,6 +981,8 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
             });
         }
         if gt_start < right.len() {
+            // The suffix is non-empty. As above, use its boundary directly
+            // for ordered labels and its extrema table otherwise.
             combine(if right_index_is_ordered {
                 if minimum {
                     right_positions[gt_start]
@@ -944,6 +1004,10 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
         }
     }
 
+    // A null left value is not present in the filtered `left` loop above, so
+    // handle it separately. In NumPy mode it compares unequal to every right
+    // value, including right nulls. In extension mode it compares as `NA`,
+    // which is false in a filtering operation, so it contributes no pairs.
     let nonnull_extreme = match keep {
         Keep::First => right_positions
             .iter()
@@ -960,6 +1024,8 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
             continue;
         }
         if keep == Keep::All {
+            // Every right physical position is a valid `!=` partner for a
+            // NumPy null left value.
             for &right_position in &right_positions {
                 output_left.push(left_position);
                 output_right.push(right_position);
@@ -969,6 +1035,8 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
                 output_right.push(right_position);
             }
         } else if keep == Keep::Any {
+            // Any right value is enough, so choose the first available right
+            // non-null position, falling back to a right-null position.
             if let Some(right_position) = right_positions
                 .first()
                 .or_else(|| right_null_positions.first())
@@ -978,6 +1046,8 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
                 output_right.push(right_position);
             }
         } else {
+            // For first/last, compare the best non-null and null candidates
+            // by their public right-index labels, then emit the winner.
             let candidate = match (nonnull_extreme, right_null_extreme) {
                 (Some(nonnull), Some(null)) => Some(if keep == Keep::First {
                     if right_index[nonnull] < right_index[null] {
