@@ -922,9 +922,12 @@ macro_rules! single_join_function {
         ///
         /// # Arguments
         ///
-        /// * `left`, `left_index` - Aligned left values and original labels.
-        /// * `right`, `right_index` - Aligned, already value-sorted right
-        ///   values and original labels.
+        /// * `left`, `left_index` - Left values and the full original labels.
+        ///   For `!=`, `left` is filtered non-null data and `left_index` is
+        ///   addressed through `left_positions`.
+        /// * `right`, `right_index` - Right values and the full original
+        ///   labels. For `!=`, `right` is filtered, already value-sorted data
+        ///   and `right_index` is addressed through `right_positions`.
         /// * `right_index_is_ordered` - Whether right labels are monotonically
         ///   increasing in the sorted-right layout.
         /// * `comparator` - One of `>`, `>=`, `<`, `<=`, `==`, or `!=`.
