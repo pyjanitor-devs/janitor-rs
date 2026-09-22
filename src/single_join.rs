@@ -789,14 +789,26 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
         .map_err(|_| "single join result allocation failed".to_owned())?;
 
     let need_unordered_extrema = !left.is_empty() && !right_index_is_ordered;
-    let prefix_min = (need_unordered_extrema && keep == Keep::First)
-        .then(|| prefix_min_positions(&right_labels));
-    let prefix_max =
-        (need_unordered_extrema && keep == Keep::Last).then(|| prefix_max_positions(&right_labels));
-    let suffix_min = (need_unordered_extrema && keep == Keep::First)
-        .then(|| suffix_min_positions(&right_labels));
-    let suffix_max =
-        (need_unordered_extrema && keep == Keep::Last).then(|| suffix_max_positions(&right_labels));
+    let prefix_min = if need_unordered_extrema && keep == Keep::First {
+        Some(prefix_min_positions(&right_labels))
+    } else {
+        None
+    };
+    let prefix_max = if need_unordered_extrema && keep == Keep::Last {
+        Some(prefix_max_positions(&right_labels))
+    } else {
+        None
+    };
+    let suffix_min = if need_unordered_extrema && keep == Keep::First {
+        Some(suffix_min_positions(&right_labels))
+    } else {
+        None
+    };
+    let suffix_max = if need_unordered_extrema && keep == Keep::Last {
+        Some(suffix_max_positions(&right_labels))
+    } else {
+        None
+    };
     let right_null_extreme = match keep {
         Keep::First if !is_extension_array => right_null_positions
             .iter()
