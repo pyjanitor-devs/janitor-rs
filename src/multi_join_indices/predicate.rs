@@ -458,7 +458,10 @@ pub(crate) fn parse_predicates_strings<'py>(
 ///
 /// Ordinary residual predicates are `(left, right, op)`. A null-aware `!=`
 /// predicate is `(left, left_nulls, right, right_nulls,
-/// is_extension_array, op)`.
+/// is_extension_array, op)`. For all-`!=` extended joins, these arrays are
+/// full physical layouts: candidate position pairs index them directly, and
+/// the masks are full-length authoritative null masks. The parser does not
+/// align or filter these arrays.
 pub(crate) fn parse_predicates_with_nulls_strings<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
