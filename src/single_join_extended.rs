@@ -121,6 +121,23 @@ fn materialize_windows(
                     selected = Some(right_position);
                     break;
                 }
+                //                   The logic is:
+
+                //   if nothing is selected:
+                //       select this candidate
+
+                //   otherwise:
+                //       replace the current candidate only if this label is smaller
+
+                //   Example:
+
+                //   labels = [40, 10, 30]
+
+                //   Candidates arrive in this order:
+
+                //   position 0, label 40 → selected = Some(0)
+                //   position 1, label 10 → 10 < 40, selected = Some(1)
+                //   position 2, label 30 → 30 < 10 is false, keep Some(1)
                 Keep::First => {
                     let replace = match selected {
                         None => true,
@@ -130,6 +147,34 @@ fn materialize_windows(
                         selected = Some(right_position);
                     }
                 }
+                //   - selected stores the currently chosen right position: Option<usize>.
+                //   - right_position is the new candidate’s physical position.
+                //   - label is the new candidate’s right-index value.
+                //   - current is the previously selected physical position.
+                //   - labels[current] is the previously selected right-index value.
+
+                //   Example:
+
+                //   right positions:  0    1    2
+                //   right labels:    40   10   30
+
+                //   Processing candidates:
+
+                //   1. Position 0, label 40
+                //       - Nothing selected yet.
+                //       - Select position 0.
+
+                //   2. Position 1, label 10
+                //       - 10 > 40 is false.
+                //       - Keep position 0.
+
+                //   3. Position 2, label 30
+                //       - 30 > 40 is false.
+                //       - Keep position 0.
+
+                //   Final selection:
+
+                //   selected = Some(0)
                 Keep::Last => {
                     let replace = match selected {
                         None => true,
