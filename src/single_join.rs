@@ -197,7 +197,13 @@ where
     result
 }
 
-/// Return the physical position of the smallest label for every prefix.
+/// Return the physical position of the smallest right-index label for every
+/// prefix of a `!=` candidate region.
+///
+/// The prefix contains right values strictly less than the current left value.
+/// This table is used by `keep="first"` when `right_index_is_ordered` is
+/// false, so the selected position can later be materialized through the full
+/// right-index array.
 fn prefix_min_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = Vec::with_capacity(labels.len());
     let mut current = None;
@@ -210,7 +216,11 @@ fn prefix_min_positions(labels: &[i64]) -> Vec<usize> {
     result
 }
 
-/// Return the physical position of the largest label for every prefix.
+/// Return the physical position of the largest right-index label for every
+/// prefix of a `!=` candidate region.
+///
+/// The prefix contains right values strictly less than the current left value.
+/// This table is used by `keep="last"` when `right_index_is_ordered` is false.
 fn prefix_max_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = Vec::with_capacity(labels.len());
     let mut current = None;
@@ -223,7 +233,12 @@ fn prefix_max_positions(labels: &[i64]) -> Vec<usize> {
     result
 }
 
-/// Return the physical position of the smallest label for every suffix.
+/// Return the physical position of the smallest right-index label for every
+/// suffix of a `!=` candidate region.
+///
+/// The suffix contains right values strictly greater than the current left
+/// value. This table is used by `keep="first"` when
+/// `right_index_is_ordered` is false.
 fn suffix_min_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = vec![0_usize; labels.len()];
     let mut current = None;
@@ -237,7 +252,12 @@ fn suffix_min_positions(labels: &[i64]) -> Vec<usize> {
     result
 }
 
-/// Return the physical position of the largest label for every suffix.
+/// Return the physical position of the largest right-index label for every
+/// suffix of a `!=` candidate region.
+///
+/// The suffix contains right values strictly greater than the current left
+/// value. This table is used by `keep="last"` when
+/// `right_index_is_ordered` is false.
 fn suffix_max_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = vec![0_usize; labels.len()];
     let mut current = None;
