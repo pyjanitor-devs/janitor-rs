@@ -149,12 +149,23 @@ fn range_bounds<T: PartialOrd + Copy>(
     }
 }
 
-/// Build a running minimum or maximum for every prefix of an index-label
-/// sequence.
+/// Build a running label minimum or maximum for every prefix.
 ///
-/// The iterator is consumed in logical right-array order. Keeping this helper
-/// iterator-based lets it serve both contiguous slices and strided ndarray
-/// views without copying either input first.
+/// `minimum=true` produces prefix minima; `minimum=false` produces prefix
+/// maxima. The iterator is consumed in logical right-array order. Keeping
+/// this helper iterator-based lets it serve both contiguous slices and
+/// strided ndarray views without copying either input first.
+///
+/// For example, with labels `[10, 40, 30, 20]`:
+///
+/// ```text
+/// prefix minimum → [10, 10, 10, 10]
+/// prefix maximum → [10, 40, 40, 40]
+/// ```
+///
+/// The result at position `i` summarizes the inclusive range `0..=i`.
+/// This helper returns labels, not positions, and is used by the range-join
+/// selection path.
 fn prefix_extreme<I>(values: I, minimum: bool) -> Vec<i64>
 where
     I: Iterator<Item = i64>,
@@ -172,12 +183,23 @@ where
         .collect()
 }
 
-/// Build a running minimum or maximum for every suffix of an index-label
-/// sequence.
+/// Build a running label minimum or maximum for every suffix.
 ///
-/// `ExactSizeIterator` lets the helper place each result at its original
-/// physical position while `DoubleEndedIterator` lets it scan from right to
-/// left. This preserves the logical order for strided views.
+/// `minimum=true` produces suffix minima; `minimum=false` produces suffix
+/// maxima. `ExactSizeIterator` lets the helper place each result at its
+/// original physical position while `DoubleEndedIterator` lets it scan from
+/// right to left. This preserves the logical order for strided views.
+///
+/// For example, with labels `[10, 40, 30, 20]`:
+///
+/// ```text
+/// suffix minimum → [10, 20, 20, 20]
+/// suffix maximum → [40, 40, 30, 20]
+/// ```
+///
+/// The result at position `i` summarizes the inclusive range `i..=last`.
+/// This helper returns labels, not positions, and is used by the range-join
+/// selection path.
 fn suffix_extreme<I>(values: I, minimum: bool) -> Vec<i64>
 where
     I: DoubleEndedIterator<Item = i64> + ExactSizeIterator,
@@ -204,6 +226,16 @@ where
 /// This table is used by `keep="first"` when `right_index_is_ordered` is
 /// false, so the selected position can later be materialized through the full
 /// right-index array.
+///
+/// For example, if the right labels in sorted-value order are
+/// `[40, 10, 30, 20]`:
+///
+/// ```text
+/// labels:       [40, 10, 30, 20]
+/// prefix minima: [ 0,  1,  1,  1]
+/// ```
+///
+/// The returned values are offsets into `labels`, not public index labels.
 fn prefix_min_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = Vec::with_capacity(labels.len());
     let mut current = None;
@@ -221,6 +253,15 @@ fn prefix_min_positions(labels: &[i64]) -> Vec<usize> {
 ///
 /// The prefix contains right values strictly less than the current left value.
 /// This table is used by `keep="last"` when `right_index_is_ordered` is false.
+///
+/// For example:
+///
+/// ```text
+/// labels:       [40, 10, 30, 20]
+/// prefix maxima: [ 0,  0,  2,  2]
+/// ```
+///
+/// The returned values are offsets into `labels`, not public index labels.
 fn prefix_max_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = Vec::with_capacity(labels.len());
     let mut current = None;
@@ -239,6 +280,15 @@ fn prefix_max_positions(labels: &[i64]) -> Vec<usize> {
 /// The suffix contains right values strictly greater than the current left
 /// value. This table is used by `keep="first"` when
 /// `right_index_is_ordered` is false.
+///
+/// For example:
+///
+/// ```text
+/// labels:       [40, 10, 30, 20]
+/// suffix minima: [ 1,  1,  3,  3]
+/// ```
+///
+/// The returned values are offsets into `labels`, not public index labels.
 fn suffix_min_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = vec![0_usize; labels.len()];
     let mut current = None;
@@ -258,6 +308,15 @@ fn suffix_min_positions(labels: &[i64]) -> Vec<usize> {
 /// The suffix contains right values strictly greater than the current left
 /// value. This table is used by `keep="last"` when
 /// `right_index_is_ordered` is false.
+///
+/// For example:
+///
+/// ```text
+/// labels:       [40, 10, 30, 20]
+/// suffix maxima: [ 0,  2,  2,  3]
+/// ```
+///
+/// The returned values are offsets into `labels`, not public index labels.
 fn suffix_max_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = vec![0_usize; labels.len()];
     let mut current = None;
