@@ -106,7 +106,8 @@ fn materialize_windows(
         let end = windows.ends[row];
         let left_position = windows.left_positions[row];
         let mut selected = None;
-        for right_position in start..end {
+        for (offset, &label) in labels[start..end].iter().enumerate() {
+            let right_position = start + offset;
             if !predicates_match_dispatch(
                 &views,
                 metadata_views.as_deref(),
@@ -123,7 +124,7 @@ fn materialize_windows(
                 Keep::First => {
                     let replace = match selected {
                         None => true,
-                        Some(current) => labels[right_position] < labels[current],
+                        Some(current) => label < labels[current],
                     };
                     if replace {
                         selected = Some(right_position);
@@ -132,7 +133,7 @@ fn materialize_windows(
                 Keep::Last => {
                     let replace = match selected {
                         None => true,
-                        Some(current) => labels[right_position] > labels[current],
+                        Some(current) => label > labels[current],
                     };
                     if replace {
                         selected = Some(right_position);
