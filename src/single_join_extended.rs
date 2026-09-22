@@ -121,12 +121,20 @@ fn materialize_windows(
                     break;
                 }
                 Keep::First => {
-                    if selected.is_none() || labels[right_position] < labels[selected.unwrap()] {
+                    let replace = match selected {
+                        None => true,
+                        Some(current) => labels[right_position] < labels[current],
+                    };
+                    if replace {
                         selected = Some(right_position);
                     }
                 }
                 Keep::Last => {
-                    if selected.is_none() || labels[right_position] > labels[selected.unwrap()] {
+                    let replace = match selected {
+                        None => true,
+                        Some(current) => labels[right_position] > labels[current],
+                    };
+                    if replace {
                         selected = Some(right_position);
                     }
                 }
