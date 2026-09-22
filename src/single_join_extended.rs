@@ -31,37 +31,81 @@ fn materialize_windows(
     let metadata_views = metadata.map(null_metadata_views);
     let labels = windows.right_index.as_slice();
 
-    let mut capacity = if keep == Keep::All {
-        0_usize
-    } else {
-        windows.left_index.len()
-    };
+    // Follow the established batch-indices layout: selection modes first find
+    // at most one winning physical position per left row, while `all` uses a
+    // count pass followed by an exact materialization pass. The latter avoids
+    // reserving the full range-window upper bound when residual predicates
+    // eliminate many candidates.
     if keep == Keep::All {
-        for (&start, &end) in windows.starts.iter().zip(windows.ends.iter()) {
-            capacity = capacity
-                .checked_add(
-                    end.checked_sub(start)
-                        .ok_or("single extended join window has invalid bounds")?,
-                )
-                .ok_or("single extended join result size exceeds platform capacity")?;
+        let mut output_len = 0_usize;
+        for row in 0..windows.left_index.len() {
+            let start = windows.starts[row];
+            let end = windows.ends[row];
+            let left_position = windows.left_positions[row];
+            for right_position in start..end {
+                if predicates_match_dispatch(
+                    &views,
+                    metadata_views.as_deref(),
+                    left_position,
+                    right_position,
+                ) {
+                    output_len = output_len
+                        .checked_add(1)
+                        .ok_or("single extended join result size exceeds platform capacity")?;
+                }
+            }
         }
+        if output_len == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let mut output_left = Vec::new();
+        output_left
+            .try_reserve_exact(output_len)
+            .map_err(|_| "single extended join result allocation failed")?;
+        let mut output_right = Vec::new();
+        output_right
+            .try_reserve_exact(output_len)
+            .map_err(|_| "single extended join result allocation failed")?;
+
+        for row in 0..windows.left_index.len() {
+            let start = windows.starts[row];
+            let end = windows.ends[row];
+            let left_position = windows.left_positions[row];
+            for (offset, &label) in labels[start..end].iter().enumerate() {
+                let right_position = start + offset;
+                if predicates_match_dispatch(
+                    &views,
+                    metadata_views.as_deref(),
+                    left_position,
+                    right_position,
+                ) {
+                    output_left.push(windows.left_index[row]);
+                    output_right.push(label);
+                }
+            }
+        }
+        debug_assert_eq!(output_left.len(), output_len);
+        debug_assert_eq!(output_right.len(), output_len);
+        return Ok((output_left, output_right));
     }
 
+    // Each selection mode emits no more than one pair for each retained left
+    // row. Reserving the number of range-window rows is therefore a tight
+    // upper bound and does not require a count pass.
     let mut output_left = Vec::new();
     output_left
-        .try_reserve_exact(capacity)
+        .try_reserve_exact(windows.left_index.len())
         .map_err(|_| "single extended join result allocation failed")?;
     let mut output_right = Vec::new();
     output_right
-        .try_reserve_exact(capacity)
+        .try_reserve_exact(windows.left_index.len())
         .map_err(|_| "single extended join result allocation failed")?;
-
     for row in 0..windows.left_index.len() {
         let start = windows.starts[row];
         let end = windows.ends[row];
         let left_position = windows.left_positions[row];
         let mut selected = None;
-
         for right_position in start..end {
             if !predicates_match_dispatch(
                 &views,
@@ -72,35 +116,30 @@ fn materialize_windows(
                 continue;
             }
             match keep {
-                Keep::All => {
-                    output_left.push(windows.left_index[row]);
-                    output_right.push(labels[right_position]);
-                }
                 Keep::Any => {
                     selected = Some(right_position);
                     break;
                 }
                 Keep::First => {
-                    if selected.is_none()
-                        || labels[right_position] < labels[selected.expect("selected exists")]
-                    {
+                    if selected.is_none() || labels[right_position] < labels[selected.unwrap()] {
                         selected = Some(right_position);
                     }
                 }
                 Keep::Last => {
-                    if selected.is_none()
-                        || labels[right_position] > labels[selected.expect("selected exists")]
-                    {
+                    if selected.is_none() || labels[right_position] > labels[selected.unwrap()] {
                         selected = Some(right_position);
                     }
                 }
+                Keep::All => unreachable!(),
             }
         }
-
         if let Some(right_position) = selected {
             output_left.push(windows.left_index[row]);
             output_right.push(labels[right_position]);
         }
+    }
+    if output_left.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
     }
     Ok((output_left, output_right))
 }
