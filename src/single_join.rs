@@ -684,6 +684,15 @@ fn not_equal_output_capacity<T: PartialOrd + Copy>(
     };
     let mut capacity = 0_usize;
     for left_value in left {
+        // The right values are sorted. `gt_start` is the first position whose
+        // value is strictly greater than the current left value, so
+        // `right[gt_start..]` is the strict `>` suffix. `lt_end` is the first
+        // position whose value is greater than or equal to the left value, so
+        // `right[..lt_end]` is the strict `<` prefix. Equal values are outside
+        // both ranges, as required by `!=`.
+        //
+        // Example: right = [1, 3, 5, 7], left = 5 gives
+        // `lt_end = 2` (`[1, 3]`) and `gt_start = 3` (`[7]`).
         let gt_start = partition_point(right, |value| value <= *left_value);
         let lt_end = partition_point(right, |value| value < *left_value);
         let strict_width = lt_end
