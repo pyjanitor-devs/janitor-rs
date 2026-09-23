@@ -84,7 +84,7 @@ pub struct SingleJoinResult {
 /// views cannot expose a contiguous slice, so they use the equivalent manual
 /// binary-search loop. Both paths return a physical position in the supplied
 /// right view; neither path changes or sorts the input.
-fn partition_point<T: PartialOrd + Copy>(
+pub(crate) fn partition_point<T: PartialOrd + Copy>(
     right: ArrayView1<'_, T>,
     predicate: impl Fn(T) -> bool,
 ) -> usize {
@@ -119,7 +119,7 @@ fn partition_point<T: PartialOrd + Copy>(
 /// Equality and inequality are intentionally excluded. Equality is handled
 /// upstream by pyjanitor, while inequality is the union of the strict prefix
 /// and strict suffix and needs its own null-aware implementation.
-fn range_bounds<T: PartialOrd + Copy>(
+pub(crate) fn range_bounds<T: PartialOrd + Copy>(
     left_value: T,
     right: ArrayView1<'_, T>,
     op: CompareOp,
@@ -604,7 +604,10 @@ fn choose_range(
 ///
 /// Returns an error if a position is negative or cannot be represented by the
 /// platform's `usize` type.
-fn physical_positions(name: &str, values: ArrayView1<'_, i64>) -> Result<Vec<usize>, String> {
+pub(crate) fn physical_positions(
+    name: &str,
+    values: ArrayView1<'_, i64>,
+) -> Result<Vec<usize>, String> {
     values
         .iter()
         .enumerate()
@@ -618,7 +621,7 @@ fn physical_positions(name: &str, values: ArrayView1<'_, i64>) -> Result<Vec<usi
 
 /// Validate that non-null and null positions form a complete partition of an
 /// original index array.
-fn validate_position_partition(
+pub(crate) fn validate_position_partition(
     index_name: &str,
     full_len: usize,
     non_null_positions: &[usize],
@@ -650,6 +653,120 @@ fn validate_position_partition(
             ));
         }
         seen[position] = true;
+    }
+    Ok(())
+}
+
+/// Visit every physical pair satisfying a null-aware `!=` comparison.
+///
+/// This is the aggregation counterpart to [`build_not_equal_positions_core`].
+/// It follows the same strict-prefix, strict-suffix, and null semantics but
+/// calls `visit` immediately instead of allocating output position vectors.
+///
+/// # Arguments
+///
+/// * `left` / `right` - Filtered non-null values; `right` must be sorted.
+/// * `left_full_len` / `right_full_len` - Lengths of the original physical
+///   layouts used by the aggregation source/output arrays.
+/// * `left_positions` / `right_positions` - Maps from filtered offsets to
+///   original physical positions.
+/// * `left_null_positions` / `right_null_positions` - Original positions of
+///   null rows, when present.
+/// * `is_extension_array` - Whether null comparisons should be treated as
+///   pandas `NA` and therefore excluded.
+/// * `visit` - Callback receiving `(left_physical_position,
+///   right_physical_position)` for each successful `!=` candidate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn visit_not_equal_pairs_core<T, F>(
+    left: ArrayView1<'_, T>,
+    left_full_len: usize,
+    left_positions: ArrayView1<'_, i64>,
+    right: ArrayView1<'_, T>,
+    right_full_len: usize,
+    right_positions: ArrayView1<'_, i64>,
+    left_null_positions: Option<ArrayView1<'_, i64>>,
+    right_null_positions: Option<ArrayView1<'_, i64>>,
+    is_extension_array: bool,
+    mut visit: F,
+) -> Result<(), String>
+where
+    T: PartialOrd + Copy,
+    F: FnMut(usize, usize),
+{
+    ensure_equal_lengths_core(
+        "left values",
+        left.len(),
+        "left positions",
+        left_positions.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "right values",
+        right.len(),
+        "right positions",
+        right_positions.len(),
+    )?;
+    let left_positions = physical_positions("left", left_positions)?;
+    let right_positions = physical_positions("right", right_positions)?;
+    let left_null_positions = left_null_positions
+        .map(|values| physical_positions("left null", values))
+        .transpose()?;
+    let right_null_positions = right_null_positions
+        .map(|values| physical_positions("right null", values))
+        .transpose()?;
+    let empty = Vec::new();
+    let left_null_positions = left_null_positions.as_deref().unwrap_or(&empty);
+    let right_null_positions = right_null_positions.as_deref().unwrap_or(&empty);
+    validate_position_partition(
+        "left index",
+        left_full_len,
+        &left_positions,
+        left_null_positions,
+    )?;
+    validate_position_partition(
+        "right index",
+        right_full_len,
+        &right_positions,
+        right_null_positions,
+    )?;
+
+    if is_extension_array {
+        // Extension nulls compare as NA, which is false when used as a join
+        // filter. The non-null candidate regions remain valid.
+        for (left_offset, left_value) in left.iter().enumerate() {
+            let left_position = left_positions[left_offset];
+            let gt_start = partition_point(right, |value| value <= *left_value);
+            let lt_end = partition_point(right, |value| value < *left_value);
+            for &right_position in &right_positions[..lt_end] {
+                visit(left_position, right_position);
+            }
+            for &right_position in &right_positions[gt_start..] {
+                visit(left_position, right_position);
+            }
+        }
+        return Ok(());
+    }
+
+    for (left_offset, left_value) in left.iter().enumerate() {
+        let left_position = left_positions[left_offset];
+        let gt_start = partition_point(right, |value| value <= *left_value);
+        let lt_end = partition_point(right, |value| value < *left_value);
+        for &right_position in &right_positions[..lt_end] {
+            visit(left_position, right_position);
+        }
+        for &right_position in &right_positions[gt_start..] {
+            visit(left_position, right_position);
+        }
+        for &right_position in right_null_positions {
+            visit(left_position, right_position);
+        }
+    }
+    for &left_position in left_null_positions {
+        for &right_position in &right_positions {
+            visit(left_position, right_position);
+        }
+        for &right_position in right_null_positions {
+            visit(left_position, right_position);
+        }
     }
     Ok(())
 }
