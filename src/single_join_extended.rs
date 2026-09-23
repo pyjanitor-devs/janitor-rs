@@ -304,9 +304,7 @@ fn materialize_pairs_for_ne(
                     .get_mut(left_position)
                     .ok_or("not-equal left position is out of bounds")?;
                 let slot = *output_position;
-                *output_position = (*output_position)
-                    .checked_add(1)
-                    .ok_or("single extended join result size exceeds platform capacity")?;
+                *output_position += 1;
                 output_left[slot] = left_index[left_position];
                 output_right[slot] = *right_index
                     .get(right_position)
