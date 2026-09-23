@@ -135,10 +135,11 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
             },
         )
         .map_err(PyValueError::new_err)?;
-    } else if !reverse {
-        // A forward single range join produces one contiguous right-side
-        // window per left row. Reuse the optimized prefix/suffix aggregation
-        // paths instead of visiting every matching right position.
+    } else {
+        // A single range join produces one contiguous right-side window per
+        // left row. Reuse the optimized prefix/suffix aggregation paths
+        // instead of visiting every matching position. The reverse methods
+        // scatter each source row into dense right-side output slots.
         let mut boundaries = Vec::with_capacity(left.len());
         for &left_value in left.iter() {
             let (start, end) = range_bounds(left_value, right, op);
@@ -153,27 +154,16 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
         }
         let boundaries = ArrayView1::from(&boundaries[..]);
         if matches!(op, CompareOp::Lt | CompareOp::Le) {
-            set.aggregate_starts(boundaries);
+            if reverse {
+                set.aggregate_reverse_starts(boundaries);
+            } else {
+                set.aggregate_starts(boundaries);
+            }
         } else {
-            set.aggregate_ends(boundaries);
-        }
-    } else {
-        if !matches!(
-            op,
-            CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
-        ) {
-            return Err(PyValueError::new_err(
-                "single join aggregation requires a range predicate",
-            ));
-        }
-        for (left_position, &left_value) in left.iter().enumerate() {
-            let (start, end) = range_bounds(left_value, right, op);
-            for right_position in start..end {
-                if reverse {
-                    set.update(left_position, right_position);
-                } else {
-                    set.update(right_position, left_position);
-                }
+            if reverse {
+                set.aggregate_reverse_ends(boundaries);
+            } else {
+                set.aggregate_ends(boundaries);
             }
         }
     }
