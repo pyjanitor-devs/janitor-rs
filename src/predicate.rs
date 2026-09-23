@@ -4,7 +4,7 @@ use numpy::ndarray::ArrayView1;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyBool, PyList, PyTuple};
 
 use crate::aggs::ensure_equal_lengths;
 use crate::op::CompareOp;
@@ -461,7 +461,8 @@ pub(crate) fn parse_predicates_strings<'py>(
 ///
 /// Ordinary residual predicates are `(left, right, op)`. A null-aware `!=`
 /// predicate is `(left, left_nulls, right, right_nulls,
-/// is_extension_array, op)`. For all-`!=` extended joins, these arrays are
+/// is_extension_array, op)`, where `is_extension_array` must be a Python
+/// boolean. For all-`!=` extended joins, these arrays are
 /// full physical layouts: candidate position pairs index them directly, and
 /// the masks are full-length authoritative null masks. The parser does not
 /// align or filter these arrays.
@@ -505,7 +506,11 @@ pub(crate) fn parse_predicates_with_nulls_strings<'py>(
         let right_mask = tuple
             .get_item(3)?
             .extract::<PyReadonlyArray1<'py, bool>>()?;
-        let extension_flag = tuple.get_item(4)?.extract::<bool>()?;
+        let extension_object = tuple.get_item(4)?;
+        if !extension_object.is_instance_of::<PyBool>() {
+            return Err(PyTypeError::new_err("is_extension_array must be a bool"));
+        }
+        let extension_flag = extension_object.extract::<bool>()?;
         base_tuples.append(PyTuple::new(
             py,
             [tuple.get_item(0)?, tuple.get_item(2)?, tuple.get_item(5)?],
@@ -649,4 +654,42 @@ pub(crate) fn parse_predicates_with_nulls<'py>(
         None
     };
     Ok((parsed, metadata))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::PyArray1;
+
+    #[test]
+    fn string_null_metadata_requires_a_boolean_extension_flag() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates
+                .append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![false]).into_any(),
+                        PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![false]).into_any(),
+                        1_i64.into_pyobject(py)?.into_any(),
+                        "!=".into_pyobject(py)?.into_any(),
+                    ],
+                )?)
+                .unwrap();
+
+            let error = match parse_predicates_with_nulls_strings(py, &predicates) {
+                Ok(_) => panic!("expected a non-boolean extension flag to be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.value(py).to_string(),
+                "is_extension_array must be a bool"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
 }
