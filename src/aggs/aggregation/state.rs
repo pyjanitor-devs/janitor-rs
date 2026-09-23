@@ -89,6 +89,8 @@ enum State<'a> {
     CountAll,
     /// Count only successful comparisons whose source mask marks a value valid.
     CountNonNull(View<'a>, Vec<i64>),
+    /// Count valid source positions using only a dtype-independent mask.
+    CountNonNullMask(ArrayView1<'a, bool>, Vec<i64>),
     Product(View<'a>, Vec<i64>),
     ProductU64(ArrayView1<'a, u64>, ArrayView1<'a, bool>, Vec<u64>),
     ProductF64(View<'a>, Vec<f64>),
@@ -159,6 +161,28 @@ impl<'a> AggregationSet<'a> {
             let (values, nulls, op) = match input {
                 AggregationInput::CountAll => {
                     states.push(State::CountAll);
+                    continue;
+                }
+                AggregationInput::CountNonNull(mask) => {
+                    let mask = mask.as_array();
+                    let length = mask.len();
+                    if let Some(expected) = candidate_len {
+                        ensure_equal_lengths(
+                            "first aggregation array",
+                            expected,
+                            "current aggregation mask",
+                            length,
+                        )?;
+                    } else {
+                        candidate_len = Some(length);
+                    }
+                    ensure_equal_lengths(
+                        "comparison source array",
+                        source_len,
+                        "aggregation mask",
+                        length,
+                    )?;
+                    states.push(State::CountNonNullMask(mask, vec![0; output_len]));
                     continue;
                 }
                 AggregationInput::I64(a, m, o) => (Values::I64(a.as_array()), m.as_array(), *o),
@@ -294,6 +318,11 @@ impl<'a> AggregationSet<'a> {
                 }
                 State::CountNonNull(view, values) => {
                     if !view.nulls[source_position] {
+                        values[output_position] += 1;
+                    }
+                }
+                State::CountNonNullMask(nulls, values) => {
+                    if !nulls[source_position] {
                         values[output_position] += 1;
                     }
                 }
@@ -469,6 +498,27 @@ impl<'a> AggregationSet<'a> {
                                     }
                                 }
                                 output[row] = count;
+                            }
+                        }
+                    }
+                }
+                State::CountNonNullMask(nulls, output) => {
+                    if running {
+                        let mut suffix = vec![0_i64; self.source_len + 1];
+                        for position in (0..self.source_len).rev() {
+                            suffix[position] = suffix[position + 1] + i64::from(!nulls[position]);
+                        }
+                        for (row, range) in ranges.iter().enumerate() {
+                            if let Some((start, _)) = range {
+                                output[row] = suffix[*start];
+                            }
+                        }
+                    } else {
+                        for (row, range) in ranges.iter().enumerate() {
+                            if let Some((start, end)) = range {
+                                output[row] = (*start..*end)
+                                    .filter(|&position| !nulls[position])
+                                    .count() as i64;
                             }
                         }
                     }
@@ -680,6 +730,27 @@ impl<'a> AggregationSet<'a> {
                                     }
                                 }
                                 output[row] = count;
+                            }
+                        }
+                    }
+                }
+                State::CountNonNullMask(nulls, output) => {
+                    if running {
+                        let mut prefix = vec![0_i64; self.source_len + 1];
+                        for position in 0..self.source_len {
+                            prefix[position + 1] = prefix[position] + i64::from(!nulls[position]);
+                        }
+                        for (row, range) in ranges.iter().enumerate() {
+                            if let Some((_, end)) = range {
+                                output[row] = prefix[*end];
+                            }
+                        }
+                    } else {
+                        for (row, range) in ranges.iter().enumerate() {
+                            if let Some((start, end)) = range {
+                                output[row] = (*start..*end)
+                                    .filter(|&position| !nulls[position])
+                                    .count() as i64;
                             }
                         }
                     }
@@ -905,6 +976,27 @@ impl<'a> AggregationSet<'a> {
                         }
                     }
                 }
+                State::CountNonNullMask(nulls, output) => {
+                    if use_tree {
+                        let mut prefix = vec![0_i64; self.source_len + 1];
+                        for position in 0..self.source_len {
+                            prefix[position + 1] = prefix[position] + i64::from(!nulls[position]);
+                        }
+                        for (row, range) in ranges.iter().enumerate() {
+                            if let Some((start, end)) = range {
+                                output[row] = prefix[*end] - prefix[*start];
+                            }
+                        }
+                    } else {
+                        for (row, range) in ranges.iter().enumerate() {
+                            if let Some((start, end)) = range {
+                                output[row] = (*start..*end)
+                                    .filter(|&position| !nulls[position])
+                                    .count() as i64;
+                            }
+                        }
+                    }
+                }
                 State::Sum(view, output) => {
                     if use_tree {
                         update_signed_segment_ranges(view, output, &ranges, false);
@@ -1064,6 +1156,25 @@ impl<'a> AggregationSet<'a> {
                     }
                     // Once the boundary event has been applied, its value is
                     // active for the rest of the suffix sweep.
+                    let mut running = 0_i64;
+                    for position in 0..self.output_len {
+                        running += events[position];
+                        output[position] = running;
+                    }
+                }
+                State::CountNonNullMask(nulls, output) => {
+                    if !use_sweep {
+                        update_count_ranges_mask(nulls, output, &suffix_ranges);
+                        continue;
+                    }
+                    let mut events = vec![0_i64; self.output_len];
+                    for (row, start) in valid_starts.iter().enumerate() {
+                        if let Some(start) = start {
+                            if !nulls[row] {
+                                events[*start] += 1;
+                            }
+                        }
+                    }
                     let mut running = 0_i64;
                     for position in 0..self.output_len {
                         running += events[position];
@@ -1295,6 +1406,25 @@ impl<'a> AggregationSet<'a> {
                         output[position] = running;
                     }
                 }
+                State::CountNonNullMask(nulls, output) => {
+                    if !use_sweep {
+                        update_count_ranges_mask(nulls, output, &prefix_ranges);
+                        continue;
+                    }
+                    let mut events = vec![0_i64; self.output_len];
+                    for (row, end) in valid_ends.iter().enumerate() {
+                        if let Some(end) = end {
+                            if !nulls[row] {
+                                events[*end - 1] += 1;
+                            }
+                        }
+                    }
+                    let mut running = 0_i64;
+                    for position in (0..self.output_len).rev() {
+                        running += events[position];
+                        output[position] = running;
+                    }
+                }
                 State::Sum(view, output) => {
                     if !use_sweep {
                         update_reverse_signed_ranges(view, output, &prefix_ranges, false);
@@ -1501,6 +1631,17 @@ impl<'a> AggregationSet<'a> {
                     for (row, range) in ranges.iter().enumerate() {
                         if let Some((start, end)) = range {
                             if !view.nulls[row] {
+                                for slot in &mut output[*start..*end] {
+                                    *slot += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                State::CountNonNullMask(nulls, output) => {
+                    for (row, range) in ranges.iter().enumerate() {
+                        if let Some((start, end)) = range {
+                            if !nulls[row] {
                                 for slot in &mut output[*start..*end] {
                                     *slot += 1;
                                 }
@@ -1751,9 +1892,10 @@ impl<'a> AggregationSet<'a> {
                 .into_pyarray(py)
                 .unbind()
                 .into_any(),
-                State::CountNonNull(_, v) | State::Min(_, v) | State::Max(_, v) => {
-                    Array1::from_vec(v).into_pyarray(py).unbind().into_any()
-                }
+                State::CountNonNull(_, v)
+                | State::CountNonNullMask(_, v)
+                | State::Min(_, v)
+                | State::Max(_, v) => Array1::from_vec(v).into_pyarray(py).unbind().into_any(),
             };
             results.push(result);
         }
@@ -2314,6 +2456,27 @@ fn update_count_ranges(view: &View<'_>, output: &mut [i64], ranges: &[Option<(us
     for (row, range) in ranges.iter().enumerate() {
         let Some((start, end)) = range else { continue };
         if view.nulls[row] {
+            continue;
+        }
+        for slot in &mut output[*start..*end] {
+            *slot += 1;
+        }
+    }
+}
+
+/// Count valid source rows across dense reverse ranges without a value view.
+///
+/// This is the dtype-independent counterpart to [`update_count_ranges`]. The
+/// wildcard `count` request supplies only its authoritative null mask, so the
+/// aggregation never needs to extract or inspect the source dtype.
+fn update_count_ranges_mask(
+    nulls: &ArrayView1<'_, bool>,
+    output: &mut [i64],
+    ranges: &[Option<(usize, usize)>],
+) {
+    for (row, range) in ranges.iter().enumerate() {
+        let Some((start, end)) = range else { continue };
+        if nulls[row] {
             continue;
         }
         for slot in &mut output[*start..*end] {

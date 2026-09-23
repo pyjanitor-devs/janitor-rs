@@ -1088,3 +1088,10 @@ dtype promotion on overflow. This is a public dtype-specific contract and
 must remain documented and covered by boundary-value tests. Floating-point
 aggregation uses the corresponding `f32` or `f64` arithmetic; position,
 length, and allocation calculations remain checked.
+
+Count-like aggregation has a separate dtype-independent contract. `size`
+uses the wildcard `("*", "size")` request and counts every successful
+comparison. `count` uses `("*", null_mask, "count")` and consults only the
+authoritative boolean mask, so strings, objects, and extension values do not
+enter numeric dtype dispatch. Value reductions still require supported numeric
+arrays and their aligned masks.

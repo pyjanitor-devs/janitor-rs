@@ -65,6 +65,9 @@ impl AggregationOp {
 pub(crate) enum AggregationInput<'py> {
     /// Count every successful comparison without reading a value column.
     CountAll,
+    /// Count successful comparisons whose source value is valid, using only
+    /// the authoritative boolean null mask and no source value array.
+    CountNonNull(PyReadonlyArray1<'py, bool>),
     // Each variant preserves the original NumPy dtype. The output dtype is
     // an operation contract, not a consequence of whichever dtype happened
     // to be supplied by the caller.
@@ -123,7 +126,8 @@ pub(crate) enum AggregationInput<'py> {
 /// Parse Python aggregation requests and preserve their concrete NumPy dtypes.
 ///
 /// Each list item is either a three-element tuple
-/// `(values, null_mask, operation)` or the two-element count-all shorthand
+/// `(values, null_mask, operation)`, the dtype-independent count form
+/// `("*", null_mask, "count")`, or the two-element count-all shorthand
 /// `("*", "count")`; `("*", "size")` is also accepted. The values and mask
 /// are borrowed rather than copied, so their Python owners must remain alive
 /// while the returned inputs are used by [`super::state::AggregationSet`].
@@ -135,9 +139,9 @@ pub(crate) enum AggregationInput<'py> {
 ///   unsigned, or float NumPy dtypes. Null masks must be one-dimensional
 ///   boolean arrays aligned with their value arrays. The caller owns null
 ///   tracking: a mask entry of `true` is the only null marker recognized here.
-///   A wildcard count-all request does not need a value array or mask. A
-///   three-element `count` request counts non-null values; `size` requests
-///   count-all.
+///   A wildcard count-all request does not need a value array or mask. The
+///   wildcard three-element `count` request needs only its boolean mask and
+///   counts non-null values; `size` requests count-all.
 ///
 /// # Returns
 ///
@@ -187,6 +191,13 @@ pub(crate) fn parse_inputs<'py>(
             .get_item(1)?
             .extract::<PyReadonlyArray1<'py, bool>>()?;
         let op = AggregationOp::parse(&tuple.get_item(2)?)?;
+        if array.extract::<String>().ok().as_deref() == Some("*") {
+            if op != AggregationOp::CountNonNull {
+                return Err(PyValueError::new_err("wildcard aggregation must use count"));
+            }
+            result.push(AggregationInput::CountNonNull(mask));
+            continue;
+        }
         let dtype = array
             .getattr("dtype")?
             .getattr("name")?
