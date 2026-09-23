@@ -284,6 +284,34 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
 macro_rules! single_join_aggregation_functions {
     ($forward:ident, $reverse:ident, $ty:ty) => {
         /// Fused forward aggregation for one range or `!=` predicate.
+        ///
+        /// Range values must already be aligned and the right values must be
+        /// sorted by PyJanitor. `!=` values contain only non-null entries;
+        /// their position arrays map them back to the complete physical
+        /// layouts. The kernel consumes every successful pair, so there is no
+        /// `keep` argument.
+        ///
+        /// # Arguments
+        ///
+        /// * `py` - Active Python interpreter token.
+        /// * `left` / `right` - Predicate value arrays using the dtype encoded
+        ///   by this exported function name.
+        /// * `comparator` - One of `<`, `<=`, `>`, `>=`, or `!=`. Equality is
+        ///   handled upstream.
+        /// * `left_positions` / `right_positions` - Required physical maps
+        ///   for `!=`; `None` for range predicates.
+        /// * `left_null_positions` / `right_null_positions` - Optional null
+        ///   physical partitions for `!=`.
+        /// * `is_extension_array` - Selects pandas nullable null semantics for
+        ///   `!=`; it must be false for range predicates.
+        /// * `aggregations` - Non-empty value/mask/operation requests. Values
+        ///   use the complete physical layout of the right source.
+        ///
+        /// # Example
+        ///
+        /// With `left = [2, 3]`, sorted `right = [1, 2, 4]`, and comparator
+        /// `<`, the matching suffixes are `[4]` and `[4]`. A forward sum
+        /// request updates one result slot per left row from right values.
         #[pyfunction]
         #[allow(clippy::too_many_arguments)]
         pub fn $forward<'py>(
@@ -314,6 +342,31 @@ macro_rules! single_join_aggregation_functions {
         }
 
         /// Fused reverse aggregation for one range or `!=` predicate.
+        ///
+        /// Reverse aggregation uses the same predicate and position contract
+        /// as the forward function, but writes dense output slots for right
+        /// rows while reading aggregation values from left rows. Single range
+        /// predicates use `aggregate_reverse_starts` or
+        /// `aggregate_reverse_ends`, which may select direct, event-sweep, or
+        /// boundary-table reductions internally.
+        ///
+        /// # Arguments
+        ///
+        /// * `py` - Active Python interpreter token.
+        /// * `left` / `right` - Aligned predicate arrays.
+        /// * `comparator` - A supported non-equality comparator.
+        /// * `left_positions` / `right_positions` - Physical maps required by
+        ///   `!=` and otherwise omitted.
+        /// * `left_null_positions` / `right_null_positions` - Optional null
+        ///   partitions for `!=`.
+        /// * `is_extension_array` - pandas nullable null-semantics flag for
+        ///   `!=`.
+        /// * `aggregations` - Requests over the complete left source layout.
+        ///
+        /// # Returns
+        ///
+        /// Returns `None` when no pair succeeds. Otherwise returns a matched
+        /// mask indexed by right rows and aggregation arrays in request order.
         #[pyfunction]
         #[allow(clippy::too_many_arguments)]
         pub fn $reverse<'py>(
