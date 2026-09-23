@@ -1728,4 +1728,46 @@ mod tests {
         );
         assert!(result.is_err());
     }
+
+    #[test]
+    fn not_equal_rejects_out_of_bounds_physical_positions() {
+        let result = build_not_equal_positions_core(
+            array![2_i64].view(),
+            array![10_i64, 11].view(),
+            array![2_i64].view(),
+            array![1_i64].view(),
+            array![20_i64].view(),
+            array![0_i64].view(),
+            Some(array![0_i64].view()),
+            None,
+            true,
+            false,
+            Keep::Any,
+        );
+        assert_eq!(
+            result,
+            Err("left index non-null position 2 is out of bounds".to_owned())
+        );
+    }
+
+    #[test]
+    fn not_equal_rejects_duplicate_physical_positions() {
+        let result = build_not_equal_positions_core(
+            array![2_i64, 3].view(),
+            array![10_i64, 11].view(),
+            array![0_i64, 0].view(),
+            array![1_i64].view(),
+            array![20_i64].view(),
+            array![0_i64].view(),
+            None,
+            None,
+            true,
+            false,
+            Keep::Any,
+        );
+        assert_eq!(
+            result,
+            Err("left index position 0 appears more than once".to_owned())
+        );
+    }
 }
