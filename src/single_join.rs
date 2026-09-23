@@ -286,7 +286,7 @@ fn prefix_min_positions(labels: &[i64]) -> Vec<usize> {
 ///
 /// ```text
 /// labels:       [40, 10, 30, 20]
-/// prefix maxima: [ 0,  0,  2,  2]
+/// prefix maxima: [ 0,  0,  0,  0]
 /// ```
 ///
 /// The returned values are offsets into `labels`, not public index labels.
@@ -583,6 +583,27 @@ fn choose_range(
     Ok((output_left, output_right))
 }
 
+/// Convert Python-facing physical positions from `int64` to Rust indexing
+/// positions.
+///
+/// Pyjanitor supplies these positions as signed `int64` arrays because that is
+/// the stable NumPy/PyO3 boundary type. Rust indexing requires `usize`, but a
+/// negative value is invalid rather than a sentinel that can be cast safely.
+/// Validate the value first and report its input offset in the error.
+///
+/// # Arguments
+///
+/// * `name` - Human-readable name used in validation errors.
+/// * `values` - Physical positions in logical filtered-array order.
+///
+/// # Returns
+///
+/// The same positions as `usize`, preserving input order.
+///
+/// # Errors
+///
+/// Returns an error if a position is negative or cannot be represented by the
+/// platform's `usize` type.
 fn physical_positions(name: &str, values: ArrayView1<'_, i64>) -> Result<Vec<usize>, String> {
     values
         .iter()
@@ -818,15 +839,6 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    // Binary search works on the sorted, filtered values. Selection and
-    // output, however, use the original right-index labels. Build the label
-    // vector in the same filtered order so an offset returned by an extrema
-    // table can be translated back to a physical right position.
-    let right_labels: Vec<i64> = right_positions
-        .iter()
-        .map(|&position| right_index[position])
-        .collect();
-
     // `all` can emit many pairs per left row, so it gets an exact checked
     // capacity estimate. The selected modes emit at most one pair per left
     // row, so the full left-index length is a sufficient upper bound.
@@ -858,24 +870,34 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
     // or largest (`last`) label from a prefix/suffix would otherwise require
     // scanning that region for every left row. These tables store the best
     // physical position seen so far, so each window can select in O(1).
-    let need_unordered_extrema = !left.is_empty() && !right_index_is_ordered;
+    let need_unordered_extrema =
+        !left.is_empty() && !right_index_is_ordered && matches!(keep, Keep::First | Keep::Last);
+    // Only unordered `first`/`last` selection needs labels in filtered value
+    // order. Ordered labels, `any`, and `all` can use boundaries directly, so
+    // avoid copying the right-label vector in those cases.
+    let right_labels = need_unordered_extrema.then(|| {
+        right_positions
+            .iter()
+            .map(|&position| right_index[position])
+            .collect::<Vec<_>>()
+    });
     let prefix_min = if need_unordered_extrema && keep == Keep::First {
-        Some(prefix_min_positions(&right_labels))
+        Some(prefix_min_positions(right_labels.as_deref().unwrap()))
     } else {
         None
     };
     let prefix_max = if need_unordered_extrema && keep == Keep::Last {
-        Some(prefix_max_positions(&right_labels))
+        Some(prefix_max_positions(right_labels.as_deref().unwrap()))
     } else {
         None
     };
     let suffix_min = if need_unordered_extrema && keep == Keep::First {
-        Some(suffix_min_positions(&right_labels))
+        Some(suffix_min_positions(right_labels.as_deref().unwrap()))
     } else {
         None
     };
     let suffix_max = if need_unordered_extrema && keep == Keep::Last {
-        Some(suffix_max_positions(&right_labels))
+        Some(suffix_max_positions(right_labels.as_deref().unwrap()))
     } else {
         None
     };

@@ -708,6 +708,16 @@ mod tests {
     use super::*;
     use numpy::{PyArray1, PyArrayMethods};
 
+    fn assert_value_error<'py>(
+        result: PyResult<Option<Bound<'py, PyDict>>>,
+        py: Python<'py>,
+        expected: &str,
+    ) {
+        let error = result.expect_err("expected the extended join to reject its input");
+        assert!(error.is_instance_of::<PyValueError>(py));
+        assert_eq!(error.value(py).to_string(), expected);
+    }
+
     fn read_pair<'py>(result: &Bound<'py, PyDict>, py: Python<'py>) -> (Vec<i64>, Vec<i64>) {
         let left = result
             .get_item("left_index")
@@ -852,6 +862,190 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(read_pair(&result, py), (vec![10, 11, 12], vec![21, 20, 20]));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn validation_errors_report_their_exact_contract() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let no_predicates = PyList::empty(py);
+            assert_value_error(
+                single_join_extended_indices_int64(py, &no_predicates, "all"),
+                py,
+                "single extended join requires at least two predicates",
+            );
+
+            let bad_first_shape = PyList::empty(py);
+            bad_first_shape.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            bad_first_shape.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(py, &bad_first_shape, "all"),
+                py,
+                "the first extended predicate must contain 6 or 11 elements",
+            );
+
+            let invalid_keep = PyList::empty(py);
+            invalid_keep.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64, 21]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            invalid_keep.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(py, &invalid_keep, "middle"),
+                py,
+                "invalid keep value: middle (expected one of first, last, any, all)",
+            );
+
+            let bad_residual_shape = PyList::empty(py);
+            bad_residual_shape.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64, 21]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            bad_residual_shape.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![3_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(py, &bad_residual_shape, "all"),
+                py,
+                "each residual comparison must contain 3 or 6 elements",
+            );
+
+            let invalid_residual_operator = PyList::empty(py);
+            invalid_residual_operator.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            invalid_residual_operator.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    "like".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(py, &invalid_residual_operator, "all"),
+                py,
+                "invalid comparison operator: like (expected one of >, >=, <, <=, ==, !=)",
+            );
+
+            let mismatched_residual = PyList::empty(py);
+            mismatched_residual.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            mismatched_residual.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64, 2]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(py, &mismatched_residual, "all"),
+                py,
+                "first left predicate array and residual left predicate array must have equal lengths; got 1 and 2",
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn not_equal_validation_rejects_incomplete_physical_partitions() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 11]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    py.None().into_pyobject(py)?.into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64, 21]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    py.None().into_pyobject(py)?.into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64, 2]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64, 21]).into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(py, &predicates, "all"),
+                py,
+                "left index length must equal the number of non-null values plus null positions",
+            );
             Ok(())
         })
         .unwrap();

@@ -333,12 +333,15 @@ pub(crate) fn predicates_match_dispatch(
     }
 }
 
-/// Parse Python comparison tuples into typed predicates.
+/// Parse retained legacy numeric-opcode comparison tuples into typed
+/// predicates.
 ///
 /// Each item must be a three-element `(left, right, op)` tuple. The left and
 /// right objects must be one-dimensional NumPy arrays with one of the numeric
-/// dtypes supported by this module; `op` is the comparison opcode understood
-/// by [`CompareOp`].
+/// dtypes supported by this module; `op` is the numeric comparison opcode
+/// understood by [`CompareOp`]. New callers should use
+/// [`parse_predicates_strings`], but this entry point remains for existing
+/// batch wrappers until their migration is complete.
 ///
 /// # Arguments
 ///
@@ -564,7 +567,8 @@ pub(crate) fn parse_predicates_with_nulls_strings<'py>(
 ///
 /// Returns a Python type/value error for malformed tuples, invalid opcodes,
 /// unsupported dtypes, invalid extension flags, or mask/array length
-/// mismatches.
+/// mismatches. The numeric extension flag remains the legacy `0`/`1` form;
+/// the string-based parser uses a real Python boolean instead.
 pub(crate) fn parse_predicates_with_nulls<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
