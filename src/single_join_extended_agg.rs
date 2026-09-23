@@ -169,6 +169,10 @@ fn aggregate_not_equal<T: PartialOrd + Copy>(
 /// * `py` - Active Python interpreter token used to create the temporary list.
 /// * `predicates` - Full extended predicate list, including the first anchor
 ///   predicate at position zero.
+/// * `require_not_equal` - When true, validate that every residual operator is
+///   `!=`, as required when the first predicate generates the all-`!=`
+///   candidate stream. Range anchors pass false and allow all residual
+///   operators supported by the shared predicate parser.
 ///
 /// # Returns
 ///
@@ -177,12 +181,33 @@ fn aggregate_not_equal<T: PartialOrd + Copy>(
 fn residuals<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
+    require_not_equal: bool,
 ) -> PyResult<(
     Vec<crate::predicate::Predicate<'py>>,
     Option<Vec<crate::predicate::NullMetadata<'py>>>,
 )> {
     let values = PyList::empty(py);
     for item in predicates.iter().skip(1) {
+        if require_not_equal {
+            let tuple = item
+                .cast::<PyTuple>()
+                .map_err(|_| PyValueError::new_err("each residual comparison must be a tuple"))?;
+            let op_position = match tuple.len() {
+                3 => 2,
+                6 => 5,
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "each residual comparison must contain 3 or 6 elements",
+                    ));
+                }
+            };
+            let op = CompareOp::try_from_str(tuple.get_item(op_position)?.extract::<&str>()?)?;
+            if op != CompareOp::Ne {
+                return Err(PyValueError::new_err(
+                    "all-!= joins require every predicate to use !=",
+                ));
+            }
+        }
         values.append(item)?;
     }
     parse_predicates_with_nulls_strings(py, &values)
@@ -257,7 +282,7 @@ fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
     aggregations: &Bound<'py, PyList>,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    let (parsed, metadata) = residuals(py, predicates)?;
+    let (parsed, metadata) = residuals(py, predicates, false)?;
     let left = left.as_array();
     let right = right.as_array();
     check_residual_lengths(&parsed, left.len(), right.len())?;
@@ -331,7 +356,7 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
     aggregations: &Bound<'py, PyList>,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    let (parsed, metadata) = residuals(py, predicates)?;
+    let (parsed, metadata) = residuals(py, predicates, true)?;
     check_residual_lengths(&parsed, left_index.len()?, right_index.len()?)?;
     let inputs = parse_inputs(aggregations)?;
     if inputs.is_empty() {
@@ -511,6 +536,11 @@ macro_rules! extended_aggregation_functions {
             predicates: &Bound<'py, PyList>,
             aggregations: &Bound<'py, PyList>,
         ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+            if predicates.is_empty() {
+                return Err(PyValueError::new_err(
+                    "single extended aggregation requires at least two predicates",
+                ));
+            }
             let first_item = predicates.get_item(0)?;
             let first = first_item.cast::<PyTuple>()?;
             dispatch::<$ty>(py, predicates, &first, aggregations, false)
@@ -543,6 +573,11 @@ macro_rules! extended_aggregation_functions {
             predicates: &Bound<'py, PyList>,
             aggregations: &Bound<'py, PyList>,
         ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+            if predicates.is_empty() {
+                return Err(PyValueError::new_err(
+                    "single extended aggregation requires at least two predicates",
+                ));
+            }
             let first_item = predicates.get_item(0)?;
             let first = first_item.cast::<PyTuple>()?;
             dispatch::<$ty>(py, predicates, &first, aggregations, true)
@@ -732,6 +767,82 @@ mod tests {
             let outputs_value = result.get_item(1)?;
             let outputs = outputs_value.cast::<PyList>()?;
             assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![200, 300]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn not_equal_aggregation_rejects_non_not_equal_residuals() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    py.None().into_pyobject(py)?.into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    py.None().into_pyobject(py)?.into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let aggregations = PyList::empty(py);
+
+            let error = single_join_extended_aggregate_int64(py, &predicates, &aggregations)
+                .expect_err("mixed operators after a != anchor must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: all-!= joins require every predicate to use !="
+            );
+
+            let error =
+                single_join_extended_aggregate_reverse_int64(py, &predicates, &aggregations)
+                    .expect_err("reverse mixed operators after a != anchor must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: all-!= joins require every predicate to use !="
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn empty_extended_aggregation_predicates_raise_value_error() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            let aggregations = PyList::empty(py);
+
+            let error = single_join_extended_aggregate_int64(py, &predicates, &aggregations)
+                .expect_err("an empty forward predicate list must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: single extended aggregation requires at least two predicates"
+            );
+
+            let error =
+                single_join_extended_aggregate_reverse_int64(py, &predicates, &aggregations)
+                    .expect_err("an empty reverse predicate list must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: single extended aggregation requires at least two predicates"
+            );
             Ok(())
         })
         .unwrap();

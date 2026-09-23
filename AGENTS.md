@@ -1071,10 +1071,12 @@ suffix, while `>` or `>=` creates a contiguous right-side prefix. The single
 range aggregation kernel now passes those boundaries to
 `AggregationSet::aggregate_starts` or `aggregate_ends`, allowing the existing
 adaptive direct/suffix/prefix strategies to choose the efficient reduction.
-Reverse aggregation remains candidate-based because its output is right-sided
-and the left predicate layout is not guaranteed sorted. Extended joins also
+Reverse aggregation for a single range join uses the optimized boundary path
+as well: `aggregate_reverse_starts` and `aggregate_reverse_ends` handle the
+complete prefix or suffix windows without visiting every pair. Extended joins
 remain candidate-based after residual predicates are applied, since residuals
-can make the surviving positions non-contiguous.
+can make the surviving positions non-contiguous. The same candidate traversal
+is used for `!=` joins.
 
 **Recommendation**: Preserve the boundary fast path only when the candidate
 window is a complete prefix or suffix. Use `set.update` for `!=`, reverse
