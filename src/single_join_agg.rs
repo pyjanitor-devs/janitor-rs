@@ -17,9 +17,105 @@ use crate::single_join::{range_bounds, visit_not_equal_pairs_core};
 
 /// Execute one fused aggregation pass over a single predicate.
 ///
-/// Range predicates use binary-search boundaries. `!=` uses the same strict
-/// prefix/suffix and explicit-null traversal as the index kernel, but invokes
-/// `AggregationSet::update` for each pair instead of storing that pair.
+/// This function owns the traversal decision; [`AggregationSet`] only owns
+/// the requested reductions. In other words, `AggregationSet` does not decide
+/// whether the comparison is a range or `!=` join. This function parses the
+/// comparator and chooses the matching candidate strategy before it calls
+/// `set.update`, `set.aggregate_starts`, or `set.aggregate_ends`.
+///
+/// Range predicates use binary-search boundaries. A forward `<`/`<=` query
+/// creates a suffix window for every left row, while a forward `>`/`>=` query
+/// creates a prefix window. The corresponding forward and reverse boundary
+/// methods on `AggregationSet` then choose their adaptive direct, sweep, or
+/// prefix/suffix-table implementation.
+///
+/// The reverse boundary methods use the same one-boundary-per-left-row input,
+/// but scatter each left source row into dense right output slots. This is why
+/// reverse range aggregation can use the optimized path even though its output
+/// is indexed by the right side.
+///
+/// `!=` uses the same strict prefix/suffix and explicit-null traversal as the
+/// index kernel, but invokes `AggregationSet::update` for each valid pair
+/// instead of storing that pair. The position metadata is needed because the
+/// value arrays supplied for `!=` contain only non-null rows.
+///
+/// # Position and null metadata
+///
+/// For range operators, `left` and `right` are complete, aligned physical
+/// arrays, so their lengths are sufficient to size the aggregation state.
+///
+/// For `!=`, the value arrays contain only non-null values. Their position
+/// arrays map each filtered value back to the original physical layout:
+///
+/// ```text
+/// full left values:       [10, null, 20, 30]
+/// left values:            [10, 20, 30]
+/// left_positions:         [0,    2,  3]
+/// left_null_positions:    [1]
+/// ```
+///
+/// The full physical length is therefore `3 + 1 = 4`, not `left.len() == 3`.
+/// `None` for a null-position array means that no nulls exist. `Some(empty)`
+/// means that an explicit null-position array was supplied and contains zero
+/// positions. Both contribute zero to the full length and produce the same
+/// comparison behavior; PyJanitor normally uses `None` when no nulls exist.
+///
+/// # Forward and reverse output mapping
+///
+/// Forward aggregation reads values from the right source and writes one
+/// output slot per left row. Reverse aggregation reads values from the left
+/// source and writes one output slot per right row. For example, a successful
+/// pair `(left_position=2, right_position=5)` updates as follows:
+///
+/// ```text
+/// forward: set.update(source_position=5, output_position=2)
+/// reverse: set.update(source_position=2, output_position=5)
+/// ```
+///
+/// # Arguments
+///
+/// * `py` - The active Python interpreter token used to borrow NumPy arrays
+///   and construct the result tuple.
+/// * `left` - The left predicate values. For range predicates this is the
+///   complete null-filtered left layout. For `!=` it contains only non-null
+///   values, in the physical order described by `left_positions`.
+/// * `right` - The right predicate values. For range predicates and `!=`,
+///   PyJanitor supplies the value-sorted right layout required by binary
+///   search. Rust trusts that ordering and does not sort it.
+/// * `comparator` - One of `"<"`, `"<="`, `">"`, `">="`, or `"!="`.
+///   Equality is handled upstream by PyJanitor.
+/// * `left_positions` - For `!=`, the original physical position of each
+///   non-null value in `left`; otherwise `None`.
+/// * `left_null_positions` - Optional original physical positions of null
+///   left values for NumPy-style `!=` semantics. Extension-array `!=` joins
+///   exclude null candidates instead. `None` means no nulls exist.
+/// * `right_positions` - For `!=`, the original physical position of each
+///   non-null value in `right`; otherwise `None`.
+/// * `right_null_positions` - Optional original physical positions of null
+///   right values. `None` means no nulls exist.
+/// * `is_extension_array` - Whether the `!=` comparison uses pandas nullable
+///   extension-array semantics. Null candidates are handled differently for
+///   extension arrays and NumPy arrays.
+/// * `aggregations` - Non-empty Python aggregation requests. Each request is
+///   `(values, null_mask, operation)`, where `operation` is `"sum"`,
+///   `"count"`, `"size"`, `"prod"`, `"min"`, or `"max"`. The arrays and
+///   masks must use the complete physical layout of the side being
+///   aggregated, not the filtered predicate layout.
+/// * `reverse` - If `false`, aggregate right values into left output slots.
+///   If `true`, aggregate left values into right output slots.
+///
+/// # Returns
+///
+/// Returns `Some((matched, results))` when at least one comparison succeeds.
+/// `matched` identifies output rows with at least one successful pair, and
+/// `results` contains one array per requested aggregation in request order.
+/// Returns `None` when no comparison succeeds anywhere.
+///
+/// # Errors
+///
+/// Returns a Python `ValueError` when equality is requested, required `!=`
+/// position metadata is missing, position lengths overflow, an aggregation
+/// request is invalid, or a boundary cannot be represented as `i64`.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
     py: Python<'py>,
@@ -68,11 +164,17 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
         ));
     }
 
+    // `!=` receives filtered value arrays, so their lengths alone cannot size
+    // the output. Reconstruct the complete physical domain from the
+    // non-null partition and the optional null partition. For example,
+    // `[0, 2, 3] + [1]` describes four original rows, not three.
     let left_full_len = if is_not_equal {
         let non_null = match left_positions.as_ref() {
             Some(values) => values.len()?,
             None => 0,
         };
+        // `None` means there are no null rows. `Some(empty)` is also valid and
+        // contributes zero; it is an explicit empty null partition.
         let nulls = match left_null_positions.as_ref() {
             Some(values) => values.len()?,
             None => 0,
@@ -88,6 +190,9 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
             Some(values) => values.len()?,
             None => 0,
         };
+        // Keep the same physical-length reconstruction for the right side.
+        // The position arrays are trusted after the shared core validates
+        // that their partitions are aligned and in bounds.
         let nulls = match right_null_positions.as_ref() {
             Some(values) => values.len()?,
             None => 0,
@@ -100,7 +205,9 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
     };
 
     // Forward aggregation reads values from right and writes one result slot
-    // per left row. Reverse aggregation swaps those two roles.
+    // per left row. Reverse aggregation swaps those two roles. The source
+    // length must match the full-layout aggregation arrays, while the output
+    // length determines how many matched flags and result slots are emitted.
     let output_len = if reverse {
         right_full_len
     } else {
