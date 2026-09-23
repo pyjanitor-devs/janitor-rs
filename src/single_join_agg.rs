@@ -5,6 +5,7 @@
 //! `keep` is intentionally absent: aggregation consumes every pair that
 //! satisfies the comparison.
 
+use numpy::ndarray::ArrayView1;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -134,6 +135,28 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
             },
         )
         .map_err(PyValueError::new_err)?;
+    } else if !reverse {
+        // A forward single range join produces one contiguous right-side
+        // window per left row. Reuse the optimized prefix/suffix aggregation
+        // paths instead of visiting every matching right position.
+        let mut boundaries = Vec::with_capacity(left.len());
+        for &left_value in left.iter() {
+            let (start, end) = range_bounds(left_value, right, op);
+            let boundary = if matches!(op, CompareOp::Lt | CompareOp::Le) {
+                start
+            } else {
+                end
+            };
+            boundaries.push(i64::try_from(boundary).map_err(|_| {
+                PyValueError::new_err("single join aggregation boundary exceeds int64")
+            })?);
+        }
+        let boundaries = ArrayView1::from(&boundaries[..]);
+        if matches!(op, CompareOp::Lt | CompareOp::Le) {
+            set.aggregate_starts(boundaries);
+        } else {
+            set.aggregate_ends(boundaries);
+        }
     } else {
         if !matches!(
             op,

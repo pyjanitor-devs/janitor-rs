@@ -1062,3 +1062,20 @@ or infer nullness.
 Use the same predicate traversal and residual filtering semantics as the index
 path, but call `AggregationSet::update` at each successful comparison. Return
 `None` only when no comparison survives; do not add `keep` to aggregation APIs.
+
+### [2026-09-23] Use boundary aggregation for forward single ranges
+
+**Context**: Optimizing the fused single-join aggregation path.
+**Learning**: A forward `<` or `<=` predicate creates a contiguous right-side
+suffix, while `>` or `>=` creates a contiguous right-side prefix. The single
+range aggregation kernel now passes those boundaries to
+`AggregationSet::aggregate_starts` or `aggregate_ends`, allowing the existing
+adaptive direct/suffix/prefix strategies to choose the efficient reduction.
+Reverse aggregation remains candidate-based because its output is right-sided
+and the left predicate layout is not guaranteed sorted. Extended joins also
+remain candidate-based after residual predicates are applied, since residuals
+can make the surviving positions non-contiguous.
+
+**Recommendation**: Preserve the boundary fast path only when the candidate
+window is a complete prefix or suffix. Use `set.update` for `!=`, reverse
+aggregation, and residual-filtered candidates.
