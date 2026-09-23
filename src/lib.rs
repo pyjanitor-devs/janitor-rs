@@ -4,7 +4,9 @@ mod bin_search;
 mod index_builder;
 mod multi_join_indices;
 mod op;
+mod predicate;
 mod single_join;
+mod single_join_extended;
 
 /// Narrow Rust-only surface used by `benches/kernels.rs`.
 ///
@@ -257,6 +259,7 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     multi_join_indices::register(m)?;
     index_builder::register(m)?;
     single_join::register(m)?;
+    single_join_extended::register(m)?;
     aggs::register(m)?;
     Ok(())
 }
@@ -312,11 +315,11 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (761 exports across the retained leaf
+    /// `register`, as of this PR (771 exports across the retained leaf
     /// modules).
     /// Bump this alongside any PR that intentionally adds or removes an
     /// export.
-    const EXPECTED_EXPORT_COUNT: usize = 761;
+    const EXPECTED_EXPORT_COUNT: usize = 771;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would

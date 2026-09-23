@@ -993,3 +993,48 @@ nullness from the value itself, including floating-point `NaN`.
 reviews. If an operation such as `min` or `max` needs a separate policy for a
 valid NaN because it is not totally ordered, specify that as ordering behavior
 rather than silently treating the value as null.
+
+### [2026-09-22] Extended joins are range-led and building blocks are flat
+
+**Context**: Designing the multi-predicate extension to the single conditional
+join kernel.
+**Learning**: The extended Rust path supports range-led predicates and
+all-not-equal predicates, returning flat materialized pairs. Pyjanitor prepares
+the filtered arrays, physical-position mappings, sorting, alignment, and
+authoritative null metadata before dispatching every supported predicate path
+to Rust. `return_building_blocks` remains a pyjanitor-level request that maps
+to `keep="all"`; it is not an argument to the extended Rust kernel.
+**Recommendation**: Keep `single_join.rs` as the one-predicate path and use
+`single_join_extended.rs` for multi-predicate range and all-not-equal joins. Apply
+`keep` only after all predicates have passed.
+
+### [2026-09-23] Equality is residual-only in extended single joins
+
+**Context**: Reviewing PR #210's operator support.
+**Learning**: `==` is intentionally unsupported as the first predicate because
+the first predicate must be binary-searchable (greater-than or less-than
+variants) or use the dedicated null-aware not-equal path. Equality is supported
+for subsequent residual predicate filters.
+**Recommendation**: Do not report rejection of `==` at the first-predicate
+boundary as a correctness defect unless that dispatch contract changes.
+
+### [2026-09-23] Extended single-join aggregation scope
+
+**Context**: Reviewing PR #210's scope against issue #208.
+**Learning**: Fused aggregation support is intentionally deferred to a
+separate follow-up PR; PR #210 is limited to index construction and residual
+filtering and does not claim to close issue #208.
+**Recommendation**: Do not report missing aggregations in PR #210 as a defect
+when the PR description and issue linkage explicitly keep that work separate.
+
+### [2026-09-23] Coordinate single-join API changes with pyjanitor callers
+
+**Context**: Re-reviewing PR #210 after it changed the `!=` metadata contract
+introduced by PR #209.
+**Learning**: The Rust single-join wrapper now expects filtered-to-physical
+position maps, null-position arrays, and an extension-array flag. A caller
+still passing full null masks and index labels, or omitting the final flag,
+fails at the PyO3 boundary or produces invalid position metadata.
+**Recommendation**: Treat single-join signature and coordinate-system changes
+as a coordinated Rust/pyjanitor migration. Add an integration test covering
+range and `!=` calls before merging either side.

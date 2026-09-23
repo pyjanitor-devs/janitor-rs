@@ -5,7 +5,6 @@ pub mod batch_no_range_indices;
 pub(crate) mod common;
 pub mod dual_regions;
 pub mod multi_regions;
-pub(crate) mod predicate;
 
 /// Registers the retained fused comparison and aggregation APIs.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -6,11 +6,11 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use super::predicate::{
-    null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch, Predicate,
-};
 use crate::aggs::checked_index;
 use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core, ensure_nonempty_core};
+use crate::predicate::{
+    null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch, Predicate,
+};
 
 type BatchIndices<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
 type CoreIndices = (Vec<i64>, Vec<i64>);

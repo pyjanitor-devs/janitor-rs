@@ -1,9 +1,9 @@
 //! Index construction for one non-equi join predicate.
 //!
 //! Pyjanitor supplies non-null, value-sorted arrays for the search paths and
-//! keeps each value array aligned with its original `int64` index array. Rust
-//! does not sort either side and does not infer nullness from values such as
-//! `NaN`; those responsibilities belong to the Python caller and its masks.
+//! maps each filtered value back to its original physical position. Rust does
+//! not sort either side or infer nullness from values such as `NaN`; those
+//! responsibilities belong to the Python caller and its position metadata.
 //!
 //! The value arrays and their index arrays are parallel arrays. For example:
 //!
@@ -16,9 +16,11 @@
 //! original index labels, not the physical positions in the sorted values.
 //! Consequently, `right_index_is_ordered` matters when selecting `first` or
 //! `last`: an unordered label array requires an extrema scan over the matched
-//! prefix or suffix.
+//! prefix or suffix. For `!=`, null semantics are selected by a validated
+//! pandas-extension flag: NumPy nulls participate in inequality matches,
+//! while pandas extension nulls do not.
 
-use numpy::ndarray::{s, ArrayView1};
+use numpy::ndarray::ArrayView1;
 use numpy::{IntoPyArray, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -45,7 +47,7 @@ impl Keep {
     /// Keeping this conversion at the Python boundary means the core
     /// functions can work with a closed enum and cannot silently accept a
     /// misspelled selection mode.
-    fn parse(value: &str) -> PyResult<Self> {
+    pub(crate) fn parse(value: &str) -> PyResult<Self> {
         match value {
             "first" => Ok(Self::First),
             "last" => Ok(Self::Last),
@@ -60,6 +62,8 @@ impl Keep {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SingleJoinResult {
+    /// Physical left positions corresponding to `left_index`.
+    pub(crate) left_positions: Vec<usize>,
     /// Original left index labels for rows with a non-empty match window.
     pub left_index: Vec<i64>,
     /// The complete original right index-label array, in sorted-value order.
@@ -145,12 +149,32 @@ fn range_bounds<T: PartialOrd + Copy>(
     }
 }
 
-/// Build a running minimum or maximum for every prefix of an index-label
-/// sequence.
+/// Build a running label minimum or maximum for every prefix.
 ///
-/// The iterator is consumed in logical right-array order. Keeping this helper
-/// iterator-based lets it serve both contiguous slices and strided ndarray
-/// views without copying either input first.
+/// `minimum=true` produces prefix minima; `minimum=false` produces prefix
+/// maxima. The iterator is consumed in logical right-array order. Keeping
+/// this helper iterator-based lets it serve both contiguous slices and
+/// strided ndarray views without copying either input first.
+///
+/// For example, with labels `[10, 40, 30, 20]`:
+///
+/// ```text
+/// prefix minimum → [10, 10, 10, 10]
+/// prefix maximum → [10, 40, 40, 40]
+/// ```
+///
+/// The result at position `i` summarizes the inclusive range `0..=i`.
+/// This helper returns labels, not positions, and is used by the range-join
+/// selection path.
+///
+/// # Arguments
+///
+/// * `values` - Right-index labels in logical right-array order.
+/// * `minimum` - `true` for a running minimum; `false` for a running maximum.
+///
+/// # Returns
+///
+/// A label vector with one inclusive-prefix result for each input label.
 fn prefix_extreme<I>(values: I, minimum: bool) -> Vec<i64>
 where
     I: Iterator<Item = i64>,
@@ -168,12 +192,32 @@ where
         .collect()
 }
 
-/// Build a running minimum or maximum for every suffix of an index-label
-/// sequence.
+/// Build a running label minimum or maximum for every suffix.
 ///
-/// `ExactSizeIterator` lets the helper place each result at its original
-/// physical position while `DoubleEndedIterator` lets it scan from right to
-/// left. This preserves the logical order for strided views.
+/// `minimum=true` produces suffix minima; `minimum=false` produces suffix
+/// maxima. `ExactSizeIterator` lets the helper place each result at its
+/// original physical position while `DoubleEndedIterator` lets it scan from
+/// right to left. This preserves the logical order for strided views.
+///
+/// For example, with labels `[10, 40, 30, 20]`:
+///
+/// ```text
+/// suffix minimum → [10, 20, 20, 20]
+/// suffix maximum → [40, 40, 30, 20]
+/// ```
+///
+/// The result at position `i` summarizes the inclusive range `i..=last`.
+/// This helper returns labels, not positions, and is used by the range-join
+/// selection path.
+///
+/// # Arguments
+///
+/// * `values` - Right-index labels in logical right-array order.
+/// * `minimum` - `true` for a running minimum; `false` for a running maximum.
+///
+/// # Returns
+///
+/// A label vector with one inclusive-suffix result for each input label.
 fn suffix_extreme<I>(values: I, minimum: bool) -> Vec<i64>
 where
     I: DoubleEndedIterator<Item = i64> + ExactSizeIterator,
@@ -189,6 +233,157 @@ where
             current.max(value)
         };
         result[length - 1 - offset] = current;
+    }
+    result
+}
+
+/// Return the physical position of the smallest right-index label for every
+/// prefix of a `!=` candidate region.
+///
+/// The prefix contains right values strictly less than the current left value.
+/// This table is used by `keep="first"` when `right_index_is_ordered` is
+/// false, so the selected position can later be materialized through the full
+/// right-index array.
+///
+/// For example, if the right labels in sorted-value order are
+/// `[40, 10, 30, 20]`:
+///
+/// ```text
+/// labels:       [40, 10, 30, 20]
+/// prefix minima: [ 0,  1,  1,  1]
+/// ```
+///
+/// The returned values are offsets into `labels`, not public index labels.
+///
+/// # Arguments
+///
+/// * `labels` - Right-index labels in the value-sorted right layout.
+///
+/// # Returns
+///
+/// For each prefix ending at `i`, the filtered-layout offset of its smallest
+/// label. The caller maps that offset through the right position map before
+/// indexing the full right-index array.
+fn prefix_min_positions(labels: &[i64]) -> Vec<usize> {
+    let mut result = Vec::with_capacity(labels.len());
+    let mut current = None;
+    for (position, &label) in labels.iter().enumerate() {
+        if current.is_none_or(|selected| label < labels[selected]) {
+            current = Some(position);
+        }
+        result.push(current.expect("a prefix position exists after iteration"));
+    }
+    result
+}
+
+/// Return the physical position of the largest right-index label for every
+/// prefix of a `!=` candidate region.
+///
+/// The prefix contains right values strictly less than the current left value.
+/// This table is used by `keep="last"` when `right_index_is_ordered` is false.
+///
+/// For example:
+///
+/// ```text
+/// labels:       [40, 10, 30, 20]
+/// prefix maxima: [ 0,  0,  0,  0]
+/// ```
+///
+/// The returned values are offsets into `labels`, not public index labels.
+///
+/// # Arguments
+///
+/// * `labels` - Right-index labels in the value-sorted right layout.
+///
+/// # Returns
+///
+/// For each prefix ending at `i`, the filtered-layout offset of its largest
+/// label. The caller maps that offset through the right position map before
+/// indexing the full right-index array.
+fn prefix_max_positions(labels: &[i64]) -> Vec<usize> {
+    let mut result = Vec::with_capacity(labels.len());
+    let mut current = None;
+    for (position, &label) in labels.iter().enumerate() {
+        if current.is_none_or(|selected| label > labels[selected]) {
+            current = Some(position);
+        }
+        result.push(current.expect("a prefix position exists after iteration"));
+    }
+    result
+}
+
+/// Return the physical position of the smallest right-index label for every
+/// suffix of a `!=` candidate region.
+///
+/// The suffix contains right values strictly greater than the current left
+/// value. This table is used by `keep="first"` when
+/// `right_index_is_ordered` is false.
+///
+/// For example:
+///
+/// ```text
+/// labels:       [40, 10, 30, 20]
+/// suffix minima: [ 1,  1,  3,  3]
+/// ```
+///
+/// The returned values are offsets into `labels`, not public index labels.
+///
+/// # Arguments
+///
+/// * `labels` - Right-index labels in the value-sorted right layout.
+///
+/// # Returns
+///
+/// For each suffix beginning at `i`, the filtered-layout offset of its
+/// smallest label. The caller maps that offset through the right position map
+/// before indexing the full right-index array.
+fn suffix_min_positions(labels: &[i64]) -> Vec<usize> {
+    let mut result = vec![0_usize; labels.len()];
+    let mut current = None;
+    for position in (0..labels.len()).rev() {
+        let label = labels[position];
+        if current.is_none_or(|selected| label < labels[selected]) {
+            current = Some(position);
+        }
+        result[position] = current.expect("a suffix position exists after iteration");
+    }
+    result
+}
+
+/// Return the physical position of the largest right-index label for every
+/// suffix of a `!=` candidate region.
+///
+/// The suffix contains right values strictly greater than the current left
+/// value. This table is used by `keep="last"` when
+/// `right_index_is_ordered` is false.
+///
+/// For example:
+///
+/// ```text
+/// labels:       [40, 10, 30, 20]
+/// suffix maxima: [ 0,  2,  2,  3]
+/// ```
+///
+/// The returned values are offsets into `labels`, not public index labels.
+///
+/// # Arguments
+///
+/// * `labels` - Right-index labels in the value-sorted right layout.
+///
+/// # Returns
+///
+/// For each suffix beginning at `i`, the filtered-layout offset of its largest
+/// label. The caller maps that offset through the right position map before
+/// indexing the full right-index array.
+fn suffix_max_positions(labels: &[i64]) -> Vec<usize> {
+    let mut result = vec![0_usize; labels.len()];
+    let mut current = None;
+    for position in (0..labels.len()).rev() {
+        let label = labels[position];
+        if current.is_none_or(|selected| label > labels[selected]) {
+            current = Some(position);
+        }
+        result[position] = current.expect("a suffix position exists after iteration");
     }
     result
 }
@@ -268,6 +463,7 @@ pub fn build_range_core<T: PartialOrd + Copy>(
             continue;
         }
         result.left_index.push(left_index[left_position]);
+        result.left_positions.push(left_position);
         result.starts.push(start);
         result.ends.push(end);
     }
@@ -387,152 +583,280 @@ fn choose_range(
     Ok((output_left, output_right))
 }
 
-fn null_labels(
-    mask: Option<ArrayView1<'_, bool>>,
-    index: Option<ArrayView1<'_, i64>>,
-) -> Result<Vec<i64>, String> {
-    match (mask, index) {
-        (None, None) => Ok(Vec::new()),
-        (Some(mask), Some(index)) => {
-            // The mask is authoritative: true means null, including for
-            // floating-point arrays. The value array is not inspected here.
-            ensure_equal_lengths_core("null mask", mask.len(), "null index", index.len())?;
-            Ok(mask
-                .iter()
-                .zip(index.iter())
-                .filter_map(|(&is_null, &label)| is_null.then_some(label))
-                .collect())
-        }
-        _ => Err("null masks and indexes must be provided together".to_owned()),
+/// Convert Python-facing physical positions from `int64` to Rust indexing
+/// positions.
+///
+/// Pyjanitor supplies these positions as signed `int64` arrays because that is
+/// the stable NumPy/PyO3 boundary type. Rust indexing requires `usize`, but a
+/// negative value is invalid rather than a sentinel that can be cast safely.
+/// Validate the value first and report its input offset in the error.
+///
+/// # Arguments
+///
+/// * `name` - Human-readable name used in validation errors.
+/// * `values` - Physical positions in logical filtered-array order.
+///
+/// # Returns
+///
+/// The same positions as `usize`, preserving input order.
+///
+/// # Errors
+///
+/// Returns an error if a position is negative or cannot be represented by the
+/// platform's `usize` type.
+fn physical_positions(name: &str, values: ArrayView1<'_, i64>) -> Result<Vec<usize>, String> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(offset, &position)| {
+            usize::try_from(position).map_err(|_| {
+                format!("{name} position at offset {offset} must be a non-negative int64")
+            })
+        })
+        .collect()
+}
+
+/// Validate that non-null and null positions form a complete partition of an
+/// original index array.
+fn validate_position_partition(
+    index_name: &str,
+    full_len: usize,
+    non_null_positions: &[usize],
+    null_positions: &[usize],
+) -> Result<(), String> {
+    let expected = non_null_positions
+        .len()
+        .checked_add(null_positions.len())
+        .ok_or("single join position count exceeds platform capacity")?;
+    if expected != full_len {
+        return Err(format!(
+            "{index_name} length must equal the number of non-null values plus null positions"
+        ));
     }
+    let mut seen = vec![false; full_len];
+    for (&position, kind) in non_null_positions
+        .iter()
+        .zip(std::iter::repeat("non-null"))
+        .chain(null_positions.iter().zip(std::iter::repeat("null")))
+    {
+        if position >= full_len {
+            return Err(format!(
+                "{index_name} {kind} position {position} is out of bounds"
+            ));
+        }
+        if seen[position] {
+            return Err(format!(
+                "{index_name} position {position} appears more than once"
+            ));
+        }
+        seen[position] = true;
+    }
+    Ok(())
 }
 
 /// Compute a checked output-capacity bound for the `!=` kernel.
 ///
 /// `all` can emit several pairs for one left row, so its capacity is computed
-/// from the two strict binary-search regions plus the right-null labels. The
-/// selected modes emit at most one pair for each non-null or null left row,
-/// so `left.len() + left_null_count` is a sufficient bound for them.
+/// from the two strict binary-search regions plus the right-null labels.
 fn not_equal_output_capacity<T: PartialOrd + Copy>(
     left: ArrayView1<'_, T>,
     right: ArrayView1<'_, T>,
     left_null_count: usize,
     right_null_count: usize,
-    keep: Keep,
+    is_extension_array: bool,
 ) -> Result<usize, &'static str> {
     const CAPACITY_ERROR: &str = "single join result size exceeds platform capacity";
 
-    if keep != Keep::All {
-        return left
-            .len()
-            .checked_add(left_null_count)
-            .ok_or(CAPACITY_ERROR);
+    // Null comparisons are excluded for extension arrays. Therefore, if one
+    // filtered side is empty, there cannot be any `!=` output in that mode.
+    if is_extension_array && (left.is_empty() || right.is_empty()) {
+        return Ok(0);
     }
 
-    let null_row_width = right
+    // NumPy nulls compare unequal to every value, including other nulls. If
+    // a filtered side is empty, all remaining pairs come from the null rows,
+    // so the exact capacity can be calculated without any binary searches.
+    let right_count = right
         .len()
         .checked_add(right_null_count)
         .ok_or(CAPACITY_ERROR)?;
+    if left.is_empty() {
+        return left_null_count
+            .checked_mul(right_count)
+            .ok_or(CAPACITY_ERROR);
+    }
+    if right.is_empty() {
+        let left_count = left
+            .len()
+            .checked_add(left_null_count)
+            .ok_or(CAPACITY_ERROR)?;
+        return left_count
+            .checked_mul(right_null_count)
+            .ok_or(CAPACITY_ERROR);
+    }
+
+    let right_row_width = if is_extension_array {
+        right.len()
+    } else {
+        right
+            .len()
+            .checked_add(right_null_count)
+            .ok_or(CAPACITY_ERROR)?
+    };
     let mut capacity = 0_usize;
     for left_value in left {
+        // The right values are sorted. `gt_start` is the first position whose
+        // value is strictly greater than the current left value, so
+        // `right[gt_start..]` is the strict `>` suffix. `lt_end` is the first
+        // position whose value is greater than or equal to the left value, so
+        // `right[..lt_end]` is the strict `<` prefix. Equal values are outside
+        // both ranges, as required by `!=`.
+        //
+        // Example: right = [1, 3, 5, 7], left = 5 gives
+        // `lt_end = 2` (`[1, 3]`) and `gt_start = 3` (`[7]`).
         let gt_start = partition_point(right, |value| value <= *left_value);
         let lt_end = partition_point(right, |value| value < *left_value);
         let strict_width = lt_end
             .checked_add(right.len() - gt_start)
             .ok_or(CAPACITY_ERROR)?;
-        let row_width = strict_width
-            .checked_add(right_null_count)
-            .ok_or(CAPACITY_ERROR)?;
+        let row_width = if is_extension_array {
+            strict_width
+        } else {
+            strict_width
+                .checked_add(right_null_count)
+                .ok_or(CAPACITY_ERROR)?
+        };
         capacity = capacity.checked_add(row_width).ok_or(CAPACITY_ERROR)?;
     }
-    let null_left_capacity = left_null_count
-        .checked_mul(null_row_width)
-        .ok_or(CAPACITY_ERROR)?;
+    let null_left_capacity = if is_extension_array {
+        0
+    } else {
+        left_null_count
+            .checked_mul(right_row_width)
+            .ok_or(CAPACITY_ERROR)?
+    };
     capacity
         .checked_add(null_left_capacity)
         .ok_or(CAPACITY_ERROR)
 }
 
-/// Build `!=` results from filtered non-null arrays and optional null metadata.
+/// Build physical-position pairs for `!=` from filtered non-null arrays and
+/// optional null-position metadata.
 ///
-/// # Input contract
+/// The filtered value arrays are aligned with their position maps. A filtered
+/// offset is first mapped to an original physical position, and the separate
+/// materializer then maps that position through the full index array to get
+/// the public label. Null positions are already original physical positions.
 ///
-/// `left` and `right` are the filtered non-null value arrays used for binary
-/// search. Their index arrays are aligned original `int64` labels. If nulls
-/// exist, `left_nulls`/`left_nulls_index` and
-/// `right_nulls`/`right_nulls_index` are full-array mask/label pairs: a `true`
-/// mask entry identifies the corresponding null label. Each optional pair is
-/// either fully present or fully absent.
+/// The right values must be sorted in ascending order. Rust does not sort or
+/// infer nullness. `right_index_is_ordered` describes the labels obtained from
+/// `right_index[right_positions]`; it is used only to optimize `first` and
+/// `last` selection. `is_extension_array` means both operands have the same
+/// pandas extension dtype, which pyjanitor validates upstream.
 ///
-/// `right` must be sorted. `right_index_is_ordered` means that the supplied
-/// right labels are monotonically increasing in this already value-sorted
-/// layout; when true, `first`/`last` can use boundaries directly. Rust does
-/// not sort values or infer nullness.
+/// In NumPy mode, nulls participate in `!=` and match every opposite-side
+/// value, including another null. In pandas extension mode, every comparison
+/// involving a null is excluded because it produces `NA` and filters false.
+/// The function returns physical position pairs; it returns empty vectors when
+/// no pairs match.
 ///
-/// # Inequality semantics
-///
-/// For a non-null left row, `!=` is the union of the strict `<` prefix, the
-/// strict `>` suffix, and every right-null label. Equal non-null values are
-/// excluded because both non-null regions are strict. Null-null pairs are
-/// included because null is treated as unequal to every value, including
-/// another null. For a null left row, every right row matches, including
-/// right-null rows.
-///
-/// `all` emits physical right-array order. The other modes emit at most one
-/// original right label per left row. If no candidate exists, that left row
-/// contributes no output pair.
-///
-/// # Arguments
-///
-/// * `left` - Filtered non-null left values in left-row order.
-/// * `left_index` - Original labels aligned with `left`.
-/// * `right` - Filtered non-null right values, already sorted.
-/// * `right_index` - Original labels aligned with `right`.
-/// * `left_nulls` and `left_nulls_index` - Optional full-array left mask and
-///   aligned original labels.
-/// * `right_nulls` and `right_nulls_index` - Optional full-array right mask and
-///   aligned original labels.
-/// * `right_index_is_ordered` - Whether right labels increase monotonically in
-///   the sorted-right layout.
-/// * `keep` - Selection mode controlling one result, any result, or all
-///   results per left row.
-///
-/// # Errors
-///
-/// Returns an error for mismatched value/index lengths, mismatched mask/index
-/// lengths, or incomplete optional mask/index pairs. Empty filtered arrays
-/// are valid when their original rows are represented by null labels; a side
-/// with no rows produces no pairs.
+/// Each full index length must equal the number of non-null values plus the
+/// number of null positions. Non-null and null positions must be disjoint and
+/// cover the full physical index range.
 #[allow(clippy::too_many_arguments)]
-pub fn build_not_equal_core<T: PartialOrd + Copy>(
+pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
     left: ArrayView1<'_, T>,
     left_index: ArrayView1<'_, i64>,
+    left_positions: ArrayView1<'_, i64>,
     right: ArrayView1<'_, T>,
     right_index: ArrayView1<'_, i64>,
-    left_nulls: Option<ArrayView1<'_, bool>>,
-    left_nulls_index: Option<ArrayView1<'_, i64>>,
-    right_nulls: Option<ArrayView1<'_, bool>>,
-    right_nulls_index: Option<ArrayView1<'_, i64>>,
+    right_positions: ArrayView1<'_, i64>,
+    left_null_positions: Option<ArrayView1<'_, i64>>,
+    right_null_positions: Option<ArrayView1<'_, i64>>,
     right_index_is_ordered: bool,
+    is_extension_array: bool,
     keep: Keep,
-) -> Result<(Vec<i64>, Vec<i64>), String> {
-    ensure_equal_lengths_core("left", left.len(), "left_index", left_index.len())?;
-    ensure_equal_lengths_core("right", right.len(), "right_index", right_index.len())?;
-    let left_null_labels = null_labels(left_nulls, left_nulls_index)?;
-    let right_null_labels = null_labels(right_nulls, right_nulls_index)?;
-    if (left.is_empty() && left_null_labels.is_empty())
-        || (right.is_empty() && right_null_labels.is_empty())
+) -> Result<(Vec<usize>, Vec<usize>), String> {
+    // `left` and `right` contain only non-null values. Their companion
+    // position arrays tell us where those filtered values came from in the
+    // original, full arrays. For example, a filtered value at offset `1`
+    // might have original physical position `4`.
+    ensure_equal_lengths_core(
+        "left values",
+        left.len(),
+        "left positions",
+        left_positions.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "right values",
+        right.len(),
+        "right positions",
+        right_positions.len(),
+    )?;
+
+    // Convert the Python-facing int64 positions into Rust `usize` positions
+    // once. These positions are used for indexing the full index arrays and
+    // are also what this core returns to the wrapper.
+    let left_positions = physical_positions("left", left_positions)?;
+    let right_positions = physical_positions("right", right_positions)?;
+
+    // Null positions are optional because pyjanitor passes `None` when that
+    // side contains no nulls. `map` converts each supplied array, while
+    // `transpose` changes `Option<Result<...>>` into `Result<Option<...>>`,
+    // allowing a malformed negative/out-of-range position to return an error.
+    let left_null_positions = left_null_positions
+        .map(|positions| physical_positions("left null", positions))
+        .transpose()?;
+    let right_null_positions = right_null_positions
+        .map(|positions| physical_positions("right null", positions))
+        .transpose()?;
+    let empty = Vec::new();
+    let left_null_positions = left_null_positions.as_deref().unwrap_or(&empty);
+    let right_null_positions = right_null_positions.as_deref().unwrap_or(&empty);
+
+    // The filtered non-null positions and the null positions must together
+    // describe every physical row exactly once. This catches missing,
+    // duplicated, and out-of-range positions before any output is built.
+    validate_position_partition(
+        "left index",
+        left_index.len(),
+        &left_positions,
+        left_null_positions,
+    )?;
+    validate_position_partition(
+        "right index",
+        right_index.len(),
+        &right_positions,
+        right_null_positions,
+    )?;
+
+    // There is nothing to match when a side has no non-null values and no
+    // null positions either. In particular, this avoids invoking binary
+    // search for an actually empty input.
+    if (left.is_empty() && left_null_positions.is_empty())
+        || (right.is_empty() && right_null_positions.is_empty())
     {
         return Ok((Vec::new(), Vec::new()));
     }
-    let output_capacity = not_equal_output_capacity(
-        left,
-        right,
-        left_null_labels.len(),
-        right_null_labels.len(),
-        keep,
-    )
-    .map_err(str::to_owned)?;
+
+    // `all` can emit many pairs per left row, so it gets an exact checked
+    // capacity estimate. The selected modes emit at most one pair per left
+    // row, so the full left-index length is a sufficient upper bound.
+    let output_capacity = if keep == Keep::All {
+        not_equal_output_capacity(
+            left,
+            right,
+            left_null_positions.len(),
+            right_null_positions.len(),
+            is_extension_array,
+        )
+        .map_err(str::to_owned)?
+    } else {
+        // Every selected mode emits at most one pair per left row. The actual
+        // result may be shorter when a left row has no unequal match, but the
+        // full left-index length is a simple safe upper bound.
+        left_index.len()
+    };
     let mut output_left = Vec::new();
     output_left
         .try_reserve_exact(output_capacity)
@@ -541,212 +865,268 @@ pub fn build_not_equal_core<T: PartialOrd + Copy>(
     output_right
         .try_reserve_exact(output_capacity)
         .map_err(|_| "single join result allocation failed".to_owned())?;
-    // Prefix/suffix extrema are used only for non-null left rows. Avoid
-    // building them when the filtered left side is empty; null-left rows use
-    // whole-array extrema below instead.
-    let need_unordered_extrema = !left.is_empty() && !right_index_is_ordered;
+
+    // If the right labels are not ordered, selecting the smallest (`first`)
+    // or largest (`last`) label from a prefix/suffix would otherwise require
+    // scanning that region for every left row. These tables store the best
+    // physical position seen so far, so each window can select in O(1).
+    let need_unordered_extrema =
+        !left.is_empty() && !right_index_is_ordered && matches!(keep, Keep::First | Keep::Last);
+    // Only unordered `first`/`last` selection needs labels in filtered value
+    // order. Ordered labels, `any`, and `all` can use boundaries directly, so
+    // avoid copying the right-label vector in those cases.
+    let right_labels = need_unordered_extrema.then(|| {
+        right_positions
+            .iter()
+            .map(|&position| right_index[position])
+            .collect::<Vec<_>>()
+    });
     let prefix_min = if need_unordered_extrema && keep == Keep::First {
-        Some(prefix_extreme(right_index.iter().copied(), true))
+        Some(prefix_min_positions(right_labels.as_deref().unwrap()))
     } else {
         None
     };
     let prefix_max = if need_unordered_extrema && keep == Keep::Last {
-        Some(prefix_extreme(right_index.iter().copied(), false))
+        Some(prefix_max_positions(right_labels.as_deref().unwrap()))
     } else {
         None
     };
     let suffix_min = if need_unordered_extrema && keep == Keep::First {
-        Some(suffix_extreme(right_index.iter().copied(), true))
+        Some(suffix_min_positions(right_labels.as_deref().unwrap()))
     } else {
         None
     };
     let suffix_max = if need_unordered_extrema && keep == Keep::Last {
-        Some(suffix_extreme(right_index.iter().copied(), false))
+        Some(suffix_max_positions(right_labels.as_deref().unwrap()))
     } else {
         None
     };
-    // Compute the right-null winner once. Recomputing this inside the
-    // per-left-row loop would scan every right-null label for every left row.
+
+    // Nulls are candidates in NumPy mode, but not in extension-array mode.
+    // For first/last, precompute the best null label once instead of scanning
+    // every right-null position for every left row.
     let right_null_extreme = match keep {
-        Keep::First => right_null_labels.iter().copied().min(),
-        Keep::Last => right_null_labels.iter().copied().max(),
-        Keep::Any | Keep::All => None,
+        Keep::First if !is_extension_array => right_null_positions
+            .iter()
+            .copied()
+            .min_by_key(|&position| right_index[position]),
+        Keep::Last if !is_extension_array => right_null_positions
+            .iter()
+            .copied()
+            .max_by_key(|&position| right_index[position]),
+        _ => None,
     };
 
-    /// Append one selected join pair when a candidate exists.
-    ///
-    /// The selected modes (`first`, `last`, and `any`) represent a possible
-    /// right match as `Option<i64>` because a left row may have no `<`, `>`, or
-    /// null candidate. `Some(right_label)` appends one pair to the two
-    /// parallel output vectors; `None` leaves both vectors unchanged.
-    ///
-    /// # Arguments
-    ///
-    /// * `output_left` - Output left-label vector, mutated in place.
-    /// * `output_right` - Output right-label vector, mutated in lockstep with
-    ///   `output_left`.
-    /// * `left_label` - Original label for the left row being emitted.
-    /// * `candidate` - Optional original right label selected for that row.
-    fn emit(
-        output_left: &mut Vec<i64>,
-        output_right: &mut Vec<i64>,
-        left_label: i64,
-        candidate: Option<i64>,
-    ) {
-        // `None` represents a left row for which all candidate regions were
-        // empty. Keeping this check in one helper prevents each selection
-        // branch from duplicating the same conditional append logic.
-        if let Some(right_label) = candidate {
-            output_left.push(left_label);
-            output_right.push(right_label);
-        }
-    }
-    for (left_position, left_value) in left.iter().enumerate() {
-        // Example: right values [1, 3, 3, 5] with left value 3 produce a
-        // `<` prefix [1] ending at lt_end == 1 and a `>` suffix [5]
-        // beginning at gt_start == 3. The equal values [3, 3] are excluded.
+    // Process each filtered non-null left value. `left_offset` indexes the
+    // filtered value/position arrays; `left_position` is the corresponding
+    // physical position in the original left array.
+    for (left_offset, left_value) in left.iter().enumerate() {
+        let left_position = left_positions[left_offset];
+
+        // The sorted right values are divided into three regions:
+        //   right[..lt_end]   contains values strictly less than the left;
+        //   right[lt_end..gt_start] contains values equal to the left;
+        //   right[gt_start..] contains values strictly greater than the left.
+        // `!=` emits only the first and third regions.
         let gt_start = partition_point(right, |value| value <= *left_value);
         let lt_end = partition_point(right, |value| value < *left_value);
         if keep == Keep::All {
-            // The two strict non-null regions are disjoint. Append them in
-            // physical right-array order, then append right-null labels;
-            // exact parity with Python's internal ordering is not required,
-            // but every valid pair must be represented.
-            for &label in right_index.slice(s![..lt_end]) {
-                output_left.push(left_index[left_position]);
-                output_right.push(label);
+            // Materialize every strict-less and strict-greater pair. Equal
+            // values are deliberately skipped, and NumPy nulls are appended
+            // because they compare unequal to this non-null value.
+            for &right_position in &right_positions[..lt_end] {
+                output_left.push(left_position);
+                output_right.push(right_position);
             }
-            for &label in right_index.slice(s![gt_start..]) {
-                output_left.push(left_index[left_position]);
-                output_right.push(label);
+            for &right_position in &right_positions[gt_start..] {
+                output_left.push(left_position);
+                output_right.push(right_position);
             }
-            // This loop is inside the filtered non-null left path, so a
-            // right-null value is never paired with a left-null value here.
-            for &label in &right_null_labels {
-                output_left.push(left_index[left_position]);
-                output_right.push(label);
+            if !is_extension_array {
+                for &right_position in right_null_positions {
+                    output_left.push(left_position);
+                    output_right.push(right_position);
+                }
             }
             continue;
         }
         if keep == Keep::Any {
-            // Prefer a strict non-null candidate because it is available from
-            // a boundary without scanning. If neither strict region exists,
-            // a right-null label is the only possible candidate.
-            if lt_end > 0 {
-                emit(
-                    &mut output_left,
-                    &mut output_right,
-                    left_index[left_position],
-                    Some(right_index[0]),
-                );
+            // Any match is sufficient. Prefer the first available strict
+            // region, then a right-null candidate in NumPy mode. This avoids
+            // scanning or building all matching pairs.
+            let candidate = if lt_end > 0 {
+                right_positions.first().copied()
             } else if gt_start < right.len() {
-                emit(
-                    &mut output_left,
-                    &mut output_right,
-                    left_index[left_position],
-                    Some(right_index[gt_start]),
-                );
+                Some(right_positions[gt_start])
+            } else if !is_extension_array {
+                right_null_positions.first().copied()
             } else {
-                emit(
-                    &mut output_left,
-                    &mut output_right,
-                    left_index[left_position],
-                    right_null_labels.first().copied(),
-                );
+                None
+            };
+            if let Some(right_position) = candidate {
+                output_left.push(left_position);
+                output_right.push(right_position);
             }
             continue;
         }
+
+        // For `first` and `last`, combine at most one candidate from each
+        // possible source: the strict-less prefix, the strict-greater suffix,
+        // and the right-null positions. `minimum` tells the closure whether
+        // the smallest or largest public right-index label wins.
         let minimum = keep == Keep::First;
         let mut candidate = None;
-        let mut combine = |value: i64| {
-            candidate = Some(candidate.map_or(value, |current| {
-                if (minimum && value < current) || (!minimum && value > current) {
-                    value
+        let mut combine = |position: usize| {
+            candidate = Some(candidate.map_or(position, |current| {
+                let value = right_index[position];
+                let current_value = right_index[current];
+                if (minimum && value < current_value) || (!minimum && value > current_value) {
+                    position
                 } else {
                     current
                 }
             }));
         };
         if lt_end > 0 {
-            // Select the appropriate extreme from the `<` prefix. Ordered
-            // labels need no table; unordered labels use the table matching
-            // the requested first/last mode.
-            combine(if right_index_is_ordered && minimum {
-                right_index[0]
-            } else if right_index_is_ordered {
-                right_index[lt_end - 1]
+            // The prefix is non-empty. If labels are ordered, its boundary
+            // position is enough; otherwise use the precomputed prefix table.
+            combine(if right_index_is_ordered {
+                if minimum {
+                    right_positions[0]
+                } else {
+                    right_positions[lt_end - 1]
+                }
             } else if minimum {
-                prefix_min.as_ref().unwrap()[lt_end - 1]
+                right_positions[prefix_min.as_ref().unwrap()[lt_end - 1]]
             } else {
-                prefix_max.as_ref().unwrap()[lt_end - 1]
+                right_positions[prefix_max.as_ref().unwrap()[lt_end - 1]]
             });
         }
         if gt_start < right.len() {
-            // Select the corresponding extreme from the `>` suffix.
-            combine(if right_index_is_ordered && minimum {
-                right_index[gt_start]
-            } else if right_index_is_ordered {
-                right_index[right_index.len() - 1]
+            // The suffix is non-empty. As above, use its boundary directly
+            // for ordered labels and its extrema table otherwise.
+            combine(if right_index_is_ordered {
+                if minimum {
+                    right_positions[gt_start]
+                } else {
+                    *right_positions.last().unwrap()
+                }
             } else if minimum {
-                suffix_min.as_ref().unwrap()[gt_start]
+                right_positions[suffix_min.as_ref().unwrap()[gt_start]]
             } else {
-                suffix_max.as_ref().unwrap()[gt_start]
+                right_positions[suffix_max.as_ref().unwrap()[gt_start]]
             });
         }
-        if let Some(value) = right_null_extreme {
-            // Right-null labels are valid candidates for non-null left rows.
-            // Null labels are compared by their original index only here;
-            // their values are never compared to the non-null values.
-            combine(value);
+        if let Some(position) = right_null_extreme {
+            combine(position);
         }
-        emit(
-            &mut output_left,
-            &mut output_right,
-            left_index[left_position],
-            candidate,
-        );
+        if let Some(right_position) = candidate {
+            output_left.push(left_position);
+            output_right.push(right_position);
+        }
     }
-    let (nonnull_extreme, null_extreme) = match keep {
-        Keep::First => (right_index.iter().copied().min(), right_null_extreme),
-        Keep::Last => (right_index.iter().copied().max(), right_null_extreme),
-        Keep::Any | Keep::All => (None, None),
+
+    // A null left value is not present in the filtered `left` loop above, so
+    // handle it separately. In NumPy mode it compares unequal to every right
+    // value, including right nulls. In extension mode it compares as `NA`,
+    // which is false in a filtering operation, so it contributes no pairs.
+    let nonnull_extreme = match keep {
+        Keep::First => right_positions
+            .iter()
+            .copied()
+            .min_by_key(|&position| right_index[position]),
+        Keep::Last => right_positions
+            .iter()
+            .copied()
+            .max_by_key(|&position| right_index[position]),
+        _ => None,
     };
-    for &left_label in &left_null_labels {
-        // A null left value is unequal to every right value, including right
-        // nulls. The filtered right values and the separately supplied right
-        // null labels therefore both contribute matches here.
+    for &left_position in left_null_positions {
+        if is_extension_array {
+            continue;
+        }
         if keep == Keep::All {
-            for &right_label in right_index.iter() {
-                output_left.push(left_label);
-                output_right.push(right_label);
+            // Every right physical position is a valid `!=` partner for a
+            // NumPy null left value.
+            for &right_position in &right_positions {
+                output_left.push(left_position);
+                output_right.push(right_position);
             }
-            for &right_label in &right_null_labels {
-                output_left.push(left_label);
-                output_right.push(right_label);
+            for &right_position in right_null_positions {
+                output_left.push(left_position);
+                output_right.push(right_position);
             }
         } else if keep == Keep::Any {
-            emit(
-                &mut output_left,
-                &mut output_right,
-                left_label,
-                right_index
-                    .first()
-                    .copied()
-                    .or_else(|| right_null_labels.first().copied()),
-            );
+            // Any right value is enough, so choose the first available right
+            // non-null position, falling back to a right-null position.
+            if let Some(right_position) = right_positions
+                .first()
+                .or_else(|| right_null_positions.first())
+                .copied()
+            {
+                output_left.push(left_position);
+                output_right.push(right_position);
+            }
         } else {
-            let candidate = match (nonnull_extreme, null_extreme) {
+            // For first/last, compare the best non-null and null candidates
+            // by their public right-index labels, then emit the winner.
+            let candidate = match (nonnull_extreme, right_null_extreme) {
                 (Some(nonnull), Some(null)) => Some(if keep == Keep::First {
-                    nonnull.min(null)
+                    if right_index[nonnull] < right_index[null] {
+                        nonnull
+                    } else {
+                        null
+                    }
+                } else if right_index[nonnull] > right_index[null] {
+                    nonnull
                 } else {
-                    nonnull.max(null)
+                    null
                 }),
                 (Some(nonnull), None) => Some(nonnull),
                 (None, Some(null)) => Some(null),
                 (None, None) => None,
             };
-            emit(&mut output_left, &mut output_right, left_label, candidate);
+            if let Some(right_position) = candidate {
+                output_left.push(left_position);
+                output_right.push(right_position);
+            }
         }
+    }
+    Ok((output_left, output_right))
+}
+
+/// Convert physical position pairs into public index-label pairs.
+fn materialize_index_pairs(
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    left_positions: Vec<usize>,
+    right_positions: Vec<usize>,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    ensure_equal_lengths_core(
+        "materialized left positions",
+        left_positions.len(),
+        "materialized right positions",
+        right_positions.len(),
+    )?;
+    let mut output_left = Vec::new();
+    output_left
+        .try_reserve_exact(left_positions.len())
+        .map_err(|_| "single join result allocation failed".to_owned())?;
+    let mut output_right = Vec::new();
+    output_right
+        .try_reserve_exact(right_positions.len())
+        .map_err(|_| "single join result allocation failed".to_owned())?;
+    for (&left_position, &right_position) in left_positions.iter().zip(&right_positions) {
+        output_left.push(
+            *left_index
+                .get(left_position)
+                .ok_or("left position is out of bounds")?,
+        );
+        output_right.push(
+            *right_index
+                .get(right_position)
+                .ok_or("right position is out of bounds")?,
+        );
     }
     Ok((output_left, output_right))
 }
@@ -828,25 +1208,33 @@ macro_rules! single_join_function {
         /// it returns fully materialized flat pairs, equivalent to
         /// `keep="all"`, because `!=` has no single window.
         ///
-        /// For `!=`, the value arrays are filtered non-null arrays. Optional
-        /// null masks, when present, are full-array masks paired with their
-        /// full-array original index labels. A mask entry of `true` is the
-        /// sole authority that the corresponding row is null.
+        /// For `!=`, the value arrays are filtered non-null arrays. Their
+        /// position arrays map filtered offsets to physical positions in the
+        /// full index arrays. Optional null-position arrays contain physical
+        /// positions in those full arrays. `is_extension_array` means both
+        /// operands use the same pandas extension dtype; pyjanitor validates
+        /// that invariant before calling Rust.
         ///
         /// # Arguments
         ///
-        /// * `left`, `left_index` - Aligned left values and original labels.
-        /// * `right`, `right_index` - Aligned, already value-sorted right
-        ///   values and original labels.
+        /// * `left`, `left_index` - Left values and the full original labels.
+        ///   For `!=`, `left` is filtered non-null data and `left_index` is
+        ///   addressed through `left_positions`.
+        /// * `right`, `right_index` - Right values and the full original
+        ///   labels. For `!=`, `right` is filtered, already value-sorted data
+        ///   and `right_index` is addressed through `right_positions`.
         /// * `right_index_is_ordered` - Whether right labels are monotonically
         ///   increasing in the sorted-right layout.
         /// * `comparator` - One of `>`, `>=`, `<`, `<=`, `==`, or `!=`.
         /// * `keep` - One of `first`, `last`, `any`, or `all`.
         /// * `return_building_blocks` - Ignore `keep` and return range windows
         ///   or, for `!=`, all fully materialized pairs.
-        /// * `left_nulls`, `left_nulls_index`, `right_nulls`,
-        ///   `right_nulls_index` - Optional full-array null metadata used only
-        ///   for `!=`.
+        /// * `left_positions`, `right_positions` - Filtered-to-original
+        ///   physical position maps used only for `!=`.
+        /// * `left_null_positions`, `right_null_positions` - Optional null
+        ///   physical positions used only for `!=`.
+        /// * `is_extension_array` - Whether both operands use the same pandas
+        ///   extension dtype.
         ///
         /// # Returns
         ///
@@ -863,10 +1251,11 @@ macro_rules! single_join_function {
             comparator: &str,
             keep: &str,
             return_building_blocks: bool,
-            left_nulls: Option<PyReadonlyArray1<'py, bool>>,
-            left_nulls_index: Option<PyReadonlyArray1<'py, i64>>,
-            right_nulls: Option<PyReadonlyArray1<'py, bool>>,
-            right_nulls_index: Option<PyReadonlyArray1<'py, i64>>,
+            left_positions: Option<PyReadonlyArray1<'py, i64>>,
+            left_null_positions: Option<PyReadonlyArray1<'py, i64>>,
+            right_positions: Option<PyReadonlyArray1<'py, i64>>,
+            right_null_positions: Option<PyReadonlyArray1<'py, i64>>,
+            is_extension_array: bool,
         ) -> PyResult<Option<Bound<'py, PyDict>>> {
             let op = CompareOp::try_from_str(comparator)?;
             let requested_keep = Keep::parse(keep)?;
@@ -881,17 +1270,31 @@ macro_rules! single_join_function {
             let left_index = left_index.as_array();
             let right_index = right_index.as_array();
             if op == CompareOp::Ne {
-                let (out_left, out_right) = build_not_equal_core(
+                let left_positions = left_positions
+                    .as_ref()
+                    .ok_or_else(|| PyValueError::new_err("left positions are required for !="))?;
+                let right_positions = right_positions
+                    .as_ref()
+                    .ok_or_else(|| PyValueError::new_err("right positions are required for !="))?;
+                let (left_positions, right_positions) = build_not_equal_positions_core(
                     left,
                     left_index,
+                    left_positions.as_array(),
                     right,
                     right_index,
-                    left_nulls.as_ref().map(|value| value.as_array()),
-                    left_nulls_index.as_ref().map(|value| value.as_array()),
-                    right_nulls.as_ref().map(|value| value.as_array()),
-                    right_nulls_index.as_ref().map(|value| value.as_array()),
+                    right_positions.as_array(),
+                    left_null_positions.as_ref().map(|value| value.as_array()),
+                    right_null_positions.as_ref().map(|value| value.as_array()),
                     right_index_is_ordered,
+                    is_extension_array,
                     keep,
+                )
+                .map_err(PyValueError::new_err)?;
+                let (out_left, out_right) = materialize_index_pairs(
+                    left_index,
+                    right_index,
+                    left_positions,
+                    right_positions,
                 )
                 .map_err(PyValueError::new_err)?;
                 if out_left.is_empty() {
@@ -899,13 +1302,14 @@ macro_rules! single_join_function {
                 }
                 return Ok(Some(result_dict(py, out_left, out_right, None, None)?));
             }
-            if left_nulls.is_some()
-                || left_nulls_index.is_some()
-                || right_nulls.is_some()
-                || right_nulls_index.is_some()
+            if left_positions.is_some()
+                || left_null_positions.is_some()
+                || right_positions.is_some()
+                || right_null_positions.is_some()
+                || is_extension_array
             {
                 return Err(PyValueError::new_err(
-                    "null metadata is only supported for !=",
+                    "position metadata is only supported for !=",
                 ));
             }
             let windows = build_range_core(
@@ -1134,196 +1538,236 @@ mod tests {
     }
 
     #[test]
-    fn not_equal_includes_null_null_and_reduces_extrema() {
-        let equal_values_are_excluded = build_not_equal_core(
+    fn not_equal_positions_materialize_original_labels() {
+        let positions = build_not_equal_positions_core(
             array![2_i64].view(),
-            array![10_i64].view(),
+            array![100_i64].view(),
+            array![0_i64].view(),
             array![1, 2, 3].view(),
             array![20, 21, 22].view(),
-            None,
-            None,
+            array![0, 1, 2].view(),
             None,
             None,
             true,
+            false,
             Keep::All,
         )
         .unwrap();
-        assert_eq!(equal_values_are_excluded, (vec![10, 10], vec![20, 22]));
+        assert_eq!(positions, (vec![0, 0], vec![0, 2]));
+        assert_eq!(
+            materialize_index_pairs(
+                array![100_i64].view(),
+                array![20, 21, 22].view(),
+                positions.0,
+                positions.1,
+            )
+            .unwrap(),
+            (vec![100, 100], vec![20, 22])
+        );
+    }
 
-        let result = build_not_equal_core(
-            array![2_i64].view(),
-            array![10_i64].view(),
-            array![1, 2, 3].view(),
-            array![30, 20, 40].view(),
-            Some(array![false, true].view()),
-            Some(array![10, 11].view()),
-            Some(array![false, true, false].view()),
-            Some(array![30, 21, 40].view()),
+    #[test]
+    fn not_equal_first_and_last_use_labels_not_positions() {
+        let first = build_not_equal_positions_core(
+            array![4_i64].view(),
+            array![100_i64].view(),
+            array![0_i64].view(),
+            array![1, 3, 5, 7].view(),
+            array![40, 10, 30, 20].view(),
+            array![0, 1, 2, 3].view(),
+            None,
+            None,
+            false,
             false,
             Keep::First,
         )
         .unwrap();
-        assert_eq!(result, (vec![10, 11], vec![21, 20]));
-
-        let result = build_not_equal_core(
-            array![2_i64].view(),
-            array![10_i64].view(),
-            array![1].view(),
-            array![30].view(),
-            Some(array![false, true].view()),
-            Some(array![10, 11].view()),
-            Some(array![false, true].view()),
-            Some(array![30, 31].view()),
-            true,
-            Keep::All,
-        )
-        .unwrap();
-        assert_eq!(result, (vec![10, 10, 11, 11], vec![30, 31, 30, 31],));
-    }
-
-    #[test]
-    fn not_equal_building_blocks_ignore_keep_and_materialize_all_pairs() {
-        let with_building_blocks = build_not_equal_core(
-            array![2_i64].view(),
-            array![10_i64].view(),
-            array![1, 3].view(),
-            array![20, 30].view(),
-            None,
-            None,
-            None,
-            None,
-            true,
-            effective_keep(Keep::First, true),
-        )
-        .unwrap();
-        let with_all = build_not_equal_core(
-            array![2_i64].view(),
-            array![10_i64].view(),
-            array![1, 3].view(),
-            array![20, 30].view(),
-            None,
-            None,
-            None,
-            None,
-            true,
-            Keep::All,
-        )
-        .unwrap();
-        assert_eq!(with_building_blocks, with_all);
-    }
-
-    #[test]
-    fn not_equal_handles_empty_regions_and_ordered_labels() {
-        let prefix_only = build_not_equal_core(
-            array![10_i64].view(),
+        let last = build_not_equal_positions_core(
+            array![4_i64].view(),
             array![100_i64].view(),
-            array![1, 3, 5].view(),
-            array![10, 20, 30].view(),
-            None,
-            None,
-            None,
-            None,
-            true,
-            Keep::First,
-        )
-        .unwrap();
-        assert_eq!(prefix_only, (vec![100], vec![10]));
-
-        let suffix_only = build_not_equal_core(
             array![0_i64].view(),
-            array![101_i64].view(),
-            array![1, 3, 5].view(),
-            array![10, 20, 30].view(),
+            array![1, 3, 5, 7].view(),
+            array![40, 10, 30, 20].view(),
+            array![0, 1, 2, 3].view(),
             None,
             None,
-            None,
-            None,
-            true,
+            false,
+            false,
             Keep::Last,
         )
         .unwrap();
-        assert_eq!(suffix_only, (vec![101], vec![30]));
-
-        let null_only = build_not_equal_core(
-            array![3_i64].view(),
-            array![102_i64].view(),
-            array![3].view(),
-            array![20].view(),
-            None,
-            None,
-            Some(array![false, true].view()),
-            Some(array![20, 21].view()),
-            true,
-            Keep::Any,
-        )
-        .unwrap();
-        assert_eq!(null_only, (vec![102], vec![21]));
-
-        let no_match = build_not_equal_core(
-            array![3_i64].view(),
-            array![103_i64].view(),
-            array![3].view(),
-            array![20].view(),
-            None,
-            None,
-            None,
-            None,
-            true,
-            Keep::Any,
-        )
-        .unwrap();
-        assert!(no_match.0.is_empty());
-        assert!(no_match.1.is_empty());
+        assert_eq!(first, (vec![0], vec![1]));
+        assert_eq!(last, (vec![0], vec![0]));
     }
 
     #[test]
-    fn not_equal_handles_empty_filtered_null_sides() {
-        let both_null = build_not_equal_core::<i64>(
-            array![].view(),
-            array![].view(),
-            array![].view(),
-            array![].view(),
-            Some(array![true, true].view()),
-            Some(array![10, 11].view()),
-            Some(array![true, true, true].view()),
-            Some(array![20, 21, 22].view()),
+    fn not_equal_any_selects_a_strict_or_null_candidate() {
+        let strict = build_not_equal_positions_core(
+            array![4_i64].view(),
+            array![100_i64].view(),
+            array![0_i64].view(),
+            array![1, 3, 5, 7].view(),
+            array![40, 10, 30, 20].view(),
+            array![0, 1, 2, 3].view(),
+            None,
+            None,
+            false,
+            false,
+            Keep::Any,
+        )
+        .unwrap();
+        // Any valid candidate is acceptable. The current fast path chooses
+        // the first physical position from the strict-less prefix.
+        assert_eq!(strict, (vec![0], vec![0]));
+
+        let null_fallback = build_not_equal_positions_core(
+            array![4_i64].view(),
+            array![100_i64].view(),
+            array![0_i64].view(),
+            array![4_i64].view(),
+            array![20_i64, 21].view(),
+            array![0_i64].view(),
+            None,
+            Some(array![1_i64].view()),
+            true,
+            false,
+            Keep::Any,
+        )
+        .unwrap();
+        assert_eq!(null_fallback, (vec![0], vec![1]));
+    }
+
+    #[test]
+    fn not_equal_numpy_null_positions_are_candidates() {
+        let positions = build_not_equal_positions_core(
+            array![2_i64].view(),
+            array![10_i64, 11].view(),
+            array![0_i64].view(),
+            array![1, 3].view(),
+            array![20_i64, 21, 22].view(),
+            array![0, 2].view(),
+            Some(array![1_i64].view()),
+            Some(array![1_i64].view()),
+            true,
+            false,
+            Keep::All,
+        )
+        .unwrap();
+        assert_eq!(positions, (vec![0, 0, 0, 1, 1, 1], vec![0, 2, 1, 0, 2, 1]));
+    }
+
+    #[test]
+    fn not_equal_extension_null_positions_are_excluded() {
+        let positions = build_not_equal_positions_core(
+            array![2_i64].view(),
+            array![10_i64, 11].view(),
+            array![0_i64].view(),
+            array![1, 3].view(),
+            array![20_i64, 21, 22].view(),
+            array![0, 2].view(),
+            Some(array![1_i64].view()),
+            Some(array![1_i64].view()),
+            true,
             true,
             Keep::All,
         )
         .unwrap();
-        assert_eq!(
-            both_null,
-            (vec![10, 10, 10, 11, 11, 11], vec![20, 21, 22, 20, 21, 22])
+        assert_eq!(positions, (vec![0, 0], vec![0, 2]));
+    }
+
+    #[test]
+    fn not_equal_empty_filtered_arrays_skip_binary_search() {
+        let both_null = build_not_equal_positions_core::<i64>(
+            array![].view(),
+            array![10_i64, 11].view(),
+            array![].view(),
+            array![].view(),
+            array![20_i64, 21].view(),
+            array![].view(),
+            Some(array![0, 1].view()),
+            Some(array![0, 1].view()),
+            true,
+            false,
+            Keep::All,
+        )
+        .unwrap();
+        assert_eq!(both_null, (vec![0, 0, 1, 1], vec![0, 1, 0, 1]));
+
+        let extension = build_not_equal_positions_core::<i64>(
+            array![].view(),
+            array![10_i64].view(),
+            array![].view(),
+            array![].view(),
+            array![20_i64].view(),
+            array![].view(),
+            Some(array![0].view()),
+            Some(array![0].view()),
+            true,
+            true,
+            Keep::All,
+        )
+        .unwrap();
+        assert!(extension.0.is_empty());
+        assert!(extension.1.is_empty());
+    }
+
+    #[test]
+    fn not_equal_rejects_incomplete_position_partition() {
+        let result = build_not_equal_positions_core(
+            array![2_i64].view(),
+            array![10_i64, 11].view(),
+            array![0_i64].view(),
+            array![1].view(),
+            array![20_i64].view(),
+            array![0].view(),
+            None,
+            None,
+            true,
+            false,
+            Keep::Any,
         );
+        assert!(result.is_err());
+    }
 
-        let left_null = build_not_equal_core::<i64>(
-            array![].view(),
-            array![].view(),
-            array![1, 2].view(),
-            array![30, 31].view(),
-            Some(array![true].view()),
-            Some(array![10].view()),
-            Some(array![false, true].view()),
-            Some(array![30, 32].view()),
+    #[test]
+    fn not_equal_rejects_out_of_bounds_physical_positions() {
+        let result = build_not_equal_positions_core(
+            array![2_i64].view(),
+            array![10_i64, 11].view(),
+            array![2_i64].view(),
+            array![1_i64].view(),
+            array![20_i64].view(),
+            array![0_i64].view(),
+            Some(array![0_i64].view()),
+            None,
             true,
-            Keep::All,
-        )
-        .unwrap();
-        assert_eq!(left_null, (vec![10, 10, 10], vec![30, 31, 32]));
+            false,
+            Keep::Any,
+        );
+        assert_eq!(
+            result,
+            Err("left index non-null position 2 is out of bounds".to_owned())
+        );
+    }
 
-        let right_null = build_not_equal_core::<i64>(
-            array![1, 2].view(),
-            array![40, 41].view(),
-            array![].view(),
-            array![].view(),
-            Some(array![false, false].view()),
-            Some(array![40, 41].view()),
-            Some(array![true, true].view()),
-            Some(array![50, 51].view()),
+    #[test]
+    fn not_equal_rejects_duplicate_physical_positions() {
+        let result = build_not_equal_positions_core(
+            array![2_i64, 3].view(),
+            array![10_i64, 11].view(),
+            array![0_i64, 0].view(),
+            array![1_i64].view(),
+            array![20_i64].view(),
+            array![0_i64].view(),
+            None,
+            None,
             true,
-            Keep::All,
-        )
-        .unwrap();
-        assert_eq!(right_null, (vec![40, 40, 41, 41], vec![50, 51, 50, 51]));
+            false,
+            Keep::Any,
+        );
+        assert_eq!(
+            result,
+            Err("left index position 0 appears more than once".to_owned())
+        );
     }
 }

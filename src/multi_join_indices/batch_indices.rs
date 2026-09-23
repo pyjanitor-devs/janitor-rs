@@ -11,7 +11,7 @@ use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 
 type BatchIndices<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>);
 
-use super::predicate::{
+use crate::predicate::{
     null_metadata_views, parse_predicates_with_nulls, predicates_match_dispatch, NullMetadata,
     Predicate,
 };
