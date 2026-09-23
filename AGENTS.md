@@ -1038,3 +1038,27 @@ fails at the PyO3 boundary or produces invalid position metadata.
 **Recommendation**: Treat single-join signature and coordinate-system changes
 as a coordinated Rust/pyjanitor migration. Add an integration test covering
 range and `!=` calls before merging either side.
+
+### [2026-09-23] Fused single and extended aggregation kernels
+
+**Context**: Implementing the aggregation phase after the index-producing
+single and extended join kernels.
+**Learning**: `single_join_agg.rs` and `single_join_extended_agg.rs` reuse the
+existing `AggregationSet`, input parsing, and result construction from the
+batch aggregation kernels. They update aggregation state during candidate
+comparison, so successful pairs are never materialized as intermediate join
+indices. Forward calls aggregate into left-side slots; reverse calls aggregate
+into right-side slots. Forward and reverse results are separate APIs and cannot
+be requested together.
+
+For `!=`, filtered non-null predicate values are accompanied by physical
+position maps and optional null-position arrays. The kernel uses those maps to
+index full-layout aggregation arrays. Null masks are authoritative, and the
+extension-array flag preserves pandas nullable comparison semantics. Pyjanitor
+performs sorting and alignment; Rust trusts those contracts and does not sort
+or infer nullness.
+
+**Recommendation**: Keep aggregation kernels separate from index materializers.
+Use the same predicate traversal and residual filtering semantics as the index
+path, but call `AggregationSet::update` at each successful comparison. Return
+`None` only when no comparison survives; do not add `keep` to aggregation APIs.
