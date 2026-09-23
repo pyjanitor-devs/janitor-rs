@@ -1601,6 +1601,43 @@ mod tests {
     }
 
     #[test]
+    fn not_equal_any_selects_a_strict_or_null_candidate() {
+        let strict = build_not_equal_positions_core(
+            array![4_i64].view(),
+            array![100_i64].view(),
+            array![0_i64].view(),
+            array![1, 3, 5, 7].view(),
+            array![40, 10, 30, 20].view(),
+            array![0, 1, 2, 3].view(),
+            None,
+            None,
+            false,
+            false,
+            Keep::Any,
+        )
+        .unwrap();
+        // Any valid candidate is acceptable. The current fast path chooses
+        // the first physical position from the strict-less prefix.
+        assert_eq!(strict, (vec![0], vec![0]));
+
+        let null_fallback = build_not_equal_positions_core(
+            array![4_i64].view(),
+            array![100_i64].view(),
+            array![0_i64].view(),
+            array![4_i64].view(),
+            array![20_i64, 21].view(),
+            array![0_i64].view(),
+            None,
+            Some(array![1_i64].view()),
+            true,
+            false,
+            Keep::Any,
+        )
+        .unwrap();
+        assert_eq!(null_fallback, (vec![0], vec![1]));
+    }
+
+    #[test]
     fn not_equal_numpy_null_positions_are_candidates() {
         let positions = build_not_equal_positions_core(
             array![2_i64].view(),
