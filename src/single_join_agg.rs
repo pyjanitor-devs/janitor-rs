@@ -111,6 +111,14 @@ use crate::single_join::{range_bounds, visit_not_equal_pairs_core};
 /// `results` contains one array per requested aggregation in request order.
 /// Returns `None` when no comparison succeeds anywhere.
 ///
+/// # Numerical contract
+///
+/// Integer `sum` and `prod` use fixed-width wrapping arithmetic at the source
+/// dtype width. This intentionally differs from pandas, which may promote an
+/// integer result when an operation overflows. Floating-point aggregation
+/// uses the corresponding `f32` or `f64` arithmetic. Arithmetic used for
+/// positions, lengths, and allocation sizes remains checked.
+///
 /// # Errors
 ///
 /// Returns a Python `ValueError` when equality is requested, required `!=`

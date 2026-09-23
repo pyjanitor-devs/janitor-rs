@@ -1081,3 +1081,10 @@ is used for `!=` joins.
 **Recommendation**: Preserve the boundary fast path only when the candidate
 window is a complete prefix or suffix. Use `set.update` for `!=`, reverse
 aggregation, and residual-filtered candidates.
+
+Fused aggregation intentionally differs from pandas for integer arithmetic:
+`sum` and `prod` use fixed-width Rust wrapping semantics rather than pandas'
+dtype promotion on overflow. This is a public dtype-specific contract and
+must remain documented and covered by boundary-value tests. Floating-point
+aggregation uses the corresponding `f32` or `f64` arithmetic; position,
+length, and allocation calculations remain checked.

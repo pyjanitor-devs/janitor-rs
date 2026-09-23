@@ -20,6 +20,13 @@
 //! contract, identities, and Kahan compensation are the same state concerns
 //! used by the comparison-driven methods, while the traversal strategy is
 //! specific to starts-only, ends-only, or starts/ends ranges.
+//!
+//! Integer `sum` and `prod` intentionally use fixed-width wrapping arithmetic
+//! (`wrapping_add`/`wrapping_mul`). This is a published dtype-specific
+//! deviation from pandas, which may promote integer results during
+//! aggregation. Floating-point operations retain their corresponding `f32`
+//! or `f64` arithmetic. Position, length, and allocation arithmetic remains
+//! checked and must not wrap.
 
 use super::input::{AggregationInput, AggregationOp};
 use numpy::ndarray::{Array1, ArrayView1};
