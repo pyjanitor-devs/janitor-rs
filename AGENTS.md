@@ -1004,8 +1004,8 @@ the filtered arrays, physical-position mappings, sorting, alignment, and
 authoritative null metadata before dispatching every supported predicate path
 to Rust. `return_building_blocks` remains a pyjanitor-level request that maps
 to `keep="all"`; it is not an argument to the extended Rust kernel.
-**Recommendation**: Keep `single_join.rs` as the one-predicate path and use
-`single_join_extended.rs` for multi-predicate range and all-not-equal joins. Apply
+**Recommendation**: Keep `single_non_equi_join.rs` as the one-predicate path and use
+`single_non_equi_join_extended.rs` for multi-predicate range and all-not-equal joins. Apply
 `keep` only after all predicates have passed.
 
 ### [2026-09-23] Equality is residual-only in extended single joins
@@ -1043,7 +1043,7 @@ range and `!=` calls before merging either side.
 
 **Context**: Implementing the aggregation phase after the index-producing
 single and extended join kernels.
-**Learning**: `single_join_agg.rs` and `single_join_extended_agg.rs` reuse the
+**Learning**: `single_non_equi_join_agg.rs` and `single_non_equi_join_extended_agg.rs` reuse the
 existing `AggregationSet`, input parsing, and result construction from the
 batch aggregation kernels. They update aggregation state during candidate
 comparison, so successful pairs are never materialized as intermediate join

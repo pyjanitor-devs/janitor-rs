@@ -17,12 +17,41 @@ use crate::predicate::{
     null_metadata_views, parse_predicates_with_nulls_strings, predicates_match_dispatch,
     PredicateView,
 };
-use crate::single_join::{range_bounds, visit_not_equal_pairs_core};
+use crate::single_non_equi_join::{range_bounds, visit_not_equal_pairs_core};
 
-/// Translate physical row positions into the compact aggregation layout.
-/// The all-`!=` path searches physical rows but receives source values in a
-/// non-null-then-null layout, so candidate positions must be mapped before
-/// updating aggregation slots.
+/// Build a lookup from original physical rows to compact aggregation slots.
+///
+/// A physical position is the row's original position in the full input.
+/// A compact position is the row's position in the trimmed aggregation array;
+/// each compact position is therefore an aggregation slot.
+///
+/// Before filtering or sorting, the physical input is:
+///
+/// ```text
+/// physical row:      [0,    1,  2]
+/// original values:   [null, 20, 10]
+/// ```
+///
+/// PyJanitor supplies the aggregation values in compact sorted order:
+///
+/// ```text
+/// compact slot:      [0,  1,  2]
+/// physical row:      [2,  1,  0]
+/// compact values:    [10, 20, null]
+/// ```
+///
+/// Rust inverts that pairing to:
+///
+/// ```text
+/// physical row:      [0,  1,  2]
+/// compact slot:      [2,  1,  0]
+/// ```
+///
+/// Thus, a candidate reported at physical row `2` is written to compact
+/// aggregation slot `physical_to_slot[2]`, which is slot `0`.
+///
+/// This lets aggregation update the compact result directly without a later
+/// scattering pass.
 fn physical_to_local_positions(
     name: &str,
     full_len: usize,

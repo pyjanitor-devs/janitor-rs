@@ -457,7 +457,7 @@ pub(crate) fn parse_predicates_strings<'py>(
 }
 
 /// Parse the string-based residual predicate form used by
-/// `single_join_extended.rs`.
+/// `single_non_equi_join_extended.rs`.
 ///
 /// Ordinary residual predicates are `(left, right, op)`. A null-aware `!=`
 /// predicate is `(left, left_nulls, right, right_nulls,

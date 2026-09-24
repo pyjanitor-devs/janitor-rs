@@ -1,6 +1,6 @@
 //! Fused aggregation for one conditional-join predicate.
 //!
-//! This module mirrors `single_join.rs`'s candidate traversal but updates
+//! This module mirrors `single_non_equi_join.rs`'s candidate traversal but updates
 //! `AggregationSet` immediately instead of building left/right index arrays.
 //! `keep` is intentionally absent: aggregation consumes every pair that
 //! satisfies the comparison.
@@ -13,7 +13,7 @@ use pyo3::types::{PyList, PyTuple};
 
 use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
 use crate::op::CompareOp;
-use crate::single_join::{range_bounds, visit_not_equal_pairs_core};
+use crate::single_non_equi_join::{range_bounds, visit_not_equal_pairs_core};
 
 /// Build a lookup from original physical rows to compact aggregation slots.
 ///
