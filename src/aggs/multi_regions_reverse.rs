@@ -99,7 +99,7 @@ pub fn aggregate_multi_regions_reverse<'py>(
         .map(|predicate| predicate.view())
         .collect();
     let metadata_views = metadata.as_deref().map(null_metadata_views);
-    let mut set = AggregationSet::new(right.len(), left.len(), &inputs)?;
+    let mut set = AggregationSet::new(right.len(), left.len(), &inputs, true)?;
     let mut next = vec![-1_i64; right.len()];
     let mut groups = BTreeMap::<i64, GroupState>::new();
     let mut previous_end = right.len();

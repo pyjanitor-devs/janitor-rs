@@ -41,7 +41,7 @@ pub fn aggregate_starts_ends<'py>(
             "at least one aggregation is required",
         ));
     }
-    let mut state = AggregationSet::new(starts.len(), right_len, &inputs)?;
+    let mut state = AggregationSet::new(starts.len(), right_len, &inputs, true)?;
     state.aggregate_starts_ends(starts, ends);
     if state.is_empty() {
         return Ok(None);

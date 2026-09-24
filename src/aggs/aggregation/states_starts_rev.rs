@@ -65,7 +65,7 @@ pub fn aggregate_starts_reverse<'py>(
             "at least one aggregation is required",
         ));
     }
-    let mut state = AggregationSet::new(right_index.len(), starts.len(), &inputs)?;
+    let mut state = AggregationSet::new(right_index.len(), starts.len(), &inputs, true)?;
     state.aggregate_reverse_starts(starts);
     if state.is_empty() {
         return Ok(None);

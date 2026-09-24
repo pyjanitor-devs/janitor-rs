@@ -198,6 +198,11 @@ pub(crate) fn parse_inputs<'py>(
             result.push(AggregationInput::CountNonNull(mask));
             continue;
         }
+        if op == AggregationOp::CountNonNull {
+            return Err(PyValueError::new_err(
+                "count must use the wildcard null-mask form",
+            ));
+        }
         let dtype = array
             .getattr("dtype")?
             .getattr("name")?

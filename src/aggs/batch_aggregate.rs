@@ -108,7 +108,7 @@ pub fn compare_batch_aggregate<'py>(
     let metadata_views = metadata.as_deref().map(null_metadata_views);
     let starts = starts.as_ref().map(|values| values.as_array());
     let ends = ends.as_ref().map(|values| values.as_array());
-    let mut set = AggregationSet::new(left_len, right_len, &inputs)?;
+    let mut set = AggregationSet::new(left_len, right_len, &inputs, true)?;
     for row in 0..left_len {
         let start = starts.map_or(0, |values| values[row]);
         let end = ends.map_or(right_len as i64, |values| values[row]);

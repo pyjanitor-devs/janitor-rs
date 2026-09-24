@@ -10,7 +10,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
-use crate::aggs::aggregation::{make_results, parse_inputs, AggregationSet};
+use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
 use crate::aggs::ensure_equal_lengths_core;
 use crate::op::CompareOp;
 use crate::predicate::{
@@ -18,6 +18,35 @@ use crate::predicate::{
     PredicateView,
 };
 use crate::single_join::{range_bounds, visit_not_equal_pairs_core};
+
+/// Translate physical row positions into the compact aggregation layout.
+/// The all-`!=` path searches physical rows but receives source values in a
+/// non-null-then-null layout, so candidate positions must be mapped before
+/// updating aggregation slots.
+fn physical_to_local_positions(
+    name: &str,
+    full_len: usize,
+    output_positions: ArrayView1<'_, i64>,
+) -> Result<Vec<usize>, String> {
+    if output_positions.len() != full_len {
+        return Err(format!(
+            "{name} output positions must cover the complete physical layout"
+        ));
+    }
+    let mut local_positions = vec![usize::MAX; full_len];
+    for (local, &physical) in output_positions.iter().enumerate() {
+        let physical = usize::try_from(physical)
+            .map_err(|_| format!("{name} output position must be non-negative"))?;
+        if physical >= full_len {
+            return Err(format!("{name} output position is out of bounds"));
+        }
+        if local_positions[physical] != usize::MAX {
+            return Err(format!("{name} output positions contain duplicates"));
+        }
+        local_positions[physical] = local;
+    }
+    Ok(local_positions)
+}
 
 /// Visit a range-led extended join and update aggregations for survivors.
 ///
@@ -91,8 +120,9 @@ fn aggregate_range<T: PartialOrd + Copy>(
 /// The filtered value arrays contain only non-null values. `left_positions`
 /// and `right_positions` map those values to the complete physical domains;
 /// the optional null-position arrays complete those domains when nulls exist.
+/// Separate output-position arrays describe the compact aggregation layouts.
 /// Consequently, `left_full_len` and `right_full_len` describe the original
-/// physical layouts, not the filtered value-array lengths.
+/// physical layouts, while `AggregationSet` uses compact layout lengths.
 ///
 /// # Arguments
 ///
@@ -103,6 +133,8 @@ fn aggregate_range<T: PartialOrd + Copy>(
 ///   filtered values in the original layouts.
 /// * `left_null_positions` / `right_null_positions` - Optional physical
 ///   positions of null rows.
+/// * `left_output_positions` / `right_output_positions` - Complete physical
+///   positions in the compact source/output layouts.
 /// * `is_extension_array` - Selects pandas nullable versus NumPy null
 ///   comparison behavior.
 /// * `residuals` - Parsed predicates after the first `!=` predicate.
@@ -123,12 +155,16 @@ fn aggregate_not_equal<T: PartialOrd + Copy>(
     right_full_len: usize,
     right_positions: ArrayView1<'_, i64>,
     right_null_positions: Option<ArrayView1<'_, i64>>,
+    left_output_positions: ArrayView1<'_, i64>,
+    right_output_positions: ArrayView1<'_, i64>,
     is_extension_array: bool,
     residuals: &[PredicateView<'_>],
     residual_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
     set: &mut AggregationSet<'_>,
     reverse: bool,
 ) -> Result<(), String> {
+    let left_map = physical_to_local_positions("left", left_full_len, left_output_positions)?;
+    let right_map = physical_to_local_positions("right", right_full_len, right_output_positions)?;
     visit_not_equal_pairs_core(
         left,
         left_full_len,
@@ -147,9 +183,9 @@ fn aggregate_not_equal<T: PartialOrd + Copy>(
                 right_position,
             ) {
                 if reverse {
-                    set.update(left_position, right_position);
+                    set.update(left_map[left_position], right_map[right_position]);
                 } else {
-                    set.update(right_position, left_position);
+                    set.update(right_map[right_position], left_map[left_position]);
                 }
             }
         },
@@ -266,12 +302,13 @@ fn check_residual_lengths(
 /// * `op` - First predicate's range comparator.
 /// * `aggregations` - Parsed at the shared boundary as value/mask/operation
 ///   requests. Arrays must use the complete source-side physical layout.
+/// * `return_matched` - Include the per-output matched array when true.
 /// * `reverse` - Aggregate left values into right output slots when true.
 ///
 /// # Returns
 ///
 /// Returns `None` when no candidate survives all predicates. Otherwise
-/// returns the common `(matched, aggregation_arrays)` tuple.
+/// returns the common `(output_positions, matched, aggregation_arrays)` tuple.
 #[allow(clippy::too_many_arguments)]
 fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
     py: Python<'py>,
@@ -280,6 +317,9 @@ fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
     right: PyReadonlyArray1<'py, T>,
     op: CompareOp,
     aggregations: &Bound<'py, PyList>,
+    output_positions: Option<ArrayView1<'_, i64>>,
+    output_len: usize,
+    return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let (parsed, metadata) = residuals(py, predicates, false)?;
@@ -293,9 +333,10 @@ fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
         ));
     }
     let mut set = AggregationSet::new(
-        if reverse { right.len() } else { left.len() },
+        output_len,
         if reverse { left.len() } else { right.len() },
         &inputs,
+        return_matched,
     )?;
     let views: Vec<_> = parsed.iter().map(|predicate| predicate.view()).collect();
     let metadata_views = metadata.as_deref().map(null_metadata_views);
@@ -311,12 +352,19 @@ fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
     if set.is_empty() {
         return Ok(None);
     }
-    Ok(Some(make_results(py, set)?))
+    Ok(Some(make_results_with_positions(
+        py,
+        set,
+        output_positions,
+        output_len,
+        return_matched,
+    )?))
 }
 
 /// Run fused aggregation for an all-`!=` extended join.
 ///
-/// The first tuple uses the eleven-element null-aware position contract. Its
+/// The first tuple uses the thirteen-element null-aware aggregation contract.
+/// The legacy eleven-element form remains accepted during migration. Its
 /// filtered value arrays and physical position partitions generate candidate
 /// pairs. Every later tuple is a residual predicate over the full physical
 /// layouts. No pair tape is materialized; successful candidates update the
@@ -334,12 +382,13 @@ fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
 ///   partitions.
 /// * `is_extension_array` - Selects pandas extension-array null semantics.
 /// * `aggregations` - Full-layout aggregation requests.
+/// * `return_matched` - Include the per-output matched array when true.
 /// * `reverse` - Selects right-oriented output and left-side source values.
 ///
 /// # Returns
 ///
 /// Returns `None` when no pair survives every predicate; otherwise returns the
-/// standard matched-mask and aggregation-array tuple.
+/// standard output-position, matched-mask, and aggregation-array tuple.
 #[allow(clippy::too_many_arguments)]
 fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
     py: Python<'py>,
@@ -352,8 +401,11 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
     right_index: PyReadonlyArray1<'py, i64>,
     right_positions: PyReadonlyArray1<'py, i64>,
     right_null_positions: Option<PyReadonlyArray1<'py, i64>>,
+    left_output_positions: PyReadonlyArray1<'py, i64>,
+    right_output_positions: PyReadonlyArray1<'py, i64>,
     is_extension_array: bool,
     aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let (parsed, metadata) = residuals(py, predicates, true)?;
@@ -366,19 +418,17 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
     }
     let left_full_len = left_index.len()?;
     let right_full_len = right_index.len()?;
-    let mut set = AggregationSet::new(
-        if reverse {
-            right_full_len
-        } else {
-            left_full_len
-        },
-        if reverse {
-            left_full_len
-        } else {
-            right_full_len
-        },
-        &inputs,
-    )?;
+    let output_len = if reverse {
+        right_output_positions.len()?
+    } else {
+        left_output_positions.len()?
+    };
+    let source_len = if reverse {
+        left_output_positions.len()?
+    } else {
+        right_output_positions.len()?
+    };
+    let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
     let views: Vec<_> = parsed.iter().map(|predicate| predicate.view()).collect();
     let metadata_views = metadata.as_deref().map(null_metadata_views);
     aggregate_not_equal(
@@ -392,6 +442,8 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
         right_null_positions
             .as_ref()
             .map(|values| values.as_array()),
+        left_output_positions.as_array(),
+        right_output_positions.as_array(),
         is_extension_array,
         &views,
         metadata_views.as_deref(),
@@ -402,13 +454,19 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
     if set.is_empty() {
         return Ok(None);
     }
-    Ok(Some(make_results(py, set)?))
+    Ok(Some(make_results_with_positions(
+        py,
+        set,
+        None,
+        output_len,
+        return_matched,
+    )?))
 }
 
 /// Validate the first extended predicate and dispatch to its fused traversal.
 ///
-/// The first tuple is the algorithm anchor. A six-element tuple is a range
-/// anchor; an eleven-element tuple is the null-aware all-`!=` anchor. The
+/// The first tuple is the algorithm anchor. A six- or eight-element tuple is a
+/// range anchor; an eleven-element tuple is the null-aware all-`!=` anchor. The
 /// tuple shape is deliberately checked here so malformed Python input fails
 /// before any aggregation state or candidate loop is created.
 ///
@@ -419,18 +477,20 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
 ///   least the anchor and one residual predicate.
 /// * `first` - The first predicate tuple, already extracted from `predicates`.
 /// * `aggregations` - Non-empty aggregation requests.
+/// * `return_matched` - Include the per-output matched array when true.
 /// * `reverse` - Selects forward or reverse output mapping.
 ///
 /// # Returns
 ///
-/// Returns the common `(matched, aggregation_arrays)` tuple, or `None` when no
-/// candidate survives.
+/// Returns the common `(output_positions, matched, aggregation_arrays)` tuple,
+/// or `None` when no candidate survives.
 #[allow(clippy::too_many_arguments)]
 fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
     first: &Bound<'py, PyTuple>,
     aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
     if predicates.len() < 2 {
@@ -440,18 +500,20 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
     }
     let op_position = match first.len() {
         6 => 5,
+        8 => 7,
         11 => 10,
+        13 => 12,
         _ => {
             return Err(PyValueError::new_err(
-                "the first extended predicate must contain 6 or 11 elements",
+                "the first extended predicate must contain 6, 8, 11, or 13 elements",
             ))
         }
     };
     let op = CompareOp::try_from_str(first.get_item(op_position)?.extract::<&str>()?)?;
     if op != CompareOp::Ne {
-        if first.len() != 6 {
+        if first.len() != 6 && first.len() != 8 {
             return Err(PyValueError::new_err(
-                "the first range predicate must contain 6 elements",
+                "the first range predicate must contain 6 or 8 elements",
             ));
         }
         if !matches!(
@@ -463,6 +525,31 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
             ));
         }
         first.get_item(4)?.extract::<bool>()?;
+        let left_positions = first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?;
+        let right_positions = first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?;
+        let (left_output_len, right_output_len) = if first.len() == 8 {
+            (left_positions.len()?, right_positions.len()?)
+        } else {
+            (
+                first
+                    .get_item(0)?
+                    .extract::<PyReadonlyArray1<'py, T>>()?
+                    .len()?,
+                first
+                    .get_item(2)?
+                    .extract::<PyReadonlyArray1<'py, T>>()?
+                    .len()?,
+            )
+        };
+        let calculation_output_positions = if first.len() == 8 {
+            Some(if reverse {
+                right_positions.as_array()
+            } else {
+                left_positions.as_array()
+            })
+        } else {
+            None
+        };
         return run_range(
             py,
             predicates,
@@ -470,12 +557,19 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
             first.get_item(2)?.extract::<PyReadonlyArray1<'py, T>>()?,
             op,
             aggregations,
+            calculation_output_positions,
+            if reverse {
+                right_output_len
+            } else {
+                left_output_len
+            },
+            return_matched,
             reverse,
         );
     }
-    if first.len() != 11 {
+    if first.len() != 11 && first.len() != 13 {
         return Err(PyValueError::new_err(
-            "the first != predicate must contain 11 elements",
+            "the first != predicate must contain 11 or 13 elements",
         ));
     }
     let left_null_positions = if first.get_item(3)?.is_none() {
@@ -488,6 +582,21 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
     } else {
         Some(first.get_item(7)?.extract::<PyReadonlyArray1<'py, i64>>()?)
     };
+    let (left_output_positions, right_output_positions) = if first.len() == 13 {
+        (
+            first
+                .get_item(10)?
+                .extract::<PyReadonlyArray1<'py, i64>>()?,
+            first
+                .get_item(11)?
+                .extract::<PyReadonlyArray1<'py, i64>>()?,
+        )
+    } else {
+        (
+            first.get_item(2)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+            first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+        )
+    };
     run_not_equal(
         py,
         predicates,
@@ -499,8 +608,11 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
         first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?,
         first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?,
         right_null_positions,
+        left_output_positions,
+        right_output_positions,
         first.get_item(9)?.extract::<bool>()?,
         aggregations,
+        return_matched,
         reverse,
     )
 }
@@ -535,6 +647,7 @@ macro_rules! extended_aggregation_functions {
             py: Python<'py>,
             predicates: &Bound<'py, PyList>,
             aggregations: &Bound<'py, PyList>,
+            return_matched: bool,
         ) -> PyResult<Option<Bound<'py, PyTuple>>> {
             if predicates.is_empty() {
                 return Err(PyValueError::new_err(
@@ -543,7 +656,7 @@ macro_rules! extended_aggregation_functions {
             }
             let first_item = predicates.get_item(0)?;
             let first = first_item.cast::<PyTuple>()?;
-            dispatch::<$ty>(py, predicates, &first, aggregations, false)
+            dispatch::<$ty>(py, predicates, &first, aggregations, return_matched, false)
         }
 
         /// Fused reverse aggregation for multiple conditional-join
@@ -565,13 +678,14 @@ macro_rules! extended_aggregation_functions {
         ///
         /// # Returns
         ///
-        /// Returns `None` when no pair survives, otherwise a matched mask and
-        /// one result array per aggregation request.
+        /// Returns `None` when no pair survives, otherwise output positions,
+        /// a matched mask, and one result array per aggregation request.
         #[pyfunction]
         pub fn $reverse<'py>(
             py: Python<'py>,
             predicates: &Bound<'py, PyList>,
             aggregations: &Bound<'py, PyList>,
+            return_matched: bool,
         ) -> PyResult<Option<Bound<'py, PyTuple>>> {
             if predicates.is_empty() {
                 return Err(PyValueError::new_err(
@@ -580,7 +694,7 @@ macro_rules! extended_aggregation_functions {
             }
             let first_item = predicates.get_item(0)?;
             let first = first_item.cast::<PyTuple>()?;
-            dispatch::<$ty>(py, predicates, &first, aggregations, true)
+            dispatch::<$ty>(py, predicates, &first, aggregations, return_matched, true)
         }
     };
 }
@@ -707,10 +821,11 @@ mod tests {
                 ],
             )?;
             let aggregations = PyList::new(py, [aggregation])?;
-            let result = single_join_extended_aggregate_int64(py, &predicates, &aggregations)?
-                .expect("the filtered range has matches");
-            assert_eq!(result.get_item(0)?.extract::<Vec<bool>>()?, vec![true]);
-            let outputs_value = result.get_item(1)?;
+            let result =
+                single_join_extended_aggregate_int64(py, &predicates, &aggregations, true)?
+                    .expect("the filtered range has matches");
+            assert_eq!(result.get_item(1)?.extract::<Vec<bool>>()?, vec![true]);
+            let outputs_value = result.get_item(2)?;
             let outputs = outputs_value.cast::<PyList>()?;
             assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![70]);
             Ok(())
@@ -758,13 +873,14 @@ mod tests {
                 ],
             )?;
             let aggregations = PyList::new(py, [aggregation])?;
-            let result = single_join_extended_aggregate_int64(py, &predicates, &aggregations)?
-                .expect("the not-equal join has matches");
+            let result =
+                single_join_extended_aggregate_int64(py, &predicates, &aggregations, true)?
+                    .expect("the not-equal join has matches");
             assert_eq!(
-                result.get_item(0)?.extract::<Vec<bool>>()?,
+                result.get_item(1)?.extract::<Vec<bool>>()?,
                 vec![true, true]
             );
-            let outputs_value = result.get_item(1)?;
+            let outputs_value = result.get_item(2)?;
             let outputs = outputs_value.cast::<PyList>()?;
             assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![200, 300]);
             Ok(())
@@ -803,7 +919,7 @@ mod tests {
             )?)?;
             let aggregations = PyList::empty(py);
 
-            let error = single_join_extended_aggregate_int64(py, &predicates, &aggregations)
+            let error = single_join_extended_aggregate_int64(py, &predicates, &aggregations, true)
                 .expect_err("mixed operators after a != anchor must be rejected");
             assert_eq!(
                 error.to_string(),
@@ -811,7 +927,7 @@ mod tests {
             );
 
             let error =
-                single_join_extended_aggregate_reverse_int64(py, &predicates, &aggregations)
+                single_join_extended_aggregate_reverse_int64(py, &predicates, &aggregations, true)
                     .expect_err("reverse mixed operators after a != anchor must be rejected");
             assert_eq!(
                 error.to_string(),
@@ -829,7 +945,7 @@ mod tests {
             let predicates = PyList::empty(py);
             let aggregations = PyList::empty(py);
 
-            let error = single_join_extended_aggregate_int64(py, &predicates, &aggregations)
+            let error = single_join_extended_aggregate_int64(py, &predicates, &aggregations, true)
                 .expect_err("an empty forward predicate list must be rejected");
             assert_eq!(
                 error.to_string(),
@@ -837,7 +953,7 @@ mod tests {
             );
 
             let error =
-                single_join_extended_aggregate_reverse_int64(py, &predicates, &aggregations)
+                single_join_extended_aggregate_reverse_int64(py, &predicates, &aggregations, true)
                     .expect_err("an empty reverse predicate list must be rejected");
             assert_eq!(
                 error.to_string(),

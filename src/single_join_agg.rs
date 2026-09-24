@@ -11,9 +11,41 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
-use crate::aggs::aggregation::{make_results, parse_inputs, AggregationSet};
+use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
 use crate::op::CompareOp;
 use crate::single_join::{range_bounds, visit_not_equal_pairs_core};
+
+/// Build a physical-position to trimmed-layout-position lookup.
+///
+/// `!=` candidate generation works in the original physical domain, while
+/// aggregation values are supplied in a compact layout (non-null rows first,
+/// followed by null rows). This map translates a candidate's physical row
+/// into the corresponding compact aggregation slot without scattering the
+/// final result.
+fn physical_to_local_positions(
+    name: &str,
+    full_len: usize,
+    output_positions: ArrayView1<'_, i64>,
+) -> Result<Vec<usize>, String> {
+    if output_positions.len() != full_len {
+        return Err(format!(
+            "{name} output positions must cover the complete physical layout"
+        ));
+    }
+    let mut local_positions = vec![usize::MAX; full_len];
+    for (local, &physical) in output_positions.iter().enumerate() {
+        let physical = usize::try_from(physical)
+            .map_err(|_| format!("{name} output position must be non-negative"))?;
+        if physical >= full_len {
+            return Err(format!("{name} output position is out of bounds"));
+        }
+        if local_positions[physical] != usize::MAX {
+            return Err(format!("{name} output positions contain duplicates"));
+        }
+        local_positions[physical] = local;
+    }
+    Ok(local_positions)
+}
 
 /// Execute one fused aggregation pass over a single predicate.
 ///
@@ -99,26 +131,36 @@ use crate::single_join::{range_bounds, visit_not_equal_pairs_core};
 /// * `aggregations` - Non-empty Python aggregation requests. Each request is
 ///   `(values, null_mask, operation)`, where `operation` is `"sum"`,
 ///   `"count"`, `"size"`, `"prod"`, `"min"`, or `"max"`. The arrays and
-///   masks must use the complete physical layout of the side being
-///   aggregated, not the filtered predicate layout.
+///   masks use the compact source layout supplied by PyJanitor.
+/// * `left_output_positions` - For `!=`, the compact left layout positions.
+///   It contains every physical position exactly once, normally with
+///   non-null positions followed by null positions.
+/// * `right_output_positions` - For `!=`, the corresponding compact right
+///   layout positions. Range calls retain these arguments for the common
+///   wrapper signature; range output alignment comes from its calculation map.
+/// * `return_matched` - Whether to include the per-output boolean matched
+///   array. When false, the return shape is
+///   `(output_positions, aggregation_arrays)` instead of
+///   `(output_positions, matched, aggregation_arrays)`.
 /// * `reverse` - If `false`, aggregate right values into left output slots.
 ///   If `true`, aggregate left values into right output slots.
 ///
 /// # Returns
 ///
-/// Returns `Some((matched, results))` when at least one comparison succeeds.
-/// `matched` identifies output rows with at least one successful pair, and
-/// `results` contains one array per requested aggregation in request order.
+/// Returns `Some((output_positions, matched, results))` when at least one
+/// comparison succeeds. The first array has the same trimmed calculation
+/// order as the returned aggregation arrays; `results` contains one array per
+/// requested aggregation in request order.
 /// Returns `None` when no comparison succeeds anywhere.
 ///
 /// # Numerical contract
 ///
-/// Integer `sum` and `prod` use fixed-width wrapping arithmetic at the source
-/// dtype width. This intentionally differs from pandas, which may promote an
-/// integer result when an operation overflows. Floating-point aggregation
-/// uses `f64` arithmetic and returns `f64` results for both `f32` and `f64`
-/// inputs. Arithmetic used for positions, lengths, and allocation sizes
-/// remains checked.
+/// PyJanitor normalizes numeric aggregation inputs before this boundary:
+/// signed integer `sum` and `prod` use `int64`, unsigned inputs use `uint64`,
+/// and floating inputs retain their source dtype (`float32` or `float64`) at
+/// the PyJanitor materialization boundary. `min` and `max` retain the source
+/// dtype. Arithmetic used for positions, lengths, and allocation sizes remains
+/// checked.
 ///
 /// # Errors
 ///
@@ -137,6 +179,9 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
     right_null_positions: Option<PyReadonlyArray1<'py, i64>>,
     is_extension_array: bool,
     aggregations: &Bound<'py, PyList>,
+    left_output_positions: Option<PyReadonlyArray1<'py, i64>>,
+    right_output_positions: Option<PyReadonlyArray1<'py, i64>>,
+    return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let op = CompareOp::try_from_str(comparator)?;
@@ -157,14 +202,10 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
 
     let is_not_equal = op == CompareOp::Ne;
     if !is_not_equal
-        && (left_positions.is_some()
-            || left_null_positions.is_some()
-            || right_positions.is_some()
-            || right_null_positions.is_some()
-            || is_extension_array)
+        && (left_null_positions.is_some() || right_null_positions.is_some() || is_extension_array)
     {
         return Err(PyValueError::new_err(
-            "position metadata is only supported for !=",
+            "null metadata is only supported for != aggregation",
         ));
     }
     if is_not_equal && (left_positions.is_none() || right_positions.is_none()) {
@@ -174,9 +215,10 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
     }
 
     // `!=` receives filtered value arrays, so their lengths alone cannot size
-    // the output. Reconstruct the complete physical domain from the
-    // non-null partition and the optional null partition. For example,
-    // `[0, 2, 3] + [1]` describes four original rows, not three.
+    // the physical domain. Reconstruct it from the non-null partition and the
+    // optional null partition. For example, `[0, 2, 3] + [1]` describes four
+    // original rows, not three. The output-position arrays are compact layouts
+    // and therefore must not be used as physical-domain lengths.
     let left_full_len = if is_not_equal {
         let non_null = match left_positions.as_ref() {
             Some(values) => values.len()?,
@@ -213,23 +255,81 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
         right.len()
     };
 
-    // Forward aggregation reads values from right and writes one result slot
-    // per left row. Reverse aggregation swaps those two roles. The source
-    // length must match the full-layout aggregation arrays, while the output
-    // length determines how many matched flags and result slots are emitted.
-    let output_len = if reverse {
-        right_full_len
+    if let Some(values) = left_positions.as_ref() {
+        if values.len()? != left.len() {
+            return Err(PyValueError::new_err(
+                "left position map must match left predicate values",
+            ));
+        }
+    }
+    if let Some(values) = right_positions.as_ref() {
+        if values.len()? != right.len() {
+            return Err(PyValueError::new_err(
+                "right position map must match right predicate values",
+            ));
+        }
+    }
+
+    // Forward aggregation reads values from right and writes one trimmed
+    // result slot per calculation-order left row. Reverse aggregation swaps
+    // those roles. Range inputs have already been trimmed by PyJanitor, so
+    // their dense optimized state must use the trimmed lengths directly.
+    let output_positions = if is_not_equal {
+        Some(if reverse {
+            right_output_positions
+                .as_ref()
+                .ok_or_else(|| {
+                    PyValueError::new_err("right output positions are required for != aggregation")
+                })?
+                .as_array()
+        } else {
+            left_output_positions
+                .as_ref()
+                .ok_or_else(|| {
+                    PyValueError::new_err("left output positions are required for != aggregation")
+                })?
+                .as_array()
+        })
     } else {
-        left_full_len
+        None
     };
-    let source_len = if reverse {
-        left_full_len
+    let output_len = if is_not_equal {
+        if reverse {
+            right_output_positions.as_ref().unwrap().len()?
+        } else {
+            left_output_positions.as_ref().unwrap().len()?
+        }
+    } else if reverse {
+        right.len()
     } else {
-        right_full_len
+        left.len()
     };
-    let mut set = AggregationSet::new(output_len, source_len, &inputs)?;
+    let source_len = if is_not_equal {
+        if reverse {
+            left_output_positions.as_ref().unwrap().len()?
+        } else {
+            right_output_positions.as_ref().unwrap().len()?
+        }
+    } else if reverse {
+        left.len()
+    } else {
+        right.len()
+    };
+    let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
 
     if is_not_equal {
+        let left_map = physical_to_local_positions(
+            "left",
+            left_full_len,
+            left_output_positions.as_ref().unwrap().as_array(),
+        )
+        .map_err(PyValueError::new_err)?;
+        let right_map = physical_to_local_positions(
+            "right",
+            right_full_len,
+            right_output_positions.as_ref().unwrap().as_array(),
+        )
+        .map_err(PyValueError::new_err)?;
         visit_not_equal_pairs_core(
             left,
             left_full_len,
@@ -244,18 +344,18 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
             is_extension_array,
             |left_position, right_position| {
                 if reverse {
-                    set.update(left_position, right_position);
+                    set.update(left_map[left_position], right_map[right_position]);
                 } else {
-                    set.update(right_position, left_position);
+                    set.update(right_map[right_position], left_map[left_position]);
                 }
             },
         )
         .map_err(PyValueError::new_err)?;
     } else {
         // A single range join produces one contiguous right-side window per
-        // left row. Reuse the optimized prefix/suffix aggregation paths
-        // instead of visiting every matching position. The reverse methods
-        // scatter each source row into dense right-side output slots.
+        // trimmed left row. Reuse the optimized prefix/suffix aggregation
+        // paths instead of visiting every matching position. Reverse methods
+        // write directly into the trimmed right calculation layout.
         let mut boundaries = Vec::with_capacity(left.len());
         for &left_value in left.iter() {
             let (start, end) = range_bounds(left_value, right, op);
@@ -282,12 +382,34 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
                 set.aggregate_ends(boundaries);
             }
         }
+        let output_positions = if reverse {
+            right_positions.as_ref().map(|values| values.as_array())
+        } else {
+            left_positions.as_ref().map(|values| values.as_array())
+        };
+        return if set.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(make_results_with_positions(
+                py,
+                set,
+                output_positions,
+                output_len,
+                return_matched,
+            )?))
+        };
     }
 
     if set.is_empty() {
         return Ok(None);
     }
-    Ok(Some(make_results(py, set)?))
+    Ok(Some(make_results_with_positions(
+        py,
+        set,
+        output_positions,
+        output_len,
+        return_matched,
+    )?))
 }
 
 macro_rules! single_join_aggregation_functions {
@@ -297,7 +419,8 @@ macro_rules! single_join_aggregation_functions {
         /// Range values must already be aligned and the right values must be
         /// sorted by PyJanitor. `!=` values contain only non-null entries;
         /// their position arrays map them back to the complete physical
-        /// layouts. The kernel consumes every successful pair, so there is no
+        /// layouts, while aggregation sources use the compact layout. The
+        /// kernel consumes every successful pair, so there is no
         /// `keep` argument.
         ///
         /// # Arguments
@@ -314,7 +437,7 @@ macro_rules! single_join_aggregation_functions {
         /// * `is_extension_array` - Selects pandas nullable null semantics for
         ///   `!=`; it must be false for range predicates.
         /// * `aggregations` - Non-empty value/mask/operation requests. Values
-        ///   use the complete physical layout of the right source.
+        ///   use the compact calculation layout of the source side.
         ///
         /// # Example
         ///
@@ -334,6 +457,9 @@ macro_rules! single_join_aggregation_functions {
             right_null_positions: Option<PyReadonlyArray1<'py, i64>>,
             is_extension_array: bool,
             aggregations: &Bound<'py, PyList>,
+            left_output_positions: Option<PyReadonlyArray1<'py, i64>>,
+            right_output_positions: Option<PyReadonlyArray1<'py, i64>>,
+            return_matched: bool,
         ) -> PyResult<Option<Bound<'py, PyTuple>>> {
             aggregate_single(
                 py,
@@ -346,6 +472,9 @@ macro_rules! single_join_aggregation_functions {
                 right_null_positions,
                 is_extension_array,
                 aggregations,
+                left_output_positions,
+                right_output_positions,
+                return_matched,
                 false,
             )
         }
@@ -389,6 +518,9 @@ macro_rules! single_join_aggregation_functions {
             right_null_positions: Option<PyReadonlyArray1<'py, i64>>,
             is_extension_array: bool,
             aggregations: &Bound<'py, PyList>,
+            left_output_positions: Option<PyReadonlyArray1<'py, i64>>,
+            right_output_positions: Option<PyReadonlyArray1<'py, i64>>,
+            return_matched: bool,
         ) -> PyResult<Option<Bound<'py, PyTuple>>> {
             aggregate_single(
                 py,
@@ -401,6 +533,9 @@ macro_rules! single_join_aggregation_functions {
                 right_null_positions,
                 is_extension_array,
                 aggregations,
+                left_output_positions,
+                right_output_positions,
+                return_matched,
                 true,
             )
         }
@@ -522,13 +657,16 @@ mod tests {
                 None,
                 false,
                 &aggregations,
+                None,
+                None,
+                true,
             )?
             .expect("the range has matching candidates");
             assert_eq!(
-                result.get_item(0)?.extract::<Vec<bool>>()?,
+                result.get_item(1)?.extract::<Vec<bool>>()?,
                 vec![true, true]
             );
-            let outputs_value = result.get_item(1)?;
+            let outputs_value = result.get_item(2)?;
             let outputs = outputs_value.cast::<PyList>()?;
             assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![30, 30]);
             Ok(())
@@ -564,13 +702,16 @@ mod tests {
                 None,
                 false,
                 &aggregations,
+                None,
+                None,
+                true,
             )?
             .expect("the range has matching candidates");
             assert_eq!(
-                result.get_item(0)?.extract::<Vec<bool>>()?,
+                result.get_item(1)?.extract::<Vec<bool>>()?,
                 vec![true, true]
             );
-            let outputs_value = result.get_item(1)?;
+            let outputs_value = result.get_item(2)?;
             let outputs = outputs_value.cast::<PyList>()?;
             assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![30, 30]);
             Ok(())
@@ -579,12 +720,12 @@ mod tests {
     }
 
     #[test]
-    fn narrow_integer_sum_and_product_wrap_at_source_width() {
+    fn promoted_integer_sum_and_product_use_pandas_widths() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
-            let left = PyArray1::from_vec(py, vec![1_u8]);
-            let right = PyArray1::from_vec(py, vec![2_u8, 3]);
-            let values = PyArray1::from_vec(py, vec![250_u8, 10]);
+            let left = PyArray1::from_vec(py, vec![1_u64]);
+            let right = PyArray1::from_vec(py, vec![2_u64, 3]);
+            let values = PyArray1::from_vec(py, vec![250_u64, 10]);
             let mask = PyArray1::from_vec(py, vec![false, false]);
             let sum = PyTuple::new(
                 py,
@@ -603,7 +744,7 @@ mod tests {
                 ],
             )?;
             let aggregations = PyList::new(py, [sum, product])?;
-            let result = single_join_aggregate_uint8(
+            let result = single_join_aggregate_uint64(
                 py,
                 left.readonly(),
                 right.readonly(),
@@ -614,12 +755,15 @@ mod tests {
                 None,
                 false,
                 &aggregations,
+                None,
+                None,
+                true,
             )?
             .expect("the range has matching candidates");
-            let outputs_value = result.get_item(1)?;
+            let outputs_value = result.get_item(2)?;
             let outputs = outputs_value.cast::<PyList>()?;
-            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![4]);
-            assert_eq!(outputs.get_item(1)?.extract::<Vec<i64>>()?, vec![196]);
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<u64>>()?, vec![260]);
+            assert_eq!(outputs.get_item(1)?.extract::<Vec<u64>>()?, vec![2500]);
             Ok(())
         })
         .unwrap();

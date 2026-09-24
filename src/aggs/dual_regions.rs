@@ -59,7 +59,7 @@ pub fn aggregate_dual_regions<'py>(
             "at least one aggregation is required",
         ));
     }
-    let mut set = AggregationSet::new(left.len(), right.len(), &inputs)?;
+    let mut set = AggregationSet::new(left.len(), right.len(), &inputs, true)?;
     let mut next = vec![-1_i64; right.len()];
     let mut groups = BTreeMap::<i64, GroupState>::new();
     let mut previous_end = right.len();
