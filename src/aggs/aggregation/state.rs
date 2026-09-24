@@ -25,8 +25,8 @@
 //! (`wrapping_add`/`wrapping_mul`). This is a published dtype-specific
 //! deviation from pandas, which may promote integer results during
 //! aggregation. Floating-point operations retain their corresponding `f32`
-//! or `f64` arithmetic. Position, length, and allocation arithmetic remains
-//! checked and must not wrap.
+//! or `f64` arithmetic and returns floating results as `f64`. Position,
+//! length, and allocation arithmetic remains checked and must not wrap.
 
 use super::input::{AggregationInput, AggregationOp};
 use numpy::ndarray::{Array1, ArrayView1};
@@ -57,6 +57,32 @@ enum Values<'a> {
     F32(ArrayView1<'a, f32>),
 }
 
+#[derive(Clone, Copy)]
+enum IntegerWidth {
+    I64,
+    I32,
+    I16,
+    I8,
+    U32,
+    U16,
+    U8,
+}
+
+impl Values<'_> {
+    fn integer_width(&self) -> IntegerWidth {
+        match self {
+            Values::I64(_) => IntegerWidth::I64,
+            Values::I32(_) => IntegerWidth::I32,
+            Values::I16(_) => IntegerWidth::I16,
+            Values::I8(_) => IntegerWidth::I8,
+            Values::U32(_) => IntegerWidth::U32,
+            Values::U16(_) => IntegerWidth::U16,
+            Values::U8(_) => IntegerWidth::U8,
+            Values::U64(_) | Values::F64(_) | Values::F32(_) => IntegerWidth::I64,
+        }
+    }
+}
+
 /// The source values and their null metadata for one requested aggregation.
 ///
 /// The value array is expected to be null-free; null tracking is supplied
@@ -69,6 +95,16 @@ enum Values<'a> {
 struct View<'a> {
     values: Values<'a>,
     nulls: ArrayView1<'a, bool>,
+}
+
+impl View<'_> {
+    fn wrapping_add(&self, left: i64, right: i64) -> i64 {
+        wrap_integer(left.wrapping_add(right), self.values.integer_width())
+    }
+
+    fn wrapping_mul(&self, left: i64, right: i64) -> i64 {
+        wrap_integer(left.wrapping_mul(right), self.values.integer_width())
+    }
 }
 
 /// Runtime state for one operation, including its output buffer.
@@ -328,8 +364,10 @@ impl<'a> AggregationSet<'a> {
                 }
                 State::Sum(view, values) => {
                     if !view.nulls[source_position] {
-                        values[output_position] = values[output_position]
-                            .wrapping_add(as_i64(&view.values, source_position));
+                        values[output_position] = view.wrapping_add(
+                            values[output_position],
+                            as_i64(&view.values, source_position),
+                        );
                     }
                 }
                 State::SumU64(source, nulls, values) => {
@@ -349,8 +387,10 @@ impl<'a> AggregationSet<'a> {
                 }
                 State::Product(view, values) => {
                     if !view.nulls[source_position] {
-                        values[output_position] = values[output_position]
-                            .wrapping_mul(as_i64(&view.values, source_position));
+                        values[output_position] = view.wrapping_mul(
+                            values[output_position],
+                            as_i64(&view.values, source_position),
+                        );
                     }
                 }
                 State::ProductU64(source, nulls, values) => {
@@ -529,8 +569,8 @@ impl<'a> AggregationSet<'a> {
                         for position in (0..self.source_len).rev() {
                             suffix[position] = suffix[position + 1];
                             if !view.nulls[position] {
-                                suffix[position] =
-                                    suffix[position].wrapping_add(as_i64(&view.values, position));
+                                suffix[position] = view
+                                    .wrapping_add(suffix[position], as_i64(&view.values, position));
                             }
                         }
                         for (row, range) in ranges.iter().enumerate() {
@@ -569,8 +609,8 @@ impl<'a> AggregationSet<'a> {
                         for position in (0..self.source_len).rev() {
                             suffix[position] = suffix[position + 1];
                             if !view.nulls[position] {
-                                suffix[position] =
-                                    suffix[position].wrapping_mul(as_i64(&view.values, position));
+                                suffix[position] = view
+                                    .wrapping_mul(suffix[position], as_i64(&view.values, position));
                             }
                         }
                         for (row, range) in ranges.iter().enumerate() {
@@ -761,8 +801,10 @@ impl<'a> AggregationSet<'a> {
                         for position in 0..self.source_len {
                             prefix[position + 1] = prefix[position];
                             if !view.nulls[position] {
-                                prefix[position + 1] = prefix[position + 1]
-                                    .wrapping_add(as_i64(&view.values, position));
+                                prefix[position + 1] = view.wrapping_add(
+                                    prefix[position + 1],
+                                    as_i64(&view.values, position),
+                                );
                             }
                         }
                         for (row, range) in ranges.iter().enumerate() {
@@ -802,8 +844,10 @@ impl<'a> AggregationSet<'a> {
                         for position in 0..self.source_len {
                             prefix[position + 1] = prefix[position];
                             if !view.nulls[position] {
-                                prefix[position + 1] = prefix[position + 1]
-                                    .wrapping_mul(as_i64(&view.values, position));
+                                prefix[position + 1] = view.wrapping_mul(
+                                    prefix[position + 1],
+                                    as_i64(&view.values, position),
+                                );
                             }
                         }
                         for (row, range) in ranges.iter().enumerate() {
@@ -1194,13 +1238,13 @@ impl<'a> AggregationSet<'a> {
                         if let Some(start) = start {
                             if !view.nulls[row] {
                                 events[*start] =
-                                    events[*start].wrapping_add(as_i64(&view.values, row));
+                                    view.wrapping_add(events[*start], as_i64(&view.values, row));
                             }
                         }
                     }
                     let mut running = 0_i64;
                     for position in 0..self.output_len {
-                        running = running.wrapping_add(events[position]);
+                        running = view.wrapping_add(running, events[position]);
                         output[position] = running;
                     }
                 }
@@ -1248,13 +1292,13 @@ impl<'a> AggregationSet<'a> {
                         if let Some(start) = start {
                             if !view.nulls[row] {
                                 events[*start] =
-                                    events[*start].wrapping_mul(as_i64(&view.values, row));
+                                    view.wrapping_mul(events[*start], as_i64(&view.values, row));
                             }
                         }
                     }
                     let mut running = 1_i64;
                     for position in 0..self.output_len {
-                        running = running.wrapping_mul(events[position]);
+                        running = view.wrapping_mul(running, events[position]);
                         output[position] = running;
                     }
                 }
@@ -1435,13 +1479,13 @@ impl<'a> AggregationSet<'a> {
                         if let Some(end) = end {
                             if !view.nulls[row] {
                                 events[*end - 1] =
-                                    events[*end - 1].wrapping_add(as_i64(&view.values, row));
+                                    view.wrapping_add(events[*end - 1], as_i64(&view.values, row));
                             }
                         }
                     }
                     let mut running = 0_i64;
                     for position in (0..self.output_len).rev() {
-                        running = running.wrapping_add(events[position]);
+                        running = view.wrapping_add(running, events[position]);
                         output[position] = running;
                     }
                 }
@@ -1489,13 +1533,13 @@ impl<'a> AggregationSet<'a> {
                         if let Some(end) = end {
                             if !view.nulls[row] {
                                 events[*end - 1] =
-                                    events[*end - 1].wrapping_mul(as_i64(&view.values, row));
+                                    view.wrapping_mul(events[*end - 1], as_i64(&view.values, row));
                             }
                         }
                     }
                     let mut running = 1_i64;
                     for position in (0..self.output_len).rev() {
-                        running = running.wrapping_mul(events[position]);
+                        running = view.wrapping_mul(running, events[position]);
                         output[position] = running;
                     }
                 }
@@ -1655,7 +1699,7 @@ impl<'a> AggregationSet<'a> {
                             if !view.nulls[row] {
                                 let value = as_i64(&view.values, row);
                                 for slot in &mut output[*start..*end] {
-                                    *slot = slot.wrapping_add(value);
+                                    *slot = view.wrapping_add(*slot, value);
                                 }
                             }
                         }
@@ -1694,7 +1738,7 @@ impl<'a> AggregationSet<'a> {
                             if !view.nulls[row] {
                                 let value = as_i64(&view.values, row);
                                 for slot in &mut output[*start..*end] {
-                                    *slot = slot.wrapping_mul(value);
+                                    *slot = view.wrapping_mul(*slot, value);
                                 }
                             }
                         }
@@ -1950,9 +1994,9 @@ fn update_signed_segment_ranges(
     // each tree node represents one contiguous half-open source block.
     for node in (1..length).rev() {
         tree[node] = if product {
-            tree[node * 2].wrapping_mul(tree[node * 2 + 1])
+            view.wrapping_mul(tree[node * 2], tree[node * 2 + 1])
         } else {
-            tree[node * 2].wrapping_add(tree[node * 2 + 1])
+            view.wrapping_add(tree[node * 2], tree[node * 2 + 1])
         };
     }
 
@@ -1977,18 +2021,18 @@ fn update_signed_segment_ranges(
         while start < end {
             if start & 1 == 1 {
                 total = if product {
-                    total.wrapping_mul(tree[start])
+                    view.wrapping_mul(total, tree[start])
                 } else {
-                    total.wrapping_add(tree[start])
+                    view.wrapping_add(total, tree[start])
                 };
                 start += 1;
             }
             if end & 1 == 1 {
                 end -= 1;
                 total = if product {
-                    total.wrapping_mul(tree[end])
+                    view.wrapping_mul(total, tree[end])
                 } else {
-                    total.wrapping_add(tree[end])
+                    view.wrapping_add(total, tree[end])
                 };
             }
             start /= 2;
@@ -2094,9 +2138,9 @@ fn update_signed_ranges(
             }
             let value = as_i64(&view.values, position);
             total = if product {
-                total.wrapping_mul(value)
+                view.wrapping_mul(total, value)
             } else {
-                total.wrapping_add(value)
+                view.wrapping_add(total, value)
             };
         }
         output[row] = total;
@@ -2504,9 +2548,9 @@ fn update_reverse_signed_ranges(
         let value = as_i64(&view.values, row);
         for slot in &mut output[*start..*end] {
             *slot = if product {
-                slot.wrapping_mul(value)
+                view.wrapping_mul(*slot, value)
             } else {
-                slot.wrapping_add(value)
+                view.wrapping_add(*slot, value)
             };
         }
     }
@@ -2571,6 +2615,23 @@ fn update_reverse_range_extreme(
                 *slot = row as i64;
             }
         }
+    }
+}
+
+/// Reduce an `i64` value to the source integer width before storing it.
+///
+/// The accumulator remains represented as `i64` for the existing output
+/// contract, but every update is reduced to the source width so narrow
+/// integer overflow wraps where the input dtype would wrap.
+fn wrap_integer(value: i64, width: IntegerWidth) -> i64 {
+    match width {
+        IntegerWidth::I64 => value,
+        IntegerWidth::I32 => value as i32 as i64,
+        IntegerWidth::I16 => value as i16 as i64,
+        IntegerWidth::I8 => value as i8 as i64,
+        IntegerWidth::U32 => (value as u32) as i64,
+        IntegerWidth::U16 => (value as u16) as i64,
+        IntegerWidth::U8 => (value as u8) as i64,
     }
 }
 

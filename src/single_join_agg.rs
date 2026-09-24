@@ -116,8 +116,9 @@ use crate::single_join::{range_bounds, visit_not_equal_pairs_core};
 /// Integer `sum` and `prod` use fixed-width wrapping arithmetic at the source
 /// dtype width. This intentionally differs from pandas, which may promote an
 /// integer result when an operation overflows. Floating-point aggregation
-/// uses the corresponding `f32` or `f64` arithmetic. Arithmetic used for
-/// positions, lengths, and allocation sizes remains checked.
+/// uses `f64` arithmetic and returns `f64` results for both `f32` and `f64`
+/// inputs. Arithmetic used for positions, lengths, and allocation sizes
+/// remains checked.
 ///
 /// # Errors
 ///
@@ -572,6 +573,53 @@ mod tests {
             let outputs_value = result.get_item(1)?;
             let outputs = outputs_value.cast::<PyList>()?;
             assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![30, 30]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn narrow_integer_sum_and_product_wrap_at_source_width() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left = PyArray1::from_vec(py, vec![1_u8]);
+            let right = PyArray1::from_vec(py, vec![2_u8, 3]);
+            let values = PyArray1::from_vec(py, vec![250_u8, 10]);
+            let mask = PyArray1::from_vec(py, vec![false, false]);
+            let sum = PyTuple::new(
+                py,
+                [
+                    values.clone().into_any(),
+                    mask.clone().into_any(),
+                    "sum".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let product = PyTuple::new(
+                py,
+                [
+                    values.into_any(),
+                    mask.into_any(),
+                    "prod".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let aggregations = PyList::new(py, [sum, product])?;
+            let result = single_join_aggregate_uint8(
+                py,
+                left.readonly(),
+                right.readonly(),
+                "<",
+                None,
+                None,
+                None,
+                None,
+                false,
+                &aggregations,
+            )?
+            .expect("the range has matching candidates");
+            let outputs_value = result.get_item(1)?;
+            let outputs = outputs_value.cast::<PyList>()?;
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![4]);
+            assert_eq!(outputs.get_item(1)?.extract::<Vec<i64>>()?, vec![196]);
             Ok(())
         })
         .unwrap();

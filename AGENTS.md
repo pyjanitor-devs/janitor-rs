@@ -1086,8 +1086,8 @@ Fused aggregation intentionally differs from pandas for integer arithmetic:
 `sum` and `prod` use fixed-width Rust wrapping semantics rather than pandas'
 dtype promotion on overflow. This is a public dtype-specific contract and
 must remain documented and covered by boundary-value tests. Floating-point
-aggregation uses the corresponding `f32` or `f64` arithmetic; position,
-length, and allocation calculations remain checked.
+aggregation uses `f64` arithmetic and returns `f64` for both `f32` and `f64`
+inputs; position, length, and allocation calculations remain checked.
 
 Count-like aggregation has a separate dtype-independent contract. `size`
 uses the wildcard `("*", "size")` request and counts every successful
