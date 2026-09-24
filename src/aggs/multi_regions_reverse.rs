@@ -162,12 +162,11 @@ mod tests {
             let right_region = PyArray1::from_vec(py, vec![1_i64, 2, 3]);
             let starts = PyArray1::from_vec(py, vec![0_i64]);
             let right_index = PyArray1::from_vec(py, vec![30_i64, 10, 20]);
-            let values = PyArray1::from_vec(py, vec![7_i64]);
             let mask = PyArray1::from_vec(py, vec![false]);
             let aggregation = PyTuple::new(
                 py,
                 [
-                    values.into_any(),
+                    "*".into_pyobject(py).unwrap().into_any(),
                     mask.into_any(),
                     "count".into_pyobject(py).unwrap().into_any(),
                 ],

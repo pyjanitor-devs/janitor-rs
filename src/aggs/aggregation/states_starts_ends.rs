@@ -107,7 +107,7 @@ mod tests {
             let count = PyTuple::new(
                 py,
                 [
-                    values.clone().into_any(),
+                    "*".into_pyobject(py).unwrap().into_any(),
                     mask.clone().into_any(),
                     "count".into_pyobject(py).unwrap().into_any(),
                 ],

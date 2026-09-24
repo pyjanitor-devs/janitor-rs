@@ -171,11 +171,20 @@ mod tests {
                 )
                 .unwrap()
             };
+            let count = PyTuple::new(
+                py,
+                [
+                    "*".into_pyobject(py).unwrap().into_any(),
+                    mask.clone().into_any(),
+                    "count".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap();
             let aggregations = PyList::new(
                 py,
                 [
                     aggregation("sum"),
-                    aggregation("count"),
+                    count,
                     aggregation("prod"),
                     aggregation("min"),
                     aggregation("max"),

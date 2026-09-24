@@ -194,7 +194,7 @@ mod tests {
             let non_null_count = PyTuple::new(
                 py,
                 [
-                    values.into_any(),
+                    "*".into_pyobject(py).unwrap().into_any(),
                     mask.into_any(),
                     "count".into_pyobject(py).unwrap().into_any(),
                 ],
