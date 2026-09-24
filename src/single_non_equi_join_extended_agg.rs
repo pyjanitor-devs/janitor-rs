@@ -393,11 +393,15 @@ fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
 /// Run fused aggregation for an all-`!=` extended join.
 ///
 /// The first tuple uses the thirteen-element null-aware aggregation contract.
-/// The legacy eleven-element form remains accepted during migration. Its
-/// filtered value arrays and physical position partitions generate candidate
-/// pairs. Every later tuple is a residual predicate over the full physical
-/// layouts. No pair tape is materialized; successful candidates update the
-/// aggregation state immediately.
+/// The eleven-element form is the corresponding index-generation contract;
+/// it is intentionally not described as an aggregation fallback because it
+/// does not contain the output-layout positions required by aggregation.
+/// Both forms contain filtered value arrays and physical position partitions
+/// for candidate generation. The aggregation form additionally supplies the
+/// complete physical-to-compact output layouts. Every later tuple is a
+/// residual predicate over the full physical layouts. No pair tape is
+/// materialized; successful candidates update the aggregation state
+/// immediately.
 ///
 /// # Arguments
 ///
@@ -495,9 +499,11 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
 /// Validate the first extended predicate and dispatch to its fused traversal.
 ///
 /// The first tuple is the algorithm anchor. A six- or eight-element tuple is a
-/// range anchor; an eleven-element tuple is the null-aware all-`!=` anchor. The
-/// tuple shape is deliberately checked here so malformed Python input fails
-/// before any aggregation state or candidate loop is created.
+/// range anchor; an eleven-element tuple is the null-aware all-`!=` index
+/// anchor, while a thirteen-element tuple is the corresponding aggregation
+/// anchor with output-layout positions. The tuple shape is deliberately
+/// checked here so malformed Python input fails before any aggregation state
+/// or candidate loop is created.
 ///
 /// # Arguments
 ///
@@ -652,8 +658,9 @@ macro_rules! extended_aggregation_functions {
         /// predicates.
         ///
         /// The first predicate must be either a range comparator (`<`, `<=`,
-        /// `>`, `>=`) or the null-aware eleven-element `!=` form. Remaining
-        /// predicates are aligned residual filters. Aggregation is performed
+        /// `>`, `>=`) or the null-aware thirteen-element `!=` aggregation
+        /// form. The eleven-element form belongs to index generation.
+        /// Remaining predicates are aligned residual filters. Aggregation is performed
         /// as candidates pass the first predicate and all residual filters;
         /// no intermediate pair indices are returned or allocated.
         ///
