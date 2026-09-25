@@ -324,10 +324,7 @@ impl<'a> AggregationSet<'a> {
         if source_position >= self.source_len || output_position >= self.output_len {
             return;
         }
-        self.successful = true;
-        if let Some(matched) = &mut self.matched {
-            matched[output_position] = true;
-        }
+        self.mark_matched(output_position);
         // One successful comparison is one event. Broadcast that event to
         // every requested aggregation before moving to the next candidate.
         // This is the central multi-aggregation benefit: predicates and
@@ -868,11 +865,37 @@ impl<'a> AggregationSet<'a> {
     fn mark_ranges(&mut self, ranges: &[Option<(usize, usize)>]) {
         for (row, range) in ranges.iter().enumerate() {
             if range.is_some() {
-                if let Some(matched) = &mut self.matched {
-                    matched[row] = true;
-                }
-                self.successful = true;
+                self.mark_matched(row);
             }
+        }
+    }
+
+    /// Mark one output slot as matched.
+    ///
+    /// `successful` is always updated, while the boolean vector is updated
+    /// only when the caller requested matched metadata. Keeping that policy in
+    /// one helper prevents comparison and range paths from drifting apart.
+    #[inline]
+    fn mark_matched(&mut self, output_position: usize) {
+        // `successful` answers whether any pair matched at all and is needed
+        // even when the caller did not request the public matched array.
+        // Keeping the allocation optional avoids building an O(output_len)
+        // boolean buffer for callers that only need aggregation values.
+        self.successful = true;
+        if let Some(matched) = &mut self.matched {
+            matched[output_position] = true;
+        }
+    }
+
+    /// Mark every output slot in one valid half-open range as matched.
+    #[inline]
+    fn mark_matched_range(&mut self, start: usize, end: usize) {
+        // Reverse range kernels discover whole half-open output intervals at
+        // once. Mark the interval in one fill rather than visiting each slot
+        // through the per-pair update path.
+        self.successful = true;
+        if let Some(matched) = &mut self.matched {
+            matched[start..end].fill(true);
         }
     }
 
@@ -1746,30 +1769,21 @@ impl<'a> AggregationSet<'a> {
     /// Mark every right position covered by at least one valid suffix.
     fn mark_reverse_suffixes(&mut self, starts: &[Option<usize>]) {
         for start in starts.iter().flatten() {
-            if let Some(matched) = &mut self.matched {
-                matched[*start..].fill(true);
-            }
-            self.successful = true;
+            self.mark_matched_range(*start, self.output_len);
         }
     }
 
     /// Mark every right position covered by at least one valid prefix.
     fn mark_reverse_prefixes(&mut self, ends: &[Option<usize>]) {
         for end in ends.iter().flatten() {
-            if let Some(matched) = &mut self.matched {
-                matched[..*end].fill(true);
-            }
-            self.successful = true;
+            self.mark_matched_range(0, *end);
         }
     }
 
     /// Mark every right position covered by an arbitrary valid interval.
     fn mark_reverse_ranges(&mut self, ranges: &[Option<(usize, usize)>]) {
         for (start, end) in ranges.iter().flatten() {
-            if let Some(matched) = &mut self.matched {
-                matched[*start..*end].fill(true);
-            }
-            self.successful = true;
+            self.mark_matched_range(*start, *end);
         }
     }
 
@@ -2686,10 +2700,17 @@ fn kahan_add(total: &mut f64, compensation: &mut f64, value: f64) {
 }
 
 /// Kahan addition using `f32` storage and arithmetic.
+///
+/// The compensation reset mirrors [`kahan_add`]. An infinite input can make
+/// the compensation `NaN` even when the running total is a valid infinity;
+/// carrying that `NaN` into the next update would poison the total.
 fn kahan_add_f32(total: &mut f32, compensation: &mut f32, value: f32) {
     let adjusted = value - *compensation;
     let next = *total + adjusted;
     *compensation = (next - *total) - adjusted;
+    if !compensation.is_finite() {
+        *compensation = 0.;
+    }
     *total = next;
 }
 /// Return whether the candidate at `a` is strictly less than the current
@@ -2731,5 +2752,26 @@ fn is_greater(view: &View<'_>, a: usize, b: usize) -> bool {
         Values::U8(v) => v[a] > v[b],
         Values::F64(v) => v[a] > v[b],
         Values::F32(v) => v[a] > v[b],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kahan_add_f32;
+
+    #[test]
+    fn kahan_add_f32_resets_non_finite_compensation() {
+        let mut total = 5.0_f32;
+        let mut compensation = 0.0_f32;
+
+        kahan_add_f32(&mut total, &mut compensation, f32::INFINITY);
+        assert_eq!(total, f32::INFINITY);
+        assert_eq!(compensation, 0.0);
+
+        // A finite value after infinity must preserve the valid infinite
+        // total instead of becoming NaN through stale compensation.
+        kahan_add_f32(&mut total, &mut compensation, 3.0);
+        assert_eq!(total, f32::INFINITY);
+        assert_eq!(compensation, 0.0);
     }
 }

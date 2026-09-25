@@ -1095,3 +1095,29 @@ comparison. `count` uses `("*", null_mask, "count")` and consults only the
 authoritative boolean mask, so strings, objects, and extension values do not
 enter numeric dtype dispatch. Value reductions still require supported numeric
 arrays and their aligned masks.
+
+### [2026-09-25] Extended aggregation tuple contracts
+
+**Context**: Auditing extended aggregation dispatch and physical-position
+mapping.
+**Learning**: The eight-element range anchor stores its output-layout position
+arrays in fields 5 and 6; fields 1 and 3 are the predicate index arrays. The
+thirteen-element `!=` anchor is the aggregation-only form and carries the
+complete output-layout mappings in fields 10 and 11. The eleven-element
+`!=` form belongs to index generation and must be rejected by aggregation.
+
+**Recommendation**: Keep tuple-shape validation explicit at the aggregation
+boundary and pass the selected output-position mapping through the returned
+result. Do not infer an identity mapping when the physical and compact layouts
+differ.
+
+### [2026-09-25] Floating-point compensation must recover after infinity
+
+**Context**: Comparing the f32 and f64 Kahan update helpers.
+**Learning**: Adding an infinity can leave the compensation value as `NaN`
+even when the running total is a valid infinity. A later finite update then
+becomes `NaN` unless the non-finite compensation is reset.
+
+**Recommendation**: Keep the f32 and f64 compensation guards symmetrical and
+test an infinity followed by a finite value in both direct and boundary-sweep
+aggregation paths.

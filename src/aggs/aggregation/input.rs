@@ -16,7 +16,7 @@
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyList, PyString, PyTuple};
 
 /// Operation requested for one aggregation input.
 ///
@@ -191,7 +191,21 @@ pub(crate) fn parse_inputs<'py>(
             .get_item(1)?
             .extract::<PyReadonlyArray1<'py, bool>>()?;
         let op = AggregationOp::parse(&tuple.get_item(2)?)?;
-        if array.extract::<String>().ok().as_deref() == Some("*") {
+        // ELI5: `"*"` is a deliberate sentinel meaning "there is no value
+        // array; use only this mask". A normal request starts with a NumPy
+        // array, so checking for Python's string type tells us which input
+        // shape we received without relying on a failed array conversion.
+        //
+        // Do not replace this with unconditional array extraction: wildcard
+        // count is specifically what lets strings, objects, categoricals,
+        // and extension values use the dtype-independent mask path.
+        if array.is_instance_of::<PyString>() {
+            let wildcard = array.extract::<&str>()?;
+            if wildcard != "*" {
+                return Err(PyValueError::new_err(
+                    "three-element wildcard aggregations must use '*' as the first value",
+                ));
+            }
             if op != AggregationOp::CountNonNull {
                 return Err(PyValueError::new_err("wildcard aggregation must use count"));
             }

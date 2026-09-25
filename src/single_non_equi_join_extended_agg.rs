@@ -393,15 +393,13 @@ fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
 /// Run fused aggregation for an all-`!=` extended join.
 ///
 /// The first tuple uses the thirteen-element null-aware aggregation contract.
-/// The eleven-element form is the corresponding index-generation contract;
-/// it is intentionally not described as an aggregation fallback because it
-/// does not contain the output-layout positions required by aggregation.
-/// Both forms contain filtered value arrays and physical position partitions
-/// for candidate generation. The aggregation form additionally supplies the
-/// complete physical-to-compact output layouts. Every later tuple is a
-/// residual predicate over the full physical layouts. No pair tape is
-/// materialized; successful candidates update the aggregation state
-/// immediately.
+/// The eleven-element form belongs to index generation and is rejected here:
+/// it does not contain the output-layout positions required by aggregation.
+/// The thirteen-element form contains filtered value arrays and physical
+/// position partitions for candidate generation, followed by complete
+/// physical-to-compact output layouts. Every later tuple is a residual
+/// predicate over the full physical layouts. No pair tape is materialized;
+/// successful candidates update the aggregation state immediately.
 ///
 /// # Arguments
 ///
@@ -487,10 +485,18 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
     if set.is_empty() {
         return Ok(None);
     }
+    // The accumulator is stored in the trimmed layout described by the
+    // selected output map. Returning `None` here would make the Python side
+    // fabricate an identity map and silently mislabel reordered `!=` results.
+    let output_positions = if reverse {
+        right_output_positions.as_array()
+    } else {
+        left_output_positions.as_array()
+    };
     Ok(Some(make_results_with_positions(
         py,
         set,
-        None,
+        Some(output_positions),
         output_len,
         return_matched,
     )?))
@@ -499,11 +505,11 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
 /// Validate the first extended predicate and dispatch to its fused traversal.
 ///
 /// The first tuple is the algorithm anchor. A six- or eight-element tuple is a
-/// range anchor; an eleven-element tuple is the null-aware all-`!=` index
-/// anchor, while a thirteen-element tuple is the corresponding aggregation
-/// anchor with output-layout positions. The tuple shape is deliberately
-/// checked here so malformed Python input fails before any aggregation state
-/// or candidate loop is created.
+/// range anchor; a thirteen-element tuple is the null-aware all-`!=`
+/// aggregation anchor with output-layout positions. The eleven-element
+/// all-`!=` tuple belongs to index generation and is rejected here. The tuple
+/// shape is deliberately checked before any aggregation state or candidate
+/// loop is created.
 ///
 /// # Arguments
 ///
@@ -533,57 +539,75 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
             "single extended aggregation requires at least two predicates",
         ));
     }
-    let op_position = match first.len() {
-        6 => 5,
-        8 => 7,
-        11 => 10,
-        13 => 12,
+    // Aggregation has three supported anchor layouts:
+    //
+    // * 6 elements: the compact range contract;
+    // * 8 elements: the range contract plus trimmed output-position maps;
+    // * 13 elements: the null-aware `!=` aggregation contract.
+    //
+    // The 11-element `!=` tuple is intentionally absent. It is the index-only
+    // contract and lacks the maps needed to place aggregation results safely.
+    // Rejecting it here prevents identity-position output from appearing
+    // correct when the physical and compact layouts differ.
+    match first.len() {
+        6 | 8 | 13 => {}
         _ => {
             return Err(PyValueError::new_err(
-                "the first extended predicate must contain 6, 8, 11, or 13 elements",
-            ))
-        }
-    };
-    let op = CompareOp::try_from_str(first.get_item(op_position)?.extract::<&str>()?)?;
-    if op != CompareOp::Ne {
-        if first.len() != 6 && first.len() != 8 {
-            return Err(PyValueError::new_err(
-                "the first range predicate must contain 6 or 8 elements",
+                "the first extended aggregation predicate must contain 6, 8, or 13 elements",
             ));
         }
+    }
+    // Every accepted anchor puts its comparator in the final field. Reading
+    // it once after structural validation keeps tuple-length handling separate
+    // from operator validation and avoids one bespoke opcode branch per shape.
+    let op = CompareOp::try_from_str(first.get_item(first.len() - 1)?.extract::<&str>()?)?;
+    if first.len() != 13 {
         if !matches!(
             op,
             CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
         ) {
             return Err(PyValueError::new_err(
-                "single extended aggregation requires a range predicate first",
+                "the range aggregation predicate must use <, <=, >, or >=",
             ));
         }
         first.get_item(4)?.extract::<bool>()?;
-        let left_positions = first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?;
-        let right_positions = first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?;
-        let (left_output_len, right_output_len) = if first.len() == 8 {
-            (left_positions.len()?, right_positions.len()?)
-        } else {
+        let (left_output_positions, right_output_positions) = if first.len() == 8 {
+            // In the eight-element range form, fields 1 and 3 identify the
+            // predicate arrays' physical labels. Fields 5 and 6 identify the
+            // trimmed output layout used by aggregation and returned to
+            // Python; they must not be substituted for one another.
             (
-                first
-                    .get_item(0)?
-                    .extract::<PyReadonlyArray1<'py, T>>()?
-                    .len()?,
-                first
-                    .get_item(2)?
-                    .extract::<PyReadonlyArray1<'py, T>>()?
-                    .len()?,
+                Some(first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?),
+                Some(first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?),
             )
-        };
-        let calculation_output_positions = if first.len() == 8 {
-            Some(if reverse {
-                right_positions.as_array()
-            } else {
-                left_positions.as_array()
-            })
         } else {
-            None
+            (None, None)
+        };
+        let (left_output_len, right_output_len) =
+            if let (Some(left_output_positions), Some(right_output_positions)) =
+                (&left_output_positions, &right_output_positions)
+            {
+                (left_output_positions.len()?, right_output_positions.len()?)
+            } else {
+                (
+                    first
+                        .get_item(0)?
+                        .extract::<PyReadonlyArray1<'py, T>>()?
+                        .len()?,
+                    first
+                        .get_item(2)?
+                        .extract::<PyReadonlyArray1<'py, T>>()?
+                        .len()?,
+                )
+            };
+        let calculation_output_positions = match (
+            reverse,
+            left_output_positions.as_ref(),
+            right_output_positions.as_ref(),
+        ) {
+            (true, _, Some(right_output_positions)) => Some(right_output_positions.as_array()),
+            (false, Some(left_output_positions), _) => Some(left_output_positions.as_array()),
+            _ => None,
         };
         return run_range(
             py,
@@ -602,9 +626,9 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
             reverse,
         );
     }
-    if first.len() != 11 && first.len() != 13 {
+    if op != CompareOp::Ne {
         return Err(PyValueError::new_err(
-            "the first != predicate must contain 11 or 13 elements",
+            "the thirteen-element aggregation predicate must use !=",
         ));
     }
     let left_null_positions = if first.get_item(3)?.is_none() {
@@ -617,21 +641,12 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
     } else {
         Some(first.get_item(7)?.extract::<PyReadonlyArray1<'py, i64>>()?)
     };
-    let (left_output_positions, right_output_positions) = if first.len() == 13 {
-        (
-            first
-                .get_item(10)?
-                .extract::<PyReadonlyArray1<'py, i64>>()?,
-            first
-                .get_item(11)?
-                .extract::<PyReadonlyArray1<'py, i64>>()?,
-        )
-    } else {
-        (
-            first.get_item(2)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-            first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        )
-    };
+    let left_output_positions = first
+        .get_item(10)?
+        .extract::<PyReadonlyArray1<'py, i64>>()?;
+    let right_output_positions = first
+        .get_item(11)?
+        .extract::<PyReadonlyArray1<'py, i64>>()?;
     run_not_equal(
         py,
         predicates,
@@ -870,6 +885,55 @@ mod tests {
     }
 
     #[test]
+    fn range_aggregation_uses_eight_element_output_position_fields() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![4_i64, 6]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64, 200]).into_any(),
+                    PyArray1::from_vec(py, vec![5_i64, 7]).into_any(),
+                    PyArray1::from_vec(py, vec![400_i64, 300]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 0]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![4_i64, 6]).into_any(),
+                    PyArray1::from_vec(py, vec![5_i64, 7]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let values = PyArray1::from_vec(py, vec![10_i64, 20]);
+            let mask = PyArray1::from_vec(py, vec![false, false]);
+            let aggregation = PyTuple::new(
+                py,
+                [
+                    values.into_any(),
+                    mask.into_any(),
+                    "sum".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let aggregations = PyList::new(py, [aggregation])?;
+            let result =
+                single_join_extended_aggregate_int64(py, &predicates, &aggregations, true)?
+                    .expect("the range join has matches");
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![1, 0]);
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![30, 20]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn all_not_equal_residuals_aggregate_without_materializing_pairs() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
@@ -952,7 +1016,7 @@ mod tests {
                 [
                     PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
                     PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
-                    "==".into_pyobject(py)?.into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
             let values = PyArray1::from_vec(py, vec![100_i64, 200]);
@@ -1026,6 +1090,48 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "ValueError: all-!= joins require every predicate to use !="
+            );
+
+            let legacy_predicate = PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    py.None().into_pyobject(py)?.into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    py.None().into_pyobject(py)?.into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let legacy_predicates = PyList::new(py, [legacy_predicate])?;
+            let legacy_predicates = {
+                let predicates = PyList::empty(py);
+                predicates.append(legacy_predicates.get_item(0)?)?;
+                predicates.append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                        "!=".into_pyobject(py)?.into_any(),
+                    ],
+                )?)?;
+                predicates
+            };
+            let error = single_join_extended_aggregate_int64(
+                py,
+                &legacy_predicates,
+                &aggregations,
+                true,
+            )
+            .expect_err("the index-only eleven-element tuple must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "ValueError: the first extended aggregation predicate must contain 6, 8, or 13 elements"
             );
             Ok(())
         })
