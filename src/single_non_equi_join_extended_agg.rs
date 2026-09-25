@@ -1009,7 +1009,7 @@ mod tests {
                     false.into_pyobject(py)?.to_owned().into_any(),
                     false.into_pyobject(py)?.to_owned().into_any(),
                     PyArray1::from_vec(py, vec![1_i64, 0]).into_any(),
-                    PyArray1::from_vec(py, vec![1_i64, 0]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
                     "!=".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
@@ -1042,7 +1042,7 @@ mod tests {
             );
             let outputs_item = result.get_item(2)?;
             let outputs = outputs_item.cast::<PyList>()?;
-            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![200, 100]);
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![100, 200]);
             Ok(())
         })
         .unwrap();
