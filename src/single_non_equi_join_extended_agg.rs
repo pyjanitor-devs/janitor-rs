@@ -925,6 +925,64 @@ mod tests {
     }
 
     #[test]
+    fn not_equal_aggregation_maps_reordered_physical_positions_to_compact_slots() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![10_i64, 20]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 0]).into_any(),
+                    py.None().into_pyobject(py)?.into_any(),
+                    PyArray1::from_vec(py, vec![100_i64, 200]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64, 200]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 0]).into_any(),
+                    py.None().into_pyobject(py)?.into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 0]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 0]).into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                    "==".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let values = PyArray1::from_vec(py, vec![100_i64, 200]);
+            let mask = PyArray1::from_vec(py, vec![false, false]);
+            let aggregation = PyTuple::new(
+                py,
+                [
+                    values.into_any(),
+                    mask.into_any(),
+                    "sum".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let aggregations = PyList::new(py, [aggregation])?;
+            let result =
+                single_join_extended_aggregate_int64(py, &predicates, &aggregations, true)?
+                    .expect("the reordered not-equal layout has matches");
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![1, 0]);
+            assert_eq!(
+                result.get_item(1)?.extract::<Vec<bool>>()?,
+                vec![true, true]
+            );
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![100, 200]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn not_equal_aggregation_rejects_non_not_equal_residuals() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
