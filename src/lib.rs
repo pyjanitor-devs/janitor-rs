@@ -1,18 +1,17 @@
 use pyo3::prelude::*;
 mod aggs;
+mod anchor_non_equi_join;
+mod anchor_non_equi_join_agg;
 mod bin_search;
-mod extended;
-mod extended_join_agg;
 mod index_builder;
+mod join_aggregation_helpers;
+mod join_candidate_materialization;
 mod join_common;
 mod multi_join_indices;
 mod op;
 mod predicate;
 mod range_join;
 mod range_join_agg;
-mod single_non_equi_join;
-mod single_non_equi_join_agg;
-mod single_non_equi_join_extended;
 
 /// Narrow Rust-only surface used by `benches/kernels.rs`.
 ///
@@ -264,12 +263,10 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     bin_search::register(m)?;
     multi_join_indices::register(m)?;
     index_builder::register(m)?;
-    single_non_equi_join::register(m)?;
+    anchor_non_equi_join::register(m)?;
     range_join::register(m)?;
     range_join_agg::register(m)?;
-    single_non_equi_join_agg::register(m)?;
-    extended_join_agg::register(m)?;
-    single_non_equi_join_extended::register(m)?;
+    anchor_non_equi_join_agg::register(m)?;
     aggs::register(m)?;
     Ok(())
 }

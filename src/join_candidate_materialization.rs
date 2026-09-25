@@ -1,6 +1,6 @@
-//! Shared residual filtering and materialization for extended joins.
+//! Shared residual filtering and materialization for join candidates.
 //!
-//! The single-predicate and two-range extended wrappers construct candidates
+//! The single-anchor and two-range join wrappers construct candidates
 //! differently, but once candidates exist they use the same rules:
 //!
 //! - evaluate every residual predicate before applying `keep`;
@@ -37,7 +37,7 @@ use crate::predicate::{null_metadata_views, predicates_match_dispatch, NullMetad
 ///
 /// Returns an error for misaligned positions, invalid candidate bounds, or an
 /// output allocation that exceeds platform capacity.
-pub(crate) fn materialize_windows_for_non_ne(
+pub(crate) fn materialize_range_candidates(
     windows: &SingleJoinResult,
     predicates: &[Predicate<'_>],
     metadata: Option<&[NullMetadata<'_>]>,
@@ -166,7 +166,7 @@ pub(crate) fn materialize_windows_for_non_ne(
 /// # Returns
 ///
 /// Flat materialized label pairs, or empty vectors when no candidate survives.
-pub(crate) fn materialize_pairs_for_ne(
+pub(crate) fn materialize_not_equal_candidates(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     left_positions: &[usize],

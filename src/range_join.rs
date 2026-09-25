@@ -13,11 +13,11 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use crate::aggs::ensure_equal_lengths_core;
 use crate::aggs::max::max_starts_ends::max_start_end_core;
 use crate::aggs::min::min_starts_ends::min_start_end_core;
-use crate::extended::materialize_windows_for_non_ne;
+use crate::anchor_non_equi_join::range_window;
+use crate::join_candidate_materialization::materialize_range_candidates;
 use crate::join_common::{result_dict, Keep, SingleJoinResult};
 use crate::op::CompareOp;
 use crate::predicate::parse_predicates_with_nulls_strings;
-use crate::single_non_equi_join::range_window;
 
 /// A typed range predicate used by the basic two-range kernel.
 ///
@@ -271,9 +271,10 @@ pub(crate) struct ParsedRangePredicate<'py, T: numpy::Element> {
 /// The tuple is `(left, left_index, right, right_index,
 /// right_index_is_ordered, comparator)`. Values are expected to be non-null
 /// and sorted on the right side before this function is called. Rust trusts
-/// that preparation. The ordering flag is validated for the shared wrapper
-/// contract, but arbitrary-window `first`/`last` selection uses range extrema
-/// instead of prefix/suffix tables.
+/// that preparation. The ordering flag is part of the shared wrapper
+/// contract, not an aggregation input: its value is validated but not used
+/// to choose an aggregation algorithm. Arbitrary-window `first`/`last`
+/// selection uses range extrema instead of prefix/suffix tables.
 ///
 /// # Errors
 ///
@@ -283,8 +284,9 @@ pub(crate) struct ParsedRangePredicate<'py, T: numpy::Element> {
 /// # Arguments
 ///
 /// * `tuple` - The six-element Python tuple at the Rust boundary. The first
-///   four fields are aligned value/label arrays, field four is the validated
-///   ordering flag, and the final field is the string comparator.
+///   four fields are aligned value/label arrays, field four is the shared
+///   ordering flag (validated but ignored by aggregation), and the final
+///   field is the string comparator.
 ///
 /// # Returns
 ///
@@ -303,6 +305,10 @@ pub(crate) fn parse_range_predicate<'py, T: numpy::Element>(
     let left_index = tuple.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?;
     let right = tuple.get_item(2)?.extract::<PyReadonlyArray1<'py, T>>()?;
     let right_index = tuple.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?;
+    // The ordering flag is part of the shared predicate tuple contract.
+    // Aggregation does not use its value: PyJanitor has already sorted the
+    // right-hand arrays before calling Rust. Extract it only to validate the
+    // tuple shape and field type.
     tuple.get_item(4)?.extract::<bool>()?;
     let op = CompareOp::try_from_str(tuple.get_item(5)?.extract::<&str>()?)?;
     Ok(ParsedRangePredicate {
@@ -556,7 +562,7 @@ fn extended_join<'py, T: numpy::Element + PartialOrd + Copy>(
         return Ok(None);
     }
     let (out_left, out_right) =
-        materialize_windows_for_non_ne(&windows, &parsed, metadata.as_deref(), keep)
+        materialize_range_candidates(&windows, &parsed, metadata.as_deref(), keep)
             .map_err(PyValueError::new_err)?;
     if out_left.is_empty() {
         return Ok(None);

@@ -3,14 +3,339 @@
 //! The two range predicates are intersected into one half-open window per
 //! left row. The windows are then passed to the existing optimized
 //! `AggregationSet` range machinery; no pair indices are materialized.
+//!
+//! This module contains two related public entry-point families:
+//!
+//! * `range_join_aggregate_*` handles exactly two range predicates and uses
+//!   the optimized prefix/suffix range kernels directly.
+//! * `range_join_extended_aggregate_*` handles the same two range anchors and
+//!   then evaluates any later predicates as residual filters before updating
+//!   aggregation state.
+//!
+//! PyJanitor is responsible for removing null rows, aligning each predicate's
+//! arrays, and sorting the right-hand range arrays in ascending order before
+//! calling these functions. Rust validates the tuple shape and lengths but
+//! does not sort the input.
 
 use numpy::ndarray::ArrayView1;
+use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
 use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
-use crate::range_join::{build_windows, parse_range_predicate, RangePredicate};
+use crate::join_aggregation_helpers::{aggregate_range_windows, check_residual_lengths, residuals};
+use crate::op::CompareOp;
+use crate::range_join::{
+    build_windows, parse_range_predicate, ParsedRangePredicate, RangePredicate,
+};
+
+/// Aggregate a range-led extended join with two confirmed range anchors.
+///
+/// The first two predicates are parsed as ascending range predicates. Their
+/// half-open windows are intersected before predicates three onward are
+/// evaluated as residual filters. Aggregation state is updated only after all
+/// residual predicates pass; no intermediate pair index is materialized.
+///
+/// This belongs beside the basic two-range aggregation entry points because
+/// its defining operation is dual-range window construction. The single
+/// extended aggregation path uses `run_range` for one anchor and treats every
+/// later predicate as a residual instead.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token used to parse residual tuples and
+///   construct the returned aggregation tuple.
+/// * `predicates` - At least two aligned predicates. The first predicate may
+///   use the six-element range tuple
+///   `(left, left_index, right, right_index, right_index_is_ordered,
+///   comparator)`, or the eight-element form with output-position arrays in
+///   fields five and six. The second predicate uses the six-element form.
+///   Predicates after the first two are residual filters evaluated in order.
+/// * `first` - The already-parsed first range anchor, including its borrowed
+///   arrays and aligned index labels.
+/// * `aggregations` - Non-empty aggregation requests over the source layout.
+/// * `output_positions` - Optional compact-to-physical output mapping from the
+///   eight-element first-anchor contract. The selected map is the left map in
+///   forward mode and the right map in reverse mode; each entry identifies the
+///   original physical row represented by that compact aggregation slot.
+/// * `output_len` - Number of compact output slots in the selected forward or
+///   reverse layout. It must equal the length of the selected output map when
+///   that map is supplied.
+/// * `return_matched` - Whether to include the per-output matched mask.
+/// * `reverse` - If true, aggregate left source values into right output
+///   slots; otherwise aggregate right source values into left output slots.
+///
+/// # Returns
+///
+/// Returns the standard aggregation tuple
+/// `(output_positions, matched, aggregation_arrays)` when `return_matched` is
+/// true, or `(output_positions, aggregation_arrays)` otherwise. Returns
+/// `None` when no candidate survives both range anchors and all residual
+/// predicates.
+///
+/// # Errors
+///
+/// Returns a Python `ValueError` for malformed range tuples, non-range second
+/// comparators, mismatched residual layouts, invalid aggregation requests, or
+/// invalid output-position metadata.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn aggregate_range_extended<'py, T: numpy::Element + PartialOrd + Copy>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    first: ParsedRangePredicate<'py, T>,
+    aggregations: &Bound<'py, PyList>,
+    output_positions: Option<ArrayView1<'_, i64>>,
+    output_len: usize,
+    return_matched: bool,
+    reverse: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    let second_object = predicates.get_item(1)?;
+    let second_tuple = second_object.cast::<PyTuple>()?;
+    let second = parse_range_predicate::<T>(second_tuple)?;
+    if !second.op.is_range() {
+        return Err(PyValueError::new_err(
+            "the second range predicate must use <, <=, >, or >=",
+        ));
+    }
+    let (parsed, metadata) = residuals(py, predicates, false, true)?;
+    let left = first.left.as_array();
+    let right = first.right.as_array();
+    check_residual_lengths(&parsed, left.len(), right.len())?;
+    let windows = build_windows(
+        RangePredicate {
+            left,
+            left_index: first.left_index.as_array(),
+            right,
+            right_index: first.right_index.as_array(),
+            op: first.op,
+        },
+        RangePredicate {
+            left: second.left.as_array(),
+            left_index: second.left_index.as_array(),
+            right: second.right.as_array(),
+            right_index: second.right_index.as_array(),
+            op: second.op,
+        },
+    )
+    .map_err(PyValueError::new_err)?;
+    aggregate_range_windows(
+        py,
+        windows,
+        &parsed,
+        metadata.as_deref(),
+        aggregations,
+        output_positions,
+        output_len,
+        if reverse { left.len() } else { right.len() },
+        return_matched,
+        reverse,
+    )
+}
+
+/// Parse and dispatch the range-led extended aggregation contract.
+///
+/// This is the Python-boundary adapter for [`aggregate_range_extended`]. The
+/// first tuple may use the ordinary six-element range form or the eight-
+/// element form that additionally carries trimmed output-position maps. The
+/// second tuple must use the ordinary six-element range form. Any predicates
+/// after those two anchors remain residual filters. The
+/// `right_index_is_ordered` field is accepted as part of the shared tuple
+/// contract. Aggregation does not use its value: PyJanitor has already
+/// established ascending order before this function is called.
+///
+/// ELI5: this function is the adapter between Python's tuple-shaped API and
+/// Rust's typed aggregation code. It checks the tuple, borrows the arrays,
+/// identifies which side is the output side, and then hands the typed values
+/// to [`aggregate_range_extended`]. It does not calculate windows itself and
+/// it does not update aggregation state itself.
+///
+/// The first tuple has one of these layouts:
+///
+/// ```text
+/// 6 fields:
+/// (left, left_index, right, right_index,
+///  right_index_is_ordered, comparator)
+///
+/// 8 fields:
+/// (left, left_index, right, right_index,
+///  left_output_positions, right_output_positions,
+///  right_index_is_ordered, comparator)
+/// ```
+///
+/// The second tuple is always the ordinary six-field form. Predicates after
+/// the first two are not used for binary search; they are residual predicates
+/// evaluated against each candidate inside the intersected window.
+///
+/// Keeping this adapter beside the range aggregation implementation prevents
+/// `anchor_non_equi_join_agg.rs` from owning dual-range tuple semantics. That
+/// module is limited to one-anchor extended aggregation and all-`!=`
+/// aggregation.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token.
+/// * `predicates` - At least two aligned predicate tuples. The first two are
+///   range anchors; later tuples are residual filters.
+/// * `first` - The first tuple, already extracted from `predicates`. It must
+///   contain six or eight fields, with the comparator in the final field.
+/// * `aggregations` - Non-empty aggregation requests in the shared Rust
+///   aggregation-input format.
+/// * `return_matched` - Whether to include one boolean match flag per output
+///   slot in the returned tuple.
+/// * `reverse` - Whether to aggregate into right-oriented output slots using
+///   left-side source values.
+///
+/// # Returns
+///
+/// Returns `(output_positions, matched, aggregation_arrays)` when
+/// `return_matched` is true, or `(output_positions, aggregation_arrays)` when
+/// it is false. Returns `None` when no complete match survives both range
+/// anchors and all residual predicates.
+///
+/// # Errors
+///
+/// Returns a Python `ValueError` for too few predicates, malformed tuple
+/// layouts, invalid comparators, non-range anchors, mismatched output maps,
+/// mismatched residual lengths, or invalid aggregation requests.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_range_extended_aggregation<'py, T: numpy::Element + PartialOrd + Copy>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    first: &Bound<'py, PyTuple>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+    reverse: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    // This entry point is specifically for a dual-range anchor. A list with
+    // fewer than two predicates cannot provide the second window that must be
+    // intersected with the first one.
+    if predicates.len() < 2 {
+        return Err(PyValueError::new_err(
+            "range extended aggregation requires at least two predicates",
+        ));
+    }
+
+    // Keep the Python tuple separate from the typed `ParsedRangePredicate`
+    // created below. The tuple is still needed to read optional output maps,
+    // while the parsed value owns the borrowed NumPy array handles used by
+    // the window builder.
+    let first_tuple = first;
+
+    // A six-field tuple is the normal range contract. The eight-field form
+    // adds two complete maps from compact aggregation slots to original
+    // physical rows. No other shape can tell this adapter where its
+    // comparator or output layout is located.
+    if !matches!(first_tuple.len(), 6 | 8) {
+        return Err(PyValueError::new_err(
+            "the first range aggregation predicate must contain 6 or 8 elements",
+        ));
+    }
+
+    // In the six-field form the comparator is field five. In the eight-field
+    // form fields five and six are output maps, so the comparator moves to
+    // field seven.
+    let comparator_position = if first_tuple.len() == 8 { 7 } else { 5 };
+
+    // The ordering flag is part of the shared predicate tuple contract.
+    // Aggregation does not use its value: PyJanitor has already sorted the
+    // right-hand arrays before calling Rust. Extract it only to validate the
+    // tuple shape and field type.
+    first_tuple.get_item(4)?.extract::<bool>()?;
+
+    // Extract the four aligned value/label arrays and decode the comparator.
+    // `ParsedRangePredicate` keeps the Python array owners alive while the
+    // range windows and residual filters borrow their views.
+    let first = ParsedRangePredicate {
+        left: first_tuple
+            .get_item(0)?
+            .extract::<PyReadonlyArray1<'py, T>>()?,
+        left_index: first_tuple
+            .get_item(1)?
+            .extract::<PyReadonlyArray1<'py, i64>>()?,
+        right: first_tuple
+            .get_item(2)?
+            .extract::<PyReadonlyArray1<'py, T>>()?,
+        right_index: first_tuple
+            .get_item(3)?
+            .extract::<PyReadonlyArray1<'py, i64>>()?,
+        op: CompareOp::try_from_str(
+            first_tuple
+                .get_item(comparator_position)?
+                .extract::<&str>()?,
+        )?,
+    };
+
+    // The dual-range implementation only supports inequality range anchors.
+    // Equality and `!=` use different upstream/kernel contracts and must not
+    // enter this window-intersection path.
+    if !first.op.is_range() {
+        return Err(PyValueError::new_err(
+            "range extended aggregation requires a range comparator first",
+        ));
+    }
+
+    // Only the eight-field form carries output maps. Each map is ordered by
+    // compact aggregation slot and stores the corresponding original
+    // physical row. Forward aggregation writes one result per left slot, so
+    // it uses the left map; reverse aggregation writes one result per right
+    // slot, so it uses the right map.
+    let (left_output_positions, right_output_positions) = if first_tuple.len() == 8 {
+        (
+            Some(
+                first_tuple
+                    .get_item(5)?
+                    .extract::<PyReadonlyArray1<'py, i64>>()?,
+            ),
+            Some(
+                first_tuple
+                    .get_item(6)?
+                    .extract::<PyReadonlyArray1<'py, i64>>()?,
+            ),
+        )
+    } else {
+        (None, None)
+    };
+
+    // The output map describes the trimmed layout, when present. Without a
+    // map, the value arrays themselves already define an identity layout.
+    // Keep both lengths because forward and reverse aggregation have
+    // different output domains.
+    let (left_output_len, right_output_len) = match (
+        left_output_positions.as_ref(),
+        right_output_positions.as_ref(),
+    ) {
+        (Some(left), Some(right)) => (left.len()?, right.len()?),
+        _ => (first.left.len()?, first.right.len()?),
+    };
+
+    // Select the map and output length for the requested orientation. The
+    // aggregation core receives only one output map because it writes into
+    // one output domain per call. The other map remains available only for a
+    // separate reverse call.
+    aggregate_range_extended(
+        py,
+        predicates,
+        first,
+        aggregations,
+        if reverse {
+            right_output_positions
+                .as_ref()
+                .map(|values| values.as_array())
+        } else {
+            left_output_positions
+                .as_ref()
+                .map(|values| values.as_array())
+        },
+        if reverse {
+            right_output_len
+        } else {
+            left_output_len
+        },
+        return_matched,
+        reverse,
+    )
+}
 
 /// Expand sparse surviving windows into dense aggregation boundaries.
 ///
@@ -57,6 +382,26 @@ fn dense_boundaries(
 /// basic path returns identity output positions rather than accepting separate
 /// output maps. Aggregation consumes every pair in the intersection; there is
 /// deliberately no `keep` parameter.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token used to build the result tuple.
+/// * `predicates` - Exactly two aligned six-element range predicate tuples.
+/// * `aggregations` - Non-empty aggregation requests. Every intersected pair
+///   contributes to the selected aggregation state.
+/// * `return_matched` - Include one boolean flag per output slot when true.
+/// * `reverse` - Aggregate left values into right output slots when true;
+///   otherwise aggregate right values into left output slots.
+///
+/// # Returns
+///
+/// Returns the standard aggregation tuple, with identity output positions, or
+/// `None` when the two windows have no intersection.
+///
+/// # Errors
+///
+/// Returns a Python `ValueError` when the predicate count, tuple layout,
+/// comparator, array lengths, or aggregation requests are invalid.
 fn run_two_range<'py, T: numpy::Element + PartialOrd + Copy>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
@@ -236,6 +581,174 @@ range_aggregation_functions!(
     f32
 );
 
+/// Export the two-range-plus-residual aggregation contract.
+///
+/// These wrappers live with the range aggregation implementation because the
+/// first two predicates are always consumed as range windows. The general
+/// extended aggregation module owns the separate one-anchor and all-`!=`
+/// wrappers; it does not own this dual-range API.
+macro_rules! range_extended_aggregation_functions {
+    ($forward:ident, $reverse:ident, $ty:ty) => {
+        /// Aggregate a range-led extended join without materializing pairs.
+        ///
+        /// The first two predicates must be ascending range anchors. The
+        /// first tuple may use the six-element range form or the eight-element
+        /// form carrying output-position maps; the second tuple uses the
+        /// six-element form. Remaining predicates are residual filters and
+        /// are evaluated in their supplied order. They do not need sorted
+        /// right arrays because they are checked by aligned physical
+        /// position.
+        ///
+        /// # Arguments
+        ///
+        /// * `py` - Active Python interpreter token.
+        /// * `predicates` - At least two aligned range-anchor/residual tuples.
+        /// * `aggregations` - Non-empty aggregation requests over the source
+        ///   layout selected by the direction of the call.
+        /// * `return_matched` - Include one matched flag per output slot when
+        ///   true.
+        ///
+        /// # Returns
+        ///
+        /// Returns `None` when no candidate survives both range anchors and
+        /// all residual predicates. Otherwise returns output positions,
+        /// optionally the matched mask, and one result array per aggregation.
+        ///
+        /// # Errors
+        ///
+        /// Returns a Python `ValueError` when fewer than two predicates are
+        /// supplied or when the predicate, layout, or aggregation contract is
+        /// invalid.
+        #[pyfunction]
+        pub fn $forward<'py>(
+            py: Python<'py>,
+            predicates: &Bound<'py, PyList>,
+            aggregations: &Bound<'py, PyList>,
+            return_matched: bool,
+        ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+            if predicates.len() < 2 {
+                return Err(PyValueError::new_err(
+                    "range extended aggregation requires at least two predicates",
+                ));
+            }
+            let first_item = predicates.get_item(0)?;
+            let first = first_item.cast::<PyTuple>()?;
+            dispatch_range_extended_aggregation::<$ty>(
+                py,
+                predicates,
+                &first,
+                aggregations,
+                return_matched,
+                false,
+            )
+        }
+
+        /// Aggregate the same range-led extended join in reverse orientation.
+        ///
+        /// The first two right arrays must already be ascending because
+        /// PyJanitor performs sorting before calling Rust. Later predicates
+        /// are residual filters evaluated by aligned physical position. The
+        /// function aggregates left-side source values into right-oriented
+        /// output slots and uses the optimized reverse boundary kernels only
+        /// for the range-window portion.
+        ///
+        /// # Arguments
+        ///
+        /// * `py` - Active Python interpreter token.
+        /// * `predicates` - At least two aligned range-anchor/residual tuples.
+        /// * `aggregations` - Non-empty aggregation requests over the left
+        ///   source layout.
+        /// * `return_matched` - Include one matched flag per right output slot
+        ///   when true.
+        ///
+        /// # Returns
+        ///
+        /// Returns `None` when no complete pair survives. Otherwise returns
+        /// output positions, optionally the matched mask, and aggregation
+        /// arrays.
+        ///
+        /// # Errors
+        ///
+        /// Returns a Python `ValueError` when fewer than two predicates are
+        /// supplied or when the predicate, layout, or aggregation contract is
+        /// invalid.
+        #[pyfunction]
+        pub fn $reverse<'py>(
+            py: Python<'py>,
+            predicates: &Bound<'py, PyList>,
+            aggregations: &Bound<'py, PyList>,
+            return_matched: bool,
+        ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+            if predicates.len() < 2 {
+                return Err(PyValueError::new_err(
+                    "range extended aggregation requires at least two predicates",
+                ));
+            }
+            let first_item = predicates.get_item(0)?;
+            let first = first_item.cast::<PyTuple>()?;
+            dispatch_range_extended_aggregation::<$ty>(
+                py,
+                predicates,
+                &first,
+                aggregations,
+                return_matched,
+                true,
+            )
+        }
+    };
+}
+
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_int64,
+    range_join_extended_aggregate_reverse_int64,
+    i64
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_int32,
+    range_join_extended_aggregate_reverse_int32,
+    i32
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_int16,
+    range_join_extended_aggregate_reverse_int16,
+    i16
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_int8,
+    range_join_extended_aggregate_reverse_int8,
+    i8
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_uint64,
+    range_join_extended_aggregate_reverse_uint64,
+    u64
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_uint32,
+    range_join_extended_aggregate_reverse_uint32,
+    u32
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_uint16,
+    range_join_extended_aggregate_reverse_uint16,
+    u16
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_uint8,
+    range_join_extended_aggregate_reverse_uint8,
+    u8
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_f64,
+    range_join_extended_aggregate_reverse_f64,
+    f64
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_f32,
+    range_join_extended_aggregate_reverse_f32,
+    f32
+);
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     macro_rules! add {
         ($($name:ident),+ $(,)?) => {
@@ -263,6 +776,26 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         range_join_aggregate_reverse_f64,
         range_join_aggregate_f32,
         range_join_aggregate_reverse_f32,
+        range_join_extended_aggregate_int64,
+        range_join_extended_aggregate_reverse_int64,
+        range_join_extended_aggregate_int32,
+        range_join_extended_aggregate_reverse_int32,
+        range_join_extended_aggregate_int16,
+        range_join_extended_aggregate_reverse_int16,
+        range_join_extended_aggregate_int8,
+        range_join_extended_aggregate_reverse_int8,
+        range_join_extended_aggregate_uint64,
+        range_join_extended_aggregate_reverse_uint64,
+        range_join_extended_aggregate_uint32,
+        range_join_extended_aggregate_reverse_uint32,
+        range_join_extended_aggregate_uint16,
+        range_join_extended_aggregate_reverse_uint16,
+        range_join_extended_aggregate_uint8,
+        range_join_extended_aggregate_reverse_uint8,
+        range_join_extended_aggregate_f64,
+        range_join_extended_aggregate_reverse_f64,
+        range_join_extended_aggregate_f32,
+        range_join_extended_aggregate_reverse_f32,
     );
     Ok(())
 }
