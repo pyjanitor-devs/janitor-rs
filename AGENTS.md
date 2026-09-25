@@ -1043,7 +1043,7 @@ range and `!=` calls before merging either side.
 
 **Context**: Implementing the aggregation phase after the index-producing
 single and extended join kernels.
-**Learning**: `single_non_equi_join_agg.rs` and `single_non_equi_join_extended_agg.rs` reuse the
+**Learning**: `single_non_equi_join_agg.rs` and `extended_join_agg.rs` reuse the
 existing `AggregationSet`, input parsing, and result construction from the
 batch aggregation kernels. They update aggregation state during candidate
 comparison, so successful pairs are never materialized as intermediate join
@@ -1121,3 +1121,16 @@ becomes `NaN` unless the non-finite compensation is reset.
 **Recommendation**: Keep the f32 and f64 compensation guards symmetrical and
 test an infinity followed by a finite value in both direct and boundary-sweep
 aggregation paths.
+
+### [2026-09-25] Keep single-anchor and dual-range extended joins separate
+
+**Context**: Clarifying the multi-predicate range-join architecture.
+**Learning**: `single_non_equi_join_extended.rs` accepts one range anchor plus
+at least one residual predicate. The first anchor builds the only candidate
+window; every later predicate is filtered inside that window, even when a
+later predicate is also a range comparison. `range_join.rs` owns the separate
+two-range-anchor contract and is the only path that intersects two windows.
+
+**Recommendation**: Do not add a second-range optimization flag to the
+single-extended API. Route confirmed dual-range joins through `range_join` and
+keep the single-extended implementation focused on one anchor plus residuals.

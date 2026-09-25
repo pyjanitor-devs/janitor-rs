@@ -11,383 +11,17 @@
 //! first range/right value array when required, and provide authoritative null
 //! metadata.
 
-use numpy::{ndarray::ArrayView1, IntoPyArray, PyReadonlyArray1};
+use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::aggs::ensure_equal_lengths_core;
+use crate::extended::{materialize_pairs_for_ne, materialize_windows_for_non_ne};
+use crate::join_common::{result_dict, Keep};
 use crate::op::CompareOp;
-use crate::predicate::{
-    null_metadata_views, parse_predicates_with_nulls_strings, predicates_match_dispatch,
-    NullMetadata, Predicate,
-};
-use crate::single_non_equi_join::{
-    build_not_equal_positions_core, build_range_core, Keep, SingleJoinResult,
-};
-
-fn materialize_windows_for_non_ne(
-    windows: &SingleJoinResult,
-    predicates: &[Predicate<'_>],
-    metadata: Option<&[NullMetadata<'_>]>,
-    keep: Keep,
-) -> Result<(Vec<i64>, Vec<i64>), String> {
-    let views: Vec<_> = predicates.iter().map(Predicate::view).collect();
-    let metadata_views = metadata.map(null_metadata_views);
-    let labels = windows.right_index.as_slice();
-
-    // Follow the established batch-indices layout: selection modes first find
-    // at most one winning physical position per left row, while `all` uses a
-    // count pass followed by an exact materialization pass. The latter avoids
-    // reserving the full range-window upper bound when residual predicates
-    // eliminate many candidates.
-    if keep == Keep::All {
-        let mut output_len = 0_usize;
-        for row in 0..windows.left_index.len() {
-            let start = windows.starts[row];
-            let end = windows.ends[row];
-            let left_position = windows.left_positions[row];
-            for right_position in start..end {
-                if predicates_match_dispatch(
-                    &views,
-                    metadata_views.as_deref(),
-                    left_position,
-                    right_position,
-                ) {
-                    output_len = output_len
-                        .checked_add(1)
-                        .ok_or("single extended join result size exceeds platform capacity")?;
-                }
-            }
-        }
-        if output_len == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
-
-        let mut output_left = Vec::new();
-        output_left
-            .try_reserve_exact(output_len)
-            .map_err(|_| "single extended join result allocation failed")?;
-        let mut output_right = Vec::new();
-        output_right
-            .try_reserve_exact(output_len)
-            .map_err(|_| "single extended join result allocation failed")?;
-
-        for row in 0..windows.left_index.len() {
-            let start = windows.starts[row];
-            let end = windows.ends[row];
-            let left_position = windows.left_positions[row];
-            for (offset, &label) in labels[start..end].iter().enumerate() {
-                let right_position = start + offset;
-                if predicates_match_dispatch(
-                    &views,
-                    metadata_views.as_deref(),
-                    left_position,
-                    right_position,
-                ) {
-                    output_left.push(windows.left_index[row]);
-                    output_right.push(label);
-                }
-            }
-        }
-        debug_assert_eq!(output_left.len(), output_len);
-        debug_assert_eq!(output_right.len(), output_len);
-        return Ok((output_left, output_right));
-    }
-
-    // Each selection mode emits no more than one pair for each retained left
-    // row. Reserving the number of range-window rows is therefore a tight
-    // upper bound and does not require a count pass.
-    let mut output_left = Vec::new();
-    output_left
-        .try_reserve_exact(windows.left_index.len())
-        .map_err(|_| "single extended join result allocation failed")?;
-    let mut output_right = Vec::new();
-    output_right
-        .try_reserve_exact(windows.left_index.len())
-        .map_err(|_| "single extended join result allocation failed")?;
-    for row in 0..windows.left_index.len() {
-        let start = windows.starts[row];
-        let end = windows.ends[row];
-        let left_position = windows.left_positions[row];
-        let mut selected = None;
-        for (offset, &label) in labels[start..end].iter().enumerate() {
-            let right_position = start + offset;
-            if !predicates_match_dispatch(
-                &views,
-                metadata_views.as_deref(),
-                left_position,
-                right_position,
-            ) {
-                continue;
-            }
-            match keep {
-                Keep::Any => {
-                    selected = Some(right_position);
-                    break;
-                }
-                //                   The logic is:
-
-                //   if nothing is selected:
-                //       select this candidate
-
-                //   otherwise:
-                //       replace the current candidate only if this label is smaller
-
-                //   Example:
-
-                //   labels = [40, 10, 30]
-
-                //   Candidates arrive in this order:
-
-                //   position 0, label 40 → selected = Some(0)
-                //   position 1, label 10 → 10 < 40, selected = Some(1)
-                //   position 2, label 30 → 30 < 10 is false, keep Some(1)
-                Keep::First => {
-                    let replace = match selected {
-                        None => true,
-                        Some(current) => label < labels[current],
-                    };
-                    if replace {
-                        selected = Some(right_position);
-                    }
-                }
-                //   - selected stores the currently chosen right position: Option<usize>.
-                //   - right_position is the new candidate’s physical position.
-                //   - label is the new candidate’s right-index value.
-                //   - current is the previously selected physical position.
-                //   - labels[current] is the previously selected right-index value.
-
-                //   Example:
-
-                //   right positions:  0    1    2
-                //   right labels:    40   10   30
-
-                //   Processing candidates:
-
-                //   1. Position 0, label 40
-                //       - Nothing selected yet.
-                //       - Select position 0.
-
-                //   2. Position 1, label 10
-                //       - 10 > 40 is false.
-                //       - Keep position 0.
-
-                //   3. Position 2, label 30
-                //       - 30 > 40 is false.
-                //       - Keep position 0.
-
-                //   Final selection:
-
-                //   selected = Some(0)
-                Keep::Last => {
-                    let replace = match selected {
-                        None => true,
-                        Some(current) => label > labels[current],
-                    };
-                    if replace {
-                        selected = Some(right_position);
-                    }
-                }
-                Keep::All => unreachable!(),
-            }
-        }
-        if let Some(right_position) = selected {
-            output_left.push(windows.left_index[row]);
-            output_right.push(labels[right_position]);
-        }
-    }
-    if output_left.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    Ok((output_left, output_right))
-}
-
-/// Filter and materialize flat physical pairs produced by a first `!=`
-/// predicate.
-///
-/// The pair positions index the full physical left and right layouts supplied
-/// for the residual predicates. Public index labels are not produced until
-/// after every residual predicate has passed.
-///
-/// `all` uses two passes: the first counts surviving pairs exactly and the
-/// second allocates that exact size and writes the labels. The selected modes
-/// retain at most one pair per left row and therefore reserve the full left
-/// index length as an upper bound.
-fn materialize_pairs_for_ne(
-    left_index: ArrayView1<'_, i64>,
-    right_index: ArrayView1<'_, i64>,
-    left_positions: &[usize],
-    right_positions: &[usize],
-    predicates: &[Predicate<'_>],
-    metadata: Option<&[NullMetadata<'_>]>,
-    keep: Keep,
-) -> Result<(Vec<i64>, Vec<i64>), String> {
-    ensure_equal_lengths_core(
-        "not-equal left positions",
-        left_positions.len(),
-        "not-equal right positions",
-        right_positions.len(),
-    )?;
-    let views: Vec<_> = predicates.iter().map(Predicate::view).collect();
-    let metadata_views = metadata.map(null_metadata_views);
-
-    if keep == Keep::All {
-        // First count the exact number of survivors. This avoids reserving a
-        // potentially huge upper bound when residual predicates reject most
-        // of the first `!=` candidate pairs.
-        // Count survivors by physical left row so the final output can retain
-        // left input order even when the first not-equal core processed
-        // non-null and null left rows separately.
-        let mut counts_by_left: Vec<usize> = Vec::new();
-        counts_by_left
-            .try_reserve_exact(left_index.len())
-            .map_err(|_| "single extended join result allocation failed")?;
-        counts_by_left.resize(left_index.len(), 0_usize);
-        for (&left_position, &right_position) in left_positions.iter().zip(right_positions) {
-            if predicates_match_dispatch(
-                &views,
-                metadata_views.as_deref(),
-                left_position,
-                right_position,
-            ) {
-                let count = counts_by_left
-                    .get_mut(left_position)
-                    .ok_or("not-equal left position is out of bounds")?;
-                *count = (*count)
-                    .checked_add(1)
-                    .ok_or("single extended join result size exceeds platform capacity")?;
-            }
-        }
-
-        // Turn each count into the starting slot for that left row. The
-        // resulting offsets let the second pass write directly into its
-        // preallocated section without storing all matched positions.
-        let mut output_len = 0_usize;
-        for count in &mut counts_by_left {
-            let row_count = *count;
-            *count = output_len;
-            output_len = output_len
-                .checked_add(row_count)
-                .ok_or("single extended join result size exceeds platform capacity")?;
-        }
-        if output_len == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
-
-        let mut output_left = Vec::new();
-        output_left
-            .try_reserve_exact(output_len)
-            .map_err(|_| "single extended join result allocation failed")?;
-        output_left.resize(output_len, 0);
-        let mut output_right = Vec::new();
-        output_right
-            .try_reserve_exact(output_len)
-            .map_err(|_| "single extended join result allocation failed")?;
-        output_right.resize(output_len, 0);
-
-        // Copy the row starts into cursors. The second pass evaluates every
-        // candidate again, then advances only that left row's cursor.
-        let mut write_positions = Vec::new();
-        write_positions
-            .try_reserve_exact(counts_by_left.len())
-            .map_err(|_| "single extended join result allocation failed")?;
-        write_positions.extend_from_slice(&counts_by_left);
-        for (&left_position, &right_position) in left_positions.iter().zip(right_positions) {
-            if predicates_match_dispatch(
-                &views,
-                metadata_views.as_deref(),
-                left_position,
-                right_position,
-            ) {
-                let output_position = write_positions
-                    .get_mut(left_position)
-                    .ok_or("not-equal left position is out of bounds")?;
-                let slot = *output_position;
-                *output_position += 1;
-                output_left[slot] = left_index[left_position];
-                output_right[slot] = *right_index
-                    .get(right_position)
-                    .ok_or("not-equal right position is out of bounds")?;
-            }
-        }
-        return Ok((output_left, output_right));
-    }
-
-    // A selected mode emits no more than one pair for each left row. Store the
-    // winning physical right position by left position, then walk the full
-    // left layout so selected output retains left input order.
-    let mut selected = vec![None; left_index.len()];
-    for (&left_position, &right_position) in left_positions.iter().zip(right_positions) {
-        if !predicates_match_dispatch(
-            &views,
-            metadata_views.as_deref(),
-            left_position,
-            right_position,
-        ) {
-            continue;
-        }
-        let selected_right = selected
-            .get_mut(left_position)
-            .ok_or("not-equal left position is out of bounds")?;
-        match keep {
-            Keep::Any => {
-                if selected_right.is_none() {
-                    *selected_right = Some(right_position);
-                }
-            }
-            Keep::First | Keep::Last => {
-                let replace = match *selected_right {
-                    None => true,
-                    Some(current) => {
-                        let value = right_index[right_position];
-                        let current_value = right_index[current];
-                        if keep == Keep::First {
-                            value < current_value
-                        } else {
-                            value > current_value
-                        }
-                    }
-                };
-                if replace {
-                    *selected_right = Some(right_position);
-                }
-            }
-            Keep::All => unreachable!(),
-        }
-    }
-
-    let mut output_left = Vec::new();
-    output_left
-        .try_reserve_exact(left_index.len())
-        .map_err(|_| "single extended join result allocation failed")?;
-    let mut output_right = Vec::new();
-    output_right
-        .try_reserve_exact(left_index.len())
-        .map_err(|_| "single extended join result allocation failed")?;
-    for (left_position, right_position) in selected.into_iter().enumerate() {
-        if let Some(right_position) = right_position {
-            output_left.push(left_index[left_position]);
-            output_right.push(
-                *right_index
-                    .get(right_position)
-                    .ok_or("not-equal right position is out of bounds")?,
-            );
-        }
-    }
-    Ok((output_left, output_right))
-}
-
-fn result_dict<'py>(
-    py: Python<'py>,
-    left: Vec<i64>,
-    right: Vec<i64>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let result = PyDict::new(py);
-    result.set_item("left_index", left.into_pyarray(py))?;
-    result.set_item("right_index", right.into_pyarray(py))?;
-    Ok(result)
-}
+use crate::predicate::parse_predicates_with_nulls_strings;
+use crate::single_non_equi_join::{build_not_equal_positions_core, build_range_core};
 
 /// Execute an all-`!=` extended join.
 ///
@@ -502,10 +136,40 @@ fn extended_not_equal_join<'py, T: numpy::Element + PartialOrd + Copy>(
     if out_left.is_empty() {
         return Ok(None);
     }
-    Ok(Some(result_dict(py, out_left, out_right)?))
+    Ok(Some(result_dict(py, out_left, out_right, None, None)?))
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Execute a single-anchor range-led extended join.
+///
+/// The first predicate supplies one sorted-right binary-search window for
+/// each left row. The remaining predicates are parsed in their original user
+/// order and evaluated as residual filters inside those windows. A later
+/// range predicate is still only a residual here; intersecting two range
+/// windows is the responsibility of `range_join.rs`.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token used to parse residual tuples and
+///   construct the returned Python dictionary.
+/// * `predicates` - At least two aligned tuples. The first tuple is the range
+///   anchor; every later tuple is a residual comparison.
+/// * `keep` - Selection mode applied only after all residual predicates pass.
+/// * `first_left` / `first_left_index` - Null-free left anchor values and
+///   labels in the same logical order.
+/// * `first_right` / `first_right_index` - Null-free, ascending right anchor
+///   values and their aligned labels.
+/// * `first_op` - The first anchor comparator: `<`, `<=`, `>`, or `>=`.
+///
+/// # Returns
+///
+/// Returns materialized public left/right labels, or `None` when no complete
+/// predicate match survives.
+///
+/// # Errors
+///
+/// Returns a Python `ValueError` for an invalid predicate count, comparator,
+/// residual shape, length mismatch, null metadata, or keep value.
 fn extended_join<'py, T: numpy::Element + PartialOrd + Copy>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
@@ -514,7 +178,6 @@ fn extended_join<'py, T: numpy::Element + PartialOrd + Copy>(
     first_left_index: PyReadonlyArray1<'py, i64>,
     first_right: PyReadonlyArray1<'py, T>,
     first_right_index: PyReadonlyArray1<'py, i64>,
-    right_index_is_ordered: bool,
     first_op: CompareOp,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
     if predicates.len() < 2 {
@@ -561,15 +224,12 @@ fn extended_join<'py, T: numpy::Element + PartialOrd + Copy>(
         )
         .map_err(PyValueError::new_err)?;
     }
-    let windows = build_range_core(
-        left,
-        left_index,
-        right,
-        right_index,
-        right_index_is_ordered,
-        first_op,
-    )
-    .map_err(PyValueError::new_err)?;
+    // The single-extended path has exactly one binary-search anchor. Every
+    // later predicate, including another range comparison, is evaluated as a
+    // residual filter inside that anchor's candidate window. Dual-range
+    // window intersection belongs exclusively to `range_join.rs`.
+    let windows = build_range_core(left, left_index, right, right_index, false, first_op)
+        .map_err(PyValueError::new_err)?;
     if windows.left_index.is_empty() {
         return Ok(None);
     }
@@ -579,7 +239,7 @@ fn extended_join<'py, T: numpy::Element + PartialOrd + Copy>(
     if out_left.is_empty() {
         return Ok(None);
     }
-    Ok(Some(result_dict(py, out_left, out_right)?))
+    Ok(Some(result_dict(py, out_left, out_right, None, None)?))
 }
 
 macro_rules! extended_join_function {
@@ -594,6 +254,35 @@ macro_rules! extended_join_function {
         /// extension-array semantics, and the comparator. Later items are
         /// ordinary three-element predicates or six-element null-aware `!=`
         /// predicates. `keep` is applied only after every predicate passes.
+        /// PyJanitor must align all residual arrays to the same physical left
+        /// and right positions before calling Rust. Rust does not sort or
+        /// realign residual arrays.
+        ///
+        /// # Arguments
+        ///
+        /// * `py` - Active Python interpreter token.
+        /// * `predicates` - At least two aligned predicate tuples. The first
+        ///   tuple establishes the candidate stream; later tuples are tested
+        ///   against those candidate positions in user order.
+        /// * `keep` - Retain `"first"`, `"last"`, `"any"`, or `"all"`
+        ///   survivors for each left row.
+        /// * Predicate one supplies the only binary-search candidate window;
+        ///   predicates two onward are residual filters evaluated in user
+        ///   order. Dual-range window intersection belongs to the separate
+        ///   `range_join` API.
+        ///
+        /// # Returns
+        ///
+        /// Returns `None` when no complete predicate match survives;
+        /// otherwise returns a dictionary with materialized `left_index` and
+        /// `right_index` arrays. Building blocks are not returned by this
+        /// extended API.
+        ///
+        /// # Errors
+        ///
+        /// Returns `ValueError` for malformed tuple layouts, unsupported
+        /// comparator combinations, mismatched aligned lengths, invalid null
+        /// metadata, or an invalid `keep` value.
         #[pyfunction]
         pub fn $name<'py>(
             py: Python<'py>,
@@ -659,6 +348,11 @@ macro_rules! extended_join_function {
                     "the first range predicate must contain 6 elements",
                 ));
             }
+            // The wrapper contract carries this flag even though the single
+            // extended kernel does not use it to choose a second window.
+            // Validate its type at the boundary so malformed tuples fail
+            // before candidate generation begins.
+            first.get_item(4)?.extract::<bool>()?;
             extended_join(
                 py,
                 predicates,
@@ -671,7 +365,6 @@ macro_rules! extended_join_function {
                     .get_item(2)?
                     .extract::<PyReadonlyArray1<'py, $type>>()?,
                 first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-                first.get_item(4)?.extract::<bool>()?,
                 first_op,
             )
         }
@@ -774,6 +467,39 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(read_pair(&result, py), (vec![100], vec![20]));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn filters_second_range_as_a_residual_before_keep_selection() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![4_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 30, 50, 70]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![4_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 6]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+
+            let result = single_join_extended_indices_int64(py, &predicates, "all")?
+                .expect("the intersected range has one match");
+            assert_eq!(read_pair(&result, py), (vec![100], vec![70]));
             Ok(())
         })
         .unwrap();
@@ -977,7 +703,11 @@ mod tests {
                 ],
             )?)?;
             assert_value_error(
-                single_join_extended_indices_int64(py, &invalid_residual_operator, "all"),
+                single_join_extended_indices_int64(
+                    py,
+                    &invalid_residual_operator,
+                    "all",
+                ),
                 py,
                 "invalid comparison operator: like (expected one of >, >=, <, <=, ==, !=)",
             );
