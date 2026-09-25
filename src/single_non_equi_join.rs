@@ -21,58 +21,14 @@
 //! while pandas extension nulls do not.
 
 use numpy::ndarray::ArrayView1;
-use numpy::{IntoPyArray, PyReadonlyArray1};
+use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::aggs::ensure_equal_lengths_core;
+use crate::join_common::{result_dict, Keep, SingleJoinResult};
 use crate::op::CompareOp;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Keep {
-    /// Select the smallest matching original right index label.
-    First,
-    /// Select the largest matching original right index label.
-    Last,
-    /// Select any one matching right index label without computing extrema.
-    Any,
-    /// Emit every matching pair in physical right-array order.
-    All,
-}
-
-impl Keep {
-    /// Parse the public string representation used by the PyO3 wrapper.
-    ///
-    /// Keeping this conversion at the Python boundary means the core
-    /// functions can work with a closed enum and cannot silently accept a
-    /// misspelled selection mode.
-    pub(crate) fn parse(value: &str) -> PyResult<Self> {
-        match value {
-            "first" => Ok(Self::First),
-            "last" => Ok(Self::Last),
-            "any" => Ok(Self::Any),
-            "all" => Ok(Self::All),
-            other => Err(PyValueError::new_err(format!(
-                "invalid keep value: {other} (expected one of first, last, any, all)"
-            ))),
-        }
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct SingleJoinResult {
-    /// Physical left positions corresponding to `left_index`.
-    pub(crate) left_positions: Vec<usize>,
-    /// Original left index labels for rows with a non-empty match window.
-    pub left_index: Vec<i64>,
-    /// The complete original right index-label array, in sorted-value order.
-    pub right_index: Vec<i64>,
-    /// Inclusive start positions of each retained row's right match window.
-    pub starts: Vec<usize>,
-    /// Exclusive end positions of each retained row's right match window.
-    pub ends: Vec<usize>,
-}
 
 /// Find the first position at which a monotone predicate becomes false.
 ///
@@ -119,7 +75,21 @@ pub(crate) fn partition_point<T: PartialOrd + Copy>(
 /// Equality and inequality are intentionally excluded. Equality is handled
 /// upstream by pyjanitor, while inequality is the union of the strict prefix
 /// and strict suffix and needs its own null-aware implementation.
-pub(crate) fn range_bounds<T: PartialOrd + Copy>(
+///
+/// The returned `(start, end)` pair identifies the contiguous portion of the
+/// ascending `right` array that satisfies `left_value op right_value`.
+///
+/// # Arguments
+///
+/// * `left_value` - One left-side value.
+/// * `right` - An ascending right-side value view.
+/// * `op` - One of `<`, `<=`, `>`, or `>=`.
+///
+/// # Returns
+///
+/// A half-open positional range into `right`. Equality and inequality are not
+/// valid inputs and are unreachable after caller validation.
+pub(crate) fn range_window<T: PartialOrd + Copy>(
     left_value: T,
     right: ArrayView1<'_, T>,
     op: CompareOp,
@@ -145,7 +115,7 @@ pub(crate) fn range_bounds<T: PartialOrd + Copy>(
             let end = partition_point(right, |value| value <= left_value);
             (0, end)
         }
-        CompareOp::Eq | CompareOp::Ne => unreachable!("range_bounds only handles range operators"),
+        CompareOp::Eq | CompareOp::Ne => unreachable!("range_window only handles range operators"),
     }
 }
 
@@ -451,14 +421,17 @@ pub fn build_range_core<T: PartialOrd + Copy>(
     // building-block output. The copy preserves their supplied physical
     // order; it does not sort or otherwise change them.
     let mut result = SingleJoinResult {
+        left_positions: Vec::new(),
+        left_index: Vec::new(),
         right_index: right_index.to_vec(),
-        ..SingleJoinResult::default()
+        starts: Vec::new(),
+        ends: Vec::new(),
     };
     if left.is_empty() || right.is_empty() {
         return Ok(result);
     }
     for (left_position, left_value) in left.iter().enumerate() {
-        let (start, end) = range_bounds(*left_value, right, op);
+        let (start, end) = range_window(*left_value, right, op);
         if start >= end {
             continue;
         }
@@ -470,7 +443,7 @@ pub fn build_range_core<T: PartialOrd + Copy>(
     Ok(result)
 }
 
-fn choose_range(
+pub(crate) fn choose_range(
     windows: &SingleJoinResult,
     keep: Keep,
     right_index_is_ordered: bool,
@@ -1246,48 +1219,6 @@ fn materialize_index_pairs(
         );
     }
     Ok((output_left, output_right))
-}
-
-fn result_dict<'py>(
-    py: Python<'py>,
-    left: Vec<i64>,
-    right: Vec<i64>,
-    starts: Option<Vec<usize>>,
-    ends: Option<Vec<usize>>,
-) -> PyResult<Bound<'py, PyDict>> {
-    // Building blocks are optional because ordinary selected results contain
-    // only the flattened left/right label arrays. Range callers request the
-    // positional starts/ends separately when they need to aggregate later.
-    let result = PyDict::new(py);
-    result.set_item("left_index", left.into_pyarray(py))?;
-    result.set_item("right_index", right.into_pyarray(py))?;
-    if let (Some(starts), Some(ends)) = (starts, ends) {
-        // Keep positions as `usize` while Rust is constructing windows, then
-        // normalize the Python-facing dtype to int64. This matches every
-        // downstream range/aggregation kernel and avoids platform-dependent
-        // NumPy `usize` output.
-        let starts = positions_to_i64(starts)?;
-        let ends = positions_to_i64(ends)?;
-        result.set_item("starts", starts.into_pyarray(py))?;
-        result.set_item("ends", ends.into_pyarray(py))?;
-    }
-    Ok(result)
-}
-
-/// Convert internal positional bounds to the stable Python-facing int64 type.
-///
-/// Rust uses `usize` for indexing because positions cannot be negative and
-/// ndarray/slice APIs use `usize`. The Python API uses int64 for all positional
-/// arrays, so the conversion is centralized at the PyO3 boundary and checked
-/// instead of using a potentially truncating cast.
-fn positions_to_i64(values: Vec<usize>) -> PyResult<Vec<i64>> {
-    values
-        .into_iter()
-        .map(|value| {
-            i64::try_from(value)
-                .map_err(|_| PyValueError::new_err("single join position exceeds int64 capacity"))
-        })
-        .collect()
 }
 
 /// Select the effective output mode for a building-block request.

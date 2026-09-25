@@ -457,7 +457,7 @@ pub(crate) fn parse_predicates_strings<'py>(
 }
 
 /// Parse the string-based residual predicate form used by
-/// `single_non_equi_join_extended.rs`.
+/// the extended range and single-join APIs.
 ///
 /// Ordinary residual predicates are `(left, right, op)`. A null-aware `!=`
 /// predicate is `(left, left_nulls, right, right_nulls,
@@ -465,7 +465,9 @@ pub(crate) fn parse_predicates_strings<'py>(
 /// boolean. For all-`!=` extended joins, these arrays are
 /// full physical layouts: candidate position pairs index them directly, and
 /// the masks are full-length authoritative null masks. The parser does not
-/// align or filter these arrays.
+/// align or filter these arrays. PyJanitor is responsible for alignment,
+/// null filtering for ordinary range predicates, and the distinction between
+/// NumPy null semantics and pandas extension-array semantics.
 pub(crate) fn parse_predicates_with_nulls_strings<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,

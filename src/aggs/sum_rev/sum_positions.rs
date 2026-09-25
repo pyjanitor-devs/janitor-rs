@@ -244,10 +244,10 @@ where
 
 /// Run floating-point positional summation with an explicit storage mode.
 /// This is a Rust-only benchmark entry point; production callers should use
-/// [`sum_positions_float_core`] for automatic dispatch.
+/// `sum_positions_float_core` for automatic dispatch.
 ///
 /// The array arguments and `to_f64` have the same meanings as
-/// [`sum_positions_float_core`]. `dense` selects vector storage when true and
+/// `sum_positions_float_core`. `dense` selects vector storage when true and
 /// HashMap storage when false.
 #[allow(clippy::too_many_arguments)]
 pub fn sum_positions_float_core_with_storage<T, F>(

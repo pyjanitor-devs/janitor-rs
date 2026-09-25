@@ -12,12 +12,16 @@ use pyo3::types::{PyList, PyTuple};
 
 use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
 use crate::aggs::ensure_equal_lengths_core;
+use crate::join_common::SingleJoinResult;
 use crate::op::CompareOp;
 use crate::predicate::{
     null_metadata_views, parse_predicates_with_nulls_strings, predicates_match_dispatch,
     PredicateView,
 };
-use crate::single_non_equi_join::{range_bounds, visit_not_equal_pairs_core};
+use crate::range_join::{
+    build_windows, parse_range_predicate, ParsedRangePredicate, RangePredicate,
+};
+use crate::single_non_equi_join::{build_range_core, visit_not_equal_pairs_core};
 
 /// Build a lookup from original physical rows to compact aggregation slots.
 ///
@@ -80,7 +84,7 @@ fn physical_to_local_positions(
 /// Visit a range-led extended join and update aggregations for survivors.
 ///
 /// The first predicate has already been separated from `residuals`. For each
-/// left value, [`range_bounds`] supplies the contiguous right-side window
+/// left value, `range_window` supplies the contiguous right-side window
 /// that satisfies that first predicate. Every candidate in that window is
 /// then checked against the remaining predicates with
 /// [`predicates_match_dispatch`]. Aggregation state is updated only after all
@@ -110,17 +114,16 @@ fn physical_to_local_positions(
 /// With `right = [2, 5, 8]`, `left = [4]`, and `left < right`, the first
 /// predicate produces the candidate window `right[1..] = [5, 8]`. A residual
 /// predicate can remove either candidate before `set.update` is called.
-fn aggregate_range<T: PartialOrd + Copy>(
-    left: ArrayView1<'_, T>,
-    right: ArrayView1<'_, T>,
-    op: CompareOp,
+#[allow(clippy::too_many_arguments)]
+fn aggregate_range(
+    windows: &SingleJoinResult,
     residuals: &[PredicateView<'_>],
     residual_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
     set: &mut AggregationSet<'_>,
     reverse: bool,
 ) {
-    for (left_position, &left_value) in left.iter().enumerate() {
-        let (start, end) = range_bounds(left_value, right, op);
+    for (row, (&start, &end)) in windows.starts.iter().zip(windows.ends.iter()).enumerate() {
+        let left_position = windows.left_positions[row];
         for right_position in start..end {
             if predicates_match_dispatch(
                 residuals,
@@ -247,12 +250,14 @@ fn residuals<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
     require_not_equal: bool,
+    skip_second_range: bool,
 ) -> PyResult<(
     Vec<crate::predicate::Predicate<'py>>,
     Option<Vec<crate::predicate::NullMetadata<'py>>>,
 )> {
     let values = PyList::empty(py);
-    for item in predicates.iter().skip(1) {
+    let start = if skip_second_range { 2 } else { 1 };
+    for item in predicates.iter().skip(start) {
         if require_not_equal {
             let tuple = item
                 .cast::<PyTuple>()
@@ -314,65 +319,35 @@ fn check_residual_lengths(
     Ok(())
 }
 
-/// Run fused aggregation for a range-led extended join.
+/// Finish aggregation after a range window has been constructed.
 ///
-/// `predicates` contains the first range tuple followed by residual tuples.
-/// The first tuple supplies the binary-searchable candidate window; residual
-/// tuples are evaluated for every candidate in that window. The result has
-/// one matched slot per left row in forward mode or per right row in reverse
-/// mode, and one aggregation array per request.
-///
-/// # Arguments
-///
-/// * `py` - Active Python interpreter token.
-/// * `predicates` - First range predicate plus aligned residual predicates.
-/// * `left` / `right` - First-predicate value arrays. The right array must
-///   already be sorted by PyJanitor.
-/// * `op` - First predicate's range comparator.
-/// * `aggregations` - Parsed at the shared boundary as value/mask/operation
-///   requests. Arrays must use the complete source-side physical layout.
-/// * `return_matched` - Include the per-output matched array when true.
-/// * `reverse` - Aggregate left values into right output slots when true.
-///
-/// # Returns
-///
-/// Returns `None` when no candidate survives all predicates. Otherwise
-/// returns the common `(output_positions, matched, aggregation_arrays)` tuple.
+/// This helper contains the shared state setup and result materialization for
+/// both range modes. It deliberately knows nothing about whether the windows
+/// came from one range predicate or the intersection of two predicates.
 #[allow(clippy::too_many_arguments)]
-fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
+fn aggregate_range_windows<'py>(
     py: Python<'py>,
-    predicates: &Bound<'py, PyList>,
-    left: PyReadonlyArray1<'py, T>,
-    right: PyReadonlyArray1<'py, T>,
-    op: CompareOp,
+    windows: SingleJoinResult,
+    parsed: &[crate::predicate::Predicate<'_>],
+    metadata: Option<&[crate::predicate::NullMetadata<'_>]>,
     aggregations: &Bound<'py, PyList>,
     output_positions: Option<ArrayView1<'_, i64>>,
     output_len: usize,
+    source_len: usize,
     return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    let (parsed, metadata) = residuals(py, predicates, false)?;
-    let left = left.as_array();
-    let right = right.as_array();
-    check_residual_lengths(&parsed, left.len(), right.len())?;
     let inputs = parse_inputs(aggregations)?;
     if inputs.is_empty() {
         return Err(PyValueError::new_err(
             "at least one aggregation is required",
         ));
     }
-    let mut set = AggregationSet::new(
-        output_len,
-        if reverse { left.len() } else { right.len() },
-        &inputs,
-        return_matched,
-    )?;
+    let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
     let views: Vec<_> = parsed.iter().map(|predicate| predicate.view()).collect();
-    let metadata_views = metadata.as_deref().map(null_metadata_views);
+    let metadata_views = metadata.map(null_metadata_views);
     aggregate_range(
-        left,
-        right,
-        op,
+        &windows,
         &views,
         metadata_views.as_deref(),
         &mut set,
@@ -388,6 +363,116 @@ fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
         output_len,
         return_matched,
     )?))
+}
+
+/// Run aggregation for one range anchor followed by residual predicates.
+///
+/// Predicate one creates the binary-search window. Predicate two may be
+/// absent; every predicate after the first is filtered inside that window.
+/// This is the single-anchor extended-join contract.
+#[allow(clippy::too_many_arguments)]
+fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    left: PyReadonlyArray1<'py, T>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right: PyReadonlyArray1<'py, T>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    op: CompareOp,
+    aggregations: &Bound<'py, PyList>,
+    output_positions: Option<ArrayView1<'_, i64>>,
+    output_len: usize,
+    return_matched: bool,
+    reverse: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    let (parsed, metadata) = residuals(py, predicates, false, false)?;
+    let left_view = left.as_array();
+    let right_view = right.as_array();
+    check_residual_lengths(&parsed, left_view.len(), right_view.len())?;
+    let windows = build_range_core(
+        left_view,
+        left_index.as_array(),
+        right_view,
+        right_index.as_array(),
+        false,
+        op,
+    )
+    .map_err(PyValueError::new_err)?;
+    aggregate_range_windows(
+        py,
+        windows,
+        &parsed,
+        metadata.as_deref(),
+        aggregations,
+        output_positions,
+        output_len,
+        if reverse {
+            left_view.len()
+        } else {
+            right_view.len()
+        },
+        return_matched,
+        reverse,
+    )
+}
+
+/// Run aggregation for two confirmed range anchors followed by residuals.
+///
+/// Predicates one and two are parsed as ascending range predicates, their
+/// windows are intersected, and predicates three onward are filtered inside
+/// the intersection. This is the range-led extended-join contract.
+#[allow(clippy::too_many_arguments)]
+fn run_dual_range<'py, T: numpy::Element + PartialOrd + Copy>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    first: ParsedRangePredicate<'py, T>,
+    aggregations: &Bound<'py, PyList>,
+    output_positions: Option<ArrayView1<'_, i64>>,
+    output_len: usize,
+    return_matched: bool,
+    reverse: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    let second_object = predicates.get_item(1)?;
+    let second_tuple = second_object.cast::<PyTuple>()?;
+    let second = parse_range_predicate::<T>(second_tuple)?;
+    if !second.op.is_range() {
+        return Err(PyValueError::new_err(
+            "the second range predicate must use <, <=, >, or >=",
+        ));
+    }
+    let (parsed, metadata) = residuals(py, predicates, false, true)?;
+    let left = first.left.as_array();
+    let right = first.right.as_array();
+    check_residual_lengths(&parsed, left.len(), right.len())?;
+    let windows = build_windows(
+        RangePredicate {
+            left,
+            left_index: first.left_index.as_array(),
+            right,
+            right_index: first.right_index.as_array(),
+            op: first.op,
+        },
+        RangePredicate {
+            left: second.left.as_array(),
+            left_index: second.left_index.as_array(),
+            right: second.right.as_array(),
+            right_index: second.right_index.as_array(),
+            op: second.op,
+        },
+    )
+    .map_err(PyValueError::new_err)?;
+    aggregate_range_windows(
+        py,
+        windows,
+        &parsed,
+        metadata.as_deref(),
+        aggregations,
+        output_positions,
+        output_len,
+        if reverse { left.len() } else { right.len() },
+        return_matched,
+        reverse,
+    )
 }
 
 /// Run fused aggregation for an all-`!=` extended join.
@@ -439,7 +524,7 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
     return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    let (parsed, metadata) = residuals(py, predicates, true)?;
+    let (parsed, metadata) = residuals(py, predicates, true, false)?;
     check_residual_lengths(&parsed, left_index.len()?, right_index.len()?)?;
     let inputs = parse_inputs(aggregations)?;
     if inputs.is_empty() {
@@ -534,9 +619,9 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
     return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    if predicates.len() < 2 {
+    if predicates.is_empty() {
         return Err(PyValueError::new_err(
-            "single extended aggregation requires at least two predicates",
+            "single extended aggregation requires at least one predicate",
         ));
     }
     // Aggregation has three supported anchor layouts:
@@ -613,7 +698,9 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
             py,
             predicates,
             first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?,
+            first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
             first.get_item(2)?.extract::<PyReadonlyArray1<'py, T>>()?,
+            first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?,
             op,
             aggregations,
             calculation_output_positions,
@@ -667,6 +754,107 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
     )
 }
 
+/// Dispatch the range-led extended aggregation contract.
+///
+/// Unlike [`dispatch`], this entry point requires predicates one and two to
+/// be range anchors. Their windows are intersected by [`run_dual_range`]; any
+/// remaining predicates are residual filters. The optional eighth-element
+/// anchor form carries trimmed output-position maps for aggregation.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_dual_range<'py, T: numpy::Element + PartialOrd + Copy>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    first: &Bound<'py, PyTuple>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+    reverse: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    if predicates.len() < 2 {
+        return Err(PyValueError::new_err(
+            "range extended aggregation requires at least two predicates",
+        ));
+    }
+    if !matches!(first.len(), 6 | 8) {
+        return Err(PyValueError::new_err(
+            "the first range aggregation predicate must contain 6 or 8 elements",
+        ));
+    }
+    let first_tuple = first;
+    let comparator_position = if first_tuple.len() == 8 { 7 } else { 5 };
+    // Validate the shared tuple field even though residual-filtered
+    // aggregation does not use ordering metadata for window selection.
+    first_tuple.get_item(4)?.extract::<bool>()?;
+    let first = ParsedRangePredicate {
+        left: first_tuple
+            .get_item(0)?
+            .extract::<PyReadonlyArray1<'py, T>>()?,
+        left_index: first_tuple
+            .get_item(1)?
+            .extract::<PyReadonlyArray1<'py, i64>>()?,
+        right: first_tuple
+            .get_item(2)?
+            .extract::<PyReadonlyArray1<'py, T>>()?,
+        right_index: first_tuple
+            .get_item(3)?
+            .extract::<PyReadonlyArray1<'py, i64>>()?,
+        op: CompareOp::try_from_str(
+            first_tuple
+                .get_item(comparator_position)?
+                .extract::<&str>()?,
+        )?,
+    };
+    if !first.op.is_range() {
+        return Err(PyValueError::new_err(
+            "range extended aggregation requires a range comparator first",
+        ));
+    }
+    let (left_output_positions, right_output_positions) = if first_tuple.len() == 8 {
+        (
+            Some(
+                first_tuple
+                    .get_item(5)?
+                    .extract::<PyReadonlyArray1<'py, i64>>()?,
+            ),
+            Some(
+                first_tuple
+                    .get_item(6)?
+                    .extract::<PyReadonlyArray1<'py, i64>>()?,
+            ),
+        )
+    } else {
+        (None, None)
+    };
+    let (left_output_len, right_output_len) = match (
+        left_output_positions.as_ref(),
+        right_output_positions.as_ref(),
+    ) {
+        (Some(left), Some(right)) => (left.len()?, right.len()?),
+        _ => (first.left.len()?, first.right.len()?),
+    };
+    run_dual_range(
+        py,
+        predicates,
+        first,
+        aggregations,
+        if reverse {
+            right_output_positions
+                .as_ref()
+                .map(|values| values.as_array())
+        } else {
+            left_output_positions
+                .as_ref()
+                .map(|values| values.as_array())
+        },
+        if reverse {
+            right_output_len
+        } else {
+            left_output_len
+        },
+        return_matched,
+        reverse,
+    )
+}
+
 macro_rules! extended_aggregation_functions {
     ($forward:ident, $reverse:ident, $ty:ty) => {
         /// Fused forward aggregation for multiple conditional-join
@@ -682,11 +870,15 @@ macro_rules! extended_aggregation_functions {
         /// # Arguments
         ///
         /// * `py` - Active Python interpreter token.
-        /// * `predicates` - Python list of aligned predicate tuples. The
-        ///   first tuple is the range or `!=` anchor.
+        /// * `predicates` - Python list of aligned predicate tuples. It must
+        ///   contain at least one tuple; the first tuple is the range or
+        ///   `!=` anchor and later tuples are residual filters.
         /// * `aggregations` - Non-empty `(values, null_mask, operation)`
         ///   requests, or wildcard count requests. Values use the complete
         ///   right-side physical layout in forward mode.
+        /// * `return_matched` - Include a boolean result slot for every output
+        ///   row when true. The slot is true if at least one complete
+        ///   predicate match contributed to that row.
         ///
         /// # Example
         ///
@@ -702,7 +894,7 @@ macro_rules! extended_aggregation_functions {
         ) -> PyResult<Option<Bound<'py, PyTuple>>> {
             if predicates.is_empty() {
                 return Err(PyValueError::new_err(
-                    "single extended aggregation requires at least two predicates",
+                    "single extended aggregation requires at least one predicate",
                 ));
             }
             let first_item = predicates.get_item(0)?;
@@ -726,6 +918,7 @@ macro_rules! extended_aggregation_functions {
         /// * `predicates` - Python list of aligned anchor and residual tuples.
         /// * `aggregations` - Non-empty aggregation requests over the complete
         ///   left-side physical layout.
+        /// * `return_matched` - Include the per-output matched mask when true.
         ///
         /// # Returns
         ///
@@ -740,7 +933,7 @@ macro_rules! extended_aggregation_functions {
         ) -> PyResult<Option<Bound<'py, PyTuple>>> {
             if predicates.is_empty() {
                 return Err(PyValueError::new_err(
-                    "single extended aggregation requires at least two predicates",
+                    "single extended aggregation requires at least one predicate",
                 ));
             }
             let first_item = predicates.get_item(0)?;
@@ -801,6 +994,130 @@ extended_aggregation_functions!(
     f32
 );
 
+/// Export the range-led extended aggregation contract through the same
+/// implementation as the general extended aggregation kernel.
+///
+/// These wrappers select the explicit two-range path because PyJanitor only
+/// routes here after validating that predicates one and two are ascending
+/// range predicates. The candidate traversal and aggregation logic remains in
+/// `run_dual_range`; these are only API-shape adapters.
+macro_rules! range_extended_aggregation_functions {
+    ($forward:ident, $reverse:ident, $ty:ty) => {
+        /// Aggregate a range-led extended join without materializing pairs.
+        ///
+        /// The first two predicates must be ascending range anchors using the
+        /// six-element range tuple form. The first tuple may use the
+        /// eight-element form when it carries output-position maps. Remaining predicates are
+        /// residual filters and are evaluated in their supplied order. This
+        /// range-specific wrapper requires two range anchors; unlike the
+        /// general single-extended API, it does not expose a fallback where
+        /// predicate two is treated as an ordinary residual.
+        ///
+        /// # Arguments
+        ///
+        /// * `py` - Active Python interpreter token.
+        /// * `predicates` - At least two aligned range-anchor/residual tuples.
+        /// * `aggregations` - Non-empty aggregation requests over the source
+        ///   layout selected by the direction of the call.
+        /// * `return_matched` - Include the output matched mask when true.
+        ///
+        /// # Returns
+        ///
+        /// Returns `None` when no candidate survives all predicates;
+        /// otherwise returns output positions, optional matched flags, and
+        /// one aggregation array per request.
+        #[pyfunction]
+        pub fn $forward<'py>(
+            py: Python<'py>,
+            predicates: &Bound<'py, PyList>,
+            aggregations: &Bound<'py, PyList>,
+            return_matched: bool,
+        ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+            if predicates.len() < 2 {
+                return Err(PyValueError::new_err(
+                    "range extended aggregation requires at least two predicates",
+                ));
+            }
+            let first_item = predicates.get_item(0)?;
+            let first = first_item.cast::<PyTuple>()?;
+            dispatch_dual_range::<$ty>(py, predicates, &first, aggregations, return_matched, false)
+        }
+
+        /// Aggregate the same range-led extended join in reverse orientation.
+        ///
+        /// This has the same tuple, residual, and `return_matched` contract as
+        /// the forward entry point, but updates right-oriented output slots
+        /// from left-side source values.
+        #[pyfunction]
+        pub fn $reverse<'py>(
+            py: Python<'py>,
+            predicates: &Bound<'py, PyList>,
+            aggregations: &Bound<'py, PyList>,
+            return_matched: bool,
+        ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+            if predicates.len() < 2 {
+                return Err(PyValueError::new_err(
+                    "range extended aggregation requires at least two predicates",
+                ));
+            }
+            let first_item = predicates.get_item(0)?;
+            let first = first_item.cast::<PyTuple>()?;
+            dispatch_dual_range::<$ty>(py, predicates, &first, aggregations, return_matched, true)
+        }
+    };
+}
+
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_int64,
+    range_join_extended_aggregate_reverse_int64,
+    i64
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_int32,
+    range_join_extended_aggregate_reverse_int32,
+    i32
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_int16,
+    range_join_extended_aggregate_reverse_int16,
+    i16
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_int8,
+    range_join_extended_aggregate_reverse_int8,
+    i8
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_uint64,
+    range_join_extended_aggregate_reverse_uint64,
+    u64
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_uint32,
+    range_join_extended_aggregate_reverse_uint32,
+    u32
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_uint16,
+    range_join_extended_aggregate_reverse_uint16,
+    u16
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_uint8,
+    range_join_extended_aggregate_reverse_uint8,
+    u8
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_f64,
+    range_join_extended_aggregate_reverse_f64,
+    f64
+);
+range_extended_aggregation_functions!(
+    range_join_extended_aggregate_f32,
+    range_join_extended_aggregate_reverse_f32,
+    f32
+);
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     macro_rules! add {
         ($($name:ident),+ $(,)?) => {
@@ -828,14 +1145,75 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         single_join_extended_aggregate_reverse_f64,
         single_join_extended_aggregate_f32,
         single_join_extended_aggregate_reverse_f32,
+        range_join_extended_aggregate_int64,
+        range_join_extended_aggregate_reverse_int64,
+        range_join_extended_aggregate_int32,
+        range_join_extended_aggregate_reverse_int32,
+        range_join_extended_aggregate_int16,
+        range_join_extended_aggregate_reverse_int16,
+        range_join_extended_aggregate_int8,
+        range_join_extended_aggregate_reverse_int8,
+        range_join_extended_aggregate_uint64,
+        range_join_extended_aggregate_reverse_uint64,
+        range_join_extended_aggregate_uint32,
+        range_join_extended_aggregate_reverse_uint32,
+        range_join_extended_aggregate_uint16,
+        range_join_extended_aggregate_reverse_uint16,
+        range_join_extended_aggregate_uint8,
+        range_join_extended_aggregate_reverse_uint8,
+        range_join_extended_aggregate_f64,
+        range_join_extended_aggregate_reverse_f64,
+        range_join_extended_aggregate_f32,
+        range_join_extended_aggregate_reverse_f32,
     );
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use numpy::PyArray1;
+
+    #[test]
+    fn single_range_aggregation_accepts_one_predicate() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // With only one predicate there is no residual tuple to parse:
+            // the range window itself is the complete join condition.
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![4_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
+                    PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let values = PyArray1::from_vec(py, vec![10_i64, 20, 30, 40]);
+            let mask = PyArray1::from_vec(py, vec![false, false, false, false]);
+            let aggregation = PyTuple::new(
+                py,
+                [
+                    values.into_any(),
+                    mask.into_any(),
+                    "sum".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let aggregations = PyList::new(py, [aggregation])?;
+
+            let result =
+                single_join_extended_aggregate_int64(py, &predicates, &aggregations, true)?
+                    .expect("the one-predicate range has matches");
+            assert_eq!(result.get_item(1)?.extract::<Vec<bool>>()?, vec![true]);
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![70]);
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn range_residuals_filter_before_forward_aggregation() {
@@ -1081,7 +1459,12 @@ mod tests {
             )?)?;
             let aggregations = PyList::empty(py);
 
-            let error = single_join_extended_aggregate_int64(py, &predicates, &aggregations, true)
+            let error = single_join_extended_aggregate_int64(
+                py,
+                &predicates,
+                &aggregations,
+                true,
+            )
                 .expect_err("mixed operators after a != anchor must be rejected");
             assert_eq!(
                 error.to_string(),
@@ -1089,7 +1472,12 @@ mod tests {
             );
 
             let error =
-                single_join_extended_aggregate_reverse_int64(py, &predicates, &aggregations, true)
+                single_join_extended_aggregate_reverse_int64(
+                    py,
+                    &predicates,
+                    &aggregations,
+                    true,
+                )
                     .expect_err("reverse mixed operators after a != anchor must be rejected");
             assert_eq!(
                 error.to_string(),
@@ -1153,7 +1541,7 @@ mod tests {
                 .expect_err("an empty forward predicate list must be rejected");
             assert_eq!(
                 error.to_string(),
-                "ValueError: single extended aggregation requires at least two predicates"
+                "ValueError: single extended aggregation requires at least one predicate"
             );
 
             let error =
@@ -1161,7 +1549,7 @@ mod tests {
                     .expect_err("an empty reverse predicate list must be rejected");
             assert_eq!(
                 error.to_string(),
-                "ValueError: single extended aggregation requires at least two predicates"
+                "ValueError: single extended aggregation requires at least one predicate"
             );
             Ok(())
         })

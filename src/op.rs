@@ -17,6 +17,11 @@ pub enum CompareOp {
 }
 
 impl CompareOp {
+    /// Return whether this operator defines a binary-search range.
+    pub(crate) fn is_range(self) -> bool {
+        matches!(self, Self::Gt | Self::Ge | Self::Lt | Self::Le)
+    }
+
     /// Decode the public string spelling used by the single-join API.
     ///
     /// ELI5: the Python boundary translates a readable operator once, then

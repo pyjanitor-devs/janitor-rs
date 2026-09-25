@@ -13,7 +13,7 @@ use pyo3::types::{PyList, PyTuple};
 
 use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
 use crate::op::CompareOp;
-use crate::single_non_equi_join::{range_bounds, visit_not_equal_pairs_core};
+use crate::single_non_equi_join::{range_window, visit_not_equal_pairs_core};
 
 /// Build a lookup from original physical rows to compact aggregation slots.
 ///
@@ -384,7 +384,7 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
         // write directly into the trimmed right calculation layout.
         let mut boundaries = Vec::with_capacity(left.len());
         for &left_value in left.iter() {
-            let (start, end) = range_bounds(left_value, right, op);
+            let (start, end) = range_window(left_value, right, op);
             let boundary = if matches!(op, CompareOp::Lt | CompareOp::Le) {
                 start
             } else {
