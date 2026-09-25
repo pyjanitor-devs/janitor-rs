@@ -1004,8 +1004,8 @@ the filtered arrays, physical-position mappings, sorting, alignment, and
 authoritative null metadata before dispatching every supported predicate path
 to Rust. `return_building_blocks` remains a pyjanitor-level request that maps
 to `keep="all"`; it is not an argument to the extended Rust kernel.
-**Recommendation**: Keep `single_join.rs` as the one-predicate path and use
-`single_join_extended.rs` for multi-predicate range and all-not-equal joins. Apply
+**Recommendation**: Keep `single_non_equi_join.rs` as the one-predicate path and use
+`single_non_equi_join_extended.rs` for multi-predicate range and all-not-equal joins. Apply
 `keep` only after all predicates have passed.
 
 ### [2026-09-23] Equality is residual-only in extended single joins
@@ -1038,3 +1038,86 @@ fails at the PyO3 boundary or produces invalid position metadata.
 **Recommendation**: Treat single-join signature and coordinate-system changes
 as a coordinated Rust/pyjanitor migration. Add an integration test covering
 range and `!=` calls before merging either side.
+
+### [2026-09-23] Fused single and extended aggregation kernels
+
+**Context**: Implementing the aggregation phase after the index-producing
+single and extended join kernels.
+**Learning**: `single_non_equi_join_agg.rs` and `single_non_equi_join_extended_agg.rs` reuse the
+existing `AggregationSet`, input parsing, and result construction from the
+batch aggregation kernels. They update aggregation state during candidate
+comparison, so successful pairs are never materialized as intermediate join
+indices. Forward calls aggregate into left-side slots; reverse calls aggregate
+into right-side slots. Forward and reverse results are separate APIs and cannot
+be requested together.
+
+For `!=`, filtered non-null predicate values are accompanied by physical
+position maps and optional null-position arrays. The kernel uses those maps to
+index full-layout aggregation arrays. Null masks are authoritative, and the
+extension-array flag preserves pandas nullable comparison semantics. Pyjanitor
+performs sorting and alignment; Rust trusts those contracts and does not sort
+or infer nullness.
+
+**Recommendation**: Keep aggregation kernels separate from index materializers.
+Use the same predicate traversal and residual filtering semantics as the index
+path, but call `AggregationSet::update` at each successful comparison. Return
+`None` only when no comparison survives; do not add `keep` to aggregation APIs.
+
+### [2026-09-23] Use boundary aggregation for forward single ranges
+
+**Context**: Optimizing the fused single-join aggregation path.
+**Learning**: A forward `<` or `<=` predicate creates a contiguous right-side
+suffix, while `>` or `>=` creates a contiguous right-side prefix. The single
+range aggregation kernel now passes those boundaries to
+`AggregationSet::aggregate_starts` or `aggregate_ends`, allowing the existing
+adaptive direct/suffix/prefix strategies to choose the efficient reduction.
+Reverse aggregation for a single range join uses the optimized boundary path
+as well: `aggregate_reverse_starts` and `aggregate_reverse_ends` handle the
+complete prefix or suffix windows without visiting every pair. Extended joins
+remain candidate-based after residual predicates are applied, since residuals
+can make the surviving positions non-contiguous. The same candidate traversal
+is used for `!=` joins.
+
+**Recommendation**: Preserve the boundary fast path only when the candidate
+window is a complete prefix or suffix. Use `set.update` for `!=`, reverse
+aggregation, and residual-filtered candidates.
+
+Fused aggregation follows pandas reduction dtypes for numeric inputs:
+signed-integer `sum` and `prod` use `int64`, unsigned-integer `sum` and `prod`
+use `uint64`, and floating reductions retain `float32` or `float64`.
+`min` and `max` retain the source dtype. PyJanitor performs the integer
+promotion before calling Rust; the Rust state layer then accumulates at the
+promoted width. Position, length, and allocation calculations remain checked.
+
+Count-like aggregation has a separate dtype-independent contract. `size`
+uses the wildcard `("*", "size")` request and counts every successful
+comparison. `count` uses `("*", null_mask, "count")` and consults only the
+authoritative boolean mask, so strings, objects, and extension values do not
+enter numeric dtype dispatch. Value reductions still require supported numeric
+arrays and their aligned masks.
+
+### [2026-09-25] Extended aggregation tuple contracts
+
+**Context**: Auditing extended aggregation dispatch and physical-position
+mapping.
+**Learning**: The eight-element range anchor stores its output-layout position
+arrays in fields 5 and 6; fields 1 and 3 are the predicate index arrays. The
+thirteen-element `!=` anchor is the aggregation-only form and carries the
+complete output-layout mappings in fields 10 and 11. The eleven-element
+`!=` form belongs to index generation and must be rejected by aggregation.
+
+**Recommendation**: Keep tuple-shape validation explicit at the aggregation
+boundary and pass the selected output-position mapping through the returned
+result. Do not infer an identity mapping when the physical and compact layouts
+differ.
+
+### [2026-09-25] Floating-point compensation must recover after infinity
+
+**Context**: Comparing the f32 and f64 Kahan update helpers.
+**Learning**: Adding an infinity can leave the compensation value as `NaN`
+even when the running total is a valid infinity. A later finite update then
+becomes `NaN` unless the non-finite compensation is reset.
+
+**Recommendation**: Keep the f32 and f64 compensation guards symmetrical and
+test an infinity followed by a finite value in both direct and boundary-sweep
+aggregation paths.

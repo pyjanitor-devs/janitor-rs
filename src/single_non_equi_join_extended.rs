@@ -22,7 +22,7 @@ use crate::predicate::{
     null_metadata_views, parse_predicates_with_nulls_strings, predicates_match_dispatch,
     NullMetadata, Predicate,
 };
-use crate::single_join::{
+use crate::single_non_equi_join::{
     build_not_equal_positions_core, build_range_core, Keep, SingleJoinResult,
 };
 

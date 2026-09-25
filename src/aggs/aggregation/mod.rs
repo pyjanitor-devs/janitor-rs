@@ -11,6 +11,8 @@
 //! update the enum and parser in `input.rs`, then add its state and update
 //! behavior in `state.rs`.
 
+use numpy::ndarray::{Array1, ArrayView1};
+use numpy::IntoPyArray;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
@@ -57,6 +59,36 @@ pub(crate) fn make_results<'py>(
     set: AggregationSet<'_>,
 ) -> PyResult<Bound<'py, PyTuple>> {
     let (matched, results) = set.into_results(py);
+    let matched = matched.expect("legacy aggregation results always request matched metadata");
     let results = PyList::new(py, results)?;
     PyTuple::new(py, [matched, results.into_any().unbind()])
+}
+
+/// Build the result used by single and extended fused joins.
+///
+/// `output_positions` describes the trimmed physical output layout. The
+/// aggregation state is already in that same calculation order; this helper
+/// only preserves the map in the returned tuple. It deliberately does not
+/// scatter or reorder any accumulator buffer.
+pub(crate) fn make_results_with_positions<'py>(
+    py: Python<'py>,
+    set: AggregationSet<'_>,
+    output_positions: Option<ArrayView1<'_, i64>>,
+    output_len: usize,
+    return_matched: bool,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let output_positions = output_positions
+        .map(|values| values.to_owned())
+        .unwrap_or_else(|| Array1::from_iter((0..output_len).map(|position| position as i64)))
+        .into_pyarray(py)
+        .unbind()
+        .into_any();
+    let (matched, results) = set.into_results(py);
+    let results = PyList::new(py, results)?;
+    if return_matched {
+        let matched = matched.expect("matched metadata was requested but not allocated");
+        PyTuple::new(py, [output_positions, matched, results.into_any().unbind()])
+    } else {
+        PyTuple::new(py, [output_positions, results.into_any().unbind()])
+    }
 }

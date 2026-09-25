@@ -99,7 +99,7 @@ pub fn aggregate_multi_regions_reverse<'py>(
         .map(|predicate| predicate.view())
         .collect();
     let metadata_views = metadata.as_deref().map(null_metadata_views);
-    let mut set = AggregationSet::new(right.len(), left.len(), &inputs)?;
+    let mut set = AggregationSet::new(right.len(), left.len(), &inputs, true)?;
     let mut next = vec![-1_i64; right.len()];
     let mut groups = BTreeMap::<i64, GroupState>::new();
     let mut previous_end = right.len();
@@ -162,12 +162,11 @@ mod tests {
             let right_region = PyArray1::from_vec(py, vec![1_i64, 2, 3]);
             let starts = PyArray1::from_vec(py, vec![0_i64]);
             let right_index = PyArray1::from_vec(py, vec![30_i64, 10, 20]);
-            let values = PyArray1::from_vec(py, vec![7_i64]);
             let mask = PyArray1::from_vec(py, vec![false]);
             let aggregation = PyTuple::new(
                 py,
                 [
-                    values.into_any(),
+                    "*".into_pyobject(py).unwrap().into_any(),
                     mask.into_any(),
                     "count".into_pyobject(py).unwrap().into_any(),
                 ],

@@ -5,8 +5,10 @@ mod index_builder;
 mod multi_join_indices;
 mod op;
 mod predicate;
-mod single_join;
-mod single_join_extended;
+mod single_non_equi_join;
+mod single_non_equi_join_agg;
+mod single_non_equi_join_extended;
+mod single_non_equi_join_extended_agg;
 
 /// Narrow Rust-only surface used by `benches/kernels.rs`.
 ///
@@ -258,8 +260,10 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     bin_search::register(m)?;
     multi_join_indices::register(m)?;
     index_builder::register(m)?;
-    single_join::register(m)?;
-    single_join_extended::register(m)?;
+    single_non_equi_join::register(m)?;
+    single_non_equi_join_agg::register(m)?;
+    single_non_equi_join_extended_agg::register(m)?;
+    single_non_equi_join_extended::register(m)?;
     aggs::register(m)?;
     Ok(())
 }
@@ -319,7 +323,7 @@ mod registration_tests {
     /// modules).
     /// Bump this alongside any PR that intentionally adds or removes an
     /// export.
-    const EXPECTED_EXPORT_COUNT: usize = 771;
+    const EXPECTED_EXPORT_COUNT: usize = 811;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would

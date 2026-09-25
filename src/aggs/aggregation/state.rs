@@ -20,10 +20,18 @@
 //! contract, identities, and Kahan compensation are the same state concerns
 //! used by the comparison-driven methods, while the traversal strategy is
 //! specific to starts-only, ends-only, or starts/ends ranges.
+//!
+//! The Python boundary normalizes numeric inputs before they reach this state:
+//! signed integer `sum` and `prod` inputs are `int64`, unsigned inputs are
+//! `uint64`, and floating inputs arrive as `f32` or `f64`. Integer accumulators
+//! therefore use the pandas result widths, and floating states preserve the
+//! input `f32` or `f64` width through materialization. Position, length, and
+//! allocation arithmetic remains checked and must not wrap.
 
 use super::input::{AggregationInput, AggregationOp};
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::IntoPyArray;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::aggs::adaptive::{
@@ -67,23 +75,25 @@ struct View<'a> {
 /// Runtime state for one operation, including its output buffer.
 ///
 /// Each variant has a fixed output type dictated by the aggregation contract:
-/// signed values use `i64`, `u64` stays `u64`, floating-point values use
-/// `f64`, and positions/counts use `i64`.
+/// signed values use `i64`, unsigned values use `u64`, floating-point values
+/// preserve `f32`/`f64`, and positions/counts use `i64`.
 enum State<'a> {
     // A state variant stores both the typed source view and the output
     // buffer. Keeping them together prevents an update from accidentally
     // pairing an operation with a source array of the wrong dtype.
     Sum(View<'a>, Vec<i64>),
     SumU64(ArrayView1<'a, u64>, ArrayView1<'a, bool>, Vec<u64>),
+    SumF32(View<'a>, Vec<f32>, Vec<f32>),
     SumF64(View<'a>, Vec<f64>, Vec<f64>),
     /// Reference the set-level count-all buffer; no value array or mask is
     /// needed. The buffer is shared so repeated count-all requests are
     /// computed once and materialized per request only when results are built.
     CountAll,
-    /// Count only successful comparisons whose source mask marks a value valid.
-    CountNonNull(View<'a>, Vec<i64>),
+    /// Count valid source positions using only a dtype-independent mask.
+    CountNonNullMask(ArrayView1<'a, bool>, Vec<i64>),
     Product(View<'a>, Vec<i64>),
     ProductU64(ArrayView1<'a, u64>, ArrayView1<'a, bool>, Vec<u64>),
+    ProductF32(View<'a>, Vec<f32>),
     ProductF64(View<'a>, Vec<f64>),
     Min(View<'a>, Vec<i64>),
     Max(View<'a>, Vec<i64>),
@@ -108,8 +118,8 @@ pub(crate) struct AggregationSet<'a> {
     /// It is allocated only when at least one count-all request is present.
     count_all: Option<Vec<i64>>,
     /// Whether each output position received at least one successful match.
-    /// This is independent of null masks and aggregation identities.
-    matched: Vec<bool>,
+    /// This is allocated only when the caller requests matched metadata.
+    matched: Option<Vec<bool>>,
     /// Whether at least one valid comparison has succeeded.
     successful: bool,
 }
@@ -145,6 +155,7 @@ impl<'a> AggregationSet<'a> {
         output_len: usize,
         source_len: usize,
         inputs: &'a [AggregationInput<'_>],
+        return_matched: bool,
     ) -> PyResult<Self> {
         let mut states = Vec::with_capacity(inputs.len());
         let mut candidate_len = None;
@@ -152,6 +163,28 @@ impl<'a> AggregationSet<'a> {
             let (values, nulls, op) = match input {
                 AggregationInput::CountAll => {
                     states.push(State::CountAll);
+                    continue;
+                }
+                AggregationInput::CountNonNull(mask) => {
+                    let mask = mask.as_array();
+                    let length = mask.len();
+                    if let Some(expected) = candidate_len {
+                        ensure_equal_lengths(
+                            "first aggregation array",
+                            expected,
+                            "current aggregation mask",
+                            length,
+                        )?;
+                    } else {
+                        candidate_len = Some(length);
+                    }
+                    ensure_equal_lengths(
+                        "comparison source array",
+                        source_len,
+                        "aggregation mask",
+                        length,
+                    )?;
+                    states.push(State::CountNonNullMask(mask, vec![0; output_len]));
                     continue;
                 }
                 AggregationInput::I64(a, m, o) => (Values::I64(a.as_array()), m.as_array(), *o),
@@ -201,7 +234,12 @@ impl<'a> AggregationSet<'a> {
             let state = match op {
                 AggregationOp::Sum => match &values {
                     Values::U64(values) => State::SumU64(*values, nulls, vec![0; output_len]),
-                    Values::F64(_) | Values::F32(_) => State::SumF64(
+                    Values::F32(_) => State::SumF32(
+                        View { values, nulls },
+                        vec![0.; output_len],
+                        vec![0.; output_len],
+                    ),
+                    Values::F64(_) => State::SumF64(
                         View { values, nulls },
                         vec![0.; output_len],
                         vec![0.; output_len],
@@ -210,11 +248,16 @@ impl<'a> AggregationSet<'a> {
                 },
                 AggregationOp::CountAll => State::CountAll,
                 AggregationOp::CountNonNull => {
-                    State::CountNonNull(View { values, nulls }, vec![0; output_len])
+                    return Err(PyValueError::new_err(
+                        "count must use the wildcard null-mask form",
+                    ));
                 }
                 AggregationOp::Product => match &values {
                     Values::U64(values) => State::ProductU64(*values, nulls, vec![1; output_len]),
-                    Values::F64(_) | Values::F32(_) => {
+                    Values::F32(_) => {
+                        State::ProductF32(View { values, nulls }, vec![1.; output_len])
+                    }
+                    Values::F64(_) => {
                         State::ProductF64(View { values, nulls }, vec![1.; output_len])
                     }
                     _ => State::Product(View { values, nulls }, vec![1; output_len]),
@@ -240,7 +283,7 @@ impl<'a> AggregationSet<'a> {
             } else {
                 None
             },
-            matched: vec![false; output_len],
+            matched: return_matched.then(|| vec![false; output_len]),
             successful: false,
         })
     }
@@ -253,7 +296,7 @@ impl<'a> AggregationSet<'a> {
     /// share one traversal.
     ///
     /// `CountAll` deliberately ignores null metadata and therefore counts
-    /// every successful comparison. `CountNonNull` and other value-based
+    /// every successful comparison. `CountNonNullMask` and other value-based
     /// operations skip a source value whose mask is `true`. A `false` mask is
     /// treated as an assertion that the value array is null-free and the value
     /// is valid; no additional null inference or sentinel filtering is
@@ -271,8 +314,7 @@ impl<'a> AggregationSet<'a> {
         if source_position >= self.source_len || output_position >= self.output_len {
             return;
         }
-        self.successful = true;
-        self.matched[output_position] = true;
+        self.mark_matched(output_position);
         // One successful comparison is one event. Broadcast that event to
         // every requested aggregation before moving to the next candidate.
         // This is the central multi-aggregation benefit: predicates and
@@ -285,8 +327,8 @@ impl<'a> AggregationSet<'a> {
                     // requests. This branch only signals that the request
                     // exists; the actual increment happens once below.
                 }
-                State::CountNonNull(view, values) => {
-                    if !view.nulls[source_position] {
+                State::CountNonNullMask(nulls, values) => {
+                    if !nulls[source_position] {
                         values[output_position] += 1;
                     }
                 }
@@ -300,6 +342,15 @@ impl<'a> AggregationSet<'a> {
                     if !nulls[source_position] {
                         values[output_position] =
                             values[output_position].wrapping_add(source[source_position]);
+                    }
+                }
+                State::SumF32(view, values, compensation) => {
+                    if !view.nulls[source_position] {
+                        kahan_add_f32(
+                            &mut values[output_position],
+                            &mut compensation[output_position],
+                            as_f32(&view.values, source_position),
+                        );
                     }
                 }
                 State::SumF64(view, values, compensation) => {
@@ -321,6 +372,11 @@ impl<'a> AggregationSet<'a> {
                     if !nulls[source_position] {
                         values[output_position] =
                             values[output_position].wrapping_mul(source[source_position]);
+                    }
+                }
+                State::ProductF32(view, values) => {
+                    if !view.nulls[source_position] {
+                        values[output_position] *= as_f32(&view.values, source_position);
                     }
                 }
                 State::ProductF64(view, values) => {
@@ -440,12 +496,11 @@ impl<'a> AggregationSet<'a> {
         for state in &mut self.states {
             match state {
                 State::CountAll => {}
-                State::CountNonNull(view, output) => {
+                State::CountNonNullMask(nulls, output) => {
                     if running {
                         let mut suffix = vec![0_i64; self.source_len + 1];
                         for position in (0..self.source_len).rev() {
-                            suffix[position] =
-                                suffix[position + 1] + i64::from(!view.nulls[position]);
+                            suffix[position] = suffix[position + 1] + i64::from(!nulls[position]);
                         }
                         for (row, range) in ranges.iter().enumerate() {
                             if let Some((start, _)) = range {
@@ -455,13 +510,9 @@ impl<'a> AggregationSet<'a> {
                     } else {
                         for (row, range) in ranges.iter().enumerate() {
                             if let Some((start, end)) = range {
-                                let mut count = 0_i64;
-                                for position in *start..*end {
-                                    if !view.nulls[position] {
-                                        count += 1;
-                                    }
-                                }
-                                output[row] = count;
+                                output[row] = (*start..*end)
+                                    .filter(|&position| !nulls[position])
+                                    .count() as i64;
                             }
                         }
                     }
@@ -502,6 +553,9 @@ impl<'a> AggregationSet<'a> {
                     } else {
                         update_u64_ranges(values, nulls, output, &ranges, false);
                     }
+                }
+                State::SumF32(view, output, compensation) => {
+                    update_float_ranges_f32(view, output, compensation, &ranges, false);
                 }
                 State::SumF64(view, output, compensation) => {
                     update_float_ranges(view, output, compensation, &ranges, false);
@@ -555,6 +609,9 @@ impl<'a> AggregationSet<'a> {
                             output[row] = value;
                         }
                     }
+                }
+                State::ProductF32(view, output) => {
+                    update_float_ranges_f32_without_compensation(view, output, &ranges);
                 }
                 State::Min(view, output) => {
                     update_extreme_ranges(view, output, &ranges, true, running, true)
@@ -651,12 +708,11 @@ impl<'a> AggregationSet<'a> {
         for state in &mut self.states {
             match state {
                 State::CountAll => {}
-                State::CountNonNull(view, output) => {
+                State::CountNonNullMask(nulls, output) => {
                     if running {
                         let mut prefix = vec![0_i64; self.source_len + 1];
                         for position in 0..self.source_len {
-                            prefix[position + 1] =
-                                prefix[position] + i64::from(!view.nulls[position]);
+                            prefix[position + 1] = prefix[position] + i64::from(!nulls[position]);
                         }
                         for (row, range) in ranges.iter().enumerate() {
                             if let Some((_, end)) = range {
@@ -666,13 +722,9 @@ impl<'a> AggregationSet<'a> {
                     } else {
                         for (row, range) in ranges.iter().enumerate() {
                             if let Some((start, end)) = range {
-                                let mut count = 0_i64;
-                                for position in *start..*end {
-                                    if !view.nulls[position] {
-                                        count += 1;
-                                    }
-                                }
-                                output[row] = count;
+                                output[row] = (*start..*end)
+                                    .filter(|&position| !nulls[position])
+                                    .count() as i64;
                             }
                         }
                     }
@@ -718,6 +770,9 @@ impl<'a> AggregationSet<'a> {
                 State::SumF64(view, output, compensation) => {
                     update_float_ranges(view, output, compensation, &ranges, false);
                 }
+                State::SumF32(view, output, compensation) => {
+                    update_float_ranges_f32(view, output, compensation, &ranges, false);
+                }
                 State::Product(view, output) => {
                     if running {
                         let mut prefix = vec![1_i64; self.source_len + 1];
@@ -756,6 +811,9 @@ impl<'a> AggregationSet<'a> {
                         update_u64_ranges(values, nulls, output, &ranges, true);
                     }
                 }
+                State::ProductF32(view, output) => {
+                    update_float_ranges_f32_without_compensation(view, output, &ranges);
+                }
                 State::ProductF64(view, output) => {
                     for (row, range) in ranges.iter().enumerate() {
                         if let Some((start, end)) = range {
@@ -789,9 +847,37 @@ impl<'a> AggregationSet<'a> {
     fn mark_ranges(&mut self, ranges: &[Option<(usize, usize)>]) {
         for (row, range) in ranges.iter().enumerate() {
             if range.is_some() {
-                self.matched[row] = true;
-                self.successful = true;
+                self.mark_matched(row);
             }
+        }
+    }
+
+    /// Mark one output slot as matched.
+    ///
+    /// `successful` is always updated, while the boolean vector is updated
+    /// only when the caller requested matched metadata. Keeping that policy in
+    /// one helper prevents comparison and range paths from drifting apart.
+    #[inline]
+    fn mark_matched(&mut self, output_position: usize) {
+        // `successful` answers whether any pair matched at all and is needed
+        // even when the caller did not request the public matched array.
+        // Keeping the allocation optional avoids building an O(output_len)
+        // boolean buffer for callers that only need aggregation values.
+        self.successful = true;
+        if let Some(matched) = &mut self.matched {
+            matched[output_position] = true;
+        }
+    }
+
+    /// Mark every output slot in one valid half-open range as matched.
+    #[inline]
+    fn mark_matched_range(&mut self, start: usize, end: usize) {
+        // Reverse range kernels discover whole half-open output intervals at
+        // once. Mark the interval in one fill rather than visiting each slot
+        // through the per-pair update path.
+        self.successful = true;
+        if let Some(matched) = &mut self.matched {
+            matched[start..end].fill(true);
         }
     }
 
@@ -872,12 +958,11 @@ impl<'a> AggregationSet<'a> {
         for state in &mut self.states {
             match state {
                 State::CountAll => {}
-                State::CountNonNull(view, output) => {
+                State::CountNonNullMask(nulls, output) => {
                     if use_tree {
                         let mut prefix = vec![0_i64; self.source_len + 1];
                         for position in 0..self.source_len {
-                            prefix[position + 1] =
-                                prefix[position] + i64::from(!view.nulls[position]);
+                            prefix[position + 1] = prefix[position] + i64::from(!nulls[position]);
                         }
                         for (row, range) in ranges.iter().enumerate() {
                             if let Some((start, end)) = range {
@@ -887,13 +972,9 @@ impl<'a> AggregationSet<'a> {
                     } else {
                         for (row, range) in ranges.iter().enumerate() {
                             if let Some((start, end)) = range {
-                                let mut count = 0_i64;
-                                for position in *start..*end {
-                                    if !view.nulls[position] {
-                                        count += 1;
-                                    }
-                                }
-                                output[row] = count;
+                                output[row] = (*start..*end)
+                                    .filter(|&position| !nulls[position])
+                                    .count() as i64;
                             }
                         }
                     }
@@ -915,6 +996,9 @@ impl<'a> AggregationSet<'a> {
                 State::SumF64(view, output, compensation) => {
                     update_float_ranges(view, output, compensation, &ranges, false);
                 }
+                State::SumF32(view, output, compensation) => {
+                    update_float_ranges_f32(view, output, compensation, &ranges, false);
+                }
                 State::Product(view, output) => {
                     if use_tree {
                         update_signed_segment_ranges(view, output, &ranges, true);
@@ -931,6 +1015,9 @@ impl<'a> AggregationSet<'a> {
                 }
                 State::ProductF64(view, output) => {
                     update_float_ranges_without_compensation(view, output, &ranges);
+                }
+                State::ProductF32(view, output) => {
+                    update_float_ranges_f32_without_compensation(view, output, &ranges);
                 }
                 State::Min(view, output) => {
                     if use_tree {
@@ -1039,24 +1126,19 @@ impl<'a> AggregationSet<'a> {
         for state in &mut self.states {
             match state {
                 State::CountAll => {}
-                State::CountNonNull(view, output) => {
+                State::CountNonNullMask(nulls, output) => {
                     if !use_sweep {
-                        update_count_ranges(view, output, &suffix_ranges);
+                        update_count_ranges_mask(nulls, output, &suffix_ranges);
                         continue;
                     }
-                    // `events[p]` means: add this row's contribution when the
-                    // sweep reaches right position `p`. A suffix beginning
-                    // at `p` affects `p` and every position to its right.
                     let mut events = vec![0_i64; self.output_len];
                     for (row, start) in valid_starts.iter().enumerate() {
                         if let Some(start) = start {
-                            if !view.nulls[row] {
+                            if !nulls[row] {
                                 events[*start] += 1;
                             }
                         }
                     }
-                    // Once the boundary event has been applied, its value is
-                    // active for the rest of the suffix sweep.
                     let mut running = 0_i64;
                     for position in 0..self.output_len {
                         running += events[position];
@@ -1120,6 +1202,21 @@ impl<'a> AggregationSet<'a> {
                         }
                     }
                 }
+                State::SumF32(view, output, compensation) => {
+                    for (row, start) in valid_starts.iter().enumerate() {
+                        if let Some(start) = start {
+                            if !view.nulls[row] {
+                                for position in *start..self.output_len {
+                                    kahan_add_f32(
+                                        &mut output[position],
+                                        &mut compensation[position],
+                                        as_f32(&view.values, row),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 State::Product(view, output) => {
                     if !use_sweep {
                         update_reverse_signed_ranges(view, output, &suffix_ranges, true);
@@ -1164,6 +1261,18 @@ impl<'a> AggregationSet<'a> {
                         if let Some(start) = start {
                             if !view.nulls[row] {
                                 let value = as_f64(&view.values, row);
+                                for slot in &mut output[*start..self.output_len] {
+                                    *slot *= value;
+                                }
+                            }
+                        }
+                    }
+                }
+                State::ProductF32(view, output) => {
+                    for (row, start) in valid_starts.iter().enumerate() {
+                        if let Some(start) = start {
+                            if !view.nulls[row] {
+                                let value = as_f32(&view.values, row);
                                 for slot in &mut output[*start..self.output_len] {
                                     *slot *= value;
                                 }
@@ -1269,15 +1378,15 @@ impl<'a> AggregationSet<'a> {
         for state in &mut self.states {
             match state {
                 State::CountAll => {}
-                State::CountNonNull(view, output) => {
+                State::CountNonNullMask(nulls, output) => {
                     if !use_sweep {
-                        update_count_ranges(view, output, &prefix_ranges);
+                        update_count_ranges_mask(nulls, output, &prefix_ranges);
                         continue;
                     }
                     let mut events = vec![0_i64; self.output_len];
                     for (row, end) in valid_ends.iter().enumerate() {
                         if let Some(end) = end {
-                            if !view.nulls[row] {
+                            if !nulls[row] {
                                 events[*end - 1] += 1;
                             }
                         }
@@ -1342,6 +1451,21 @@ impl<'a> AggregationSet<'a> {
                         }
                     }
                 }
+                State::SumF32(view, output, compensation) => {
+                    for (row, end) in valid_ends.iter().enumerate() {
+                        if let Some(end) = end {
+                            if !view.nulls[row] {
+                                for position in 0..*end {
+                                    kahan_add_f32(
+                                        &mut output[position],
+                                        &mut compensation[position],
+                                        as_f32(&view.values, row),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 State::Product(view, output) => {
                     if !use_sweep {
                         update_reverse_signed_ranges(view, output, &prefix_ranges, true);
@@ -1386,6 +1510,18 @@ impl<'a> AggregationSet<'a> {
                         if let Some(end) = end {
                             if !view.nulls[row] {
                                 let value = as_f64(&view.values, row);
+                                for slot in &mut output[..*end] {
+                                    *slot *= value;
+                                }
+                            }
+                        }
+                    }
+                }
+                State::ProductF32(view, output) => {
+                    for (row, end) in valid_ends.iter().enumerate() {
+                        if let Some(end) = end {
+                            if !view.nulls[row] {
+                                let value = as_f32(&view.values, row);
                                 for slot in &mut output[..*end] {
                                     *slot *= value;
                                 }
@@ -1488,12 +1624,10 @@ impl<'a> AggregationSet<'a> {
         for state in &mut self.states {
             match state {
                 State::CountAll => {}
-                State::CountNonNull(view, output) => {
-                    // Count-non-null uses the mask; count-all is written once
-                    // below and intentionally does not inspect any mask.
+                State::CountNonNullMask(nulls, output) => {
                     for (row, range) in ranges.iter().enumerate() {
                         if let Some((start, end)) = range {
-                            if !view.nulls[row] {
+                            if !nulls[row] {
                                 for slot in &mut output[*start..*end] {
                                     *slot += 1;
                                 }
@@ -1540,6 +1674,22 @@ impl<'a> AggregationSet<'a> {
                         }
                     }
                 }
+                State::SumF32(view, output, compensation) => {
+                    for (row, range) in ranges.iter().enumerate() {
+                        if let Some((start, end)) = range {
+                            if !view.nulls[row] {
+                                let value = as_f32(&view.values, row);
+                                for position in *start..*end {
+                                    kahan_add_f32(
+                                        &mut output[position],
+                                        &mut compensation[position],
+                                        value,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 State::Product(view, output) => {
                     for (row, range) in ranges.iter().enumerate() {
                         if let Some((start, end)) = range {
@@ -1575,6 +1725,18 @@ impl<'a> AggregationSet<'a> {
                         }
                     }
                 }
+                State::ProductF32(view, output) => {
+                    for (row, range) in ranges.iter().enumerate() {
+                        if let Some((start, end)) = range {
+                            if !view.nulls[row] {
+                                let value = as_f32(&view.values, row);
+                                for slot in &mut output[*start..*end] {
+                                    *slot *= value;
+                                }
+                            }
+                        }
+                    }
+                }
                 State::Min(view, output) => {
                     update_reverse_range_extreme(view, output, &ranges, true);
                 }
@@ -1589,24 +1751,21 @@ impl<'a> AggregationSet<'a> {
     /// Mark every right position covered by at least one valid suffix.
     fn mark_reverse_suffixes(&mut self, starts: &[Option<usize>]) {
         for start in starts.iter().flatten() {
-            self.matched[*start..].fill(true);
-            self.successful = true;
+            self.mark_matched_range(*start, self.output_len);
         }
     }
 
     /// Mark every right position covered by at least one valid prefix.
     fn mark_reverse_prefixes(&mut self, ends: &[Option<usize>]) {
         for end in ends.iter().flatten() {
-            self.matched[..*end].fill(true);
-            self.successful = true;
+            self.mark_matched_range(0, *end);
         }
     }
 
     /// Mark every right position covered by an arbitrary valid interval.
     fn mark_reverse_ranges(&mut self, ranges: &[Option<(usize, usize)>]) {
         for (start, end) in ranges.iter().flatten() {
-            self.matched[*start..*end].fill(true);
-            self.successful = true;
+            self.mark_matched_range(*start, *end);
         }
     }
 
@@ -1709,14 +1868,16 @@ impl<'a> AggregationSet<'a> {
     ///
     /// # Returns
     ///
-    /// A pair containing the boolean match indicator followed by one NumPy
-    /// array per requested aggregation. The caller wraps this pair in the
-    /// public `(matched, aggregation_arrays)` tuple.
-    pub(crate) fn into_results(self, py: Python<'_>) -> (Py<PyAny>, Vec<Py<PyAny>>) {
-        let matched = Array1::from_vec(self.matched)
-            .into_pyarray(py)
-            .unbind()
-            .into_any();
+    /// The optional boolean match indicator followed by one NumPy array per
+    /// requested aggregation. The indicator is omitted when the caller did
+    /// not request matched metadata.
+    pub(crate) fn into_results(self, py: Python<'_>) -> (Option<Py<PyAny>>, Vec<Py<PyAny>>) {
+        let matched = self.matched.map(|values| {
+            Array1::from_vec(values)
+                .into_pyarray(py)
+                .unbind()
+                .into_any()
+        });
         let count_all = self.count_all;
         let mut results = Vec::with_capacity(self.states.len());
         for state in self.states {
@@ -1734,7 +1895,11 @@ impl<'a> AggregationSet<'a> {
                     // numerically compatible.
                     Array1::from_vec(v).into_pyarray(py).unbind().into_any()
                 }
+                State::SumF32(_, v, _compensation) => {
+                    Array1::from_vec(v).into_pyarray(py).unbind().into_any()
+                }
                 State::ProductF64(_, v) => Array1::from_vec(v).into_pyarray(py).unbind().into_any(),
+                State::ProductF32(_, v) => Array1::from_vec(v).into_pyarray(py).unbind().into_any(),
                 State::CountAll => Array1::from_vec(
                     count_all
                         .as_ref()
@@ -1744,7 +1909,7 @@ impl<'a> AggregationSet<'a> {
                 .into_pyarray(py)
                 .unbind()
                 .into_any(),
-                State::CountNonNull(_, v) | State::Min(_, v) | State::Max(_, v) => {
+                State::CountNonNullMask(_, v) | State::Min(_, v) | State::Max(_, v) => {
                     Array1::from_vec(v).into_pyarray(py).unbind().into_any()
                 }
             };
@@ -2013,6 +2178,56 @@ fn update_float_ranges(
             output[row] = total;
             compensation[row] = correction;
         }
+    }
+}
+
+/// Compute `f32` floating-point reductions in source encounter order.
+fn update_float_ranges_f32(
+    view: &View<'_>,
+    output: &mut [f32],
+    compensation: &mut [f32],
+    ranges: &[Option<(usize, usize)>],
+    product: bool,
+) {
+    for (row, range) in ranges.iter().enumerate() {
+        let Some((start, end)) = range else { continue };
+        if product {
+            let mut total = 1_f32;
+            for position in *start..*end {
+                if !view.nulls[position] {
+                    total *= as_f32(&view.values, position);
+                }
+            }
+            output[row] = total;
+        } else {
+            let mut total = 0_f32;
+            let mut correction = 0_f32;
+            for position in *start..*end {
+                if !view.nulls[position] {
+                    kahan_add_f32(&mut total, &mut correction, as_f32(&view.values, position));
+                }
+            }
+            output[row] = total;
+            compensation[row] = correction;
+        }
+    }
+}
+
+/// Compute `f32` products for ranges without a compensation buffer.
+fn update_float_ranges_f32_without_compensation(
+    view: &View<'_>,
+    output: &mut [f32],
+    ranges: &[Option<(usize, usize)>],
+) {
+    for (row, range) in ranges.iter().enumerate() {
+        let Some((start, end)) = range else { continue };
+        let mut total = 1_f32;
+        for position in *start..*end {
+            if !view.nulls[position] {
+                total *= as_f32(&view.values, position);
+            }
+        }
+        output[row] = total;
     }
 }
 
@@ -2296,17 +2511,18 @@ fn merge_extreme_positions(view: &View<'_>, left: i64, right: i64, min: bool) ->
     }
 }
 
-/// Count valid values across dense reverse ranges.
+/// Count valid source rows across dense reverse ranges without a value view.
 ///
-/// This is the direct fallback for sparse starts-only and ends-only batches.
-/// The mask is authoritative: a `true` entry marks the source value null and
-/// contributes nothing; a `false` entry contributes one to every output slot
-/// covered by that source row. Count-all is intentionally handled by its
-/// separate writer because it must ignore this mask.
-fn update_count_ranges(view: &View<'_>, output: &mut [i64], ranges: &[Option<(usize, usize)>]) {
+/// The wildcard `count` request supplies only its authoritative null mask, so
+/// the aggregation never needs to extract or inspect the source dtype.
+fn update_count_ranges_mask(
+    nulls: &ArrayView1<'_, bool>,
+    output: &mut [i64],
+    ranges: &[Option<(usize, usize)>],
+) {
     for (row, range) in ranges.iter().enumerate() {
         let Some((start, end)) = range else { continue };
-        if view.nulls[row] {
+        if nulls[row] {
             continue;
         }
         for slot in &mut output[*start..*end] {
@@ -2436,6 +2652,14 @@ fn as_f64(values: &Values<'_>, n: usize) -> f64 {
     }
 }
 
+/// Read a floating-point value for an `f32` accumulator.
+fn as_f32(values: &Values<'_>, n: usize) -> f32 {
+    match values {
+        Values::F32(v) => v[n],
+        _ => unreachable!("f32 floating-point state must contain f32 values"),
+    }
+}
+
 /// Add one float using the Kahan-style compensation used by the existing
 /// aggregation kernels.
 ///
@@ -2455,6 +2679,21 @@ fn kahan_add(total: &mut f64, compensation: &mut f64, value: f64) {
         *compensation = 0.;
     }
     *total = increment;
+}
+
+/// Kahan addition using `f32` storage and arithmetic.
+///
+/// The compensation reset mirrors [`kahan_add`]. An infinite input can make
+/// the compensation `NaN` even when the running total is a valid infinity;
+/// carrying that `NaN` into the next update would poison the total.
+fn kahan_add_f32(total: &mut f32, compensation: &mut f32, value: f32) {
+    let adjusted = value - *compensation;
+    let next = *total + adjusted;
+    *compensation = (next - *total) - adjusted;
+    if !compensation.is_finite() {
+        *compensation = 0.;
+    }
+    *total = next;
 }
 /// Return whether the candidate at `a` is strictly less than the current
 /// winner at `b`.
@@ -2495,5 +2734,26 @@ fn is_greater(view: &View<'_>, a: usize, b: usize) -> bool {
         Values::U8(v) => v[a] > v[b],
         Values::F64(v) => v[a] > v[b],
         Values::F32(v) => v[a] > v[b],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kahan_add_f32;
+
+    #[test]
+    fn kahan_add_f32_resets_non_finite_compensation() {
+        let mut total = 5.0_f32;
+        let mut compensation = 0.0_f32;
+
+        kahan_add_f32(&mut total, &mut compensation, f32::INFINITY);
+        assert_eq!(total, f32::INFINITY);
+        assert_eq!(compensation, 0.0);
+
+        // A finite value after infinity must preserve the valid infinite
+        // total instead of becoming NaN through stale compensation.
+        kahan_add_f32(&mut total, &mut compensation, 3.0);
+        assert_eq!(total, f32::INFINITY);
+        assert_eq!(compensation, 0.0);
     }
 }
