@@ -326,7 +326,7 @@ mod tests {
                     true.into_pyobject(py)?.to_owned().into_any(),
                     PyArray1::from_vec(py, vec![0_i64]).into_any(),
                     PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]).into_any(),
-                    "<".into_pyobject(py)?.into_any(),
+                    "<=".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
             predicates.append(PyTuple::new(
@@ -396,6 +396,68 @@ mod tests {
             )?;
             let aggregations = PyList::new(py, [aggregation])?;
             assert!(range_join_aggregate(py, &predicates, &aggregations, true,)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reverse_two_range_aggregation_uses_intersected_windows() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            // P1 selects right positions [2, 4): values 5 and 7.
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![4_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
+                    PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            // P2 also selects a suffix beginning at position two, so the
+            // intersection remains right positions [2, 4).
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![4_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 2, 4, 6]).into_any(),
+                    PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
+                    "<=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let values = PyArray1::from_vec(py, vec![4_i64]);
+            let mask = PyArray1::from_vec(py, vec![false]);
+            let aggregation = PyTuple::new(
+                py,
+                [
+                    values.into_any(),
+                    mask.into_any(),
+                    "sum".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let aggregations = PyList::new(py, [aggregation])?;
+            let result = range_join_aggregate_reverse(py, &predicates, &aggregations, true)?
+                .expect("the reverse range intersection has matches");
+
+            // Reverse aggregation creates one output slot per right row. The
+            // left value contributes to the two right positions in the
+            // intersected window, not to the source-left slot itself.
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0, 1, 2, 3]);
+            assert_eq!(
+                result.get_item(1)?.extract::<Vec<bool>>()?,
+                vec![false, false, true, true]
+            );
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(
+                outputs.get_item(0)?.extract::<Vec<i64>>()?,
+                vec![0, 0, 4, 4]
+            );
             Ok(())
         })
         .unwrap();
