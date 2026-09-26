@@ -34,11 +34,33 @@ pub fn min_start_end_core<T: PartialOrd + Copy>(
     ends: ArrayView1<i64>,
     booleans: ArrayView1<bool>,
 ) -> Result<Array1<i64>, String> {
+    min_start_end_core_impl(arr, starts, ends, Some(booleans))
+}
+
+/// Find range minima when the caller guarantees that every source value is
+/// non-null. This avoids allocating an all-false mask for already filtered
+/// range-join inputs.
+pub(crate) fn min_start_end_core_no_nulls<T: PartialOrd + Copy>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+) -> Result<Array1<i64>, String> {
+    min_start_end_core_impl(arr, starts, ends, None)
+}
+
+fn min_start_end_core_impl<T: PartialOrd + Copy>(
+    arr: ArrayView1<T>,
+    starts: ArrayView1<i64>,
+    ends: ArrayView1<i64>,
+    booleans: Option<ArrayView1<bool>>,
+) -> Result<Array1<i64>, String> {
     ensure_nonempty_core("arr", arr.len())?;
     ensure_nonempty_core("starts", starts.len())?;
     ensure_nonempty_core("ends", ends.len())?;
     ensure_equal_lengths_core("starts", starts.len(), "ends", ends.len())?;
-    ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    if let Some(booleans) = booleans {
+        ensure_equal_lengths_core("arr", arr.len(), "booleans", booleans.len())?;
+    }
     let mut result = Array1::<i64>::from_elem(starts.len(), -1);
 
     // ELI5: a few questions are cheaper to answer by walking their ranges.
@@ -81,7 +103,7 @@ pub fn min_start_end_core<T: PartialOrd + Copy>(
         let mut values = vec![arr[0]; tree_size * 2];
         let mut positions = vec![-1_i64; tree_size * 2];
         for nn in 0..arr.len() {
-            if !booleans[nn] {
+            if booleans.is_none_or(|mask| !mask[nn]) {
                 values[tree_size + nn] = arr[nn];
                 positions[tree_size + nn] = nn as i64;
             }
@@ -128,7 +150,7 @@ pub fn min_start_end_core<T: PartialOrd + Copy>(
         let mut base: i64 = -1;
         let mut base_val = arr[start_];
         for nn in start_..end_ {
-            if booleans[nn] {
+            if booleans.is_some_and(|mask| mask[nn]) {
                 continue;
             }
             let current = arr[nn];

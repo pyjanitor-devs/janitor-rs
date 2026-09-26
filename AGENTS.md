@@ -1004,9 +1004,9 @@ the filtered arrays, physical-position mappings, sorting, alignment, and
 authoritative null metadata before dispatching every supported predicate path
 to Rust. `return_building_blocks` remains a pyjanitor-level request that maps
 to `keep="all"`; it is not an argument to the extended Rust kernel.
-**Recommendation**: Keep `single_non_equi_join.rs` as the one-predicate path and use
-`single_non_equi_join_extended.rs` for multi-predicate range and all-not-equal joins. Apply
-`keep` only after all predicates have passed.
+**Recommendation**: Keep the basic and single-anchor extended implementations in
+`anchor_non_equi_join.rs`, with clear sections for the one-predicate and residual-filtered
+paths. Apply `keep` only after all predicates have passed.
 
 ### [2026-09-23] Equality is residual-only in extended single joins
 
@@ -1043,7 +1043,9 @@ range and `!=` calls before merging either side.
 
 **Context**: Implementing the aggregation phase after the index-producing
 single and extended join kernels.
-**Learning**: `single_non_equi_join_agg.rs` and `single_non_equi_join_extended_agg.rs` reuse the
+**Learning**: `anchor_non_equi_join_agg.rs` contains both the basic and single-anchor
+extended aggregation implementations, while `join_aggregation_helpers.rs` and
+`range_join_agg.rs` provide shared residual and dual-range machinery. These modules reuse the
 existing `AggregationSet`, input parsing, and result construction from the
 batch aggregation kernels. They update aggregation state during candidate
 comparison, so successful pairs are never materialized as intermediate join
@@ -1121,3 +1123,29 @@ becomes `NaN` unless the non-finite compensation is reset.
 **Recommendation**: Keep the f32 and f64 compensation guards symmetrical and
 test an infinity followed by a finite value in both direct and boundary-sweep
 aggregation paths.
+
+### [2026-09-25] Keep single-anchor and dual-range extended joins separate
+
+**Context**: Clarifying the multi-predicate range-join architecture.
+**Learning**: `anchor_non_equi_join.rs` accepts one range anchor plus
+at least one residual predicate. The first anchor builds the only candidate
+window; every later predicate is filtered inside that window, even when a
+later predicate is also a range comparison. `range_join.rs` owns the separate
+two-range-anchor contract and is the only path that intersects two windows.
+
+**Recommendation**: Do not add a second-range optimization flag to the
+single-extended API. Route confirmed dual-range joins through `range_join` and
+keep the single-extended implementation focused on one anchor plus residuals.
+
+### [2026-09-26] Define dual-range joins by per-row window intersection
+
+**Context**: Defining the dual-range join contract and its implementation.
+**Learning**: Each of the first two range predicates builds one half-open
+window for each logical left row. Rust intersects those two windows row by row;
+index generation and aggregation then operate on the surviving positional
+windows. Anchor dtype handling is an implementation detail of each search, not
+the definition of a dual-range join.
+
+**Recommendation**: Keep PyJanitor responsible for null filtering, sorting,
+and physical alignment of the right layouts. Let Rust search each anchor using
+its supplied value representation, then intersect only the positional windows.

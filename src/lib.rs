@@ -1,14 +1,17 @@
 use pyo3::prelude::*;
 mod aggs;
+mod anchor_non_equi_join;
+mod anchor_non_equi_join_agg;
 mod bin_search;
 mod index_builder;
+mod join_aggregation_helpers;
+mod join_candidate_materialization;
+mod join_common;
 mod multi_join_indices;
 mod op;
 mod predicate;
-mod single_non_equi_join;
-mod single_non_equi_join_agg;
-mod single_non_equi_join_extended;
-mod single_non_equi_join_extended_agg;
+mod range_join;
+mod range_join_agg;
 
 /// Narrow Rust-only surface used by `benches/kernels.rs`.
 ///
@@ -260,10 +263,10 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     bin_search::register(m)?;
     multi_join_indices::register(m)?;
     index_builder::register(m)?;
-    single_non_equi_join::register(m)?;
-    single_non_equi_join_agg::register(m)?;
-    single_non_equi_join_extended_agg::register(m)?;
-    single_non_equi_join_extended::register(m)?;
+    anchor_non_equi_join::register(m)?;
+    range_join::register(m)?;
+    range_join_agg::register(m)?;
+    anchor_non_equi_join_agg::register(m)?;
     aggs::register(m)?;
     Ok(())
 }
@@ -307,6 +310,10 @@ mod registration_tests {
                 "aggregate_ends_reverse",           // reverse ends ranges
                 "aggregate_starts_ends_reverse",    // reverse starts/ends ranges
                 "single_join_indices_int64",        // single-predicate join
+                "range_join_indices",               // two-range join
+                "range_join_extended_indices",      // range-led extended join
+                "range_join_extended_aggregate",    // range-led aggregation
+                "range_join_aggregate",             // two-range aggregation
             ];
 
             for name in representative_exports {
@@ -319,11 +326,11 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (771 exports across the retained leaf
+    /// `register`, as of this PR (817 exports across the retained leaf
     /// modules).
     /// Bump this alongside any PR that intentionally adds or removes an
     /// export.
-    const EXPECTED_EXPORT_COUNT: usize = 811;
+    const EXPECTED_EXPORT_COUNT: usize = 817;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would

@@ -233,10 +233,10 @@ where
 
 /// Run floating-point positional product aggregation with an explicit storage mode.
 /// This is a Rust-only benchmark entry point; production callers should use
-/// [`prod_positions_float_core`] for automatic dispatch.
+/// `prod_positions_float_core` for automatic dispatch.
 ///
 /// The array arguments and `to_value` have the same meanings as
-/// [`prod_positions_float_core`]. `dense` selects vector storage when true and
+/// `prod_positions_float_core`. `dense` selects vector storage when true and
 /// HashMap storage when false.
 #[allow(clippy::too_many_arguments)]
 pub fn prod_positions_float_core_with_storage<T, F>(
