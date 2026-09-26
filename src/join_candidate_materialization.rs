@@ -186,7 +186,11 @@ pub(crate) fn materialize_not_equal_candidates(
 
     if keep == Keep::All {
         // Count survivors, then write directly into exact-size output buffers.
-        let mut counts_by_left = vec![0_usize; left_index.len()];
+        let mut counts_by_left = Vec::new();
+        counts_by_left
+            .try_reserve_exact(left_index.len())
+            .map_err(|_| "single extended join result allocation failed")?;
+        counts_by_left.resize(left_index.len(), 0_usize);
         for (&left_position, &right_position) in left_positions.iter().zip(right_positions) {
             if predicates_match_dispatch(
                 &views,
@@ -214,9 +218,24 @@ pub(crate) fn materialize_not_equal_candidates(
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let mut output_left = vec![0_i64; output_len];
-        let mut output_right = vec![0_i64; output_len];
-        let mut write_positions = counts_by_left.clone();
+        // Reserve and initialize explicitly so allocation failure is returned
+        // as a normal kernel error instead of becoming an unrecoverable
+        // `Vec` allocation panic for a large all-`!=` result.
+        let mut output_left = Vec::new();
+        output_left
+            .try_reserve_exact(output_len)
+            .map_err(|_| "single extended join result allocation failed")?;
+        output_left.resize(output_len, 0_i64);
+        let mut output_right = Vec::new();
+        output_right
+            .try_reserve_exact(output_len)
+            .map_err(|_| "single extended join result allocation failed")?;
+        output_right.resize(output_len, 0_i64);
+        let mut write_positions = Vec::new();
+        write_positions
+            .try_reserve_exact(counts_by_left.len())
+            .map_err(|_| "single extended join result allocation failed")?;
+        write_positions.extend_from_slice(&counts_by_left);
         for (&left_position, &right_position) in left_positions.iter().zip(right_positions) {
             if predicates_match_dispatch(
                 &views,

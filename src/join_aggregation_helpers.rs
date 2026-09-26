@@ -241,6 +241,55 @@ pub(crate) fn aggregate_range_windows<'py>(
         ));
     }
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
+
+    if parsed.is_empty() {
+        // With no residual predicates, every position in each intersected
+        // window is a successful pair. Convert the sparse window list into
+        // the dense boundary layout expected by the adaptive starts/ends
+        // aggregators. Invalid slots remain `-1`, which those kernels treat
+        // as no range. This preserves the segment-tree/boundary optimization
+        // without materializing every pair in the windows.
+        let boundary_len = if reverse { source_len } else { output_len };
+        let mut starts = vec![-1_i64; boundary_len];
+        let mut ends = vec![-1_i64; boundary_len];
+        for (row, (&start, &end)) in windows.starts.iter().zip(&windows.ends).enumerate() {
+            // The window rows retain the original left physical position.
+            // Forward aggregation uses it as the left output slot; reverse
+            // aggregation uses it as the source-left slot for the same
+            // right-oriented range.
+            let output_position = windows.left_positions[row];
+            let start = i64::try_from(start)
+                .map_err(|_| PyValueError::new_err("range aggregation start exceeds int64"))?;
+            let end = i64::try_from(end)
+                .map_err(|_| PyValueError::new_err("range aggregation end exceeds int64"))?;
+            let start_slot = starts.get_mut(output_position).ok_or_else(|| {
+                PyValueError::new_err("range aggregation output position is out of bounds")
+            })?;
+            let end_slot = ends.get_mut(output_position).ok_or_else(|| {
+                PyValueError::new_err("range aggregation output position is out of bounds")
+            })?;
+            *start_slot = start;
+            *end_slot = end;
+        }
+        let starts = ArrayView1::from(&starts[..]);
+        let ends = ArrayView1::from(&ends[..]);
+        if reverse {
+            set.aggregate_reverse_starts_ends(starts, ends);
+        } else {
+            set.aggregate_starts_ends(starts, ends);
+        }
+        if set.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(make_results_with_positions(
+            py,
+            set,
+            output_positions,
+            output_len,
+            return_matched,
+        )?));
+    }
+
     let views: Vec<_> = parsed.iter().map(|predicate| predicate.view()).collect();
     let metadata_views = metadata.map(null_metadata_views);
     aggregate_range(

@@ -1013,6 +1013,10 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
     // An empty predicate list has no anchor and therefore no way to generate
     // candidates. Reject it before reading `first` so Python receives the
     // intended ValueError rather than a lower-level indexing error.
+    // This aggregation dispatcher also serves the ordinary one-predicate
+    // anchor API, so one predicate is valid here. The extended index API has
+    // a different contract and requires an anchor plus at least one residual;
+    // its `len() < 2` validation must remain in that separate wrapper.
     if predicates.is_empty() {
         return Err(PyValueError::new_err(
             "single extended aggregation requires at least one predicate",

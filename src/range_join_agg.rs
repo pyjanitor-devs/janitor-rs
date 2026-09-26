@@ -62,7 +62,7 @@ pub(crate) fn aggregate_range_extended<'py>(
         ));
     }
 
-    // The aggregation form may carry output maps in fields four and five.
+    // The aggregation form may carry output maps in fields five and six.
     // Normalize only the first anchor to the five-field window form so the
     // dtype dispatcher can use one parser for both index and aggregation
     // paths; the maps remain borrowed separately below.
@@ -105,10 +105,11 @@ pub(crate) fn aggregate_range_extended<'py>(
         return Ok(None);
     }
 
+    // Field four remains the shared ordering flag; it is not an output map.
     let left_output_positions = if first_tuple.len() == 8 {
         Some(
             first_tuple
-                .get_item(4)?
+                .get_item(5)?
                 .extract::<PyReadonlyArray1<'py, i64>>()?,
         )
     } else {
@@ -117,7 +118,7 @@ pub(crate) fn aggregate_range_extended<'py>(
     let right_output_positions = if first_tuple.len() == 8 {
         Some(
             first_tuple
-                .get_item(5)?
+                .get_item(6)?
                 .extract::<PyReadonlyArray1<'py, i64>>()?,
         )
     } else {
@@ -323,6 +324,8 @@ mod tests {
                     right.clone().into_any(),
                     right_index.clone().into_any(),
                     true.into_pyobject(py)?.to_owned().into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]).into_any(),
                     "<".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
@@ -349,6 +352,11 @@ mod tests {
             let aggregations = PyList::new(py, [aggregation])?;
             let result = range_join_aggregate(py, &predicates, &aggregations, true)?
                 .expect("the range intersection has matches");
+            // The first anchor uses the eight-field aggregation contract:
+            // field four is the ordering bool, while fields five and six are
+            // the output-position maps. Reading the old offsets would try to
+            // extract this bool as an integer array.
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0]);
             assert_eq!(result.get_item(1)?.extract::<Vec<bool>>()?, vec![true]);
             let outputs_item = result.get_item(2)?;
             let outputs = outputs_item.cast::<PyList>()?;
