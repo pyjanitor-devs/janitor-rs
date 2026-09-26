@@ -593,11 +593,25 @@ fn labels(boundary: RegionBoundary) -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>) 
     }
     if reverse {
         // Greater-than anchors were built as prefixes. Reverse their right
-        // layout so the resulting region path follows the same traversal
-        // orientation as the other anchor.
+        // layout so the matching prefix becomes a matching suffix. Reversing
+        // alone would make the region labels descend, so complement every
+        // label around the largest right label. The left threshold needs one
+        // extra step: this preserves the strict/inclusive distinction and
+        // prevents an excluded equal boundary from becoming a match.
+        let maximum = right_region.iter().copied().max().unwrap_or(0);
         right_index.reverse();
         right_region.reverse();
+        for value in &mut right_region {
+            *value = maximum - *value;
+        }
+        for value in &mut left_region {
+            *value = maximum - *value + 1;
+        }
     }
+    // `sweep_queries` uses binary search over the first right-region path.
+    // This is the invariant that makes that search valid for all four
+    // inequality operators, including the normalized greater-than paths.
+    debug_assert!(right_region.windows(2).all(|pair| pair[0] <= pair[1]));
     (left_index, left_region, right_index, right_region)
 }
 
@@ -845,6 +859,36 @@ mod tests {
             left_second: vec![1, 2],
             right_first: vec![1, 2, 3, 4],
             right_second,
+        }
+    }
+
+    #[test]
+    fn every_inequality_orientation_produces_an_increasing_right_path() {
+        // For right values [1, 2, 3, 4] and left values [1, 3], these are
+        // the boundaries returned by `range_window`:
+        //
+        // * `<`  => first right value strictly greater: [1, 3]
+        // * `<=` => first right value greater/equal:   [0, 2]
+        // * `>`  => first right value greater/equal ends prefix: [0, 2]
+        // * `>=` => first right value strictly greater ends prefix: [1, 3]
+        //
+        // The greater-than cases use the reverse normalization in `labels`.
+        for (reverse, boundaries) in [
+            (false, vec![1, 3]), // <
+            (false, vec![0, 2]), // <=
+            (true, vec![0, 2]),  // >
+            (true, vec![1, 3]),  // >=
+        ] {
+            let (_, _, _, right_region) = labels(RegionBoundary {
+                left_index: vec![10, 11],
+                right_index: vec![20, 21, 22, 23],
+                boundaries,
+                reverse,
+            });
+            assert!(
+                right_region.windows(2).all(|pair| pair[0] <= pair[1]),
+                "right region path was not monotonic: {right_region:?}"
+            );
         }
     }
 
