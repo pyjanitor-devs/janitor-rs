@@ -67,53 +67,117 @@ pub(crate) struct RangePredicate<'a, T> {
 ///
 /// Returns an error when value/index lengths differ or either comparator is
 /// not a range comparator.
+#[cfg(test)]
 pub(crate) fn build_windows<T: PartialOrd + Copy>(
     first: RangePredicate<'_, T>,
     second: RangePredicate<'_, T>,
 ) -> Result<SingleJoinResult, String> {
+    let first = build_single_windows(first)?;
+    let second = build_single_windows(second)?;
+    intersect_windows(first, second)
+}
+
+/// Build the positional window produced by one typed range predicate.
+///
+/// ELI5: each predicate independently draws a highlighted interval in the
+/// sorted right-hand array. This helper draws one such interval at a time;
+/// [`intersect_windows`] later keeps only the overlap between two drawings.
+fn build_single_windows<T: PartialOrd + Copy>(
+    predicate: RangePredicate<'_, T>,
+) -> Result<SingleJoinResult, String> {
     ensure_equal_lengths_core(
         "left",
-        first.left.len(),
+        predicate.left.len(),
         "left_index",
-        first.left_index.len(),
+        predicate.left_index.len(),
     )?;
     ensure_equal_lengths_core(
         "right",
-        first.right.len(),
+        predicate.right.len(),
         "right_index",
-        first.right_index.len(),
+        predicate.right_index.len(),
     )?;
-    ensure_equal_lengths_core("second left", second.left.len(), "left", first.left.len())?;
-    ensure_equal_lengths_core(
-        "second right",
-        second.right.len(),
-        "right",
-        first.right.len(),
-    )?;
-    if !first.op.is_range() || !second.op.is_range() {
-        return Err("range join requires two range comparators".to_owned());
+    if !predicate.op.is_range() {
+        return Err("range join requires a range comparator".to_owned());
     }
 
     let mut result = SingleJoinResult {
         left_positions: Vec::new(),
         left_index: Vec::new(),
-        right_index: first.right_index.to_vec(),
+        right_index: predicate.right_index.to_vec(),
         starts: Vec::new(),
         ends: Vec::new(),
     };
-    for (left_position, (&first_value, &second_value)) in
-        first.left.iter().zip(second.left.iter()).enumerate()
+    for (left_position, &left_value) in predicate.left.iter().enumerate() {
+        let (start, end) = range_window(left_value, predicate.right, predicate.op);
+        // Keep one boundary pair per left row, including an empty window.
+        // Two independently typed anchors must be aligned row-for-row before
+        // their windows can be intersected; the final intersection removes
+        // empty rows from the public result.
+        result.left_positions.push(left_position);
+        result.left_index.push(predicate.left_index[left_position]);
+        result.starts.push(start);
+        result.ends.push(end);
+    }
+    Ok(result)
+}
+
+/// Intersect two already-built positional windows.
+///
+/// The value dtypes are intentionally absent here. Each anchor has already
+/// completed its own typed binary searches; this step only combines the
+/// resulting positions. PyJanitor aligns the second right array to the first
+/// right layout before calling Rust, so the two windows refer to the same
+/// physical right positions even when their value dtypes differ.
+pub(crate) fn intersect_windows(
+    first: SingleJoinResult,
+    second: SingleJoinResult,
+) -> Result<SingleJoinResult, String> {
+    ensure_equal_lengths_core(
+        "first left window",
+        first.left_positions.len(),
+        "first left labels",
+        first.left_index.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "second left window",
+        second.left_positions.len(),
+        "second left labels",
+        second.left_index.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "first window starts",
+        first.left_positions.len(),
+        "first window ends",
+        first.ends.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "second window starts",
+        second.left_positions.len(),
+        "second window ends",
+        second.ends.len(),
+    )?;
+    if first.left_positions.len() != second.left_positions.len()
+        || first.right_index != second.right_index
     {
-        // Each predicate independently produces a half-open interval in the
-        // same sorted right layout. Intersecting the starts and ends keeps
-        // only right positions that satisfy both predicates.
-        let (first_start, first_end) = range_window(first_value, first.right, first.op);
-        let (second_start, second_end) = range_window(second_value, second.right, second.op);
-        let start = first_start.max(second_start);
-        let end = first_end.min(second_end);
+        return Err(
+            "dual range predicates must use aligned left rows and right positions".to_owned(),
+        );
+    }
+
+    let mut result = SingleJoinResult {
+        left_positions: Vec::new(),
+        left_index: Vec::new(),
+        right_index: first.right_index,
+        starts: Vec::new(),
+        ends: Vec::new(),
+    };
+    for row in 0..first.left_positions.len() {
+        let start = first.starts[row].max(second.starts[row]);
+        let end = first.ends[row].min(second.ends[row]);
         if start < end {
-            result.left_positions.push(left_position);
-            result.left_index.push(first.left_index[left_position]);
+            result.left_positions.push(first.left_positions[row]);
+            result.left_index.push(first.left_index[row]);
             result.starts.push(start);
             result.ends.push(end);
         }
@@ -266,6 +330,135 @@ pub(crate) struct ParsedRangePredicate<'py, T: numpy::Element> {
     pub(crate) op: CompareOp,
 }
 
+/// A range predicate whose concrete NumPy dtype is selected at runtime.
+///
+/// The two anchors in a dual-range join do not need the same dtype. Each one
+/// is parsed into its own variant, searched with its own typed
+/// `partition_point`, and converted to an untyped positional window before
+/// the two windows are intersected.
+pub(crate) enum AnyParsedRangePredicate<'py> {
+    I64(ParsedRangePredicate<'py, i64>),
+    I32(ParsedRangePredicate<'py, i32>),
+    I16(ParsedRangePredicate<'py, i16>),
+    I8(ParsedRangePredicate<'py, i8>),
+    U64(ParsedRangePredicate<'py, u64>),
+    U32(ParsedRangePredicate<'py, u32>),
+    U16(ParsedRangePredicate<'py, u16>),
+    U8(ParsedRangePredicate<'py, u8>),
+    F64(ParsedRangePredicate<'py, f64>),
+    F32(ParsedRangePredicate<'py, f32>),
+}
+
+impl AnyParsedRangePredicate<'_> {
+    /// Build this anchor's positional windows without exposing its dtype.
+    fn windows(&self) -> Result<SingleJoinResult, String> {
+        macro_rules! build {
+            ($predicate:expr) => {{
+                let predicate = $predicate;
+                build_single_windows(RangePredicate {
+                    left: predicate.left.as_array(),
+                    left_index: predicate.left_index.as_array(),
+                    right: predicate.right.as_array(),
+                    right_index: predicate.right_index.as_array(),
+                    op: predicate.op,
+                })
+            }};
+        }
+        match self {
+            Self::I64(value) => build!(value),
+            Self::I32(value) => build!(value),
+            Self::I16(value) => build!(value),
+            Self::I8(value) => build!(value),
+            Self::U64(value) => build!(value),
+            Self::U32(value) => build!(value),
+            Self::U16(value) => build!(value),
+            Self::U8(value) => build!(value),
+            Self::F64(value) => build!(value),
+            Self::F32(value) => build!(value),
+        }
+    }
+
+    pub(crate) fn left_len(&self) -> usize {
+        match self {
+            Self::I64(value) => value.left.as_array().len(),
+            Self::I32(value) => value.left.as_array().len(),
+            Self::I16(value) => value.left.as_array().len(),
+            Self::I8(value) => value.left.as_array().len(),
+            Self::U64(value) => value.left.as_array().len(),
+            Self::U32(value) => value.left.as_array().len(),
+            Self::U16(value) => value.left.as_array().len(),
+            Self::U8(value) => value.left.as_array().len(),
+            Self::F64(value) => value.left.as_array().len(),
+            Self::F32(value) => value.left.as_array().len(),
+        }
+    }
+
+    pub(crate) fn right_len(&self) -> usize {
+        match self {
+            Self::I64(value) => value.right.as_array().len(),
+            Self::I32(value) => value.right.as_array().len(),
+            Self::I16(value) => value.right.as_array().len(),
+            Self::I8(value) => value.right.as_array().len(),
+            Self::U64(value) => value.right.as_array().len(),
+            Self::U32(value) => value.right.as_array().len(),
+            Self::U16(value) => value.right.as_array().len(),
+            Self::U8(value) => value.right.as_array().len(),
+            Self::F64(value) => value.right.as_array().len(),
+            Self::F32(value) => value.right.as_array().len(),
+        }
+    }
+}
+
+/// Parse one range anchor using the dtype of that anchor's own value arrays.
+pub(crate) fn parse_any_range_predicate<'py>(
+    tuple: &Bound<'py, PyTuple>,
+    extended: bool,
+) -> PyResult<AnyParsedRangePredicate<'py>> {
+    let dtype = tuple
+        .get_item(0)?
+        .getattr("dtype")?
+        .getattr("name")?
+        .extract::<String>()?;
+
+    macro_rules! parse {
+        ($ty:ty, $variant:ident) => {
+            if extended {
+                Ok(AnyParsedRangePredicate::$variant(
+                    parse_extended_range_predicate::<$ty>(tuple)?,
+                ))
+            } else {
+                Ok(AnyParsedRangePredicate::$variant(parse_range_predicate::<
+                    $ty,
+                >(tuple)?))
+            }
+        };
+    }
+
+    match dtype.as_str() {
+        "int64" => parse!(i64, I64),
+        "int32" => parse!(i32, I32),
+        "int16" => parse!(i16, I16),
+        "int8" => parse!(i8, I8),
+        "uint64" => parse!(u64, U64),
+        "uint32" => parse!(u32, U32),
+        "uint16" => parse!(u16, U16),
+        "uint8" => parse!(u8, U8),
+        "float64" => parse!(f64, F64),
+        "float32" => parse!(f32, F32),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported range predicate dtype: {other}"
+        ))),
+    }
+}
+
+/// Build dual-range windows while dispatching each anchor independently.
+pub(crate) fn build_any_windows(
+    first: &AnyParsedRangePredicate<'_>,
+    second: &AnyParsedRangePredicate<'_>,
+) -> Result<SingleJoinResult, String> {
+    intersect_windows(first.windows()?, second.windows()?)
+}
+
 /// Parse the six-element basic range tuple.
 ///
 /// The tuple is `(left, left_index, right, right_index,
@@ -372,192 +565,101 @@ pub(crate) fn parse_extended_range_predicate<'py, T: numpy::Element>(
     })
 }
 
-macro_rules! range_join_function {
-    ($name:ident, $ty:ty) => {
-        /// Build indices for exactly two aligned, ascending range predicates.
-        ///
-        /// # Arguments
-        ///
-        /// * `py` - Active Python interpreter token.
-        /// * `predicates` - Exactly two six-element tuples of the form
-        ///   `(left, left_index, right, right_index,
-        ///   right_index_is_ordered, comparator)`. The right values are
-        ///   already sorted by PyJanitor; Rust does not sort them.
-        /// * `keep` - Selects one matching right row or all matching rows.
-        ///   For unordered right labels, `"first"` means the smallest label
-        ///   within each exact intersection window and `"last"` means the
-        ///   largest label. `"any"` selects the first physical position.
-        /// * `return_building_blocks` - When true, return the intersected
-        ///   positional `starts`/`ends` windows instead of applying `keep`.
-        ///
-        /// # Returns
-        ///
-        /// Returns `None` when no left row has a non-empty intersection.
-        /// Otherwise returns a dictionary containing materialized `left_index`
-        /// and `right_index` arrays. Building-block output additionally
-        /// contains positional `starts` and `ends` arrays exported as int64.
-        ///
-        /// # Errors
-        ///
-        /// Returns `ValueError` unless exactly two valid range predicates are
-        /// supplied, or when `keep` is invalid.
-        #[pyfunction]
-        pub fn $name<'py>(
-            py: Python<'py>,
-            predicates: &Bound<'py, PyList>,
-            keep: &str,
-            return_building_blocks: bool,
-        ) -> PyResult<Option<Bound<'py, PyDict>>> {
-            if predicates.len() != 2 {
-                return Err(PyValueError::new_err(
-                    "range join requires exactly two predicates",
-                ));
-            }
-            let first_item = predicates.get_item(0)?;
-            let second_item = predicates.get_item(1)?;
-            let first_tuple = first_item.cast::<PyTuple>()?;
-            let second_tuple = second_item.cast::<PyTuple>()?;
-            let first = parse_range_predicate::<$ty>(&first_tuple)?;
-            let second = parse_range_predicate::<$ty>(&second_tuple)?;
-            let first_predicate = RangePredicate {
-                left: first.left.as_array(),
-                left_index: first.left_index.as_array(),
-                right: first.right.as_array(),
-                right_index: first.right_index.as_array(),
-                op: first.op,
-            };
-            let second_predicate = RangePredicate {
-                left: second.left.as_array(),
-                left_index: second.left_index.as_array(),
-                right: second.right.as_array(),
-                right_index: second.right_index.as_array(),
-                op: second.op,
-            };
-            let windows =
-                build_windows(first_predicate, second_predicate).map_err(PyValueError::new_err)?;
-            if windows.left_index.is_empty() {
-                return Ok(None);
-            }
-            if return_building_blocks {
-                return Ok(Some(result_dict(
-                    py,
-                    windows.left_index,
-                    windows.right_index,
-                    Some(windows.starts),
-                    Some(windows.ends),
-                )?));
-            }
-            let keep = Keep::parse(keep)?;
-            let (left, right) =
-                choose_range_windows(&windows, keep).map_err(PyValueError::new_err)?;
-            if left.is_empty() {
-                return Ok(None);
-            }
-            Ok(Some(result_dict(py, left, right, None, None)?))
-        }
-    };
-}
-
-range_join_function!(range_join_indices_int64, i64);
-range_join_function!(range_join_indices_int32, i32);
-range_join_function!(range_join_indices_int16, i16);
-range_join_function!(range_join_indices_int8, i8);
-range_join_function!(range_join_indices_uint64, u64);
-range_join_function!(range_join_indices_uint32, u32);
-range_join_function!(range_join_indices_uint16, u16);
-range_join_function!(range_join_indices_uint8, u8);
-range_join_function!(range_join_indices_f64, f64);
-range_join_function!(range_join_indices_f32, f32);
-
-pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(range_join_indices_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_indices_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_indices_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_indices_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_indices_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_indices_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_indices_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_indices_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_indices_f64, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_indices_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_extended_indices_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_extended_indices_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_extended_indices_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_extended_indices_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_extended_indices_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_extended_indices_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_extended_indices_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_extended_indices_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_extended_indices_f64, m)?)?;
-    m.add_function(wrap_pyfunction!(range_join_extended_indices_f32, m)?)?;
-    Ok(())
-}
-
-/// Execute a range-led extended join.
+/// Build indices for a dual-range join from two per-row windows.
 ///
-/// The first two predicates supply the two range windows. `build_windows`
-/// intersects them before residual predicates are evaluated. The caller must
-/// therefore provide two ascending range predicates; this API has no fallback
-/// that treats the second predicate as an ordinary residual.
-fn extended_join<'py, T: numpy::Element + PartialOrd + Copy>(
+/// Each anchor produces one positional window for every logical left row. The
+/// windows are intersected row by row; index generation is therefore defined
+/// by the window intersection, not by the value dtype of either anchor.
+#[pyfunction]
+pub fn range_join_indices<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
     keep: &str,
-    first: ParsedRangePredicate<'py, T>,
-    second: ParsedRangePredicate<'py, T>,
+    return_building_blocks: bool,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
-    if predicates.len() < 2 {
+    if predicates.len() != 2 {
         return Err(PyValueError::new_err(
-            "range extended join requires at least two predicates",
+            "range join requires exactly two predicates",
         ));
     }
-    if !first.op.is_range() || !second.op.is_range() {
-        return Err(PyValueError::new_err(
-            "range extended join requires two range predicates first",
-        ));
+    let first_item = predicates.get_item(0)?;
+    let second_item = predicates.get_item(1)?;
+    let first_tuple = first_item.cast::<PyTuple>()?;
+    let second_tuple = second_item.cast::<PyTuple>()?;
+    let first = parse_any_range_predicate(first_tuple, false)?;
+    let second = parse_any_range_predicate(second_tuple, false)?;
+    let windows = build_any_windows(&first, &second).map_err(PyValueError::new_err)?;
+    if windows.left_index.is_empty() {
+        return Ok(None);
     }
+    if return_building_blocks {
+        return Ok(Some(result_dict(
+            py,
+            windows.left_index,
+            windows.right_index,
+            Some(windows.starts),
+            Some(windows.ends),
+        )?));
+    }
+    let keep = Keep::parse(keep)?;
+    let (left, right) = choose_range_windows(&windows, keep).map_err(PyValueError::new_err)?;
+    if left.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(result_dict(py, left, right, None, None)?))
+}
+
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(range_join_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(range_join_extended_indices, m)?)?;
+    Ok(())
+}
+
+/// Execute the range-extended join with independently typed anchors.
+fn extended_join<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    keep: &str,
+    first: AnyParsedRangePredicate<'py>,
+    second: AnyParsedRangePredicate<'py>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
     let keep = Keep::parse(keep)?;
     let residuals = PyList::empty(py);
     for item in predicates.iter().skip(2) {
         residuals.append(item)?;
     }
     let (parsed, metadata) = parse_predicates_with_nulls_strings(py, &residuals)?;
-    let left = first.left.as_array();
-    let right = first.right.as_array();
-    let left_index = first.left_index.as_array();
-    let right_index = first.right_index.as_array();
+    ensure_equal_lengths_core(
+        "first left predicate array",
+        first.left_len(),
+        "second left predicate array",
+        second.left_len(),
+    )
+    .map_err(PyValueError::new_err)?;
+    ensure_equal_lengths_core(
+        "first right predicate array",
+        first.right_len(),
+        "second right predicate array",
+        second.right_len(),
+    )
+    .map_err(PyValueError::new_err)?;
     for predicate in &parsed {
         ensure_equal_lengths_core(
             "first left predicate array",
-            left.len(),
+            first.left_len(),
             "residual left predicate array",
             predicate.left_len(),
         )
         .map_err(PyValueError::new_err)?;
         ensure_equal_lengths_core(
             "first right predicate array",
-            right.len(),
+            first.right_len(),
             "residual right predicate array",
             predicate.right_len(),
         )
         .map_err(PyValueError::new_err)?;
     }
-    let first_predicate = RangePredicate {
-        left,
-        left_index,
-        right,
-        right_index,
-        op: first.op,
-    };
-    let second_predicate = RangePredicate {
-        left: second.left.as_array(),
-        left_index: second.left_index.as_array(),
-        right: second.right.as_array(),
-        right_index: second.right_index.as_array(),
-        op: second.op,
-    };
-    let windows =
-        build_windows(first_predicate, second_predicate).map_err(PyValueError::new_err)?;
+    let windows = build_any_windows(&first, &second).map_err(PyValueError::new_err)?;
     if windows.left_index.is_empty() {
         return Ok(None);
     }
@@ -570,71 +672,31 @@ fn extended_join<'py, T: numpy::Element + PartialOrd + Copy>(
     Ok(Some(result_dict(py, out_left, out_right, None, None)?))
 }
 
-macro_rules! range_join_extended_function {
-    ($name:ident, $ty:ty) => {
-        /// Build indices for two range anchors followed by residual filters.
-        ///
-        /// The first two predicates are five-element tuples of the form
-        /// `(left, left_index, right, right_index, comparator)`. Their right
-        /// value arrays must already be ascending and aligned to one another.
-        /// Predicates after the first two are evaluated in user order; they
-        /// may use the ordinary residual tuple form or the null-aware `!=`
-        /// form accepted by the shared predicate parser. Residual filtering
-        /// happens before `keep` is applied.
-        ///
-        /// # Arguments
-        ///
-        /// * `py` - Active Python interpreter token.
-        /// * `predicates` - At least two anchor/residual predicate tuples.
-        /// * `keep` - `"first"`, `"last"`, `"any"`, or `"all"`.
-        ///
-        /// # Returns
-        ///
-        /// Returns `None` when no candidate survives both range anchors and
-        /// all residual predicates; otherwise returns materialized left/right
-        /// index arrays in left-row order.
-        ///
-        /// # Errors
-        ///
-        /// Returns `ValueError` for invalid tuple shapes, non-range anchors,
-        /// invalid residual predicates, or an invalid `keep` value.
-        #[pyfunction]
-        pub fn $name<'py>(
-            py: Python<'py>,
-            predicates: &Bound<'py, PyList>,
-            keep: &str,
-        ) -> PyResult<Option<Bound<'py, PyDict>>> {
-            if predicates.len() < 2 {
-                return Err(PyValueError::new_err(
-                    "range extended join requires at least two predicates",
-                ));
-            }
-            let first_item = predicates.get_item(0)?;
-            let first_tuple = first_item.cast::<PyTuple>()?;
-            if first_tuple.len() != 5 {
-                return Err(PyValueError::new_err(
-                    "the first extended range predicate must contain 5 elements",
-                ));
-            }
-            let second_item = predicates.get_item(1)?;
-            let second_tuple = second_item.cast::<PyTuple>()?;
-            let first = parse_extended_range_predicate::<$ty>(&first_tuple)?;
-            let second = parse_extended_range_predicate::<$ty>(&second_tuple)?;
-            extended_join(py, predicates, keep, first, second)
-        }
-    };
+/// Build range-extended indices from two anchor windows and residual filters.
+#[pyfunction]
+pub fn range_join_extended_indices<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    keep: &str,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    if predicates.len() < 2 {
+        return Err(PyValueError::new_err(
+            "range extended join requires at least two predicates",
+        ));
+    }
+    let first_item = predicates.get_item(0)?;
+    let second_item = predicates.get_item(1)?;
+    let first_tuple = first_item.cast::<PyTuple>()?;
+    let second_tuple = second_item.cast::<PyTuple>()?;
+    if first_tuple.len() != 5 || second_tuple.len() != 5 {
+        return Err(PyValueError::new_err(
+            "extended range anchors must contain 5 elements",
+        ));
+    }
+    let first = parse_any_range_predicate(first_tuple, true)?;
+    let second = parse_any_range_predicate(second_tuple, true)?;
+    extended_join(py, predicates, keep, first, second)
 }
-
-range_join_extended_function!(range_join_extended_indices_int64, i64);
-range_join_extended_function!(range_join_extended_indices_int32, i32);
-range_join_extended_function!(range_join_extended_indices_int16, i16);
-range_join_extended_function!(range_join_extended_indices_int8, i8);
-range_join_extended_function!(range_join_extended_indices_uint64, u64);
-range_join_extended_function!(range_join_extended_indices_uint32, u32);
-range_join_extended_function!(range_join_extended_indices_uint16, u16);
-range_join_extended_function!(range_join_extended_indices_uint8, u8);
-range_join_extended_function!(range_join_extended_indices_f64, f64);
-range_join_extended_function!(range_join_extended_indices_f32, f32);
 
 #[cfg(test)]
 mod tests {
@@ -835,9 +897,45 @@ mod tests {
                 ],
             )?)?;
 
-            let result = range_join_extended_indices_int64(py, &predicates, "all")?
+            let result = range_join_extended_indices(py, &predicates, "all")?
                 .expect("the residual predicate should leave one candidate");
             assert_eq!(read_pair(&result), (vec![100], vec![30]));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn mixed_range_anchors_search_with_their_own_dtypes() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
+                    PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![6.0_f64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0.0_f64, 2.0, 4.0, 6.0]).into_any(),
+                    PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    ">".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+
+            let result = range_join_indices(py, &predicates, "all", false)?
+                .expect("the mixed-dtype windows should intersect");
+            assert_eq!(read_pair(&result), (vec![100, 100], vec![10, 30]));
             Ok(())
         })
         .unwrap();

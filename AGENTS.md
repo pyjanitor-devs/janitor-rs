@@ -1136,3 +1136,16 @@ two-range-anchor contract and is the only path that intersects two windows.
 **Recommendation**: Do not add a second-range optimization flag to the
 single-extended API. Route confirmed dual-range joins through `range_join` and
 keep the single-extended implementation focused on one anchor plus residuals.
+
+### [2026-09-26] Define dual-range joins by per-row window intersection
+
+**Context**: Defining the dual-range join contract and its implementation.
+**Learning**: Each of the first two range predicates builds one half-open
+window for each logical left row. Rust intersects those two windows row by row;
+index generation and aggregation then operate on the surviving positional
+windows. Anchor dtype handling is an implementation detail of each search, not
+the definition of a dual-range join.
+
+**Recommendation**: Keep PyJanitor responsible for null filtering, sorting,
+and physical alignment of the right layouts. Let Rust search each anchor using
+its supplied value representation, then intersect only the positional windows.

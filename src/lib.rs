@@ -290,30 +290,30 @@ mod registration_tests {
             janitor_rs(&module).expect("registration must not fail");
 
             let representative_exports = [
-                "binary_search_lt_int64",              // bin_search
-                "compare_batch_indices_first",         // fused batch comparison
-                "aggregate_batch_reverse",             // reverse fused compare
-                "aggregate_batch_no_range_reverse",    // reverse no-range compare
-                "repeat_index",                        // index_builder
-                "compute_sum_start_int64",             // aggs::sum
-                "compute_sum_rev_start_int64",         // aggs::sum_rev
-                "compute_min_start_int64",             // aggs::min
-                "compute_min_rev_start_int64",         // aggs::min_rev
-                "compute_max_start_int64",             // aggs::max
-                "compute_max_rev_start_int64",         // aggs::max_rev
-                "compute_prod_start_int64",            // aggs::prod
-                "compute_prod_rev_start_int64",        // aggs::prod_rev
-                "compute_size_rev_start",              // aggs::size_rev
-                "aggregate_dual_regions_reverse",      // reverse dual regions
-                "aggregate_multi_regions_reverse",     // reverse multi regions
-                "aggregate_starts_reverse",            // reverse starts ranges
-                "aggregate_ends_reverse",              // reverse ends ranges
-                "aggregate_starts_ends_reverse",       // reverse starts/ends ranges
-                "single_join_indices_int64",           // single-predicate join
-                "range_join_indices_int64",            // two-range join
-                "range_join_aggregate_int64",          // two-range aggregation
-                "range_join_extended_indices_int64",   // range-led extended join
-                "range_join_extended_aggregate_int64", // range-led aggregation
+                "binary_search_lt_int64",           // bin_search
+                "compare_batch_indices_first",      // fused batch comparison
+                "aggregate_batch_reverse",          // reverse fused compare
+                "aggregate_batch_no_range_reverse", // reverse no-range compare
+                "repeat_index",                     // index_builder
+                "compute_sum_start_int64",          // aggs::sum
+                "compute_sum_rev_start_int64",      // aggs::sum_rev
+                "compute_min_start_int64",          // aggs::min
+                "compute_min_rev_start_int64",      // aggs::min_rev
+                "compute_max_start_int64",          // aggs::max
+                "compute_max_rev_start_int64",      // aggs::max_rev
+                "compute_prod_start_int64",         // aggs::prod
+                "compute_prod_rev_start_int64",     // aggs::prod_rev
+                "compute_size_rev_start",           // aggs::size_rev
+                "aggregate_dual_regions_reverse",   // reverse dual regions
+                "aggregate_multi_regions_reverse",  // reverse multi regions
+                "aggregate_starts_reverse",         // reverse starts ranges
+                "aggregate_ends_reverse",           // reverse ends ranges
+                "aggregate_starts_ends_reverse",    // reverse starts/ends ranges
+                "single_join_indices_int64",        // single-predicate join
+                "range_join_indices",               // two-range join
+                "range_join_extended_indices",      // range-led extended join
+                "range_join_extended_aggregate",    // range-led aggregation
+                "range_join_aggregate",             // two-range aggregation
             ];
 
             for name in representative_exports {
@@ -326,11 +326,11 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (871 exports across the retained leaf
+    /// `register`, as of this PR (817 exports across the retained leaf
     /// modules).
     /// Bump this alongside any PR that intentionally adds or removes an
     /// export.
-    const EXPECTED_EXPORT_COUNT: usize = 871;
+    const EXPECTED_EXPORT_COUNT: usize = 817;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
