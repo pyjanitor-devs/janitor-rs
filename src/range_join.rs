@@ -103,6 +103,14 @@ pub(crate) fn build_windows<T: PartialOrd + Copy>(
 /// resulting positions. PyJanitor aligns the second right array to the first
 /// right layout before calling Rust, so the two windows refer to the same
 /// physical right positions even when their value dtypes differ.
+///
+/// The first anchor owns the right-label vector retained for output. The
+/// second anchor deliberately does not carry a second copy of those labels.
+/// Consequently, this function checks positional bounds but does not compare
+/// every label element. A same-length, differently ordered second right layout
+/// is outside the Rust contract and must be prevented by PyJanitor's alignment
+/// step. This keeps the dual-range path from paying an O(right_len) defensive
+/// scan on every call.
 pub(crate) fn intersect_windows(
     first: SingleJoinResult,
     second: SingleJoinResult,

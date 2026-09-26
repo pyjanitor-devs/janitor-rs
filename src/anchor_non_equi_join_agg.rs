@@ -12,6 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
 use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
+use crate::aggs::ensure_equal_lengths_core;
 use crate::anchor_non_equi_join::{build_range_core, range_window, visit_not_equal_pairs_core};
 use crate::join_aggregation_helpers::{aggregate_range_windows, residuals};
 use crate::op::CompareOp;
@@ -286,18 +287,22 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
     };
 
     if let Some(values) = left_positions.as_ref() {
-        if values.len()? != left.len() {
-            return Err(PyValueError::new_err(
-                "left position map must match left predicate values",
-            ));
-        }
+        ensure_equal_lengths_core(
+            "left predicate values",
+            left.len(),
+            "left position map",
+            values.len()?,
+        )
+        .map_err(PyValueError::new_err)?;
     }
     if let Some(values) = right_positions.as_ref() {
-        if values.len()? != right.len() {
-            return Err(PyValueError::new_err(
-                "right position map must match right predicate values",
-            ));
-        }
+        ensure_equal_lengths_core(
+            "right predicate values",
+            right.len(),
+            "right position map",
+            values.len()?,
+        )
+        .map_err(PyValueError::new_err)?;
     }
 
     // Forward aggregation reads values from right and writes one trimmed
