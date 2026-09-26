@@ -50,7 +50,9 @@ use crate::range_join::{
 ///   use the six-element range tuple
 ///   `(left, left_index, right, right_index, right_index_is_ordered,
 ///   comparator)`, or the eight-element form with output-position arrays in
-///   fields five and six. The second predicate uses the six-element form.
+///   fields four and five. The second predicate uses the five-element
+///   extended-anchor form `(left, left_index, right, right_index,
+///   comparator)` because its ordering flag is not needed by aggregation.
 ///   Predicates after the first two are residual filters evaluated in order.
 /// * `first` - The already-parsed first range anchor, including its borrowed
 ///   arrays and aligned index labels.
@@ -92,7 +94,11 @@ pub(crate) fn aggregate_range_extended<'py, T: numpy::Element + PartialOrd + Cop
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let second_object = predicates.get_item(1)?;
     let second_tuple = second_object.cast::<PyTuple>()?;
-    let second = parse_range_predicate::<T>(second_tuple)?;
+    // The second anchor is already known to be part of the dual-range
+    // extended contract, so it uses the compact five-field form. The ordinary
+    // six-field parser belongs to the basic two-range API, where the shared
+    // ordering flag is retained in every predicate tuple.
+    let second = crate::range_join::parse_extended_range_predicate::<T>(second_tuple)?;
     if !second.op.is_range() {
         return Err(PyValueError::new_err(
             "the second range predicate must use <, <=, >, or >=",
@@ -163,9 +169,9 @@ pub(crate) fn aggregate_range_extended<'py, T: numpy::Element + PartialOrd + Cop
 ///  right_index_is_ordered, comparator)
 /// ```
 ///
-/// The second tuple is always the ordinary six-field form. Predicates after
-/// the first two are not used for binary search; they are residual predicates
-/// evaluated against each candidate inside the intersected window.
+/// The second tuple is always the five-field extended-anchor form. Predicates
+/// after the first two are not used for binary search; they are residual
+/// predicates evaluated against each candidate inside the intersected window.
 ///
 /// Keeping this adapter beside the range aggregation implementation prevents
 /// `anchor_non_equi_join_agg.rs` from owning dual-range tuple semantics. That
@@ -239,9 +245,12 @@ pub(crate) fn dispatch_range_extended_aggregation<'py, T: numpy::Element + Parti
 
     // The ordering flag is part of the shared predicate tuple contract.
     // Aggregation does not use its value: PyJanitor has already sorted the
-    // right-hand arrays before calling Rust. Extract it only to validate the
+    // right-hand arrays before calling Rust. In the six-field form it is at
+    // field four; in the eight-field form fields four and five are the output
+    // maps, so the flag moves to field six. Extract it only to validate the
     // tuple shape and field type.
-    first_tuple.get_item(4)?.extract::<bool>()?;
+    let ordering_position = if first_tuple.len() == 8 { 6 } else { 4 };
+    first_tuple.get_item(ordering_position)?.extract::<bool>()?;
 
     // Extract the four aligned value/label arrays and decode the comparator.
     // `ParsedRangePredicate` keeps the Python array owners alive while the
@@ -277,19 +286,20 @@ pub(crate) fn dispatch_range_extended_aggregation<'py, T: numpy::Element + Parti
 
     // Only the eight-field form carries output maps. Each map is ordered by
     // compact aggregation slot and stores the corresponding original
-    // physical row. Forward aggregation writes one result per left slot, so
-    // it uses the left map; reverse aggregation writes one result per right
-    // slot, so it uses the right map.
+    // physical row. In this form the maps occupy fields four and five.
+    // Forward aggregation writes one result per left slot, so it uses the
+    // left map; reverse aggregation writes one result per right slot, so it
+    // uses the right map.
     let (left_output_positions, right_output_positions) = if first_tuple.len() == 8 {
         (
             Some(
                 first_tuple
-                    .get_item(5)?
+                    .get_item(4)?
                     .extract::<PyReadonlyArray1<'py, i64>>()?,
             ),
             Some(
                 first_tuple
-                    .get_item(6)?
+                    .get_item(5)?
                     .extract::<PyReadonlyArray1<'py, i64>>()?,
             ),
         )
