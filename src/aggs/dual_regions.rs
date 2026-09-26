@@ -59,7 +59,7 @@ pub fn aggregate_dual_regions<'py>(
             "at least one aggregation is required",
         ));
     }
-    let mut set = AggregationSet::new(left.len(), right.len(), &inputs)?;
+    let mut set = AggregationSet::new(left.len(), right.len(), &inputs, true)?;
     let mut next = vec![-1_i64; right.len()];
     let mut groups = BTreeMap::<i64, GroupState>::new();
     let mut previous_end = right.len();
@@ -107,12 +107,11 @@ mod tests {
             let left = PyArray1::from_vec(py, vec![2_i64, 3]);
             let right = PyArray1::from_vec(py, vec![1_i64, 2, 4]);
             let starts = PyArray1::from_vec(py, vec![0_i64, 0]);
-            let values = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
             let mask = PyArray1::from_vec(py, vec![false, false, false]);
             let aggregation = PyTuple::new(
                 py,
                 [
-                    values.into_any(),
+                    "*".into_pyobject(py).unwrap().into_any(),
                     mask.into_any(),
                     "count".into_pyobject(py).unwrap().into_any(),
                 ],

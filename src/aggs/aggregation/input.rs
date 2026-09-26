@@ -16,7 +16,7 @@
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyList, PyString, PyTuple};
 
 /// Operation requested for one aggregation input.
 ///
@@ -65,6 +65,9 @@ impl AggregationOp {
 pub(crate) enum AggregationInput<'py> {
     /// Count every successful comparison without reading a value column.
     CountAll,
+    /// Count successful comparisons whose source value is valid, using only
+    /// the authoritative boolean null mask and no source value array.
+    CountNonNull(PyReadonlyArray1<'py, bool>),
     // Each variant preserves the original NumPy dtype. The output dtype is
     // an operation contract, not a consequence of whichever dtype happened
     // to be supplied by the caller.
@@ -123,7 +126,8 @@ pub(crate) enum AggregationInput<'py> {
 /// Parse Python aggregation requests and preserve their concrete NumPy dtypes.
 ///
 /// Each list item is either a three-element tuple
-/// `(values, null_mask, operation)` or the two-element count-all shorthand
+/// `(values, null_mask, operation)`, the dtype-independent count form
+/// `("*", null_mask, "count")`, or the two-element count-all shorthand
 /// `("*", "count")`; `("*", "size")` is also accepted. The values and mask
 /// are borrowed rather than copied, so their Python owners must remain alive
 /// while the returned inputs are used by [`super::state::AggregationSet`].
@@ -135,9 +139,9 @@ pub(crate) enum AggregationInput<'py> {
 ///   unsigned, or float NumPy dtypes. Null masks must be one-dimensional
 ///   boolean arrays aligned with their value arrays. The caller owns null
 ///   tracking: a mask entry of `true` is the only null marker recognized here.
-///   A wildcard count-all request does not need a value array or mask. A
-///   three-element `count` request counts non-null values; `size` requests
-///   count-all.
+///   A wildcard count-all request does not need a value array or mask. The
+///   wildcard three-element `count` request needs only its boolean mask and
+///   counts non-null values; `size` requests count-all.
 ///
 /// # Returns
 ///
@@ -187,6 +191,32 @@ pub(crate) fn parse_inputs<'py>(
             .get_item(1)?
             .extract::<PyReadonlyArray1<'py, bool>>()?;
         let op = AggregationOp::parse(&tuple.get_item(2)?)?;
+        // ELI5: `"*"` is a deliberate sentinel meaning "there is no value
+        // array; use only this mask". A normal request starts with a NumPy
+        // array, so checking for Python's string type tells us which input
+        // shape we received without relying on a failed array conversion.
+        //
+        // Do not replace this with unconditional array extraction: wildcard
+        // count is specifically what lets strings, objects, categoricals,
+        // and extension values use the dtype-independent mask path.
+        if array.is_instance_of::<PyString>() {
+            let wildcard = array.extract::<&str>()?;
+            if wildcard != "*" {
+                return Err(PyValueError::new_err(
+                    "three-element wildcard aggregations must use '*' as the first value",
+                ));
+            }
+            if op != AggregationOp::CountNonNull {
+                return Err(PyValueError::new_err("wildcard aggregation must use count"));
+            }
+            result.push(AggregationInput::CountNonNull(mask));
+            continue;
+        }
+        if op == AggregationOp::CountNonNull {
+            return Err(PyValueError::new_err(
+                "count must use the wildcard null-mask form",
+            ));
+        }
         let dtype = array
             .getattr("dtype")?
             .getattr("name")?

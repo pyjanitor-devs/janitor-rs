@@ -6,7 +6,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyList, PyTuple};
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core};
 use crate::op::CompareOp;
 
 /// A typed comparison between one left-hand array and one right-hand array.
@@ -115,6 +115,36 @@ pub(crate) struct NullMetadataView<'a> {
     pub(crate) left: Option<ArrayView1<'a, bool>>,
     pub(crate) right: Option<ArrayView1<'a, bool>>,
     pub(crate) is_extension_array: bool,
+}
+
+/// Validate that parsed residual predicates use the anchor's physical layout.
+///
+/// Candidate generation produces physical left/right positions once and then
+/// reuses those positions for every residual predicate. This shared check is
+/// intentionally kept beside the predicate types so index and aggregation
+/// callers cannot drift into slightly different length-validation loops.
+pub(crate) fn check_predicate_lengths(
+    predicates: &[Predicate<'_>],
+    left_len: usize,
+    right_len: usize,
+) -> PyResult<()> {
+    for predicate in predicates {
+        ensure_equal_lengths_core(
+            "first left predicate array",
+            left_len,
+            "residual left predicate array",
+            predicate.left_len(),
+        )
+        .map_err(PyValueError::new_err)?;
+        ensure_equal_lengths_core(
+            "first right predicate array",
+            right_len,
+            "residual right predicate array",
+            predicate.right_len(),
+        )
+        .map_err(PyValueError::new_err)?;
+    }
+    Ok(())
 }
 
 impl NullMetadata<'_> {
@@ -457,7 +487,7 @@ pub(crate) fn parse_predicates_strings<'py>(
 }
 
 /// Parse the string-based residual predicate form used by
-/// `single_join_extended.rs`.
+/// the extended range and single-join APIs.
 ///
 /// Ordinary residual predicates are `(left, right, op)`. A null-aware `!=`
 /// predicate is `(left, left_nulls, right, right_nulls,
@@ -465,7 +495,9 @@ pub(crate) fn parse_predicates_strings<'py>(
 /// boolean. For all-`!=` extended joins, these arrays are
 /// full physical layouts: candidate position pairs index them directly, and
 /// the masks are full-length authoritative null masks. The parser does not
-/// align or filter these arrays.
+/// align or filter these arrays. PyJanitor is responsible for alignment,
+/// null filtering for ordinary range predicates, and the distinction between
+/// NumPy null semantics and pandas extension-array semantics.
 pub(crate) fn parse_predicates_with_nulls_strings<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,

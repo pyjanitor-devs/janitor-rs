@@ -1,4 +1,4 @@
-//! Index construction for one non-equi join predicate.
+//! Index construction for single non-equi joins.
 //!
 //! Pyjanitor supplies non-null, value-sorted arrays for the search paths and
 //! maps each filtered value back to its original physical position. Rust does
@@ -19,60 +19,31 @@
 //! prefix or suffix. For `!=`, null semantics are selected by a validated
 //! pandas-extension flag: NumPy nulls participate in inequality matches,
 //! while pandas extension nulls do not.
+//!
+//! The basic single-predicate API and the single-anchor extended API live in
+//! this module because they share the same range-window and `!=` candidate
+//! machinery. The basic functions apply `keep` directly to the first
+//! predicate; the extended functions use the first predicate to generate
+//! candidates and apply later predicates as residual filters before `keep`.
+//!
+//! The basic APIs return building blocks or materialized index dictionaries
+//! according to their wrapper contract. The extended APIs return only a
+//! materialized dictionary containing `left_index` and `right_index`; they
+//! must inspect every residual predicate before applying `keep`.
 
 use numpy::ndarray::ArrayView1;
-use numpy::{IntoPyArray, PyReadonlyArray1};
+use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::aggs::ensure_equal_lengths_core;
+use crate::join_candidate_materialization::{
+    materialize_not_equal_candidates, materialize_range_candidates,
+};
+use crate::join_common::{result_dict, Keep, SingleJoinResult};
 use crate::op::CompareOp;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Keep {
-    /// Select the smallest matching original right index label.
-    First,
-    /// Select the largest matching original right index label.
-    Last,
-    /// Select any one matching right index label without computing extrema.
-    Any,
-    /// Emit every matching pair in physical right-array order.
-    All,
-}
-
-impl Keep {
-    /// Parse the public string representation used by the PyO3 wrapper.
-    ///
-    /// Keeping this conversion at the Python boundary means the core
-    /// functions can work with a closed enum and cannot silently accept a
-    /// misspelled selection mode.
-    pub(crate) fn parse(value: &str) -> PyResult<Self> {
-        match value {
-            "first" => Ok(Self::First),
-            "last" => Ok(Self::Last),
-            "any" => Ok(Self::Any),
-            "all" => Ok(Self::All),
-            other => Err(PyValueError::new_err(format!(
-                "invalid keep value: {other} (expected one of first, last, any, all)"
-            ))),
-        }
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct SingleJoinResult {
-    /// Physical left positions corresponding to `left_index`.
-    pub(crate) left_positions: Vec<usize>,
-    /// Original left index labels for rows with a non-empty match window.
-    pub left_index: Vec<i64>,
-    /// The complete original right index-label array, in sorted-value order.
-    pub right_index: Vec<i64>,
-    /// Inclusive start positions of each retained row's right match window.
-    pub starts: Vec<usize>,
-    /// Exclusive end positions of each retained row's right match window.
-    pub ends: Vec<usize>,
-}
+use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
 
 /// Find the first position at which a monotone predicate becomes false.
 ///
@@ -84,7 +55,7 @@ pub struct SingleJoinResult {
 /// views cannot expose a contiguous slice, so they use the equivalent manual
 /// binary-search loop. Both paths return a physical position in the supplied
 /// right view; neither path changes or sorts the input.
-fn partition_point<T: PartialOrd + Copy>(
+pub(crate) fn partition_point<T: PartialOrd + Copy>(
     right: ArrayView1<'_, T>,
     predicate: impl Fn(T) -> bool,
 ) -> usize {
@@ -119,7 +90,21 @@ fn partition_point<T: PartialOrd + Copy>(
 /// Equality and inequality are intentionally excluded. Equality is handled
 /// upstream by pyjanitor, while inequality is the union of the strict prefix
 /// and strict suffix and needs its own null-aware implementation.
-fn range_bounds<T: PartialOrd + Copy>(
+///
+/// The returned `(start, end)` pair identifies the contiguous portion of the
+/// ascending `right` array that satisfies `left_value op right_value`.
+///
+/// # Arguments
+///
+/// * `left_value` - One left-side value.
+/// * `right` - An ascending right-side value view.
+/// * `op` - One of `<`, `<=`, `>`, or `>=`.
+///
+/// # Returns
+///
+/// A half-open positional range into `right`. Equality and inequality are not
+/// valid inputs and are unreachable after caller validation.
+pub(crate) fn range_window<T: PartialOrd + Copy>(
     left_value: T,
     right: ArrayView1<'_, T>,
     op: CompareOp,
@@ -145,7 +130,7 @@ fn range_bounds<T: PartialOrd + Copy>(
             let end = partition_point(right, |value| value <= left_value);
             (0, end)
         }
-        CompareOp::Eq | CompareOp::Ne => unreachable!("range_bounds only handles range operators"),
+        CompareOp::Eq | CompareOp::Ne => unreachable!("range_window only handles range operators"),
     }
 }
 
@@ -429,8 +414,37 @@ pub fn build_range_core<T: PartialOrd + Copy>(
     left_index: ArrayView1<'_, i64>,
     right: ArrayView1<'_, T>,
     right_index: ArrayView1<'_, i64>,
+    right_index_is_ordered: bool,
+    op: CompareOp,
+) -> Result<SingleJoinResult, String> {
+    build_range_core_with_labels(
+        left,
+        left_index,
+        right,
+        right_index,
+        right_index_is_ordered,
+        op,
+        true,
+        false,
+    )
+}
+
+/// Construct one range window, optionally retaining the right labels.
+///
+/// The first predicate in a dual-range join owns the labels needed for output;
+/// the second predicate contributes only positional boundaries. Avoiding the
+/// second full label copy preserves the same alignment while reducing memory
+/// traffic for large right arrays.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_range_core_with_labels<T: PartialOrd + Copy>(
+    left: ArrayView1<'_, T>,
+    left_index: ArrayView1<'_, i64>,
+    right: ArrayView1<'_, T>,
+    right_index: ArrayView1<'_, i64>,
     _right_index_is_ordered: bool,
     op: CompareOp,
+    include_right_index: bool,
+    retain_empty_windows: bool,
 ) -> Result<SingleJoinResult, String> {
     // This function only constructs the physical value windows. Whether the
     // original right labels are ordered does not affect those boundaries;
@@ -451,15 +465,22 @@ pub fn build_range_core<T: PartialOrd + Copy>(
     // building-block output. The copy preserves their supplied physical
     // order; it does not sort or otherwise change them.
     let mut result = SingleJoinResult {
-        right_index: right_index.to_vec(),
-        ..SingleJoinResult::default()
+        left_positions: Vec::new(),
+        left_index: Vec::new(),
+        right_index: if include_right_index {
+            right_index.to_vec()
+        } else {
+            Vec::new()
+        },
+        starts: Vec::new(),
+        ends: Vec::new(),
     };
     if left.is_empty() || right.is_empty() {
         return Ok(result);
     }
     for (left_position, left_value) in left.iter().enumerate() {
-        let (start, end) = range_bounds(*left_value, right, op);
-        if start >= end {
+        let (start, end) = range_window(*left_value, right, op);
+        if start >= end && !retain_empty_windows {
             continue;
         }
         result.left_index.push(left_index[left_position]);
@@ -470,7 +491,7 @@ pub fn build_range_core<T: PartialOrd + Copy>(
     Ok(result)
 }
 
-fn choose_range(
+pub(crate) fn choose_range(
     windows: &SingleJoinResult,
     keep: Keep,
     right_index_is_ordered: bool,
@@ -604,7 +625,10 @@ fn choose_range(
 ///
 /// Returns an error if a position is negative or cannot be represented by the
 /// platform's `usize` type.
-fn physical_positions(name: &str, values: ArrayView1<'_, i64>) -> Result<Vec<usize>, String> {
+pub(crate) fn physical_positions(
+    name: &str,
+    values: ArrayView1<'_, i64>,
+) -> Result<Vec<usize>, String> {
     values
         .iter()
         .enumerate()
@@ -618,7 +642,7 @@ fn physical_positions(name: &str, values: ArrayView1<'_, i64>) -> Result<Vec<usi
 
 /// Validate that non-null and null positions form a complete partition of an
 /// original index array.
-fn validate_position_partition(
+pub(crate) fn validate_position_partition(
     index_name: &str,
     full_len: usize,
     non_null_positions: &[usize],
@@ -650,6 +674,120 @@ fn validate_position_partition(
             ));
         }
         seen[position] = true;
+    }
+    Ok(())
+}
+
+/// Visit every physical pair satisfying a null-aware `!=` comparison.
+///
+/// This is the aggregation counterpart to [`build_not_equal_positions_core`].
+/// It follows the same strict-prefix, strict-suffix, and null semantics but
+/// calls `visit` immediately instead of allocating output position vectors.
+///
+/// # Arguments
+///
+/// * `left` / `right` - Filtered non-null values; `right` must be sorted.
+/// * `left_full_len` / `right_full_len` - Lengths of the original physical
+///   layouts used by the aggregation source/output arrays.
+/// * `left_positions` / `right_positions` - Maps from filtered offsets to
+///   original physical positions.
+/// * `left_null_positions` / `right_null_positions` - Original positions of
+///   null rows, when present.
+/// * `is_extension_array` - Whether null comparisons should be treated as
+///   pandas `NA` and therefore excluded.
+/// * `visit` - Callback receiving `(left_physical_position,
+///   right_physical_position)` for each successful `!=` candidate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn visit_not_equal_pairs_core<T, F>(
+    left: ArrayView1<'_, T>,
+    left_full_len: usize,
+    left_positions: ArrayView1<'_, i64>,
+    right: ArrayView1<'_, T>,
+    right_full_len: usize,
+    right_positions: ArrayView1<'_, i64>,
+    left_null_positions: Option<ArrayView1<'_, i64>>,
+    right_null_positions: Option<ArrayView1<'_, i64>>,
+    is_extension_array: bool,
+    mut visit: F,
+) -> Result<(), String>
+where
+    T: PartialOrd + Copy,
+    F: FnMut(usize, usize),
+{
+    ensure_equal_lengths_core(
+        "left values",
+        left.len(),
+        "left positions",
+        left_positions.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "right values",
+        right.len(),
+        "right positions",
+        right_positions.len(),
+    )?;
+    let left_positions = physical_positions("left", left_positions)?;
+    let right_positions = physical_positions("right", right_positions)?;
+    let left_null_positions = left_null_positions
+        .map(|values| physical_positions("left null", values))
+        .transpose()?;
+    let right_null_positions = right_null_positions
+        .map(|values| physical_positions("right null", values))
+        .transpose()?;
+    let empty = Vec::new();
+    let left_null_positions = left_null_positions.as_deref().unwrap_or(&empty);
+    let right_null_positions = right_null_positions.as_deref().unwrap_or(&empty);
+    validate_position_partition(
+        "left index",
+        left_full_len,
+        &left_positions,
+        left_null_positions,
+    )?;
+    validate_position_partition(
+        "right index",
+        right_full_len,
+        &right_positions,
+        right_null_positions,
+    )?;
+
+    if is_extension_array {
+        // Extension nulls compare as NA, which is false when used as a join
+        // filter. The non-null candidate regions remain valid.
+        for (left_offset, left_value) in left.iter().enumerate() {
+            let left_position = left_positions[left_offset];
+            let gt_start = partition_point(right, |value| value <= *left_value);
+            let lt_end = partition_point(right, |value| value < *left_value);
+            for &right_position in &right_positions[..lt_end] {
+                visit(left_position, right_position);
+            }
+            for &right_position in &right_positions[gt_start..] {
+                visit(left_position, right_position);
+            }
+        }
+        return Ok(());
+    }
+
+    for (left_offset, left_value) in left.iter().enumerate() {
+        let left_position = left_positions[left_offset];
+        let gt_start = partition_point(right, |value| value <= *left_value);
+        let lt_end = partition_point(right, |value| value < *left_value);
+        for &right_position in &right_positions[..lt_end] {
+            visit(left_position, right_position);
+        }
+        for &right_position in &right_positions[gt_start..] {
+            visit(left_position, right_position);
+        }
+        for &right_position in right_null_positions {
+            visit(left_position, right_position);
+        }
+    }
+    for &left_position in left_null_positions {
+        for &right_position in &right_positions {
+            visit(left_position, right_position);
+        }
+        for &right_position in right_null_positions {
+            visit(left_position, right_position);
+        }
     }
     Ok(())
 }
@@ -1131,48 +1269,6 @@ fn materialize_index_pairs(
     Ok((output_left, output_right))
 }
 
-fn result_dict<'py>(
-    py: Python<'py>,
-    left: Vec<i64>,
-    right: Vec<i64>,
-    starts: Option<Vec<usize>>,
-    ends: Option<Vec<usize>>,
-) -> PyResult<Bound<'py, PyDict>> {
-    // Building blocks are optional because ordinary selected results contain
-    // only the flattened left/right label arrays. Range callers request the
-    // positional starts/ends separately when they need to aggregate later.
-    let result = PyDict::new(py);
-    result.set_item("left_index", left.into_pyarray(py))?;
-    result.set_item("right_index", right.into_pyarray(py))?;
-    if let (Some(starts), Some(ends)) = (starts, ends) {
-        // Keep positions as `usize` while Rust is constructing windows, then
-        // normalize the Python-facing dtype to int64. This matches every
-        // downstream range/aggregation kernel and avoids platform-dependent
-        // NumPy `usize` output.
-        let starts = positions_to_i64(starts)?;
-        let ends = positions_to_i64(ends)?;
-        result.set_item("starts", starts.into_pyarray(py))?;
-        result.set_item("ends", ends.into_pyarray(py))?;
-    }
-    Ok(result)
-}
-
-/// Convert internal positional bounds to the stable Python-facing int64 type.
-///
-/// Rust uses `usize` for indexing because positions cannot be negative and
-/// ndarray/slice APIs use `usize`. The Python API uses int64 for all positional
-/// arrays, so the conversion is centralized at the PyO3 boundary and checked
-/// instead of using a potentially truncating cast.
-fn positions_to_i64(values: Vec<usize>) -> PyResult<Vec<i64>> {
-    values
-        .into_iter()
-        .map(|value| {
-            i64::try_from(value)
-                .map_err(|_| PyValueError::new_err("single join position exceeds int64 capacity"))
-        })
-        .collect()
-}
-
 /// Select the effective output mode for a building-block request.
 ///
 /// Range building blocks are positional windows, while `!=` has multiple
@@ -1356,6 +1452,417 @@ single_join_function!(single_join_indices_uint8, u8);
 single_join_function!(single_join_indices_f64, f64);
 single_join_function!(single_join_indices_f32, f32);
 
+/// Execute an all-`!=` extended join.
+///
+/// The first predicate supplies filtered non-null values plus physical
+/// position maps and optional null positions. It is expanded with `Keep::All`
+/// because later predicates must see every first-stage candidate. Residual
+/// predicates use full-layout arrays and masks, so their physical positions
+/// can be indexed directly. Public labels are materialized only after all
+/// residual predicates pass.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token used to build the result dict.
+/// * `predicates` - The complete predicate list. Predicate zero is the
+///   null-aware `!=` anchor; every later predicate must also use `!=`.
+/// * `keep` - Retention mode applied after all residual predicates pass.
+/// * `first_left` / `first_right` - Filtered non-null values for the anchor.
+/// * `first_left_index` / `first_right_index` - Complete physical index-label
+///   arrays used for residual indexing and final output labels.
+/// * `first_left_positions` / `first_right_positions` - Physical positions of
+///   the filtered non-null anchor values in the complete layouts.
+/// * `first_left_null_positions` / `first_right_null_positions` - Optional
+///   physical positions of null rows. `None` means that side has no null rows.
+/// * `right_index_is_ordered` - Shared tuple metadata describing right-label
+///   order. The first stage uses `Keep::All`, so this does not affect candidate
+///   generation; it is still passed through the common `!=` contract.
+/// * `is_extension_array` - Selects pandas extension-array null behavior. For
+///   NumPy semantics nulls can compare unequal; for pandas extension semantics
+///   a null comparison is treated as missing and does not survive filtering.
+///
+/// # Returns
+///
+/// Returns a dictionary containing materialized `left_index` and
+/// `right_index` arrays, or `None` when the first candidate stream or the
+/// residual filters produce no pairs.
+///
+/// # Errors
+///
+/// Returns a Python `ValueError` for an invalid keep value, malformed residual
+/// tuples, a residual operator other than `!=`, mismatched physical lengths,
+/// invalid null metadata, or invalid physical positions.
+#[allow(clippy::too_many_arguments)]
+fn extended_not_equal_join<'py, T: numpy::Element + PartialOrd + Copy>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    keep: &str,
+    first_left: PyReadonlyArray1<'py, T>,
+    first_left_index: PyReadonlyArray1<'py, i64>,
+    first_left_positions: PyReadonlyArray1<'py, i64>,
+    first_left_null_positions: Option<PyReadonlyArray1<'py, i64>>,
+    first_right: PyReadonlyArray1<'py, T>,
+    first_right_index: PyReadonlyArray1<'py, i64>,
+    first_right_positions: PyReadonlyArray1<'py, i64>,
+    first_right_null_positions: Option<PyReadonlyArray1<'py, i64>>,
+    right_index_is_ordered: bool,
+    is_extension_array: bool,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    // The extended kernel needs an anchor plus at least one residual
+    // predicate. The single-predicate case belongs to the ordinary
+    // single-join wrapper, which can apply `keep` without a residual pass.
+    if predicates.len() < 2 {
+        return Err(PyValueError::new_err(
+            "single extended join requires at least two predicates",
+        ));
+    }
+    let keep = Keep::parse(keep)?;
+
+    // Keep every predicate after the anchor in a temporary Python list. The
+    // shared parser expects a list, and this also preserves the caller's
+    // predicate order. The list stores references; it does not copy arrays.
+    let residuals = PyList::empty(py);
+    for item in predicates.iter().skip(1) {
+        let tuple = item
+            .cast::<PyTuple>()
+            .map_err(|_| PyValueError::new_err("each residual comparison must be a tuple"))?;
+        let op_position = if tuple.len() == 3 {
+            2
+        } else if tuple.len() == 6 {
+            5
+        } else {
+            return Err(PyValueError::new_err(
+                "each residual comparison must contain 3 or 6 elements",
+            ));
+        };
+        // All-`!=` extended joins use the same null-aware comparison contract
+        // for the anchor and every residual. Rejecting another operator here
+        // prevents the residual parser from silently applying incompatible
+        // null semantics.
+        let op = CompareOp::try_from_str(tuple.get_item(op_position)?.extract::<&str>()?)?;
+        if op != CompareOp::Ne {
+            return Err(PyValueError::new_err(
+                "all-!= joins require every predicate to use !=",
+            ));
+        }
+        residuals.append(item)?;
+    }
+    // Residual arrays represent the complete physical layouts, not the
+    // filtered non-null arrays used by the anchor. Parse their masks before
+    // validating lengths so the hot candidate loop can use borrowed views.
+    let (parsed, metadata) = parse_predicates_with_nulls_strings(py, &residuals)?;
+    let left_index = first_left_index.as_array();
+    let right_index = first_right_index.as_array();
+
+    // Residual predicates use the full physical layouts, so their lengths
+    // must match the full indexes rather than the filtered first-predicate
+    // value arrays.
+    check_predicate_lengths(&parsed, left_index.len(), right_index.len())?;
+
+    // The first `!=` predicate is always expanded fully. Applying `keep`
+    // here would discard pairs needed by later predicates. The core returns
+    // physical position pairs, not public labels, so residual predicates can
+    // index their complete arrays directly.
+    let (left_positions, right_positions) = build_not_equal_positions_core(
+        first_left.as_array(),
+        left_index,
+        first_left_positions.as_array(),
+        first_right.as_array(),
+        right_index,
+        first_right_positions.as_array(),
+        first_left_null_positions
+            .as_ref()
+            .map(|values| values.as_array()),
+        first_right_null_positions
+            .as_ref()
+            .map(|values| values.as_array()),
+        right_index_is_ordered,
+        is_extension_array,
+        Keep::All,
+    )
+    .map_err(PyValueError::new_err)?;
+    if left_positions.is_empty() {
+        // No first-stage candidates means no residual can produce a match.
+        return Ok(None);
+    }
+
+    // Only now apply `keep`. This is important: `first`, `last`, and `any`
+    // must be chosen from candidates that survive every residual predicate,
+    // not from the broader first `!=` candidate stream.
+    let (out_left, out_right) = materialize_not_equal_candidates(
+        left_index,
+        right_index,
+        &left_positions,
+        &right_positions,
+        &parsed,
+        metadata.as_deref(),
+        keep,
+    )
+    .map_err(PyValueError::new_err)?;
+    if out_left.is_empty() {
+        // The first candidate stream was non-empty, but all candidates may
+        // have been rejected by the residual predicates.
+        return Ok(None);
+    }
+    // Position pairs are converted to the caller-visible index labels only
+    // after filtering and keep selection are complete.
+    Ok(Some(result_dict(py, out_left, out_right, None, None)?))
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Execute a single-anchor range-led extended join.
+///
+/// The first predicate supplies one sorted-right binary-search window for
+/// each left row. The remaining predicates are parsed in their original user
+/// order and evaluated as residual filters inside those windows. A later
+/// range predicate is still only a residual here; intersecting two range
+/// windows is the responsibility of `range_join.rs`.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token used to parse residual tuples and
+///   construct the returned Python dictionary.
+/// * `predicates` - At least two aligned tuples. The first tuple is the range
+///   anchor; every later tuple is a residual comparison.
+/// * `keep` - Selection mode applied only after all residual predicates pass.
+/// * `first_left` / `first_left_index` - Null-free left anchor values and
+///   labels in the same logical order.
+/// * `first_right` / `first_right_index` - Null-free, ascending right anchor
+///   values and their aligned labels.
+/// * `first_op` - The first anchor comparator: `<`, `<=`, `>`, or `>=`.
+///
+/// # Returns
+///
+/// Returns materialized public left/right labels, or `None` when no complete
+/// predicate match survives.
+///
+/// # Errors
+///
+/// Returns a Python `ValueError` for an invalid predicate count, comparator,
+/// residual shape, length mismatch, null metadata, or keep value.
+fn extended_join<'py, T: numpy::Element + PartialOrd + Copy>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    keep: &str,
+    first_left: PyReadonlyArray1<'py, T>,
+    first_left_index: PyReadonlyArray1<'py, i64>,
+    first_right: PyReadonlyArray1<'py, T>,
+    first_right_index: PyReadonlyArray1<'py, i64>,
+    first_op: CompareOp,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    // A single-anchor extended join needs at least one residual predicate.
+    // Dual-range joins are routed separately through `range_join.rs`.
+    if predicates.len() < 2 {
+        return Err(PyValueError::new_err(
+            "single extended join requires at least two predicates",
+        ));
+    }
+    // `!=` requires the null-aware physical-position tuple. It must not be
+    // interpreted as an ordinary range anchor with a missing null contract.
+    if first_op == CompareOp::Ne {
+        return Err(PyValueError::new_err(
+            "all-!= joins must use the null-aware first-predicate form",
+        ));
+    }
+    if !matches!(
+        first_op,
+        CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+    ) {
+        return Err(PyValueError::new_err(
+            "single extended join requires a range predicate first",
+        ));
+    }
+    let keep = Keep::parse(keep)?;
+
+    // Copy only the Python tuple references for predicates after the anchor.
+    // The shared parser then borrows their aligned arrays and authoritative
+    // null metadata for the residual loop.
+    let residuals = PyList::empty(py);
+    for item in predicates.iter().skip(1) {
+        residuals.append(item)?;
+    }
+    let (parsed, metadata) = parse_predicates_with_nulls_strings(py, &residuals)?;
+    let left = first_left.as_array();
+    let right = first_right.as_array();
+    let left_index = first_left_index.as_array();
+    let right_index = first_right_index.as_array();
+
+    // Candidate positions from the first range are physical positions in the
+    // anchor arrays. Every residual must therefore have exactly the same
+    // physical left/right shape before any candidate is visited.
+    check_predicate_lengths(&parsed, left.len(), right.len())?;
+    // The single-extended path has exactly one binary-search anchor. Every
+    // later predicate, including another range comparison, is evaluated as a
+    // residual filter inside that anchor's candidate window. Dual-range
+    // window intersection belongs exclusively to `range_join.rs`.
+    let windows = build_range_core(left, left_index, right, right_index, false, first_op)
+        .map_err(PyValueError::new_err)?;
+    if windows.left_index.is_empty() {
+        // No anchor window means there are no candidates for the residual
+        // predicates, so the public join result is `None`.
+        return Ok(None);
+    }
+    // The window contains only candidates for the first predicate. The
+    // materializer checks every residual in user order and applies `keep`
+    // only to the survivors.
+    let (out_left, out_right) =
+        materialize_range_candidates(&windows, &parsed, metadata.as_deref(), keep)
+            .map_err(PyValueError::new_err)?;
+    if out_left.is_empty() {
+        // An anchor match is not enough: all candidates may have failed a
+        // residual predicate.
+        return Ok(None);
+    }
+    // The materializer has already translated surviving physical positions
+    // into the original public index labels.
+    Ok(Some(result_dict(py, out_left, out_right, None, None)?))
+}
+
+macro_rules! extended_join_function {
+    ($name:ident, $type:ty) => {
+        /// Build flat indices for a multi-predicate conditional join.
+        ///
+        /// Mixed joins use a six-element range first-predicate form:
+        /// `(left, left_index, right, right_index,
+        /// right_index_is_ordered, comparator)`. All-`!=` joins use an
+        /// eleven-element first-predicate form containing filtered values,
+        /// physical position maps, full indexes, null positions, ordering,
+        /// extension-array semantics, and the comparator. Later items are
+        /// ordinary three-element predicates or six-element null-aware `!=`
+        /// predicates. `keep` is applied only after every predicate passes.
+        /// PyJanitor must align all residual arrays to the same physical left
+        /// and right positions before calling Rust. Rust does not sort or
+        /// realign residual arrays.
+        ///
+        /// # Arguments
+        ///
+        /// * `py` - Active Python interpreter token.
+        /// * `predicates` - At least two aligned predicate tuples. The first
+        ///   tuple establishes the candidate stream; later tuples are tested
+        ///   against those candidate positions in user order.
+        /// * `keep` - Retain `"first"`, `"last"`, `"any"`, or `"all"`
+        ///   survivors for each left row.
+        /// * Predicate one supplies the only binary-search candidate window;
+        ///   predicates two onward are residual filters evaluated in user
+        ///   order. Dual-range window intersection belongs to the separate
+        ///   `range_join` API.
+        ///
+        /// # Returns
+        ///
+        /// Returns `None` when no complete predicate match survives;
+        /// otherwise returns a dictionary with materialized `left_index` and
+        /// `right_index` arrays. Building blocks are not returned by this
+        /// extended API.
+        ///
+        /// # Errors
+        ///
+        /// Returns `ValueError` for malformed tuple layouts, unsupported
+        /// comparator combinations, mismatched aligned lengths, invalid null
+        /// metadata, or an invalid `keep` value.
+        #[pyfunction]
+        pub fn $name<'py>(
+            py: Python<'py>,
+            predicates: &Bound<'py, PyList>,
+            keep: &str,
+        ) -> PyResult<Option<Bound<'py, PyDict>>> {
+            if predicates.len() < 2 {
+                return Err(PyValueError::new_err(
+                    "single extended join requires at least two predicates",
+                ));
+            }
+            let first_item = predicates.get_item(0)?;
+            let first = first_item.cast::<PyTuple>()?;
+            let first_op_position = if first.len() == 6 {
+                5
+            } else if first.len() == 11 {
+                10
+            } else {
+                return Err(PyValueError::new_err(
+                    "the first extended predicate must contain 6 or 11 elements",
+                ));
+            };
+            let first_op =
+                CompareOp::try_from_str(first.get_item(first_op_position)?.extract::<&str>()?)?;
+            if first_op == CompareOp::Ne {
+                if first.len() != 11 {
+                    return Err(PyValueError::new_err(
+                        "the first != predicate must contain 11 elements",
+                    ));
+                }
+                let first_left_null_positions = if first.get_item(3)?.is_none() {
+                    None
+                } else {
+                    Some(first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+                };
+                let first_right_null_positions = if first.get_item(7)?.is_none() {
+                    None
+                } else {
+                    Some(first.get_item(7)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+                };
+                // Fields eight and nine belong to the shared null-aware
+                // anchor contract. Field eight carries right-label ordering
+                // metadata and field nine identifies pandas extension-array
+                // semantics. The former is retained for contract alignment;
+                // the latter controls how null candidates are treated.
+                return extended_not_equal_join(
+                    py,
+                    predicates,
+                    keep,
+                    first
+                        .get_item(0)?
+                        .extract::<PyReadonlyArray1<'py, $type>>()?,
+                    first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+                    first.get_item(2)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+                    first_left_null_positions,
+                    first
+                        .get_item(4)?
+                        .extract::<PyReadonlyArray1<'py, $type>>()?,
+                    first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+                    first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+                    first_right_null_positions,
+                    first.get_item(8)?.extract::<bool>()?,
+                    first.get_item(9)?.extract::<bool>()?,
+                );
+            }
+            if first.len() != 6 {
+                return Err(PyValueError::new_err(
+                    "the first range predicate must contain 6 elements",
+                ));
+            }
+            // The wrapper contract carries this flag even though the single
+            // extended kernel does not use it to choose a second window.
+            // Validate its type at the boundary so malformed tuples fail
+            // before candidate generation begins.
+            first.get_item(4)?.extract::<bool>()?;
+            extended_join(
+                py,
+                predicates,
+                keep,
+                first
+                    .get_item(0)?
+                    .extract::<PyReadonlyArray1<'py, $type>>()?,
+                first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+                first
+                    .get_item(2)?
+                    .extract::<PyReadonlyArray1<'py, $type>>()?,
+                first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+                first_op,
+            )
+        }
+    };
+}
+
+extended_join_function!(single_join_extended_indices_int64, i64);
+extended_join_function!(single_join_extended_indices_int32, i32);
+extended_join_function!(single_join_extended_indices_int16, i16);
+extended_join_function!(single_join_extended_indices_int8, i8);
+extended_join_function!(single_join_extended_indices_uint64, u64);
+extended_join_function!(single_join_extended_indices_uint32, u32);
+extended_join_function!(single_join_extended_indices_uint16, u16);
+extended_join_function!(single_join_extended_indices_uint8, u8);
+extended_join_function!(single_join_extended_indices_f64, f64);
+extended_join_function!(single_join_extended_indices_f32, f32);
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(single_join_indices_int64, m)?)?;
     m.add_function(wrap_pyfunction!(single_join_indices_int32, m)?)?;
@@ -1367,6 +1874,16 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(single_join_indices_uint8, m)?)?;
     m.add_function(wrap_pyfunction!(single_join_indices_f64, m)?)?;
     m.add_function(wrap_pyfunction!(single_join_indices_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(single_join_extended_indices_int64, m)?)?;
+    m.add_function(wrap_pyfunction!(single_join_extended_indices_int32, m)?)?;
+    m.add_function(wrap_pyfunction!(single_join_extended_indices_int16, m)?)?;
+    m.add_function(wrap_pyfunction!(single_join_extended_indices_int8, m)?)?;
+    m.add_function(wrap_pyfunction!(single_join_extended_indices_uint64, m)?)?;
+    m.add_function(wrap_pyfunction!(single_join_extended_indices_uint32, m)?)?;
+    m.add_function(wrap_pyfunction!(single_join_extended_indices_uint16, m)?)?;
+    m.add_function(wrap_pyfunction!(single_join_extended_indices_uint8, m)?)?;
+    m.add_function(wrap_pyfunction!(single_join_extended_indices_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(single_join_extended_indices_f32, m)?)?;
     Ok(())
 }
 
@@ -1769,5 +2286,391 @@ mod tests {
             result,
             Err("left index position 0 appears more than once".to_owned())
         );
+    }
+}
+
+#[cfg(test)]
+mod extended_tests {
+    use super::*;
+    use numpy::{PyArray1, PyArrayMethods};
+
+    fn assert_value_error<'py>(
+        result: PyResult<Option<Bound<'py, PyDict>>>,
+        py: Python<'py>,
+        expected: &str,
+    ) {
+        let error = result.expect_err("expected the extended join to reject its input");
+        assert!(error.is_instance_of::<PyValueError>(py));
+        assert_eq!(error.value(py).to_string(), expected);
+    }
+
+    fn read_pair<'py>(result: &Bound<'py, PyDict>, py: Python<'py>) -> (Vec<i64>, Vec<i64>) {
+        let left = result
+            .get_item("left_index")
+            .unwrap()
+            .unwrap()
+            .cast::<PyArray1<i64>>()
+            .unwrap()
+            .readonly()
+            .as_array()
+            .to_vec();
+        let right = result
+            .get_item("right_index")
+            .unwrap()
+            .unwrap()
+            .cast::<PyArray1<i64>>()
+            .unwrap()
+            .readonly()
+            .as_array()
+            .to_vec();
+        let _ = py;
+        (left, right)
+    }
+
+    #[test]
+    fn filters_range_windows_before_keep_selection() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates
+                .append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![4_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
+                        PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
+                        true.into_pyobject(py)?.to_owned().into_any(),
+                        "<".into_pyobject(py)?.into_any(),
+                    ],
+                )?)
+                .unwrap();
+            predicates
+                .append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![4_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![3_i64, 7, 9, 7]).into_any(),
+                        "<".into_pyobject(py)?.into_any(),
+                    ],
+                )?)
+                .unwrap();
+
+            let result = single_join_extended_indices_int64(py, &predicates, "first")
+                .unwrap()
+                .unwrap();
+            assert_eq!(read_pair(&result, py), (vec![100], vec![20]));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn filters_second_range_as_a_residual_before_keep_selection() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![4_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 30, 50, 70]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![4_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 6]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+
+            let result = single_join_extended_indices_int64(py, &predicates, "all")?
+                .expect("the intersected range has one match");
+            assert_eq!(read_pair(&result, py), (vec![100], vec![70]));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn no_surviving_residual_matches_returns_none() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates
+                .append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![4_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![5_i64, 7]).into_any(),
+                        PyArray1::from_vec(py, vec![10_i64, 20]).into_any(),
+                        true.into_pyobject(py)?.to_owned().into_any(),
+                        "<".into_pyobject(py)?.into_any(),
+                    ],
+                )?)
+                .unwrap();
+            predicates
+                .append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![4_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![1_i64, 2]).into_any(),
+                        "==".into_pyobject(py)?.into_any(),
+                    ],
+                )?)
+                .unwrap();
+
+            assert!(single_join_extended_indices_int64(py, &predicates, "all")
+                .unwrap()
+                .is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn all_not_equal_joins_filter_flat_position_pairs() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates
+                .append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![1_i64, 2, 3]).into_any(),
+                        PyArray1::from_vec(py, vec![10_i64, 11, 12]).into_any(),
+                        PyArray1::from_vec(py, vec![0_i64, 1, 2]).into_any(),
+                        py.None().into_pyobject(py)?.into_any(),
+                        PyArray1::from_vec(py, vec![1_i64, 2, 3]).into_any(),
+                        PyArray1::from_vec(py, vec![20_i64, 21, 22]).into_any(),
+                        PyArray1::from_vec(py, vec![0_i64, 1, 2]).into_any(),
+                        py.None().into_pyobject(py)?.into_any(),
+                        true.into_pyobject(py)?.to_owned().into_any(),
+                        false.into_pyobject(py)?.to_owned().into_any(),
+                        "!=".into_pyobject(py)?.into_any(),
+                    ],
+                )?)
+                .unwrap();
+            predicates
+                .append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![1_i64, 2, 3]).into_any(),
+                        PyArray1::from_vec(py, vec![1_i64, 3, 2]).into_any(),
+                        "!=".into_pyobject(py)?.into_any(),
+                    ],
+                )?)
+                .unwrap();
+
+            let result = single_join_extended_indices_int64(py, &predicates, "all")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                read_pair(&result, py),
+                (vec![10, 10, 11, 12], vec![21, 22, 20, 20])
+            );
+
+            let result = single_join_extended_indices_int64(py, &predicates, "first")
+                .unwrap()
+                .unwrap();
+            assert_eq!(read_pair(&result, py), (vec![10, 11, 12], vec![21, 20, 20]));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn validation_errors_report_their_exact_contract() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let no_predicates = PyList::empty(py);
+            assert_value_error(
+                single_join_extended_indices_int64(py, &no_predicates, "all"),
+                py,
+                "single extended join requires at least two predicates",
+            );
+
+            let bad_first_shape = PyList::empty(py);
+            bad_first_shape.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            bad_first_shape.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(py, &bad_first_shape, "all"),
+                py,
+                "the first extended predicate must contain 6 or 11 elements",
+            );
+
+            let invalid_keep = PyList::empty(py);
+            invalid_keep.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64, 21]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            invalid_keep.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(py, &invalid_keep, "middle"),
+                py,
+                "invalid keep value: middle (expected one of first, last, any, all)",
+            );
+
+            let bad_residual_shape = PyList::empty(py);
+            bad_residual_shape.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64, 21]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            bad_residual_shape.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![3_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(py, &bad_residual_shape, "all"),
+                py,
+                "each residual comparison must contain 3 or 6 elements",
+            );
+
+            let invalid_residual_operator = PyList::empty(py);
+            invalid_residual_operator.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            invalid_residual_operator.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    "like".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(
+                    py,
+                    &invalid_residual_operator,
+                    "all",
+                ),
+                py,
+                "invalid comparison operator: like (expected one of >, >=, <, <=, ==, !=)",
+            );
+
+            let mismatched_residual = PyList::empty(py);
+            mismatched_residual.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            mismatched_residual.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64, 2]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(py, &mismatched_residual, "all"),
+                py,
+                "first left predicate array and residual left predicate array must have equal lengths; got 1 and 2",
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn not_equal_validation_rejects_incomplete_physical_partitions() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 11]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    py.None().into_pyobject(py)?.into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64, 21]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    py.None().into_pyobject(py)?.into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64, 2]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64, 21]).into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(py, &predicates, "all"),
+                py,
+                "left index length must equal the number of non-null values plus null positions",
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 }

@@ -41,7 +41,7 @@ pub fn aggregate_starts_ends<'py>(
             "at least one aggregation is required",
         ));
     }
-    let mut state = AggregationSet::new(starts.len(), right_len, &inputs)?;
+    let mut state = AggregationSet::new(starts.len(), right_len, &inputs, true)?;
     state.aggregate_starts_ends(starts, ends);
     if state.is_empty() {
         return Ok(None);
@@ -107,7 +107,7 @@ mod tests {
             let count = PyTuple::new(
                 py,
                 [
-                    values.clone().into_any(),
+                    "*".into_pyobject(py).unwrap().into_any(),
                     mask.clone().into_any(),
                     "count".into_pyobject(py).unwrap().into_any(),
                 ],

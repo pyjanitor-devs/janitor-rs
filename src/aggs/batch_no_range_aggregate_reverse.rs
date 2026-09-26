@@ -93,7 +93,7 @@ pub fn aggregate_batch_no_range_reverse<'py>(
         .map(|predicate| predicate.view())
         .collect();
     let metadata_views = metadata.as_deref().map(null_metadata_views);
-    let mut set = AggregationSet::new(right_len, left_len, &inputs)?;
+    let mut set = AggregationSet::new(right_len, left_len, &inputs, true)?;
     for (row, position) in positions.as_array().iter().enumerate() {
         let Some(candidate) = checked_index(*position, right_len) else {
             continue;
@@ -154,7 +154,7 @@ mod tests {
             let count = PyTuple::new(
                 py,
                 [
-                    values.into_any(),
+                    "*".into_pyobject(py).unwrap().into_any(),
                     mask.into_any(),
                     "count".into_pyobject(py).unwrap().into_any(),
                 ],
