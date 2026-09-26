@@ -13,9 +13,11 @@ use pyo3::types::{PyList, PyTuple};
 
 use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
 use crate::anchor_non_equi_join::{build_range_core, range_window, visit_not_equal_pairs_core};
-use crate::join_aggregation_helpers::{aggregate_range_windows, check_residual_lengths, residuals};
+use crate::join_aggregation_helpers::{aggregate_range_windows, residuals};
 use crate::op::CompareOp;
-use crate::predicate::{null_metadata_views, predicates_match_dispatch, PredicateView};
+use crate::predicate::{
+    check_predicate_lengths, null_metadata_views, predicates_match_dispatch, PredicateView,
+};
 
 /// Build a lookup from original physical rows to compact aggregation slots.
 ///
@@ -805,7 +807,7 @@ fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
     let (parsed, metadata) = residuals(py, predicates, false, false)?;
     let left_view = left.as_array();
     let right_view = right.as_array();
-    check_residual_lengths(&parsed, left_view.len(), right_view.len())?;
+    check_predicate_lengths(&parsed, left_view.len(), right_view.len())?;
     let windows = build_range_core(
         left_view,
         left_index.as_array(),
@@ -886,7 +888,7 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let (parsed, metadata) = residuals(py, predicates, true, false)?;
-    check_residual_lengths(&parsed, left_index.len()?, right_index.len()?)?;
+    check_predicate_lengths(&parsed, left_index.len()?, right_index.len()?)?;
     let inputs = parse_inputs(aggregations)?;
     if inputs.is_empty() {
         return Err(PyValueError::new_err(

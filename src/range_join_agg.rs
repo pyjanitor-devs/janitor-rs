@@ -29,7 +29,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
-use crate::join_aggregation_helpers::{aggregate_range_windows, check_residual_lengths};
+use crate::join_aggregation_helpers::aggregate_range_windows;
 use crate::range_join::{build_any_windows, parse_any_range_predicate};
 
 /// Build and aggregate the per-row windows for a dual-range join.
@@ -93,13 +93,7 @@ pub(crate) fn aggregate_range_extended<'py>(
     let second = parse_any_range_predicate(second_tuple, true)?;
     let (parsed, metadata) =
         crate::join_aggregation_helpers::residuals(py, predicates, false, true)?;
-    for predicate in &parsed {
-        check_residual_lengths(
-            std::slice::from_ref(predicate),
-            first.left_len(),
-            first.right_len(),
-        )?;
-    }
+    crate::predicate::check_predicate_lengths(&parsed, first.left_len(), first.right_len())?;
     let windows = build_any_windows(&first, &second).map_err(PyValueError::new_err)?;
     if windows.left_index.is_empty() {
         return Ok(None);

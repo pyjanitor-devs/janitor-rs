@@ -43,7 +43,7 @@ use crate::join_candidate_materialization::{
 };
 use crate::join_common::{result_dict, Keep, SingleJoinResult};
 use crate::op::CompareOp;
-use crate::predicate::parse_predicates_with_nulls_strings;
+use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
 
 /// Find the first position at which a monotone predicate becomes false.
 ///
@@ -414,8 +414,37 @@ pub fn build_range_core<T: PartialOrd + Copy>(
     left_index: ArrayView1<'_, i64>,
     right: ArrayView1<'_, T>,
     right_index: ArrayView1<'_, i64>,
+    right_index_is_ordered: bool,
+    op: CompareOp,
+) -> Result<SingleJoinResult, String> {
+    build_range_core_with_labels(
+        left,
+        left_index,
+        right,
+        right_index,
+        right_index_is_ordered,
+        op,
+        true,
+        false,
+    )
+}
+
+/// Construct one range window, optionally retaining the right labels.
+///
+/// The first predicate in a dual-range join owns the labels needed for output;
+/// the second predicate contributes only positional boundaries. Avoiding the
+/// second full label copy preserves the same alignment while reducing memory
+/// traffic for large right arrays.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_range_core_with_labels<T: PartialOrd + Copy>(
+    left: ArrayView1<'_, T>,
+    left_index: ArrayView1<'_, i64>,
+    right: ArrayView1<'_, T>,
+    right_index: ArrayView1<'_, i64>,
     _right_index_is_ordered: bool,
     op: CompareOp,
+    include_right_index: bool,
+    retain_empty_windows: bool,
 ) -> Result<SingleJoinResult, String> {
     // This function only constructs the physical value windows. Whether the
     // original right labels are ordered does not affect those boundaries;
@@ -438,7 +467,11 @@ pub fn build_range_core<T: PartialOrd + Copy>(
     let mut result = SingleJoinResult {
         left_positions: Vec::new(),
         left_index: Vec::new(),
-        right_index: right_index.to_vec(),
+        right_index: if include_right_index {
+            right_index.to_vec()
+        } else {
+            Vec::new()
+        },
         starts: Vec::new(),
         ends: Vec::new(),
     };
@@ -447,7 +480,7 @@ pub fn build_range_core<T: PartialOrd + Copy>(
     }
     for (left_position, left_value) in left.iter().enumerate() {
         let (start, end) = range_window(*left_value, right, op);
-        if start >= end {
+        if start >= end && !retain_empty_windows {
             continue;
         }
         result.left_index.push(left_index[left_position]);
@@ -1524,22 +1557,7 @@ fn extended_not_equal_join<'py, T: numpy::Element + PartialOrd + Copy>(
     // Residual predicates use the full physical layouts, so their lengths
     // must match the full indexes rather than the filtered first-predicate
     // value arrays.
-    for predicate in &parsed {
-        ensure_equal_lengths_core(
-            "full left index",
-            left_index.len(),
-            "residual left predicate array",
-            predicate.left_len(),
-        )
-        .map_err(PyValueError::new_err)?;
-        ensure_equal_lengths_core(
-            "full right index",
-            right_index.len(),
-            "residual right predicate array",
-            predicate.right_len(),
-        )
-        .map_err(PyValueError::new_err)?;
-    }
+    check_predicate_lengths(&parsed, left_index.len(), right_index.len())?;
 
     // The first `!=` predicate is always expanded fully. Applying `keep`
     // here would discard pairs needed by later predicates. The core returns
@@ -1672,22 +1690,7 @@ fn extended_join<'py, T: numpy::Element + PartialOrd + Copy>(
     // Candidate positions from the first range are physical positions in the
     // anchor arrays. Every residual must therefore have exactly the same
     // physical left/right shape before any candidate is visited.
-    for predicate in &parsed {
-        ensure_equal_lengths_core(
-            "first left predicate array",
-            left.len(),
-            "residual left predicate array",
-            predicate.left_len(),
-        )
-        .map_err(PyValueError::new_err)?;
-        ensure_equal_lengths_core(
-            "first right predicate array",
-            right.len(),
-            "residual right predicate array",
-            predicate.right_len(),
-        )
-        .map_err(PyValueError::new_err)?;
-    }
+    check_predicate_lengths(&parsed, left.len(), right.len())?;
     // The single-extended path has exactly one binary-search anchor. Every
     // later predicate, including another range comparison, is evaluated as a
     // residual filter inside that anchor's candidate window. Dual-range

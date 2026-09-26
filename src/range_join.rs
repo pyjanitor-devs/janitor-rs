@@ -11,13 +11,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::aggs::ensure_equal_lengths_core;
-use crate::aggs::max::max_starts_ends::max_start_end_core;
-use crate::aggs::min::min_starts_ends::min_start_end_core;
-use crate::anchor_non_equi_join::range_window;
+use crate::aggs::max::max_starts_ends::max_start_end_core_no_nulls;
+use crate::aggs::min::min_starts_ends::min_start_end_core_no_nulls;
+use crate::anchor_non_equi_join::build_range_core_with_labels;
 use crate::join_candidate_materialization::materialize_range_candidates;
 use crate::join_common::{result_dict, Keep, SingleJoinResult};
 use crate::op::CompareOp;
-use crate::predicate::parse_predicates_with_nulls_strings;
+use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
 
 /// A typed range predicate used by the basic two-range kernel.
 ///
@@ -25,6 +25,7 @@ use crate::predicate::parse_predicates_with_nulls_strings;
 /// arrays carry the labels that must be returned to Python. PyJanitor owns
 /// sorting and alignment before constructing this value; Rust only consumes
 /// the already-aligned views.
+#[cfg(test)]
 pub(crate) struct RangePredicate<'a, T> {
     /// Left values in logical left-row order. Null rows have already been
     /// removed for range predicates.
@@ -72,54 +73,27 @@ pub(crate) fn build_windows<T: PartialOrd + Copy>(
     first: RangePredicate<'_, T>,
     second: RangePredicate<'_, T>,
 ) -> Result<SingleJoinResult, String> {
-    let first = build_single_windows(first)?;
-    let second = build_single_windows(second)?;
+    let first = build_range_core_with_labels(
+        first.left,
+        first.left_index,
+        first.right,
+        first.right_index,
+        true,
+        first.op,
+        true,
+        true,
+    )?;
+    let second = build_range_core_with_labels(
+        second.left,
+        second.left_index,
+        second.right,
+        second.right_index,
+        true,
+        second.op,
+        false,
+        true,
+    )?;
     intersect_windows(first, second)
-}
-
-/// Build the positional window produced by one typed range predicate.
-///
-/// ELI5: each predicate independently draws a highlighted interval in the
-/// sorted right-hand array. This helper draws one such interval at a time;
-/// [`intersect_windows`] later keeps only the overlap between two drawings.
-fn build_single_windows<T: PartialOrd + Copy>(
-    predicate: RangePredicate<'_, T>,
-) -> Result<SingleJoinResult, String> {
-    ensure_equal_lengths_core(
-        "left",
-        predicate.left.len(),
-        "left_index",
-        predicate.left_index.len(),
-    )?;
-    ensure_equal_lengths_core(
-        "right",
-        predicate.right.len(),
-        "right_index",
-        predicate.right_index.len(),
-    )?;
-    if !predicate.op.is_range() {
-        return Err("range join requires a range comparator".to_owned());
-    }
-
-    let mut result = SingleJoinResult {
-        left_positions: Vec::new(),
-        left_index: Vec::new(),
-        right_index: predicate.right_index.to_vec(),
-        starts: Vec::new(),
-        ends: Vec::new(),
-    };
-    for (left_position, &left_value) in predicate.left.iter().enumerate() {
-        let (start, end) = range_window(left_value, predicate.right, predicate.op);
-        // Keep one boundary pair per left row, including an empty window.
-        // Two independently typed anchors must be aligned row-for-row before
-        // their windows can be intersected; the final intersection removes
-        // empty rows from the public result.
-        result.left_positions.push(left_position);
-        result.left_index.push(predicate.left_index[left_position]);
-        result.starts.push(start);
-        result.ends.push(end);
-    }
-    Ok(result)
 }
 
 /// Intersect two already-built positional windows.
@@ -157,12 +131,17 @@ pub(crate) fn intersect_windows(
         "second window ends",
         second.ends.len(),
     )?;
-    if first.left_positions.len() != second.left_positions.len()
-        || first.right_index != second.right_index
-    {
+    if first.left_positions.len() != second.left_positions.len() {
         return Err(
             "dual range predicates must use aligned left rows and right positions".to_owned(),
         );
+    }
+    // The second anchor's right labels are deliberately not copied: PyJanitor
+    // guarantees that both right value arrays use the same physical layout.
+    // Boundary validation still catches a second array whose windows reach
+    // beyond the first anchor's right domain.
+    if second.ends.iter().any(|&end| end > first.right_index.len()) {
+        return Err("dual range predicates must use aligned right positions".to_owned());
     }
 
     let mut result = SingleJoinResult {
@@ -284,22 +263,17 @@ pub(crate) fn choose_range_windows(
             i64::try_from(value).map_err(|_| "range window end exceeds int64 capacity".to_owned())
         })
         .collect::<Result<_, _>>()?;
-    let nulls = Array1::from_elem(labels.len(), false);
-    // The RMQ kernels return offsets into `labels`, not public labels. The
-    // final loop below performs that last position-to-label conversion.
+    // Range inputs have already had null rows removed by PyJanitor. The
+    // no-null RMQ entry points avoid allocating a full all-false mask solely
+    // to satisfy the general nullable-array API. They return offsets into
+    // `labels`, not public labels; the final loop performs that conversion.
     let selected_positions = match keep {
-        Keep::First => min_start_end_core(
-            ArrayView1::from(labels),
-            starts.view(),
-            ends.view(),
-            nulls.view(),
-        )?,
-        Keep::Last => max_start_end_core(
-            ArrayView1::from(labels),
-            starts.view(),
-            ends.view(),
-            nulls.view(),
-        )?,
+        Keep::First => {
+            min_start_end_core_no_nulls(ArrayView1::from(labels), starts.view(), ends.view())?
+        }
+        Keep::Last => {
+            max_start_end_core_no_nulls(ArrayView1::from(labels), starts.view(), ends.view())?
+        }
         Keep::Any | Keep::All => unreachable!(),
     };
 
@@ -351,17 +325,20 @@ pub(crate) enum AnyParsedRangePredicate<'py> {
 
 impl AnyParsedRangePredicate<'_> {
     /// Build this anchor's positional windows without exposing its dtype.
-    fn windows(&self) -> Result<SingleJoinResult, String> {
+    fn windows(&self, include_right_index: bool) -> Result<SingleJoinResult, String> {
         macro_rules! build {
             ($predicate:expr) => {{
                 let predicate = $predicate;
-                build_single_windows(RangePredicate {
-                    left: predicate.left.as_array(),
-                    left_index: predicate.left_index.as_array(),
-                    right: predicate.right.as_array(),
-                    right_index: predicate.right_index.as_array(),
-                    op: predicate.op,
-                })
+                build_range_core_with_labels(
+                    predicate.left.as_array(),
+                    predicate.left_index.as_array(),
+                    predicate.right.as_array(),
+                    predicate.right_index.as_array(),
+                    true,
+                    predicate.op,
+                    include_right_index,
+                    true,
+                )
             }};
         }
         match self {
@@ -456,7 +433,7 @@ pub(crate) fn build_any_windows(
     first: &AnyParsedRangePredicate<'_>,
     second: &AnyParsedRangePredicate<'_>,
 ) -> Result<SingleJoinResult, String> {
-    intersect_windows(first.windows()?, second.windows()?)
+    intersect_windows(first.windows(true)?, second.windows(false)?)
 }
 
 /// Parse the six-element basic range tuple.
@@ -643,22 +620,7 @@ fn extended_join<'py>(
         second.right_len(),
     )
     .map_err(PyValueError::new_err)?;
-    for predicate in &parsed {
-        ensure_equal_lengths_core(
-            "first left predicate array",
-            first.left_len(),
-            "residual left predicate array",
-            predicate.left_len(),
-        )
-        .map_err(PyValueError::new_err)?;
-        ensure_equal_lengths_core(
-            "first right predicate array",
-            first.right_len(),
-            "residual right predicate array",
-            predicate.right_len(),
-        )
-        .map_err(PyValueError::new_err)?;
-    }
+    check_predicate_lengths(&parsed, first.left_len(), first.right_len())?;
     let windows = build_any_windows(&first, &second).map_err(PyValueError::new_err)?;
     if windows.left_index.is_empty() {
         return Ok(None);

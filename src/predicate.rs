@@ -6,7 +6,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyList, PyTuple};
 
-use crate::aggs::ensure_equal_lengths;
+use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core};
 use crate::op::CompareOp;
 
 /// A typed comparison between one left-hand array and one right-hand array.
@@ -115,6 +115,36 @@ pub(crate) struct NullMetadataView<'a> {
     pub(crate) left: Option<ArrayView1<'a, bool>>,
     pub(crate) right: Option<ArrayView1<'a, bool>>,
     pub(crate) is_extension_array: bool,
+}
+
+/// Validate that parsed residual predicates use the anchor's physical layout.
+///
+/// Candidate generation produces physical left/right positions once and then
+/// reuses those positions for every residual predicate. This shared check is
+/// intentionally kept beside the predicate types so index and aggregation
+/// callers cannot drift into slightly different length-validation loops.
+pub(crate) fn check_predicate_lengths(
+    predicates: &[Predicate<'_>],
+    left_len: usize,
+    right_len: usize,
+) -> PyResult<()> {
+    for predicate in predicates {
+        ensure_equal_lengths_core(
+            "first left predicate array",
+            left_len,
+            "residual left predicate array",
+            predicate.left_len(),
+        )
+        .map_err(PyValueError::new_err)?;
+        ensure_equal_lengths_core(
+            "first right predicate array",
+            right_len,
+            "residual right predicate array",
+            predicate.right_len(),
+        )
+        .map_err(PyValueError::new_err)?;
+    }
+    Ok(())
 }
 
 impl NullMetadata<'_> {
