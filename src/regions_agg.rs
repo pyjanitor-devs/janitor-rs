@@ -1,0 +1,623 @@
+//! Aggregation over the streaming paper sweep.
+//!
+//! This module deliberately does not materialize candidate pairs. The region
+//! sweep visits each primary candidate once; residual predicates are applied
+//! while those candidates are being visited.
+//!
+//! Beginner's mental model:
+//!
+//! 1. The first two predicates have already been converted into two integer
+//!    region labels for every left and right row.
+//! 2. The first region label tells us which suffix of right rows may match.
+//! 3. The ordered map groups that suffix by the second region label.
+//! 4. The map range keeps only groups satisfying the second predicate.
+//! 5. Each physical right position in those groups is an aggregation event.
+
+use std::collections::BTreeMap;
+
+use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
+use crate::join_aggregation_helpers::residuals;
+use crate::multi_join_indices::common::{add_right_region, GroupState};
+use crate::predicate::{
+    check_predicate_lengths, null_metadata_views, predicates_match_dispatch, Predicate,
+};
+use crate::regions;
+use numpy::ndarray::ArrayView1;
+use numpy::PyReadonlyArray1;
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3::types::{PyList, PyTuple};
+
+/// Normalize the first aggregation predicate to the five-field region-anchor
+/// form. Aggregation callers may add output-position maps to that tuple; the
+/// maps are consumed separately by the Python aggregation entry points.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token used to create the normalized
+///   temporary list and tuple.
+/// * `predicates` - Full predicate list. The first item is the first region
+///   anchor, the second item is the second five-field region anchor, and any
+///   later items are copied unchanged as residual filters.
+///
+/// # Returns
+///
+/// A temporary predicate list suitable for [`regions::parse_and_align`]. The
+/// returned list borrows the original NumPy arrays; it does not copy values.
+///
+/// # Errors
+///
+/// Returns `ValueError` when the first anchor does not contain six or eight
+/// fields, or when the second anchor does not contain five fields.
+fn normalized_predicates<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyList>> {
+    // Aggregation anchors may contain two extra arrays after the four data
+    // arrays: one map for forward output slots and one for reverse output
+    // slots. Region construction does not use those maps, so it expects the
+    // ordinary five-field anchor ending in the comparison operator.
+    let first_item = predicates.get_item(0)?;
+    let first = first_item.cast::<PyTuple>()?;
+    let second_item = predicates.get_item(1)?;
+    let second = second_item.cast::<PyTuple>()?;
+    // Six fields means the operator is at position five. Eight fields means
+    // positions five and six are output maps, so the operator moves to seven.
+    let first_op = match first.len() {
+        6 => first.get_item(5)?,
+        8 => first.get_item(7)?,
+        _ => {
+            return Err(PyValueError::new_err(
+                "region aggregation first anchor must contain 6 or 8 elements",
+            ));
+        }
+    };
+    if second.len() != 5 {
+        return Err(PyValueError::new_err(
+            "region aggregation second anchor must contain 5 elements",
+        ));
+    }
+    let normalized = PyList::empty(py);
+    // Keep the original NumPy arrays borrowed. This creates only a small
+    // tuple/list wrapper; it does not copy the join columns or index labels.
+    normalized.append(PyTuple::new(
+        py,
+        [
+            first.get_item(0)?,
+            first.get_item(1)?,
+            first.get_item(2)?,
+            first.get_item(3)?,
+            first_op,
+        ],
+    )?)?;
+    normalized.append(second)?;
+    for item in predicates.iter().skip(2) {
+        // Residual predicates remain unchanged. They are parsed later and
+        // evaluated against the aligned physical positions during the sweep.
+        normalized.append(item)?;
+    }
+    Ok(normalized)
+}
+
+/// Execute exact dual-region aggregation and build the standard Python result.
+///
+/// Only the first two predicates are accepted. Both are converted into region
+/// labels, and every candidate surviving both labels updates the aggregation
+/// set. There is no residual predicate phase on this path.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token used for parsing and result
+///   construction.
+/// * `predicates` - Exactly two inequality region anchors. The first anchor
+///   may include compact output-position maps.
+/// * `aggregations` - Non-empty aggregation requests.
+/// * `return_matched` - Whether to include the matched output mask.
+/// * `reverse` - Whether left values are aggregated into right output slots.
+///
+/// # Returns
+///
+/// `None` when no candidate updates the aggregation state; otherwise the
+/// standard aggregation result tuple.
+///
+/// # Errors
+///
+/// Returns a Python error for invalid predicate counts, malformed anchors,
+/// invalid aggregation requests, or invalid output metadata.
+#[allow(clippy::too_many_arguments)]
+fn aggregate_regions_exact<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+    reverse: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    if predicates.len() != 2 {
+        return Err(PyValueError::new_err(
+            "region aggregation requires exactly two predicates",
+        ));
+    }
+
+    let first_item = predicates.get_item(0)?;
+    let first = first_item.cast::<PyTuple>()?;
+    let normalized = normalized_predicates(py, predicates)?;
+    let regions = regions::parse_and_align(&normalized)?;
+    if regions.left_index.is_empty() || regions.right_index.is_empty() {
+        return Ok(None);
+    }
+
+    let inputs = parse_inputs(aggregations)?;
+    if inputs.is_empty() {
+        return Err(PyValueError::new_err(
+            "at least one aggregation is required",
+        ));
+    }
+
+    // The optional maps translate compact region layouts back to the output
+    // slots expected by PyJanitor. Without maps, positions are identity
+    // ordered and the original physical lengths define the output domain.
+    let left_output_positions = if first.len() == 8 {
+        Some(first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+    } else {
+        None
+    };
+    let right_output_positions = if first.len() == 8 {
+        Some(first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+    } else {
+        None
+    };
+    let output_positions = if reverse {
+        right_output_positions
+            .as_ref()
+            .map(|values| values.as_array())
+    } else {
+        left_output_positions
+            .as_ref()
+            .map(|values| values.as_array())
+    };
+    let output_len = output_positions
+        .map(|values| values.len())
+        .unwrap_or(if reverse {
+            first
+                .get_item(3)?
+                .extract::<PyReadonlyArray1<'py, i64>>()?
+                .len()?
+        } else {
+            first
+                .get_item(1)?
+                .extract::<PyReadonlyArray1<'py, i64>>()?
+                .len()?
+        });
+    let source_len = if reverse {
+        first
+            .get_item(1)?
+            .extract::<PyReadonlyArray1<'py, i64>>()?
+            .len()?
+    } else {
+        first
+            .get_item(3)?
+            .extract::<PyReadonlyArray1<'py, i64>>()?
+            .len()?
+    };
+    let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
+
+    // Process queries from larger first-region starts to smaller starts. The
+    // active right suffix therefore grows leftward and each right row enters
+    // the map only once.
+    let queries = regions::sweep_queries(&regions);
+    let mut active = BTreeMap::<i64, GroupState>::new();
+    // `next` is a linked list for duplicate second-region labels. `-1` means
+    // that a physical right position is the last item in its chain.
+    let mut next = vec![-1_i64; regions.right_index.len()];
+    let mut previous_end = regions.right_index.len();
+    for (start, left_position) in queries {
+        if start >= regions.right_index.len() {
+            continue;
+        }
+        add_right_region(
+            ArrayView1::from(&regions.right_second[..]),
+            start,
+            previous_end,
+            &mut next,
+            &mut active,
+        );
+        previous_end = start;
+        for (_, group) in active.range(regions.left_second[left_position]..) {
+            let mut position = group.head;
+            while position >= 0 {
+                let right_position = position as usize;
+                // `AggregationSet::update` takes source position first and
+                // output position second. Reverse aggregation swaps them.
+                if reverse {
+                    set.update(left_position, right_position);
+                } else {
+                    set.update(right_position, left_position);
+                }
+                position = next[right_position];
+            }
+        }
+    }
+
+    if set.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(make_results_with_positions(
+        py,
+        set,
+        output_positions,
+        output_len,
+        return_matched,
+    )?))
+}
+
+/// Execute extended region aggregation and build the standard Python result.
+///
+/// This is the implementation behind the two extended Python functions:
+///
+/// ```text
+/// region_extended_aggregate           residual filters, forward
+/// region_extended_aggregate_reverse   residual filters, reverse
+/// ```
+///
+/// `regions` are built from the first two predicates. Predicates after those
+/// two anchors are evaluated for each primary candidate before aggregation.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token used for parsing inputs and
+///   constructing the result tuple.
+/// * `predicates` - At least two region anchors, followed by optional residual
+///   predicates. The first anchor may contain output-position maps in its
+///   eight-field form.
+/// * `aggregations` - Non-empty aggregation requests accepted by
+///   `AggregationSet`, such as sum, min, max, product, size, or count.
+/// * `return_matched` - Whether the result includes a boolean matched array.
+/// * `reverse` - When false, aggregate right-side source values into left
+///   output slots. When true, aggregate left-side source values into right
+///   output slots.
+///
+/// # Returns
+///
+/// Returns `None` when no pair reaches an aggregation update. Otherwise
+/// returns the established aggregation tuple: output positions, optionally
+/// the matched mask, and the requested aggregation arrays.
+///
+/// # Errors
+///
+/// Returns a Python error for malformed anchors, invalid residual predicates,
+/// misaligned predicate lengths, empty aggregation requests, invalid
+/// aggregation inputs, or invalid output maps.
+#[allow(clippy::too_many_arguments)]
+fn aggregate_regions_extended<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+    reverse: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    // This implementation serves the two extended Python entry points.
+    // `reverse` changes which side supplies values; residual predicates are
+    // always part of this path.
+    if predicates.len() < 2 {
+        return Err(PyValueError::new_err(
+            "region aggregation requires at least two predicates",
+        ));
+    }
+
+    // Keep the original first tuple because its optional output maps are
+    // needed after region construction to put results back into PyJanitor's
+    // compact output layout.
+    let first_item = predicates.get_item(0)?;
+    let first = first_item.cast::<PyTuple>()?;
+
+    // Region construction reads only the first two anchors. It aligns their
+    // left and right rows by original index labels, so the two independently
+    // built region paths can be traversed together safely.
+    let normalized = normalized_predicates(py, predicates)?;
+    let regions = regions::parse_and_align(&normalized)?;
+    if regions.left_index.is_empty() || regions.right_index.is_empty() {
+        // At least one anchor has no surviving aligned rows. There can be no
+        // aggregation event, so return the same no-match result as other
+        // aggregation kernels.
+        return Ok(None);
+    }
+
+    // Only predicates after the two region anchors are residual filters.
+    // `residuals` also preserves nullable `!=` metadata for the shared
+    // predicate matcher.
+    let (parsed, metadata) = residuals(py, predicates, false, true)?;
+    // Residual predicates use physical positions directly in the hot loop.
+    // Therefore their arrays must describe the same aligned layouts as the
+    // two region paths.
+    check_predicate_lengths(&parsed, regions.left_index.len(), regions.right_index.len())?;
+    // Parse aggregation requests once before entering the sweep. The set
+    // owns output accumulators while borrowing the source NumPy arrays.
+    let inputs = parse_inputs(aggregations)?;
+    if inputs.is_empty() {
+        return Err(PyValueError::new_err(
+            "at least one aggregation is required",
+        ));
+    }
+
+    // An eight-field first anchor carries compact-output maps. The left map
+    // is used for forward aggregation and the right map for reverse
+    // aggregation. Six-field anchors already use identity positions.
+    let left_output_positions = if first.len() == 8 {
+        Some(first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+    } else {
+        None
+    };
+    let right_output_positions = if first.len() == 8 {
+        Some(first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+    } else {
+        None
+    };
+    let output_positions = if reverse {
+        right_output_positions
+            .as_ref()
+            .map(|values| values.as_array())
+    } else {
+        left_output_positions
+            .as_ref()
+            .map(|values| values.as_array())
+    };
+    // `output_len` is the number of rows receiving results. Forward output
+    // has one slot per left row; reverse output has one slot per right row.
+    // When a compact map exists, its length is the authoritative slot count.
+    let output_len = output_positions
+        .map(|values| values.len())
+        .unwrap_or(if reverse {
+            first
+                .get_item(3)?
+                .extract::<PyReadonlyArray1<'py, i64>>()?
+                .len()?
+        } else {
+            first
+                .get_item(1)?
+                .extract::<PyReadonlyArray1<'py, i64>>()?
+                .len()?
+        });
+    // `source_len` is the length of the values being aggregated. It is the
+    // right side in forward mode and the left side in reverse mode.
+    let source_len = if reverse {
+        first
+            .get_item(1)?
+            .extract::<PyReadonlyArray1<'py, i64>>()?
+            .len()?
+    } else {
+        first
+            .get_item(3)?
+            .extract::<PyReadonlyArray1<'py, i64>>()?
+            .len()?
+    };
+    let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
+
+    // Convert parsed residual predicates into cheap Rust-side views once.
+    // The hot loop then compares physical positions without repeatedly
+    // touching Python objects.
+    let views: Vec<_> = parsed.iter().map(Predicate::view).collect();
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
+    // Each query is `(first_region_start, left_position)`. Queries are
+    // sorted by descending start so the active right suffix only grows
+    // leftward and every right position is inserted at most once.
+    let queries = regions::sweep_queries(&regions);
+    let mut active = BTreeMap::<i64, GroupState>::new();
+    // `next[position]` links equal second-region values together. `-1`
+    // is the end-of-chain sentinel; this is why the value is signed.
+    let mut next = vec![-1_i64; regions.right_index.len()];
+    let mut previous_end = regions.right_index.len();
+
+    // The first two predicates have already become regions. Every candidate
+    // is now checked explicitly against the residual filters before it
+    // updates aggregation state.
+    for (start, left_position) in queries {
+        if start >= regions.right_index.len() {
+            // The first inequality has no eligible right position for
+            // this left row. There is nothing to add or aggregate.
+            continue;
+        }
+        // Add only the newly exposed section between `start` and the
+        // previous query boundary. `add_right_region` inserts positions
+        // into the ordered map, preserving duplicates via linked chains.
+        add_right_region(
+            ArrayView1::from(&regions.right_second[..]),
+            start,
+            previous_end,
+            &mut next,
+            &mut active,
+        );
+        previous_end = start;
+        // Every map key in this range satisfies the second inequality.
+        // The value is a GroupState pointing to all physical right rows
+        // carrying that region label.
+        for (_, group) in active.range(regions.left_second[left_position]..) {
+            let mut position = group.head;
+            while position >= 0 {
+                let right_position = position as usize;
+                // Primary regions only produce candidates. Residual
+                // predicates are checked before any accumulator changes.
+                let passes = predicates_match_dispatch(
+                    &views,
+                    metadata_views.as_deref(),
+                    left_position,
+                    right_position,
+                );
+                if passes {
+                    // AggregationSet expects (source_position,
+                    // output_position). Reverse mode swaps those roles.
+                    if reverse {
+                        set.update(left_position, right_position);
+                    } else {
+                        set.update(right_position, left_position);
+                    }
+                }
+                // Follow the duplicate chain. Different right rows may
+                // share one region number and must remain separate
+                // aggregation events.
+                position = next[right_position];
+            }
+        }
+    }
+
+    if set.is_empty() {
+        // The region sweep may find candidates, but null masks or residual
+        // filters can still reject every aggregation update.
+        return Ok(None);
+    }
+    // Convert accumulator state into the established Python tuple shape and
+    // attach the compact-to-original output map when one was supplied.
+    Ok(Some(make_results_with_positions(
+        py,
+        set,
+        output_positions,
+        output_len,
+        return_matched,
+    )?))
+}
+
+/// Aggregate exactly two region predicates in the forward direction.
+///
+/// Every pair satisfying both inequality anchors updates the aggregation
+/// state. There are no residual filter predicates on this path.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token.
+/// * `predicates` - Exactly two region predicates. The first may use the
+///   six-field form or the eight-field form with output-position maps.
+/// * `aggregations` - Non-empty aggregation requests over right-side values.
+/// * `return_matched` - Whether to include the output matched mask.
+///
+/// # Returns
+///
+/// `None` when no pair matches; otherwise the standard aggregation result
+/// tuple aligned to the left output layout.
+///
+/// # Errors
+///
+/// Returns an error when the predicate count, anchor shapes, lengths, or
+/// aggregation requests are invalid.
+#[pyfunction]
+pub fn region_aggregate<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    aggregate_regions_exact(py, predicates, aggregations, return_matched, false)
+}
+
+/// Aggregate exactly two region predicates in the reverse direction.
+///
+/// This uses the same two region anchors as forward aggregation, but treats
+/// left-side values as the aggregation source and right-side rows as output
+/// slots.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token.
+/// * `predicates` - Exactly two region predicates.
+/// * `aggregations` - Non-empty aggregation requests over left-side values.
+/// * `return_matched` - Whether to include the output matched mask.
+///
+/// # Returns
+///
+/// `None` when no pair matches; otherwise the standard aggregation result
+/// tuple aligned to the right output layout.
+///
+/// # Errors
+///
+/// Returns an error when the predicate count, anchor shapes, lengths, or
+/// aggregation requests are invalid.
+#[pyfunction]
+pub fn region_aggregate_reverse<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    aggregate_regions_exact(py, predicates, aggregations, return_matched, true)
+}
+
+/// Aggregate two region predicates followed by residual filter predicates.
+///
+/// The first two predicates perform the efficient region sweep. Every later
+/// predicate is evaluated against the physical left/right candidate before
+/// the right-side source value updates a left-side aggregation slot.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token.
+/// * `predicates` - At least two predicates: two inequality region anchors
+///   followed by zero or more residual filters.
+/// * `aggregations` - Non-empty aggregation requests over right-side values.
+/// * `return_matched` - Whether to include the output matched mask.
+///
+/// # Returns
+///
+/// `None` when no candidate survives the region anchors and residual filters;
+/// otherwise the standard result tuple aligned to the left output layout.
+///
+/// # Errors
+///
+/// Returns an error for malformed predicates, misaligned arrays, unsupported
+/// residual operators, or invalid aggregation requests.
+#[pyfunction]
+pub fn region_extended_aggregate<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    aggregate_regions_extended(py, predicates, aggregations, return_matched, false)
+}
+
+/// Aggregate two region predicates plus residual filters in reverse direction.
+///
+/// The first two predicates define the candidate regions. Later predicates
+/// filter those candidates. A passing left-side source value updates the
+/// corresponding right-side aggregation slot.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token.
+/// * `predicates` - At least two predicates: two inequality region anchors
+///   followed by residual filters.
+/// * `aggregations` - Non-empty aggregation requests over left-side values.
+/// * `return_matched` - Whether to include the output matched mask.
+///
+/// # Returns
+///
+/// `None` when no complete candidate survives; otherwise the standard result
+/// tuple aligned to the right output layout.
+///
+/// # Errors
+///
+/// Returns an error for malformed predicates, misaligned arrays, unsupported
+/// residual operators, or invalid aggregation requests.
+#[pyfunction]
+pub fn region_extended_aggregate_reverse<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    aggregate_regions_extended(py, predicates, aggregations, return_matched, true)
+}
+
+/// Register all region aggregation Python entry points on the module.
+///
+/// # Arguments
+///
+/// * `m` - The parent `janitor_rs` Python module.
+///
+/// # Errors
+///
+/// Returns any PyO3 error raised while adding a function to `m`.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(region_aggregate, m)?)?;
+    m.add_function(wrap_pyfunction!(region_aggregate_reverse, m)?)?;
+    m.add_function(wrap_pyfunction!(region_extended_aggregate, m)?)?;
+    m.add_function(wrap_pyfunction!(region_extended_aggregate_reverse, m)?)?;
+    Ok(())
+}

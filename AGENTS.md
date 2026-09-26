@@ -383,6 +383,14 @@ work, while one width-eight query makes that regression obvious.
 
 ## Learned Patterns
 
+- Region aggregation consumes every pair passing the primary and residual
+  predicates. `Keep` selection semantics (`all`, `first`, `last`, `any`) apply
+  only to index-returning paths and must not be part of the aggregation API.
+- The streaming primary-region sweep currently belongs in `regions_agg.rs`,
+  because aggregation is its only consumer. Keep index-generation sweeps
+  specialized until a later abstraction pass demonstrates a shared helper
+  without obscuring their two-pass allocation and selection behavior.
+
 <!--
 This section is for agents to record new learnings.
 Add entries in the format:
