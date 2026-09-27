@@ -6,6 +6,35 @@
 //!
 //! The region construction and sweep follow:
 //! <https://www.scitepress.org/papers/2018/68268/68268.pdf>
+//!
+//! ## Coordinate systems
+//!
+//! This file uses three different positions. Keeping them separate is
+//! essential:
+//!
+//! 1. **Source positions** index the original value arrays supplied by
+//!    PyJanitor.
+//! 2. **Region positions** index the compact arrays after impossible left rows
+//!    are removed and after a greater-than first anchor reverses the right
+//!    traversal layout.
+//! 3. **Index labels** are the `i64` values returned to the caller. They may be
+//!    ordinary positions, dataframe index values, or another caller-defined
+//!    identifier.
+//!
+//! `AlignedRegions::left_positions` and `right_positions` translate region
+//! positions back to source positions. The sweep itself works only in region
+//! coordinates; residual predicates and aggregation state use the mappings
+//! before touching source arrays.
+//!
+//! ## Sweep overview
+//!
+//! The first inequality creates a monotonic `right_first` path. For each left
+//! row, `sweep_queries` binary-searches that path to find the first eligible
+//! right region. Queries are processed from the largest start to the smallest
+//! start, so the active right suffix grows in one direction. The ordered map
+//! groups active right rows by `right_second`; a map range then reports the
+//! rows satisfying the second inequality. Duplicate labels are preserved by a
+//! linked list stored in each map group.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -29,6 +58,11 @@ use crate::range_predicate::{parse_any_range_predicate, AnyParsedRangePredicate}
 /// each boundary ends the matching right prefix and `reverse` records that
 /// orientation for region construction.
 pub(crate) struct RegionBoundary {
+    /// One independently searched primary inequality before alignment.
+    ///
+    /// A `RegionBoundary` is temporary: the first and second anchors each
+    /// produce one, then [`align`] combines them by their original labels.
+    /// The fields below are parallel arrays until `labels` consumes them.
     /// Original left-row identifiers paired with `boundaries`.
     pub(crate) left_index: Vec<i64>,
     /// Original right-row identifiers paired with the sorted right values.
@@ -41,6 +75,11 @@ pub(crate) struct RegionBoundary {
 
 /// Two primary region label sequences aligned by original row identifiers.
 pub(crate) struct AlignedRegions {
+    /// The two primary predicates after label-based alignment.
+    ///
+    /// Rows that cannot participate in a primary region are absent from these
+    /// compact vectors. The position mappings below preserve their locations
+    /// in the original arrays.
     /// Original left-row identifiers in aligned traversal order.
     pub(crate) left_index: Vec<i64>,
     /// Original right-row identifiers in the first anchor's physical order.
@@ -76,7 +115,25 @@ fn first_eligible(values: &[i64], left: i64) -> usize {
     range_window(left, ArrayView1::from(values), CompareOp::Le).0
 }
 
-/// Order left queries for the paper sweep.
+/// Convert each left row into a first-region query and order the queries for
+/// the paper sweep.
+///
+/// # Arguments
+///
+/// * `regions` - Two primary region paths already aligned by original labels.
+///   `regions.right_first` must be monotonic nondecreasing.
+///
+/// # Returns
+///
+/// A vector of `(right_start, left_position)` pairs sorted by descending
+/// `right_start`. The left position is a compact region position, not a
+/// source-array position.
+///
+/// # Complexity
+///
+/// Building the query vector is `O(left_rows log right_rows)` because each
+/// query uses the existing binary-search window helper. Sorting costs
+/// `O(left_rows log left_rows)`.
 pub(crate) fn sweep_queries(regions: &AlignedRegions) -> Vec<(usize, usize)> {
     // Each query stores `(first_region_start, left_position)`. The start is
     // the first right position that can satisfy the first primary predicate.
@@ -93,6 +150,29 @@ pub(crate) fn sweep_queries(regions: &AlignedRegions) -> Vec<(usize, usize)> {
 }
 
 /// Materialize an exact two-range `all` result directly from two sweeps.
+///
+/// # Arguments
+///
+/// * `regions` - Aligned primary regions with no residual predicates.
+///
+/// # Returns
+///
+/// Two equal-length vectors of original left and right labels. Left rows are
+/// emitted in canonical left order. Right-row order is the order produced by
+/// the region traversal and is not promised for non-monotonic second paths.
+/// Empty vectors mean that no pair passed both primary inequalities.
+///
+/// # Errors
+///
+/// Returns an error if the number of matching pairs cannot be represented by
+/// the platform's `usize` capacity.
+///
+/// # Algorithm
+///
+/// The first pass counts matches per left row and computes prefix offsets. The
+/// second pass repeats the same sweep and writes directly into the final
+/// buffers. This avoids storing a nested candidate vector and guarantees that
+/// allocation happens only after the exact result size is known.
 ///
 /// The first sweep counts matches per left row and computes offsets. The
 /// second sweep writes directly into the final index buffers, so no candidate
@@ -182,6 +262,22 @@ fn build_all_indices(regions: &AlignedRegions) -> Result<(Vec<i64>, Vec<i64>), S
 }
 
 /// Materialize extended `all` results by filtering inside two sweeps.
+///
+/// # Arguments
+///
+/// * `regions` - Aligned primary region paths.
+/// * `predicates_pass` - Callback receiving compact region positions and
+///   returning whether all residual predicates pass. The caller is responsible
+///   for translating positions through the mappings in `regions`.
+///
+/// # Returns
+///
+/// Original index-label pairs in canonical left-row order. Residual failures
+/// are excluded before counts, offsets, or output allocation are finalized.
+///
+/// # Errors
+///
+/// Returns an error on checked count/offset overflow.
 fn build_all_indices_extended<P>(
     regions: &AlignedRegions,
     mut predicates_pass: P,
@@ -283,6 +379,19 @@ where
 }
 
 /// Materialize extended `first`, `last`, or `any` results in one sweep.
+///
+/// # Arguments
+///
+/// * `regions` - Aligned primary region paths.
+/// * `keep` - Selection mode applied only after residual predicates pass.
+/// * `predicates_pass` - Residual predicate callback over compact region
+///   positions.
+///
+/// # Returns
+///
+/// At most one original-index pair per left row. `first` and `last` compare
+/// original right labels, while `any` stops at the first passing traversal
+/// candidate.
 fn build_selected_indices_extended<P>(
     regions: &AlignedRegions,
     keep: Keep,
@@ -369,6 +478,10 @@ where
 
 /// Materialize `first`, `last`, or `any` for exactly two range predicates.
 ///
+/// This is the no-residual fast path. Because the two primary inequalities are
+/// the complete predicate set, every candidate reported by the region sweep
+/// is immediately eligible for `keep` selection.
+///
 /// This path has no residual predicate callback. `first` and `last` select by
 /// original right index label, while `any` returns the first candidate found
 /// by the sweep.
@@ -447,6 +560,7 @@ fn build_selected_indices(regions: &AlignedRegions, keep: Keep) -> (Vec<i64>, Ve
 /// # Returns
 ///
 /// Paired original left and right index labels.
+/// The result is empty when no primary pair matches.
 pub(crate) fn build_indices(
     regions: &AlignedRegions,
     keep: Keep,
@@ -470,8 +584,9 @@ pub(crate) fn build_indices(
 /// * `regions` - The two primary region paths after alignment.
 /// * `keep` - Selection semantics applied after residual predicates pass.
 /// * `predicates_pass` - Callback returning whether all residual predicates
-///   pass for a positional left/right pair. Use a callback that always returns
-///   `true` when there are no residual predicates.
+///   pass for compact region positions. Use a callback that always returns
+///   `true` when there are no residual predicates. The callback is invoked
+///   after primary-region filtering and before `keep` selection.
 ///
 /// # Returns
 ///
@@ -497,6 +612,13 @@ where
 }
 
 /// Build one monotonic boundary sequence from a typed primary anchor.
+///
+/// For `<` and `<=`, each left value produces the beginning of an eligible
+/// right suffix. For `>` and `>=`, each left value produces the end of an
+/// eligible right prefix and the later label construction reverses that
+/// orientation. The binary search is delegated to [`range_window`], so the
+/// four operator variants retain the same boundary semantics as the existing
+/// range kernels.
 ///
 /// # Arguments
 ///
@@ -553,7 +675,8 @@ fn region_boundaries(anchor: &AnyParsedRangePredicate<'_>) -> Result<RegionBound
     }
 }
 
-/// Convert one boundary sequence into left/right region numbers.
+/// Convert one boundary sequence into left/right region numbers and source
+/// position mappings.
 ///
 /// # Arguments
 ///
@@ -576,6 +699,21 @@ struct LabeledRegions {
     right_len: usize,
 }
 
+///
+/// # How labels are built
+///
+/// `boundaries` is treated as a set of increments. An increment at position
+/// `p` means that the right-side region number changes starting at `p`.
+/// Cumulative summation turns those increments into one label per physical
+/// right row. A left row reads the label at its boundary. If the boundary is
+/// outside the right array, that left row has no possible match and is omitted
+/// from the compact left path.
+///
+/// For a greater-than anchor, the right layout is reversed and labels are
+/// complemented. This turns a matching prefix into a matching suffix while
+/// preserving the strict/inclusive distinction. `right_positions` records
+/// that the new region position `0` came from the old source position
+/// `right_len - 1`.
 fn labels(boundary: RegionBoundary) -> LabeledRegions {
     let RegionBoundary {
         left_index: original_left_index,
@@ -669,11 +807,16 @@ fn labels(boundary: RegionBoundary) -> LabeledRegions {
 ///
 /// An [`AlignedRegions`] value containing both region numbers for every
 /// retained left and right identifier.
+/// The first anchor supplies canonical traversal order. The second anchor is
+/// looked up by original identifier and contributes only its corresponding
+/// region labels. The returned source-position mappings always refer to the
+/// first anchor's original value layout.
 ///
 /// # Errors
 ///
 /// Empty aligned sides are returned as empty vectors; they represent a valid
-/// no-match result rather than a malformed join.
+/// no-match result rather than a malformed join. Malformed parallel arrays
+/// are rejected earlier by [`AnyParsedRangePredicate::validate_lengths`].
 pub(crate) fn align(
     first: RegionBoundary,
     second: RegionBoundary,
@@ -735,6 +878,12 @@ pub(crate) fn align(
 
 /// Parse and align the first two predicates in a dual or multi-predicate join.
 ///
+/// This is the region boundary between Python-shaped data and the internal
+/// sweep representation. It parses only the first two predicates; later
+/// predicates are deliberately left to the residual matcher so they may use
+/// any supported operator, including equality and inequality operators that
+/// cannot define monotonic regions.
+///
 /// # Arguments
 ///
 /// * `predicates` - A list whose first two entries are five-element primary
@@ -743,8 +892,9 @@ pub(crate) fn align(
 ///
 /// # Errors
 ///
-/// Returns a Python `ValueError` when fewer than two anchors are supplied or
-/// an anchor is malformed or uses `==`/`!=`.
+/// Returns a Python `ValueError` when fewer than two anchors are supplied, a
+/// value/index pair is malformed, an anchor is malformed, or an anchor uses
+/// `==`/`!=`.
 pub(crate) fn parse_and_align<'py>(predicates: &Bound<'py, PyList>) -> PyResult<AlignedRegions> {
     if predicates.len() < 2 {
         return Err(PyValueError::new_err(
@@ -771,6 +921,11 @@ pub(crate) fn parse_and_align<'py>(predicates: &Bound<'py, PyList>) -> PyResult<
 }
 
 /// Build index pairs from aligned regions and optional residual predicates.
+///
+/// The first two predicates have already been consumed by `parse_and_align`.
+/// This helper copies the remaining Python tuples into the shared predicate
+/// parser, translates compact region positions back to source positions for
+/// residual evaluation, and delegates `keep` behavior to the region builders.
 fn build_regions_indices<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,

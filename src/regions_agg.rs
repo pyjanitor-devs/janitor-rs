@@ -12,6 +12,35 @@
 //! 3. The ordered map groups that suffix by the second region label.
 //! 4. The map range keeps only groups satisfying the second predicate.
 //! 5. Each physical right position in those groups is an aggregation event.
+//!
+//! ## Position rules
+//!
+//! The sweep's left and right positions are compact region coordinates. They
+//! are not automatically valid positions into aggregation arrays. Region
+//! construction records `left_positions` and `right_positions` mappings back
+//! to the source arrays; every residual predicate and every `AggregationSet`
+//! update must use those mappings.
+//!
+//! The first two predicates are always the region anchors and must use `<`,
+//! `<=`, `>`, or `>=`. Equality and inequality operators remain valid only in
+//! later residual predicates. Residual predicates are evaluated before the
+//! aggregation update, so null handling and predicate alignment retain the
+//! same semantics as the other kernels.
+//!
+//! ## Aggregation tuple forms
+//!
+//! The first anchor accepts either:
+//!
+//! ```text
+//! (left, left_index, right, right_index, ordered, operator)
+//! (left, left_index, right, right_index,
+//!  left_output_positions, right_output_positions, ordered, operator)
+//! ```
+//!
+//! The ordering flag is validated but not used by regions; PyJanitor has
+//! already sorted the right layout. The output-position arrays are returned to
+//! Python and are also shape-checked against the source arrays. The second
+//! anchor always uses the five-field region form.
 
 use std::collections::BTreeMap;
 
@@ -48,7 +77,9 @@ use pyo3::types::{PyList, PyTuple};
 /// # Errors
 ///
 /// Returns `ValueError` when the first anchor does not contain six or eight
-/// fields, or when the second anchor does not contain five fields.
+/// fields, when the ordering flag is not boolean, or when the second anchor
+/// does not contain five fields. The output maps are not copied into the
+/// normalized tuple because region construction does not need them.
 fn normalized_predicates<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
@@ -139,6 +170,9 @@ fn aggregate_regions_exact<'py>(
     return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    // This exact path is intentionally separate from the extended path. With
+    // no residual predicates, the sweep can update aggregation state directly
+    // for every candidate and does not need to build predicate views.
     if predicates.len() != 2 {
         return Err(PyValueError::new_err(
             "region aggregation requires exactly two predicates",
@@ -160,9 +194,10 @@ fn aggregate_regions_exact<'py>(
         ));
     }
 
-    // The optional maps translate compact region layouts back to the output
-    // slots expected by PyJanitor. Without maps, positions are identity
-    // ordered and the original physical lengths define the output domain.
+    // The optional maps are labels for the output rows returned to Python.
+    // They do not replace the source-position mappings in `regions`: an empty
+    // region row may mean that compact region position 0 belongs to original
+    // source position 1.
     let left_output_positions = if first.len() == 8 {
         Some(first.get_item(4)?.extract::<PyReadonlyArray1<'py, i64>>()?)
     } else {
@@ -224,7 +259,8 @@ fn aggregate_regions_exact<'py>(
 
     // Process queries from larger first-region starts to smaller starts. The
     // active right suffix therefore grows leftward and each right row enters
-    // the map only once.
+    // the map only once. `left_position` and `right_position` below are region
+    // coordinates until the explicit mapping is applied at `set.update`.
     let queries = regions::sweep_queries(&regions);
     let mut active = BTreeMap::<i64, GroupState>::new();
     // `next` is a linked list for duplicate second-region labels. `-1` means
@@ -248,7 +284,9 @@ fn aggregate_regions_exact<'py>(
             while position >= 0 {
                 let right_position = position as usize;
                 // `AggregationSet::update` takes source position first and
-                // output position second. Reverse aggregation swaps them.
+                // output position second. Reverse aggregation swaps the
+                // logical sides, but both positions still need translation
+                // from region coordinates to original source coordinates.
                 if reverse {
                     set.update(
                         regions.left_positions[left_position],
@@ -322,6 +360,10 @@ fn aggregate_regions_extended<'py>(
     return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    // The extended path keeps the same region sweep as the exact path, but
+    // inserts a residual-filter step between candidate discovery and the
+    // aggregation update. This is why it cannot use the exact path's direct
+    // update loop.
     // This implementation serves the two extended Python entry points.
     // `reverse` changes which side supplies values; residual predicates are
     // always part of this path.
@@ -353,9 +395,10 @@ fn aggregate_regions_extended<'py>(
     // `residuals` also preserves nullable `!=` metadata for the shared
     // predicate matcher.
     let (parsed, metadata) = residuals(py, predicates, false, true)?;
-    // Residual predicates use physical positions directly in the hot loop.
-    // Therefore their arrays must describe the same aligned layouts as the
-    // two region paths.
+    // Residual arrays retain the original source layout, including rows that
+    // were removed from the compact region path. Validate against the source
+    // lengths, then translate each compact candidate through the mappings
+    // before invoking the shared matcher.
     check_predicate_lengths(&parsed, regions.left_len, regions.right_len)?;
     // Parse aggregation requests once before entering the sweep. The set
     // owns output accumulators while borrowing the source NumPy arrays.
@@ -366,9 +409,10 @@ fn aggregate_regions_extended<'py>(
         ));
     }
 
-    // An eight-field first anchor carries compact-output maps. The left map
-    // is used for forward aggregation and the right map for reverse
-    // aggregation. Six-field anchors already use identity positions.
+    // An eight-field first anchor carries output labels for the compact source
+    // layout. The left map is returned for forward aggregation and the right
+    // map for reverse aggregation. Six-field anchors use an implicit identity
+    // output layout.
     let left_output_positions = if first.len() == 8 {
         Some(first.get_item(4)?.extract::<PyReadonlyArray1<'py, i64>>()?)
     } else {
@@ -438,9 +482,10 @@ fn aggregate_regions_extended<'py>(
     // touching Python objects.
     let views: Vec<_> = parsed.iter().map(Predicate::view).collect();
     let metadata_views = metadata.as_deref().map(null_metadata_views);
-    // Each query is `(first_region_start, left_position)`. Queries are
-    // sorted by descending start so the active right suffix only grows
-    // leftward and every right position is inserted at most once.
+    // Each query is `(first_region_start, left_position)`, where both the
+    // start and left position are region coordinates. Queries are sorted by
+    // descending start so the active right suffix only grows leftward and
+    // every right position is inserted at most once.
     let queries = regions::sweep_queries(&regions);
     let mut active = BTreeMap::<i64, GroupState>::new();
     // `next[position]` links equal second-region values together. `-1`
@@ -476,7 +521,8 @@ fn aggregate_regions_extended<'py>(
             while position >= 0 {
                 let right_position = position as usize;
                 // Primary regions only produce candidates. Residual
-                // predicates are checked before any accumulator changes.
+                // predicates are checked after translating both positions back
+                // to the source arrays and before any accumulator changes.
                 let passes = predicates_match_dispatch(
                     &views,
                     metadata_views.as_deref(),
@@ -485,7 +531,8 @@ fn aggregate_regions_extended<'py>(
                 );
                 if passes {
                     // AggregationSet expects (source_position,
-                    // output_position). Reverse mode swaps those roles.
+                    // output_position). Reverse mode swaps those roles, while
+                    // the explicit mappings correct compacted/reversed paths.
                     if reverse {
                         set.update(
                             regions.left_positions[left_position],

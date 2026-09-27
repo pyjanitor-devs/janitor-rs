@@ -1,4 +1,25 @@
 //! Typed range-anchor predicates shared by range joins and regions.
+//!
+//! A range anchor is the Rust-facing description of one comparison between a
+//! left value array and a sorted right value array. The normal six-field
+//! Python representation is:
+//!
+//! ```text
+//! (left_values, left_index, right_values, right_index,
+//!  right_index_is_ordered, operator)
+//! ```
+//!
+//! Region callers normalize this to the five-field representation:
+//!
+//! ```text
+//! (left_values, left_index, right_values, right_index, operator)
+//! ```
+//!
+//! The ordering flag is validated at the Python boundary but is not used by
+//! the region algorithm. PyJanitor owns sorting and supplies the right values
+//! in the order required by binary search. This module owns only tuple
+//! parsing, dtype dispatch, shape validation, and delegation to the existing
+//! typed window implementation.
 
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
@@ -17,10 +38,15 @@ use crate::op::CompareOp;
 /// `operator`; that flag is validated by the parser but sorting is owned by
 /// PyJanitor.
 pub(crate) struct ParsedRangePredicate<'py, T: numpy::Element> {
+    /// Left-side query values. There is one value for each logical left row.
     pub(crate) left: PyReadonlyArray1<'py, T>,
+    /// Original labels or positional identifiers for the left rows.
     pub(crate) left_index: PyReadonlyArray1<'py, i64>,
+    /// Sorted right-side values searched by the range kernel.
     pub(crate) right: PyReadonlyArray1<'py, T>,
+    /// Original labels or positional identifiers paired with `right`.
     pub(crate) right_index: PyReadonlyArray1<'py, i64>,
+    /// Comparison operator for this anchor.
     pub(crate) op: CompareOp,
 }
 
@@ -29,15 +55,25 @@ pub(crate) struct ParsedRangePredicate<'py, T: numpy::Element> {
 /// The two anchors may use different dtypes, but the left and right value
 /// arrays within one anchor must share a dtype.
 pub(crate) enum AnyParsedRangePredicate<'py> {
+    /// A signed 64-bit anchor.
     I64(ParsedRangePredicate<'py, i64>),
+    /// A signed 32-bit anchor.
     I32(ParsedRangePredicate<'py, i32>),
+    /// A signed 16-bit anchor.
     I16(ParsedRangePredicate<'py, i16>),
+    /// A signed 8-bit anchor.
     I8(ParsedRangePredicate<'py, i8>),
+    /// An unsigned 64-bit anchor.
     U64(ParsedRangePredicate<'py, u64>),
+    /// An unsigned 32-bit anchor.
     U32(ParsedRangePredicate<'py, u32>),
+    /// An unsigned 16-bit anchor.
     U16(ParsedRangePredicate<'py, u16>),
+    /// An unsigned 8-bit anchor.
     U8(ParsedRangePredicate<'py, u8>),
+    /// A 64-bit floating-point anchor.
     F64(ParsedRangePredicate<'py, f64>),
+    /// A 32-bit floating-point anchor.
     F32(ParsedRangePredicate<'py, f32>),
 }
 
@@ -47,6 +83,11 @@ impl AnyParsedRangePredicate<'_> {
     /// Region construction uses values and labels independently while it
     /// builds paths, so malformed tuples must be rejected before that code
     /// performs positional indexing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a descriptive string if either value/index pair has different
+    /// lengths. The caller converts this into a Python `ValueError`.
     pub(crate) fn validate_lengths(&self) -> Result<(), String> {
         macro_rules! validate {
             ($predicate:expr) => {{
@@ -98,6 +139,8 @@ impl AnyParsedRangePredicate<'_> {
     ///
     /// A [`SingleJoinResult`] containing left positions, original left IDs,
     /// optional right IDs, and half-open right-position windows.
+    /// The windows use positions in the supplied sorted `right` array; they
+    /// are not labels from `right_index`.
     ///
     /// # Errors
     ///
@@ -136,6 +179,8 @@ impl AnyParsedRangePredicate<'_> {
     /// Return the number of logical left rows in the anchor.
     ///
     /// This is the length before empty windows are removed.
+    /// It is therefore also the expected length of every left-side residual
+    /// predicate and aggregation-position map.
     pub(crate) fn left_len(&self) -> usize {
         match self {
             Self::I64(value) => value.left.as_array().len(),
@@ -155,6 +200,8 @@ impl AnyParsedRangePredicate<'_> {
     ///
     /// This is the length of the sorted right layout, not the number of
     /// matching candidates.
+    /// It is also the expected length of every right-side residual predicate,
+    /// source aggregation array, and output-position map.
     pub(crate) fn right_len(&self) -> usize {
         match self {
             Self::I64(value) => value.right.as_array().len(),
@@ -175,12 +222,18 @@ impl AnyParsedRangePredicate<'_> {
 ///
 /// # Arguments
 ///
-/// * `tuple` - A five-element extended anchor or six-element basic anchor.
-/// * `extended` - Selects the five-element extended form when `true`.
+/// * `tuple` - A Python tuple containing NumPy arrays and an operator. When
+///   `extended` is `false`, it must have six fields; when `true`, five.
+/// * `extended` - Selects the five-field region/range-extended form when
+///   `true`, or the six-field basic form when `false`.
 ///
 /// # Errors
 ///
-/// Returns a Python `ValueError` for an invalid tuple, comparator, or dtype.
+/// Returns a Python `ValueError` for an invalid tuple shape, unsupported
+/// dtype, invalid ordering flag, or unsupported comparator. Value/index length
+/// validation is deliberately exposed separately through
+/// [`AnyParsedRangePredicate::validate_lengths`] because ordinary range
+/// windows and region construction validate at different stages.
 pub(crate) fn parse_any_range_predicate<'py>(
     tuple: &Bound<'py, PyTuple>,
     extended: bool,
@@ -237,7 +290,7 @@ pub(crate) fn parse_any_range_predicate<'py>(
 /// # Errors
 ///
 /// Returns a Python error for an invalid tuple length, array dtype, ordering
-/// flag, or comparator.
+/// flag, comparator, or value/index dtype conversion.
 fn parse_range_predicate<'py, T: numpy::Element>(
     tuple: &Bound<'py, PyTuple>,
 ) -> PyResult<ParsedRangePredicate<'py, T>> {
@@ -275,7 +328,8 @@ fn parse_range_predicate<'py, T: numpy::Element>(
 /// # Errors
 ///
 /// Returns a Python error for an invalid tuple length, array dtype, or
-/// comparator.
+/// comparator. Parallel-array lengths are checked by
+/// [`AnyParsedRangePredicate::validate_lengths`] before region construction.
 fn parse_extended_range_predicate<'py, T: numpy::Element>(
     tuple: &Bound<'py, PyTuple>,
 ) -> PyResult<ParsedRangePredicate<'py, T>> {
