@@ -92,7 +92,11 @@ struct PreparedPredicates<'py> {
 /// Returns `ValueError` for invalid tuple length, a non-boolean ordering flag,
 /// invalid output maps, unsupported dtypes/operators, or mismatched
 /// value/index lengths.
-/// Parse the first two region aggregation anchors once.
+///
+/// Parsing is intentionally separate from residual parsing. The first two
+/// tuples define the paper sweep and must be parsed before any later tuple is
+/// interpreted; later tuples may use operators such as `==` or `!=` that are
+/// valid residual filters but cannot define a region boundary.
 ///
 /// The returned request keeps the first anchor's output maps alongside its
 /// typed range data and keeps the second typed range separately. Later
@@ -105,6 +109,9 @@ fn parse_region_anchors<'py>(predicates: &Bound<'py, PyList>) -> PyResult<Prepar
     let second = second_item.cast::<PyTuple>()?;
     let parsed_first = parse_aggregation_range_anchor(first, true)?;
     let parsed_second = parse_aggregation_range_anchor(second, false)?;
+    // Keep the first anchor's output metadata attached to its range. The
+    // second anchor contributes only a region path; it must not overwrite the
+    // canonical first-anchor physical layout during alignment.
     Ok(PreparedPredicates {
         first: parsed_first,
         second: parsed_second.range,
@@ -136,6 +143,10 @@ fn aggregation_layout<'py>(
             .as_ref()
             .map(|values| values.as_array())
     };
+    // Forward aggregation has one slot per left source row and reads right
+    // values. Reverse aggregation swaps those roles. A supplied map changes
+    // only the labels returned to Python; the accumulator remains indexed by
+    // the compact output layout supplied by PyJanitor.
     let output_len = output_positions
         .map(|values| values.len())
         .unwrap_or(if reverse {
@@ -151,8 +162,7 @@ fn aggregation_layout<'py>(
     (output_positions, output_len, source_len)
 }
 
-/// Parse and align the two primary region anchors, then describe the selected
-/// aggregation direction.
+/// Parse and align the two primary region anchors once for an aggregation call.
 ///
 /// Exact and extended aggregation intentionally keep separate candidate
 /// consumers, because only the extended path evaluates residual predicates.
@@ -172,6 +182,9 @@ fn prepare_region_aggregation<'py>(
     predicates: &Bound<'py, PyList>,
 ) -> PyResult<(PreparedPredicates<'py>, regions::AlignedRegions)> {
     let prepared = parse_region_anchors(predicates)?;
+    // Alignment happens once, before exact and extended consumers diverge.
+    // This is what guarantees that residual predicates and aggregations see
+    // the same compact-to-source position maps.
     let regions = regions::align_parsed(&prepared.first.range, &prepared.second)
         .map_err(PyValueError::new_err)?;
     Ok((prepared, regions))
@@ -240,6 +253,9 @@ fn aggregate_regions_exact<'py>(
     // The shared traversal supplies compact region coordinates. Translate
     // them back to source coordinates only at the accumulator boundary.
     regions::traverse_candidates(&regions, |left_position, right_position| {
+        // `left_position` and `right_position` are compact region positions.
+        // Convert them through the source maps exactly once, at the point
+        // where an aggregation event is recorded.
         if reverse {
             set.update(
                 regions.left_positions[left_position],
@@ -367,6 +383,9 @@ fn aggregate_regions_extended<'py>(
     // The shared traversal handles primary-region candidates. This callback
     // keeps the extended-only residual filtering directly before the update.
     regions::traverse_candidates(&regions, |left_position, right_position| {
+        // Residual predicates use source positions, not compact region
+        // positions. Filtering here means `AggregationSet::update` sees only
+        // candidates that passed every predicate, including null semantics.
         let passes = predicates_match_dispatch(
             &views,
             metadata_views.as_deref(),

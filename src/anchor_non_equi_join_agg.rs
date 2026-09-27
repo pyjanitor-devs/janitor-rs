@@ -1042,6 +1042,21 @@ struct ParsedNotEqualAggregationAnchor<'py, T: numpy::Element> {
 }
 
 /// Parse the thirteen-field null-aware `!=` aggregation anchor once.
+///
+/// The parser validates the operator and boolean metadata before borrowing
+/// the arrays. The value arrays are filtered non-null arrays, so their
+/// physical position arrays and optional null-position arrays are part of the
+/// contract; treating a filtered offset as a full-frame position would write
+/// aggregation results into the wrong source row.
+///
+/// # Arguments
+///
+/// * `first` - The thirteen-field first predicate tuple.
+///
+/// # Errors
+///
+/// Returns `ValueError` when the tuple length, operator, boolean metadata, or
+/// any typed array field does not match the `!=` aggregation contract.
 fn parse_not_equal_aggregation_anchor<'py, T: numpy::Element>(
     first: &Bound<'py, PyTuple>,
 ) -> PyResult<ParsedNotEqualAggregationAnchor<'py, T>> {
@@ -1056,6 +1071,9 @@ fn parse_not_equal_aggregation_anchor<'py, T: numpy::Element>(
             "the thirteen-element aggregation predicate must use !=",
         ));
     }
+    // `None` means the caller has no null partition. An empty NumPy array is
+    // different but has the same zero-row contribution; preserve both forms
+    // because the caller's metadata shape is meaningful.
     let left_null_positions = if first.get_item(3)?.is_none() {
         None
     } else {
@@ -1066,6 +1084,9 @@ fn parse_not_equal_aggregation_anchor<'py, T: numpy::Element>(
     } else {
         Some(first.get_item(7)?.extract::<PyReadonlyArray1<'py, i64>>()?)
     };
+    // Field 8 is retained for tuple compatibility and validated even though
+    // aggregation consumes every passing candidate and does not use ordering
+    // to select first/last rows.
     first.get_item(8)?.extract::<bool>()?;
     let is_extension_array = first.get_item(9)?.extract::<bool>()?;
     Ok(ParsedNotEqualAggregationAnchor {
@@ -1109,6 +1130,9 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
         ));
     }
     if first.len() == 13 {
+        // The thirteen-field shape is a distinct null-aware `!=` protocol.
+        // Dispatch it before range-shape validation so its specialized maps
+        // and null partitions cannot be mistaken for range output metadata.
         let anchor = parse_not_equal_aggregation_anchor::<T>(first)?;
         return run_not_equal(
             py,
@@ -1147,6 +1171,9 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
     // Extracting the first value array here preserves the old behavior: a
     // call through the int64 wrapper with int32 predicate values fails at the
     // Python boundary instead of silently selecting a different dispatch arm.
+    // This is an intentional second boundary check: parse_any_range_parts
+    // chooses a runtime variant for shared callers, while this wrapper must
+    // reject a tuple whose dtype disagrees with the exported function name.
     first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?;
     let anchor = parse_aggregation_range_anchor(first, true)?;
     let left_output_len = anchor

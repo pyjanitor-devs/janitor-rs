@@ -150,6 +150,10 @@ fn first_eligible(values: &[i64], left: i64) -> usize {
 /// query uses the existing binary-search window helper. Sorting costs
 /// `O(left_rows log left_rows)`.
 pub(crate) fn sweep_queries(regions: &AlignedRegions) -> Vec<(usize, usize)> {
+    // A query is `(first_region_start, left_position)`. The start is a
+    // position in the physical right layout, not a dataframe label. For
+    // example, a start of 3 means “right positions 3..right_len may satisfy
+    // the first anchor”; it says nothing about the right row's index value.
     // Each query stores `(first_region_start, left_position)`. The start is
     // the first right position that can satisfy the first primary predicate.
     let mut queries = regions
@@ -229,6 +233,9 @@ where
 
         // Only groups at or above the left second-region label satisfy the
         // second inequality. Walk every duplicate in each qualifying chain.
+        // ELI5: the B-tree tells us which labelled buckets qualify; the
+        // linked list inside each bucket tells us which individual right rows
+        // belong to that bucket. We need both because labels can repeat.
         'candidate_groups: for (_, state) in active.range(regions.left_second[left_position]..) {
             let mut position = state.head;
             while position >= 0 {
@@ -294,6 +301,9 @@ where
     })?;
 
     let mut offsets = vec![0_usize; counts.len() + 1];
+    // `offsets[row]..offsets[row + 1]` is the final output bucket for one
+    // compact left row. The sweep visits rows by boundary order, so these
+    // buckets are what restore the caller's canonical left-row order.
     for (left_position, count) in counts.iter().copied().enumerate() {
         offsets[left_position + 1] = offsets[left_position]
             .checked_add(count)
@@ -307,6 +317,8 @@ where
     let mut left_index = vec![0_i64; total];
     let mut right_index = vec![0_i64; total];
     let mut cursors = offsets[..regions.left_index.len()].to_vec();
+    // Each cursor starts at its row's bucket and advances only within that
+    // bucket. Therefore no sorting is needed after the second sweep.
     // Second pass: write directly into the final output arrays. The cursor
     // for each left row starts at that row's offset and advances independently.
     traverse_candidates(regions, |left_position, right_position| {
@@ -434,10 +446,16 @@ where
         }
         match keep {
             Keep::Any if selected[left_position].is_none() => {
+                // Returning `Ok(false)` stops the shared traversal for this
+                // left row only. The outer sweep still processes every other
+                // left row.
                 selected[left_position] = Some(right_position);
                 Ok(false)
             }
             Keep::First => {
+                // “First” means the smallest original right label, not the
+                // first physical candidate encountered in the non-monotonic
+                // second-region path.
                 selected[left_position] = match selected[left_position] {
                     None => Some(right_position),
                     Some(current)
@@ -450,6 +468,8 @@ where
                 Ok(true)
             }
             Keep::Last => {
+                // “Last” follows the same rule in the opposite direction:
+                // compare original labels, not traversal order.
                 selected[left_position] = match selected[left_position] {
                     None => Some(right_position),
                     Some(current)

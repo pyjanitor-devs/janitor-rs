@@ -46,13 +46,20 @@ use crate::op::CompareOp;
 /// `operator`; that flag is validated by the parser but sorting is owned by
 /// PyJanitor.
 pub(crate) struct ParsedRangePredicate<'py, T: numpy::Element> {
-    /// Left-side query values. There is one value for each logical left row.
+    /// Left-side query values. There is one value for each logical left row;
+    /// this array is not necessarily sorted because PyJanitor may sort each
+    /// anchor independently before alignment.
     pub(crate) left: PyReadonlyArray1<'py, T>,
-    /// Original labels or positional identifiers for the left rows.
+    /// Original labels or physical positions paired with `left`. Region code
+    /// uses these labels to align independent anchors and uses the resulting
+    /// position maps when residual predicates read source arrays.
     pub(crate) left_index: PyReadonlyArray1<'py, i64>,
-    /// Sorted right-side values searched by the range kernel.
+    /// Sorted right-side values searched by the binary-search kernel. The
+    /// parser deliberately does not sort this array; the caller owns that
+    /// preparation contract.
     pub(crate) right: PyReadonlyArray1<'py, T>,
-    /// Original labels or positional identifiers paired with `right`.
+    /// Original labels or physical positions paired with the sorted right
+    /// values. Sorting the values does not change these labels' identity.
     pub(crate) right_index: PyReadonlyArray1<'py, i64>,
     /// Comparison operator for this anchor.
     pub(crate) op: CompareOp,
@@ -63,7 +70,8 @@ pub(crate) struct ParsedRangePredicate<'py, T: numpy::Element> {
 /// The two anchors may use different dtypes, but the left and right value
 /// arrays within one anchor must share a dtype.
 pub(crate) enum AnyParsedRangePredicate<'py> {
-    /// A signed 64-bit anchor.
+    /// A signed 64-bit anchor. Each variant keeps the concrete type so the
+    /// binary search and aggregation loops remain statically typed.
     I64(ParsedRangePredicate<'py, i64>),
     /// A signed 32-bit anchor.
     I32(ParsedRangePredicate<'py, i32>),
@@ -97,9 +105,12 @@ pub(crate) struct ParsedAggregationRangeAnchor<'py> {
     /// The public ordering flag, when the tuple carries one. Region and
     /// range aggregation validate it but rely on PyJanitor for sorting.
     pub(crate) ordered: Option<bool>,
-    /// Optional compact output labels for forward aggregation.
+    /// Optional compact output labels for forward aggregation. These describe
+    /// the output layout returned to Python; they are not source-position
+    /// maps for reading aggregation values.
     pub(crate) left_output_positions: Option<PyReadonlyArray1<'py, i64>>,
-    /// Optional compact output labels for reverse aggregation.
+    /// Optional compact output labels for reverse aggregation. The reverse
+    /// accumulator still reads source positions from the aligned region maps.
     pub(crate) right_output_positions: Option<PyReadonlyArray1<'py, i64>>,
 }
 
@@ -108,12 +119,37 @@ pub(crate) struct ParsedAggregationRangeAnchor<'py> {
 ///
 /// The first anchor uses the established six- or eight-field aggregation
 /// form. The second anchor uses the five-field range form because it does not
-/// carry output maps. All NumPy arrays remain borrowed through the returned
-/// request; no value or index column is copied.
+/// carry output maps:
+///
+/// ```text
+/// first, six:  (left, left_index, right, right_index, ordered, op)
+/// first, eight:(left, left_index, right, right_index, ordered,
+///              left_output_positions, right_output_positions, op)
+/// second:     (left, left_index, right, right_index, op)
+/// ```
+///
+/// All NumPy arrays remain borrowed through the returned request; no value or
+/// index column is copied. This function is the only place where aggregation
+/// code should interpret those numeric tuple positions.
+///
+/// # Arguments
+///
+/// * `tuple` - One Python predicate tuple in one of the forms above.
+/// * `first` - `true` for the output-bearing first anchor; `false` for the
+///   five-field second anchor.
+///
+/// # Errors
+///
+/// Returns `ValueError` for malformed tuple lengths, non-boolean ordering
+/// flags, unsupported dtypes/operators, unequal value/index lengths, or
+/// output maps whose lengths do not match their source arrays.
 pub(crate) fn parse_aggregation_range_anchor<'py>(
     tuple: &Bound<'py, PyTuple>,
     first: bool,
 ) -> PyResult<ParsedAggregationRangeAnchor<'py>> {
+    // The first tuple has metadata that the second tuple does not. Parse the
+    // shape and metadata before touching values so malformed output maps are
+    // reported at the public boundary rather than during result assembly.
     let (range, ordered, left_output_positions, right_output_positions) = if first {
         let (operator_position, ordered, left_output_positions, right_output_positions) =
             match tuple.len() {
@@ -153,9 +189,15 @@ pub(crate) fn parse_aggregation_range_anchor<'py>(
         (parse_any_range_predicate(tuple, true)?, None, None, None)
     };
 
+    // Operator validation intentionally precedes length validation. Equality
+    // and inequality are legal residual predicates, but cannot define the
+    // monotonic boundary required by a range window or region anchor.
     range
         .validate_range_operator()
         .map_err(PyValueError::new_err)?;
+    // Validate both value/index pairs before region construction can compact
+    // rows or reverse the right layout. This prevents a malformed tuple from
+    // becoming a positional panic in labels or alignment.
     range.validate_lengths().map_err(PyValueError::new_err)?;
     if let Some(values) = left_output_positions.as_ref() {
         if values.as_array().len() != range.left_len() {
@@ -193,6 +235,9 @@ pub(crate) fn parse_any_range_parts<'py>(
     right_index: &Bound<'py, PyAny>,
     operator: &Bound<'py, PyAny>,
 ) -> PyResult<AnyParsedRangePredicate<'py>> {
+    // Dtype dispatch is based on the left values. The extraction of the right
+    // values uses that same concrete type, so a left/right dtype mismatch is
+    // rejected by PyO3 instead of being silently coerced.
     let dtype = left
         .getattr("dtype")?
         .getattr("name")?
@@ -235,6 +280,9 @@ impl AnyParsedRangePredicate<'_> {
     /// both six/eight-field first anchors and five-field second anchors use
     /// the same error and validation rule.
     pub(crate) fn validate_range_operator(&self) -> Result<(), String> {
+        // This check is deliberately separate from CompareOp parsing: parsing
+        // answers “is this a known operator?”, while this method answers “is
+        // it an operator that can produce one monotonic search boundary?”
         macro_rules! validate {
             ($predicate:expr) => {
                 if matches!($predicate.op, CompareOp::Eq | CompareOp::Ne) {
