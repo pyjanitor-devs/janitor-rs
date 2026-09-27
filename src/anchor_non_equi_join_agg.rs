@@ -1010,8 +1010,23 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
 /// `return_matched` is true, or `(output_positions, aggregation_arrays)` when
 /// it is false. Returns `None` when no candidate survives.
 /// Named representation of the thirteen-field null-aware `!=` aggregation
-/// anchor. The tuple layout is parsed once at the Python/Rust boundary; the
-/// traversal functions below consume these fields directly.
+/// anchor.
+///
+/// This intentionally does not reuse [`ParsedAggregationRangeAnchor`]. A
+/// range anchor has two value arrays and one comparator. The `!=` anchor has a
+/// different physical contract: its value arrays have already had nulls
+/// removed, its position arrays map those filtered values back to the full
+/// source layout, its optional null-position arrays describe the excluded
+/// rows, and its output maps describe a compact/reordered result layout.
+/// Combining both contracts into one struct would turn these required fields
+/// into a collection of unrelated `Option`s and make it easier to use a
+/// filtered position as though it were a source position.
+///
+/// The tuple layout is parsed once at the Python/Rust boundary; traversal
+/// functions below consume these named fields directly. Keeping the parser
+/// separate still gives both families the same important property: tuple
+/// positions are confined to one boundary function rather than scattered
+/// through the hot loop.
 struct ParsedNotEqualAggregationAnchor<'py, T: numpy::Element> {
     left: PyReadonlyArray1<'py, T>,
     left_index: PyReadonlyArray1<'py, i64>,
@@ -1150,6 +1165,14 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
             .as_ref()
             .map(|values| values.as_array())
     };
+    // `run_range` is generic over the concrete NumPy element type, while the
+    // Python boundary gives us one runtime `AnyParsedRangePredicate`. Rust
+    // therefore needs one arm per supported dtype to recover the concrete
+    // type before calling the generic kernel. This repetition is deliberate:
+    // the arms make the dtype contract and ownership transfer visible, avoid
+    // converting columns into a common temporary dtype, and keep the hot path
+    // free of dynamic dispatch. A macro could shorten the source, but would
+    // hide the same type-specialized calls without changing runtime work.
     match anchor.range {
         AnyParsedRangePredicate::I64(value) => run_range(
             py,
