@@ -28,6 +28,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
+use crate::aggs::ensure_equal_lengths_core;
 use crate::join_aggregation_helpers::aggregate_range_windows;
 use crate::range_join::build_any_windows;
 use crate::range_predicate::parse_aggregation_range_anchor;
@@ -875,6 +876,34 @@ mod tests {
                 .to_string()
                 .contains("range extended aggregation has invalid anchor tuple lengths"));
 
+            let bad_maps = PyList::empty(py);
+            bad_maps.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64, 2]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64, 3, 4]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 11, 12]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    // One map entry for two left rows is malformed.
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            bad_maps.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64, 2]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 2, 4]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 11, 12]).into_any(),
+                    "<=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let error = range_join_aggregate(py, &bad_maps, &aggregation, true).unwrap_err();
+            assert!(error.to_string().contains("left output positions"));
+
             let mismatched = PyList::empty(py);
             mismatched.append(PyTuple::new(
                 py,
@@ -899,6 +928,75 @@ mod tests {
             )?)?;
             let error = range_join_aggregate(py, &mismatched, &aggregation, true).unwrap_err();
             assert!(error.to_string().contains("left and left_index"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn range_aggregation_preserves_integer_overflow_semantics() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            // Both anchors select both right rows.  Keeping the right layout
+            // tiny makes the expected wrapping arithmetic obvious.
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20]).into_any(),
+                    "<=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+
+            let values = PyArray1::from_vec(py, vec![i64::MAX, 2]);
+            let nulls = PyArray1::from_vec(py, vec![false, false]);
+            let aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.into_any(),
+                            nulls.into_any(),
+                            "prod".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+            let result = range_join_aggregate(py, &predicates, &aggregations, false)?
+                .expect("the overflow fixture has matches");
+            let outputs_item = result.get_item(1)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(
+                outputs.get_item(0)?.extract::<Vec<i64>>()?,
+                vec![i64::MAX.wrapping_add(2)]
+            );
+            assert_eq!(
+                outputs.get_item(1)?.extract::<Vec<i64>>()?,
+                vec![i64::MAX.wrapping_mul(2)]
+            );
             Ok(())
         })
         .unwrap();

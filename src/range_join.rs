@@ -831,6 +831,116 @@ mod tests {
     }
 
     #[test]
+    fn public_range_indices_dispatch_every_anchor_dtype() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            macro_rules! check_dtype {
+                ($ty:ty) => {{
+                    let predicates = PyList::empty(py);
+                    predicates.append(PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, vec![2 as $ty]).into_any(),
+                            PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                            PyArray1::from_vec(py, vec![1 as $ty, 3 as $ty, 5 as $ty]).into_any(),
+                            PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                            true.into_pyobject(py)?.to_owned().into_any(),
+                            "<".into_pyobject(py)?.into_any(),
+                        ],
+                    )?)?;
+                    predicates.append(PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, vec![2 as $ty]).into_any(),
+                            PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                            PyArray1::from_vec(py, vec![0 as $ty, 2 as $ty, 4 as $ty]).into_any(),
+                            PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                            true.into_pyobject(py)?.to_owned().into_any(),
+                            ">=".into_pyobject(py)?.into_any(),
+                        ],
+                    )?)?;
+                    let result = range_join_indices(py, &predicates, "all", false)?
+                        .expect("every supported dtype should dispatch");
+                    assert_eq!(read_pair(&result), (vec![100], vec![20]));
+                    Ok::<(), PyErr>(())
+                }};
+            }
+
+            check_dtype!(i64)?;
+            check_dtype!(i32)?;
+            check_dtype!(i16)?;
+            check_dtype!(i8)?;
+            check_dtype!(u64)?;
+            check_dtype!(u32)?;
+            check_dtype!(u16)?;
+            check_dtype!(u8)?;
+            check_dtype!(f64)?;
+            check_dtype!(f32)?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn public_range_indices_handles_infinite_and_nan_anchor_values() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // Infinity is an ordinary ordered endpoint: every finite value
+            // is below positive infinity, and negative infinity is the first
+            // value in an ascending right layout.  This checks the two
+            // boundary values without relying on a finite sentinel.
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![f64::INFINITY]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![f64::NEG_INFINITY, 0.0, f64::INFINITY]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    ">=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![f64::INFINITY]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![f64::NEG_INFINITY, 0.0, f64::INFINITY]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    ">".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let result = range_join_indices(py, &predicates, "all", false)?
+                .expect("infinite endpoints should produce matches");
+            assert_eq!(read_pair(&result), (vec![100, 100], vec![10, 20]));
+
+            // NaN is not part of the sorted-range contract, but it can cross
+            // the Python boundary.  The binary-search kernels deliberately
+            // document that exact NaN parity is unspecified; this regression
+            // only requires the public path to reject neither nor panic.
+            let nan_predicates = PyList::empty(py);
+            for operator in ["<", ">="] {
+                nan_predicates.append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![f64::NAN]).into_any(),
+                        PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![-1.0_f64, 1.0]).into_any(),
+                        PyArray1::from_vec(py, vec![10_i64, 20]).into_any(),
+                        true.into_pyobject(py)?.to_owned().into_any(),
+                        operator.into_pyobject(py)?.into_any(),
+                    ],
+                )?)?;
+            }
+            let _ = range_join_indices(py, &nan_predicates, "all", false)?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn public_range_indices_match_reference_for_all_orientations_and_keeps() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
