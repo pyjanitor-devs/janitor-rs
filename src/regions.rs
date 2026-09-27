@@ -1062,6 +1062,46 @@ mod tests {
         Ok(predicates)
     }
 
+    struct RightLayout<'a> {
+        values: &'a [i64],
+        labels: &'a [i64],
+    }
+
+    /// Build two anchors whose right values are sorted independently but whose
+    /// right labels appear in different physical orders. This is the shape
+    /// that exercises `align`: region positions cannot be joined by vector
+    /// position, so the second anchor must be projected onto the first
+    /// anchor's layout by its original labels.
+    fn public_predicates_with_permuted_right_layouts<'py>(
+        py: Python<'py>,
+        left: &[i64],
+        left_index: &[i64],
+        first: RightLayout<'_>,
+        second: RightLayout<'_>,
+        first_operator: &str,
+        second_operator: &str,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let predicates = PyList::empty(py);
+        let left_values = PyArray1::from_vec(py, left.to_vec());
+        let left_labels = PyArray1::from_vec(py, left_index.to_vec());
+        for (values, labels, operator) in [
+            (first.values, first.labels, first_operator),
+            (second.values, second.labels, second_operator),
+        ] {
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    left_values.clone().into_any(),
+                    left_labels.clone().into_any(),
+                    PyArray1::from_vec(py, values.to_vec()).into_any(),
+                    PyArray1::from_vec(py, labels.to_vec()).into_any(),
+                    operator.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+        }
+        Ok(predicates)
+    }
+
     /// Read the pair arrays returned by either public index wrapper.
     fn public_pairs(result: &Bound<'_, PyDict>) -> PyResult<Vec<(i64, i64)>> {
         let left = result
@@ -1108,6 +1148,69 @@ mod tests {
             .collect()
     }
 
+    /// Return the reference matches grouped by left row for every keep mode.
+    ///
+    /// The production kernel applies `first` and `last` to the original right
+    /// labels, not to the right array's physical position. `any` has no
+    /// prescribed winner, so callers validate it by checking membership in
+    /// the complete candidate set.
+    fn expected_labeled_pairs(
+        left: &[i64],
+        left_index: &[i64],
+        first: RightLayout<'_>,
+        second: RightLayout<'_>,
+        first_operator: &str,
+        second_operator: &str,
+    ) -> Vec<Vec<(i64, i64)>> {
+        left.iter()
+            .enumerate()
+            .map(|(left_position, &left_value)| {
+                first
+                    .labels
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(first_position, &right_label)| {
+                        let second_position = second
+                            .labels
+                            .iter()
+                            .position(|label| label == &right_label)
+                            .expect("the two anchors share right labels");
+                        (comparison(left_value, first.values[first_position], first_operator)
+                            && comparison(
+                                left_value,
+                                second.values[second_position],
+                                second_operator,
+                            ))
+                        .then_some((left_index[left_position], right_label))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn expected_for_keep(candidates: &[Vec<(i64, i64)>], keep: &str) -> Vec<(i64, i64)> {
+        candidates
+            .iter()
+            .flat_map(|row| match keep {
+                "all" => row.clone(),
+                "first" => row
+                    .iter()
+                    .min_by_key(|(_, right_label)| *right_label)
+                    .copied()
+                    .into_iter()
+                    .collect(),
+                "last" => row
+                    .iter()
+                    .max_by_key(|(_, right_label)| *right_label)
+                    .copied()
+                    .into_iter()
+                    .collect(),
+                "any" => Vec::new(),
+                _ => panic!("unsupported keep mode"),
+            })
+            .collect()
+    }
+
     #[test]
     fn public_indices_match_bruteforce_for_all_anchor_operator_pairs() {
         Python::initialize();
@@ -1130,6 +1233,101 @@ mod tests {
                     actual.sort_unstable();
                     expected.sort_unstable();
                     assert_eq!(actual, expected, "{first_operator} then {second_operator}");
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn public_indices_keep_modes_align_independently_permuted_right_layouts() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left = [1, 3, 5];
+            let left_index = [17, 42, 99];
+            // Each right value array is sorted, as required by the binary
+            // search. The labels, however, are deliberately arranged
+            // differently. The second anchor therefore cannot be aligned by
+            // physical position; it must use the shared right labels.
+            let first_right = [0, 2, 4, 6];
+            let first_right_index = [101, 503, 907, 1201];
+            let second_right = [0, 2, 4, 6];
+            let second_right_index = [907, 101, 1201, 503];
+            let operators = ["<", "<=", ">", ">="];
+            let keeps = ["all", "first", "last", "any"];
+
+            for first_operator in operators {
+                for second_operator in operators {
+                    let candidates = expected_labeled_pairs(
+                        &left,
+                        &left_index,
+                        RightLayout {
+                            values: &first_right,
+                            labels: &first_right_index,
+                        },
+                        RightLayout {
+                            values: &second_right,
+                            labels: &second_right_index,
+                        },
+                        first_operator,
+                        second_operator,
+                    );
+                    for keep in keeps {
+                        let predicates = public_predicates_with_permuted_right_layouts(
+                            py,
+                            &left,
+                            &left_index,
+                            RightLayout {
+                                values: &first_right,
+                                labels: &first_right_index,
+                            },
+                            RightLayout {
+                                values: &second_right,
+                                labels: &second_right_index,
+                            },
+                            first_operator,
+                            second_operator,
+                        )?;
+                        let actual = region_indices(py, &predicates, keep)?
+                            .as_ref()
+                            .map(public_pairs)
+                            .transpose()?
+                            .unwrap_or_default();
+                        let context = format!(
+                            "first={first_operator}, second={second_operator}, keep={keep}"
+                        );
+
+                        if keep == "any" {
+                            let all_candidates: Vec<_> =
+                                candidates.iter().flatten().copied().collect();
+                            assert!(
+                                actual.iter().all(|pair| all_candidates.contains(pair)),
+                                "{context}: any returned a non-matching pair: {actual:?}"
+                            );
+                            assert!(
+                                actual.iter().all(|(left_label, _)| {
+                                    actual
+                                        .iter()
+                                        .filter(|(label, _)| label == left_label)
+                                        .count()
+                                        == 1
+                                }),
+                                "{context}: any returned more than one pair for a left row"
+                            );
+                            assert_eq!(
+                                actual.len(),
+                                candidates.iter().filter(|row| !row.is_empty()).count(),
+                                "{context}"
+                            );
+                        } else {
+                            let mut actual = actual;
+                            let mut expected = expected_for_keep(&candidates, keep);
+                            actual.sort_unstable();
+                            expected.sort_unstable();
+                            assert_eq!(actual, expected, "{context}");
+                        }
+                    }
                 }
             }
             Ok(())
