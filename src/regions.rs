@@ -295,6 +295,107 @@ where
     Ok((left_index, right_index))
 }
 
+/// Build an extended `Keep::All` result with one candidate sweep.
+///
+/// The exact two-range path uses [`build_all_indices`] because its second pass
+/// only repeats cheap region traversal and array writes. Extended joins may
+/// evaluate null masks, strings, and several residual predicates for every
+/// candidate. Repeating that work would evaluate the residual callback twice.
+///
+/// This builder therefore records only the candidates that pass the residual
+/// callback during one sweep. Counts and offsets still provide the final
+/// canonical left-row order, while the flat pair buffer replaces the second
+/// B-tree/linked-list traversal.
+///
+/// # Errors
+///
+/// Returns an error if the sweep boundary invariant is violated, the match
+/// count overflows platform capacity, or the intermediate pair buffer cannot
+/// reserve capacity.
+fn build_all_indices_extended<P>(
+    regions: &AlignedRegions,
+    mut predicates_pass: P,
+) -> Result<(Vec<i64>, Vec<i64>), String>
+where
+    P: FnMut(usize, usize) -> bool,
+{
+    let queries = sweep_queries(regions);
+    let mut counts = vec![0_usize; regions.left_index.len()];
+    let mut passing_pairs = Vec::<(usize, usize)>::new();
+    let mut active = BTreeMap::<i64, GroupState>::new();
+    let mut next = vec![-1_i64; regions.right_index.len()];
+    let mut previous_end = regions.right_index.len();
+
+    // One sweep performs both primary-region traversal and residual filtering.
+    // Store only passing candidates; rejected candidates never occupy the
+    // intermediate buffer and never reach the output-sizing phase.
+    for (start, left_position) in queries {
+        let start = checked_region_start(
+            i64::try_from(start).map_err(|_| "region start exceeds i64 capacity")?,
+            regions.right_index.len(),
+            previous_end,
+        )?;
+        let Some(start) = start else {
+            continue;
+        };
+        add_right_region(
+            ArrayView1::from(&regions.right_second[..]),
+            start,
+            previous_end,
+            &mut next,
+            &mut active,
+        );
+        previous_end = start;
+
+        for (_, state) in active.range(regions.left_second[left_position]..) {
+            let mut position = state.head;
+            while position >= 0 {
+                let right_position = position as usize;
+                if predicates_pass(left_position, right_position) {
+                    counts[left_position] = counts[left_position]
+                        .checked_add(1)
+                        .ok_or("region index result size exceeds platform capacity")?;
+                    if passing_pairs.len() == passing_pairs.capacity() {
+                        passing_pairs
+                            .try_reserve(1)
+                            .map_err(|_| "region index result allocation failed".to_owned())?;
+                    }
+                    passing_pairs.push((left_position, right_position));
+                }
+                position = next[right_position];
+            }
+        }
+    }
+
+    if passing_pairs.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    // Prefix offsets assign each left row a contiguous output bucket. This is
+    // what restores canonical left order after the sweep's descending query
+    // order, without sorting the completed output pairs.
+    let mut offsets = vec![0_usize; counts.len() + 1];
+    for (left_position, count) in counts.iter().copied().enumerate() {
+        offsets[left_position + 1] = offsets[left_position]
+            .checked_add(count)
+            .ok_or("region index result size exceeds platform capacity")?;
+    }
+    let total = offsets[regions.left_index.len()];
+    let mut left_index = vec![0_i64; total];
+    let mut right_index = vec![0_i64; total];
+    let mut cursors = offsets[..regions.left_index.len()].to_vec();
+
+    // This pass touches only the compact passing-pair buffer. It performs no
+    // region-map updates, linked-list traversal, or residual predicate calls.
+    for (left_position, right_position) in passing_pairs {
+        let output_position = cursors[left_position];
+        left_index[output_position] = regions.left_index[left_position];
+        right_index[output_position] = regions.right_index[right_position];
+        cursors[left_position] += 1;
+    }
+    Ok((left_index, right_index))
+}
+
 /// Materialize `first`, `last`, or `any` results in one sweep.
 ///
 /// # Arguments
@@ -457,7 +558,7 @@ where
     P: FnMut(usize, usize) -> bool,
 {
     if keep == Keep::All {
-        build_all_indices(regions, predicates_pass)
+        build_all_indices_extended(regions, predicates_pass)
     } else {
         build_selected_indices(regions, keep, predicates_pass)
     }
@@ -951,6 +1052,7 @@ mod tests {
     use super::*;
     use numpy::PyArray1;
     use pyo3::types::PyDict;
+    use std::cell::Cell;
 
     fn regions(right_second: Vec<i64>) -> AlignedRegions {
         AlignedRegions {
@@ -1057,6 +1159,24 @@ mod tests {
             .expect("selection should succeed");
         output.extend(left.into_iter().zip(right));
         assert_eq!(output, vec![(10, 22), (11, 22)]);
+    }
+
+    #[test]
+    fn extended_all_evaluates_each_candidate_once() {
+        let regions = regions(vec![1, 2, 3, 4]);
+        let evaluations = Cell::new(0_usize);
+        let output = build_indices_extended(&regions, Keep::All, |_, right| {
+            evaluations.set(evaluations.get() + 1);
+            right == 2
+        })
+        .expect("extended all should build");
+
+        // The primary sweep visits seven candidates in this fixture. Only two
+        // pass the residual, but the residual callback must run once for each
+        // candidate rather than once during a counting pass and again during
+        // output materialization.
+        assert_eq!(evaluations.get(), 7);
+        assert_eq!(output, (vec![10, 11], vec![22, 22]));
     }
 
     /// Construct the public five-field representation used by the index
