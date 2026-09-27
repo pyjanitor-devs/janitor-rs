@@ -34,7 +34,7 @@
 //! ```text
 //! (left, left_index, right, right_index, ordered, operator)
 //! (left, left_index, right, right_index,
-//!  left_output_positions, right_output_positions, ordered, operator)
+//!  ordered, left_output_positions, right_output_positions, operator)
 //! ```
 //!
 //! The ordering flag is validated but not used by regions; PyJanitor has
@@ -50,6 +50,7 @@ use crate::multi_join_indices::common::{add_right_region, GroupState};
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, predicates_match_dispatch, Predicate,
 };
+use crate::range_predicate::{parse_any_range_predicate, AnyParsedRangePredicate};
 use crate::regions;
 use numpy::ndarray::ArrayView1;
 use numpy::PyReadonlyArray1;
@@ -57,9 +58,117 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
+/// Parsed representation of the first aggregation anchor.
+///
+/// The Python API remains tuple-based for compatibility, but the rest of the
+/// Rust implementation uses these named fields. This prevents tuple-field
+/// numbers from spreading through the aggregation kernels and makes the
+/// established six/eight-field contract explicit in one place.
+struct ParsedAggregationAnchor<'py> {
+    /// Parsed and dtype-dispatched range data used by region construction.
+    range: AnyParsedRangePredicate<'py>,
+    /// Original operator object retained for the normalized five-field tuple.
+    operator: Bound<'py, PyAny>,
+    /// Optional labels returned for forward aggregation output positions.
+    left_output_positions: Option<PyReadonlyArray1<'py, i64>>,
+    /// Optional labels returned for reverse aggregation output positions.
+    right_output_positions: Option<PyReadonlyArray1<'py, i64>>,
+}
+
+/// The normalized predicates and the named metadata parsed from the first
+/// aggregation anchor.
+struct PreparedPredicates<'py> {
+    /// Five-field predicates consumed by region parsing and residual parsing.
+    predicates: Bound<'py, PyList>,
+    /// Named form of the first aggregation anchor.
+    first: ParsedAggregationAnchor<'py>,
+}
+
+/// Parse the first aggregation anchor once and expose named Rust fields.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token used to create the normalized
+///   five-field tuple.
+/// * `first` - The first predicate tuple. It must use either the six-field
+///   form or the established eight-field form:
+///   `(left, left_index, right, right_index, ordered, left_map, right_map,
+///   operator)`.
+///
+/// # Returns
+///
+/// A named anchor containing the parsed range predicate, operator, and output
+/// maps. NumPy arrays are borrowed; no column values are copied.
+///
+/// # Errors
+///
+/// Returns `ValueError` for invalid tuple length, a non-boolean ordering flag,
+/// invalid output maps, unsupported dtypes/operators, or mismatched
+/// value/index lengths.
+fn parse_aggregation_anchor<'py>(
+    py: Python<'py>,
+    first: &Bound<'py, PyTuple>,
+) -> PyResult<ParsedAggregationAnchor<'py>> {
+    let (operator_position, left_output_positions, right_output_positions) = match first.len() {
+        6 => {
+            // The flag is not used by the region algorithm, but it is part of
+            // the public contract and must still be a bool.
+            first.get_item(4)?.extract::<bool>()?;
+            (5, None, None)
+        }
+        8 => {
+            // Keep this order identical to range_join_agg.rs. The ordering
+            // flag comes before both output maps.
+            first.get_item(4)?.extract::<bool>()?;
+            let left = first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?;
+            let right = first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?;
+            (7, Some(left), Some(right))
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "region aggregation first anchor must contain 6 or 8 elements",
+            ));
+        }
+    };
+
+    let operator = first.get_item(operator_position)?;
+    let normalized = PyTuple::new(
+        py,
+        [
+            first.get_item(0)?,
+            first.get_item(1)?,
+            first.get_item(2)?,
+            first.get_item(3)?,
+            operator.clone(),
+        ],
+    )?;
+    let range = parse_any_range_predicate(&normalized, true)?;
+    range.validate_lengths().map_err(PyValueError::new_err)?;
+    if let Some(values) = left_output_positions.as_ref() {
+        if values.as_array().len() != range.left_len() {
+            return Err(PyValueError::new_err(
+                "left output positions must match the left value length",
+            ));
+        }
+    }
+    if let Some(values) = right_output_positions.as_ref() {
+        if values.as_array().len() != range.right_len() {
+            return Err(PyValueError::new_err(
+                "right output positions must match the right value length",
+            ));
+        }
+    }
+
+    Ok(ParsedAggregationAnchor {
+        range,
+        operator,
+        left_output_positions,
+        right_output_positions,
+    })
+}
+
 /// Normalize the first aggregation predicate to the five-field region-anchor
-/// form. Aggregation callers may add output-position maps to that tuple; the
-/// maps are consumed separately by the Python aggregation entry points.
+/// form and parse its named aggregation metadata once.
 ///
 /// # Arguments
 ///
@@ -83,33 +192,12 @@ use pyo3::types::{PyList, PyTuple};
 fn normalized_predicates<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
-) -> PyResult<Bound<'py, PyList>> {
-    // Aggregation anchors may contain two extra arrays after the four data
-    // arrays: one output-position map for each direction. Region construction
-    // does not use those maps, so it expects the ordinary five-field anchor.
+) -> PyResult<PreparedPredicates<'py>> {
     let first_item = predicates.get_item(0)?;
     let first = first_item.cast::<PyTuple>()?;
     let second_item = predicates.get_item(1)?;
     let second = second_item.cast::<PyTuple>()?;
-    let first_op = match first.len() {
-        6 => {
-            // The ordering flag is owned by PyJanitor, but its type remains
-            // part of the public tuple contract and must be validated.
-            first.get_item(4)?.extract::<bool>()?;
-            first.get_item(5)?
-        }
-        8 => {
-            // Eight-field anchors place the two output maps at positions
-            // four and five, followed by the ordering flag and operator.
-            first.get_item(6)?.extract::<bool>()?;
-            first.get_item(7)?
-        }
-        _ => {
-            return Err(PyValueError::new_err(
-                "region aggregation first anchor must contain 6 or 8 elements",
-            ));
-        }
-    };
+    let parsed_first = parse_aggregation_anchor(py, first)?;
     if second.len() != 5 {
         return Err(PyValueError::new_err(
             "region aggregation second anchor must contain 5 elements",
@@ -125,7 +213,7 @@ fn normalized_predicates<'py>(
             first.get_item(1)?,
             first.get_item(2)?,
             first.get_item(3)?,
-            first_op,
+            parsed_first.operator.clone(),
         ],
     )?)?;
     normalized.append(second)?;
@@ -134,7 +222,10 @@ fn normalized_predicates<'py>(
         // evaluated against the aligned physical positions during the sweep.
         normalized.append(item)?;
     }
-    Ok(normalized)
+    Ok(PreparedPredicates {
+        predicates: normalized,
+        first: parsed_first,
+    })
 }
 
 /// Execute exact dual-region aggregation and build the standard Python result.
@@ -179,10 +270,8 @@ fn aggregate_regions_exact<'py>(
         ));
     }
 
-    let first_item = predicates.get_item(0)?;
-    let first = first_item.cast::<PyTuple>()?;
-    let normalized = normalized_predicates(py, predicates)?;
-    let regions = regions::parse_and_align(&normalized)?;
+    let prepared = normalized_predicates(py, predicates)?;
+    let regions = regions::parse_and_align(&prepared.predicates)?;
     if regions.left_index.is_empty() || regions.right_index.is_empty() {
         return Ok(None);
     }
@@ -198,16 +287,8 @@ fn aggregate_regions_exact<'py>(
     // They do not replace the source-position mappings in `regions`: an empty
     // region row may mean that compact region position 0 belongs to original
     // source position 1.
-    let left_output_positions = if first.len() == 8 {
-        Some(first.get_item(4)?.extract::<PyReadonlyArray1<'py, i64>>()?)
-    } else {
-        None
-    };
-    let right_output_positions = if first.len() == 8 {
-        Some(first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?)
-    } else {
-        None
-    };
+    let left_output_positions = prepared.first.left_output_positions.as_ref();
+    let right_output_positions = prepared.first.right_output_positions.as_ref();
     let output_positions = if reverse {
         right_output_positions
             .as_ref()
@@ -217,43 +298,17 @@ fn aggregate_regions_exact<'py>(
             .as_ref()
             .map(|values| values.as_array())
     };
-    if let Some(values) = left_output_positions.as_ref() {
-        if values.len()? != regions.left_len {
-            return Err(PyValueError::new_err(
-                "left output positions must match the left value length",
-            ));
-        }
-    }
-    if let Some(values) = right_output_positions.as_ref() {
-        if values.len()? != regions.right_len {
-            return Err(PyValueError::new_err(
-                "right output positions must match the right value length",
-            ));
-        }
-    }
     let output_len = output_positions
         .map(|values| values.len())
         .unwrap_or(if reverse {
-            first
-                .get_item(3)?
-                .extract::<PyReadonlyArray1<'py, i64>>()?
-                .len()?
+            prepared.first.range.right_len()
         } else {
-            first
-                .get_item(1)?
-                .extract::<PyReadonlyArray1<'py, i64>>()?
-                .len()?
+            prepared.first.range.left_len()
         });
     let source_len = if reverse {
-        first
-            .get_item(1)?
-            .extract::<PyReadonlyArray1<'py, i64>>()?
-            .len()?
+        prepared.first.range.left_len()
     } else {
-        first
-            .get_item(3)?
-            .extract::<PyReadonlyArray1<'py, i64>>()?
-            .len()?
+        prepared.first.range.right_len()
     };
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
 
@@ -373,17 +428,11 @@ fn aggregate_regions_extended<'py>(
         ));
     }
 
-    // Keep the original first tuple because its optional output maps are
-    // needed after region construction to put results back into PyJanitor's
-    // compact output layout.
-    let first_item = predicates.get_item(0)?;
-    let first = first_item.cast::<PyTuple>()?;
-
     // Region construction reads only the first two anchors. It aligns their
     // left and right rows by original index labels, so the two independently
     // built region paths can be traversed together safely.
-    let normalized = normalized_predicates(py, predicates)?;
-    let regions = regions::parse_and_align(&normalized)?;
+    let prepared = normalized_predicates(py, predicates)?;
+    let regions = regions::parse_and_align(&prepared.predicates)?;
     if regions.left_index.is_empty() || regions.right_index.is_empty() {
         // At least one anchor has no surviving aligned rows. There can be no
         // aggregation event, so return the same no-match result as other
@@ -413,16 +462,8 @@ fn aggregate_regions_extended<'py>(
     // layout. The left map is returned for forward aggregation and the right
     // map for reverse aggregation. Six-field anchors use an implicit identity
     // output layout.
-    let left_output_positions = if first.len() == 8 {
-        Some(first.get_item(4)?.extract::<PyReadonlyArray1<'py, i64>>()?)
-    } else {
-        None
-    };
-    let right_output_positions = if first.len() == 8 {
-        Some(first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?)
-    } else {
-        None
-    };
+    let left_output_positions = prepared.first.left_output_positions.as_ref();
+    let right_output_positions = prepared.first.right_output_positions.as_ref();
     let output_positions = if reverse {
         right_output_positions
             .as_ref()
@@ -435,45 +476,19 @@ fn aggregate_regions_extended<'py>(
     // `output_len` is the number of rows receiving results. Forward output
     // has one slot per left row; reverse output has one slot per right row.
     // When a compact map exists, its length is the authoritative slot count.
-    if let Some(values) = left_output_positions.as_ref() {
-        if values.len()? != regions.left_len {
-            return Err(PyValueError::new_err(
-                "left output positions must match the left value length",
-            ));
-        }
-    }
-    if let Some(values) = right_output_positions.as_ref() {
-        if values.len()? != regions.right_len {
-            return Err(PyValueError::new_err(
-                "right output positions must match the right value length",
-            ));
-        }
-    }
     let output_len = output_positions
         .map(|values| values.len())
         .unwrap_or(if reverse {
-            first
-                .get_item(3)?
-                .extract::<PyReadonlyArray1<'py, i64>>()?
-                .len()?
+            prepared.first.range.right_len()
         } else {
-            first
-                .get_item(1)?
-                .extract::<PyReadonlyArray1<'py, i64>>()?
-                .len()?
+            prepared.first.range.left_len()
         });
     // `source_len` is the length of the values being aggregated. It is the
     // right side in forward mode and the left side in reverse mode.
     let source_len = if reverse {
-        first
-            .get_item(1)?
-            .extract::<PyReadonlyArray1<'py, i64>>()?
-            .len()?
+        prepared.first.range.left_len()
     } else {
-        first
-            .get_item(3)?
-            .extract::<PyReadonlyArray1<'py, i64>>()?
-            .len()?
+        prepared.first.range.right_len()
     };
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
 
