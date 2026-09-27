@@ -1762,6 +1762,11 @@ fn parse_extended_anchor<'py, T: numpy::Element + PartialOrd + Copy>(
                 op,
                 CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
             ) {
+                // This parser handles the range form only.  The separate
+                // null-aware `!=` form has an eleven-field layout and is
+                // parsed by the branch below; keep this message specific so
+                // callers can distinguish an unsupported range operator from
+                // a malformed `!=` payload.
                 return Err(PyValueError::new_err(
                     "the first range predicate must use <, <=, >, or >=",
                 ));
@@ -2565,6 +2570,35 @@ mod extended_tests {
                 single_join_extended_indices_int64(py, &bad_first_shape, "all"),
                 py,
                 "the first extended predicate must contain 6 or 11 elements",
+            );
+
+            // A six-field first predicate is the range layout.  `!=` is not
+            // a range anchor, so it must be rejected at this boundary rather
+            // than reaching the range builder with an unsupported operator.
+            let bad_range_operator = PyList::empty(py);
+            bad_range_operator.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![20_i64]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            bad_range_operator.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert_value_error(
+                single_join_extended_indices_int64(py, &bad_range_operator, "all"),
+                py,
+                "the first range predicate must use <, <=, >, or >=",
             );
 
             let invalid_keep = PyList::empty(py);
