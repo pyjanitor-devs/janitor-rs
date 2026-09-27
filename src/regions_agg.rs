@@ -797,6 +797,19 @@ mod tests {
         Ok((positions, matched, outputs))
     }
 
+    fn result_without_matched<'py>(
+        result: &Bound<'py, PyTuple>,
+    ) -> PyResult<(Vec<i64>, Vec<Vec<i64>>)> {
+        let positions = result.get_item(0)?.extract::<Vec<i64>>()?;
+        let outputs_item = result.get_item(1)?;
+        let outputs = outputs_item.cast::<PyList>()?;
+        let outputs = outputs
+            .iter()
+            .map(|output| output.extract::<Vec<i64>>())
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok((positions, outputs))
+    }
+
     #[test]
     fn greater_than_anchors_aggregate_forward_and_reverse() {
         Python::initialize();
@@ -918,6 +931,141 @@ mod tests {
                     vec![200, 0, 0, 0]
                 )
             );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn exact_aggregation_supports_multiple_operations_masks_and_no_matched_output() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = dual_predicates(py, vec![1, 2], vec![1, 2], "<=", ">=")?;
+            let values = PyArray1::from_vec(py, vec![2_i64, 3]);
+            let nulls = PyArray1::from_vec(py, vec![false, true]);
+            let aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "prod".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            nulls.clone().into_any(),
+                            "count".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            "size".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "min".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "max".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+            let result = region_aggregate(py, &predicates, &aggregations, false)?
+                .expect("the two equality pairs should aggregate");
+            let (positions, outputs) = result_without_matched(&result)?;
+            assert_eq!(positions, vec![0, 1]);
+            assert_eq!(
+                outputs,
+                vec![
+                    vec![2, 0],
+                    vec![2, 1],
+                    vec![1, 0],
+                    vec![1, 1],
+                    vec![0, -1],
+                    vec![0, -1]
+                ]
+            );
+
+            let no_match = dual_predicates(py, vec![10], vec![1, 2], "<", "<")?;
+            assert!(region_aggregate(py, &no_match, &aggregations, false)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn aggregation_supports_unsigned_and_float_sources() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = dual_predicates(py, vec![1], vec![1], "<=", ">=")?;
+            let unsigned = PyArray1::from_vec(py, vec![7_u64]);
+            let floats = PyArray1::from_vec(py, vec![1.5_f64]);
+            let mask = PyArray1::from_vec(py, vec![false]);
+            let aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            unsigned.into_any(),
+                            mask.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            floats.into_any(),
+                            mask.into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+            let result = region_aggregate(py, &predicates, &aggregations, false)?
+                .expect("the equality pair should aggregate");
+            let outputs_item = result.get_item(1)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<u64>>()?, vec![7]);
+            assert_eq!(outputs.get_item(1)?.extract::<Vec<f64>>()?, vec![1.5_f64]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn aggregation_rejects_malformed_residuals_without_panicking() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = dual_predicates(py, vec![1], vec![1], "<=", ">=")?;
+            predicates.append(PyTuple::new(py, [1_i64.into_pyobject(py)?.into_any()])?)?;
+            let aggregations = aggregation(py, vec![1])?;
+            assert!(region_extended_aggregate(py, &predicates, &aggregations, true).is_err());
             Ok(())
         })
         .unwrap();

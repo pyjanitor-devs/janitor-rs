@@ -749,6 +749,16 @@ fn labels(boundary: RegionBoundary) -> LabeledRegions {
             left_index.push(original_left_index[position]);
             left_region.push(right_region[*boundary]);
             left_positions.push(position);
+        } else if reverse && *boundary == right_region.len() && !right_region.is_empty() {
+            // A greater-than-or-equal prefix may end exactly at the right
+            // length.  That means the prefix contains every right row, not
+            // that the left row has no candidates.  There is no element at
+            // `boundary` to index, so use the label immediately after the
+            // final prefix element.  The reverse normalization below turns
+            // this into the minimum label of the reversed right suffix.
+            left_index.push(original_left_index[position]);
+            left_region.push(right_region[right_region.len() - 1] + 1);
+            left_positions.push(position);
         }
     }
     let left_len = original_left_index.len();
@@ -1059,6 +1069,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use numpy::PyArray1;
+    use pyo3::types::PyDict;
 
     fn regions(right_second: Vec<i64>) -> AlignedRegions {
         AlignedRegions {
@@ -1164,5 +1176,196 @@ mod tests {
             .expect("selection should succeed");
         output.extend(left.into_iter().zip(right));
         assert_eq!(output, vec![(10, 22), (11, 22)]);
+    }
+
+    /// Construct the public five-field representation used by the index
+    /// wrappers.  The two anchors deliberately share the same arrays here so
+    /// the expected result can be checked with a small brute-force matcher.
+    fn public_predicates<'py>(
+        py: Python<'py>,
+        left: &[i64],
+        right: &[i64],
+        first_operator: &str,
+        second_operator: &str,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let predicates = PyList::empty(py);
+        let left_index = PyArray1::from_vec(py, (0..left.len() as i64).collect());
+        let right_index = PyArray1::from_vec(py, (0..right.len() as i64).collect());
+        for operator in [first_operator, second_operator] {
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, left.to_vec()).into_any(),
+                    left_index.clone().into_any(),
+                    PyArray1::from_vec(py, right.to_vec()).into_any(),
+                    right_index.clone().into_any(),
+                    operator.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+        }
+        Ok(predicates)
+    }
+
+    /// Read the pair arrays returned by either public index wrapper.
+    fn public_pairs(result: &Bound<'_, PyDict>) -> PyResult<Vec<(i64, i64)>> {
+        let left = result
+            .get_item("left_index")?
+            .ok_or_else(|| PyValueError::new_err("result has no left_index"))?
+            .extract::<Vec<i64>>()?;
+        let right = result
+            .get_item("right_index")?
+            .ok_or_else(|| PyValueError::new_err("result has no right_index"))?
+            .extract::<Vec<i64>>()?;
+        Ok(left.into_iter().zip(right).collect())
+    }
+
+    fn comparison(left: i64, right: i64, operator: &str) -> bool {
+        match operator {
+            "<" => left < right,
+            "<=" => left <= right,
+            ">" => left > right,
+            ">=" => left >= right,
+            "==" => left == right,
+            "!=" => left != right,
+            _ => panic!("unsupported test operator"),
+        }
+    }
+
+    fn expected_pairs(
+        left: &[i64],
+        right: &[i64],
+        first_operator: &str,
+        second_operator: &str,
+    ) -> Vec<(i64, i64)> {
+        left.iter()
+            .enumerate()
+            .flat_map(|(left_position, &left_value)| {
+                right
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(right_position, &right_value)| {
+                        (comparison(left_value, right_value, first_operator)
+                            && comparison(left_value, right_value, second_operator))
+                        .then_some((left_position as i64, right_position as i64))
+                    })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn public_indices_match_bruteforce_for_all_anchor_operator_pairs() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left = [0, 1, 2, 3];
+            let right = [0, 1, 2, 3];
+            let operators = ["<", "<=", ">", ">="];
+            for first_operator in operators {
+                for second_operator in operators {
+                    let predicates =
+                        public_predicates(py, &left, &right, first_operator, second_operator)?;
+                    let result = region_indices(py, &predicates, "all")?;
+                    let mut actual = result
+                        .as_ref()
+                        .map(public_pairs)
+                        .transpose()?
+                        .unwrap_or_default();
+                    let mut expected =
+                        expected_pairs(&left, &right, first_operator, second_operator);
+                    actual.sort_unstable();
+                    expected.sort_unstable();
+                    assert_eq!(actual, expected, "{first_operator} then {second_operator}");
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn public_indices_keep_modes_handle_duplicate_right_values() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = public_predicates(py, &[1], &[1, 1, 2], "<=", ">=")?;
+            let all = region_indices(py, &predicates, "all")?
+                .map(|result| public_pairs(&result))
+                .transpose()?
+                .unwrap();
+            assert_eq!(all.len(), 2);
+
+            let first = region_indices(py, &predicates, "first")?
+                .map(|result| public_pairs(&result))
+                .transpose()?
+                .unwrap();
+            let last = region_indices(py, &predicates, "last")?
+                .map(|result| public_pairs(&result))
+                .transpose()?
+                .unwrap();
+            let any = region_indices(py, &predicates, "any")?
+                .map(|result| public_pairs(&result))
+                .transpose()?
+                .unwrap();
+            assert_eq!(first.len(), 1);
+            assert_eq!(last.len(), 1);
+            assert_eq!(any.len(), 1);
+            assert!(all.contains(&(0, 0)) && all.contains(&(0, 1)));
+            assert!(first[0].1 == 0 || first[0].1 == 1);
+            assert!(last[0].1 == 0 || last[0].1 == 1);
+            assert!(any[0].1 == 0 || any[0].1 == 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn extended_indices_filter_after_region_candidates() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = public_predicates(py, &[1, 2], &[1, 2, 3], "<=", ">=")?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![10_i64, 20]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                    "==".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let result = region_indices_extended(py, &predicates, "all")?
+                .map(|result| public_pairs(&result))
+                .transpose()?
+                .unwrap();
+            assert_eq!(result, vec![(0, 0), (1, 1)]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn public_indices_reject_malformed_lengths_and_residuals() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let empty = public_predicates(py, &[], &[], "<=", ">=")?;
+            assert!(region_indices(py, &empty, "all")?.is_none());
+
+            let predicates = PyList::new(
+                py,
+                [PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![1_i64, 2]).into_any(),
+                        PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![1_i64, 2]).into_any(),
+                        PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                        "<=".into_pyobject(py)?.into_any(),
+                    ],
+                )?],
+            )?;
+            assert!(region_indices(py, &predicates, "all").is_err());
+
+            let predicates = public_predicates(py, &[1], &[1], "<=", ">=")?;
+            predicates.append(PyTuple::new(py, [1_i64.into_pyobject(py)?.into_any()])?)?;
+            assert!(region_indices_extended(py, &predicates, "all").is_err());
+            Ok(())
+        })
+        .unwrap();
     }
 }
