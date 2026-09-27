@@ -51,58 +51,36 @@
 //! been filtered and reordered. Regions must not apply that permutation logic
 //! to these maps.
 
-use std::collections::BTreeMap;
-
 use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
 use crate::join_aggregation_helpers::residuals;
-use crate::multi_join_indices::common::{add_right_region, checked_region_start, GroupState};
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, predicates_match_dispatch, Predicate,
 };
-use crate::range_predicate::{parse_any_range_predicate, AnyParsedRangePredicate};
+use crate::range_predicate::{
+    parse_aggregation_range_anchor, AnyParsedRangePredicate, ParsedAggregationRangeAnchor,
+};
 use crate::regions;
 use numpy::ndarray::ArrayView1;
-use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
-/// Parsed representation of the first aggregation anchor.
-///
-/// The Python API remains tuple-based for compatibility, but the rest of the
-/// Rust implementation uses these named fields. This prevents tuple-field
-/// numbers from spreading through the aggregation kernels and makes the
-/// established six/eight-field contract explicit in one place.
-struct ParsedAggregationAnchor<'py> {
-    /// Parsed and dtype-dispatched range data used by region construction.
-    range: AnyParsedRangePredicate<'py>,
-    /// Original operator object retained for the normalized five-field tuple.
-    operator: Bound<'py, PyAny>,
-    /// Optional labels returned for forward aggregation output positions.
-    left_output_positions: Option<PyReadonlyArray1<'py, i64>>,
-    /// Optional labels returned for reverse aggregation output positions.
-    right_output_positions: Option<PyReadonlyArray1<'py, i64>>,
-}
-
-/// The normalized predicates and the named metadata parsed from the first
-/// aggregation anchor.
+/// The two named region anchors parsed at the Python/Rust boundary.
 struct PreparedPredicates<'py> {
-    /// Five-field predicates consumed by region parsing and residual parsing.
-    predicates: Bound<'py, PyList>,
-    /// Named form of the first aggregation anchor.
-    first: ParsedAggregationAnchor<'py>,
+    /// First anchor, including optional output-position maps.
+    first: ParsedAggregationRangeAnchor<'py>,
+    /// Second anchor, which uses the five-field region form.
+    second: AnyParsedRangePredicate<'py>,
 }
 
-/// Parse the first aggregation anchor once and expose named Rust fields.
+/// Parse the two region aggregation anchors once and expose named Rust fields.
 ///
 /// # Arguments
 ///
-/// * `py` - Active Python interpreter token used to create the normalized
-///   five-field tuple.
-/// * `first` - The first predicate tuple. It must use either the six-field
-///   form or the established eight-field form:
-///   `(left, left_index, right, right_index, ordered, left_map, right_map,
-///   operator)`.
+/// * `py` - Active Python interpreter token used while borrowing the tuples.
+/// * `predicates` - Full predicate list. The first tuple must use either the
+///   six-field form or the established eight-field form; the second tuple
+///   must use the five-field region form.
 ///
 /// # Returns
 ///
@@ -114,126 +92,22 @@ struct PreparedPredicates<'py> {
 /// Returns `ValueError` for invalid tuple length, a non-boolean ordering flag,
 /// invalid output maps, unsupported dtypes/operators, or mismatched
 /// value/index lengths.
-fn parse_aggregation_anchor<'py>(
-    py: Python<'py>,
-    first: &Bound<'py, PyTuple>,
-) -> PyResult<ParsedAggregationAnchor<'py>> {
-    let (operator_position, left_output_positions, right_output_positions) = match first.len() {
-        6 => {
-            // The flag is not used by the region algorithm, but it is part of
-            // the public contract and must still be a bool.
-            first.get_item(4)?.extract::<bool>()?;
-            (5, None, None)
-        }
-        8 => {
-            // Keep this order identical to range_join_agg.rs. The ordering
-            // flag comes before both output maps.
-            first.get_item(4)?.extract::<bool>()?;
-            let left = first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?;
-            let right = first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?;
-            (7, Some(left), Some(right))
-        }
-        _ => {
-            return Err(PyValueError::new_err(
-                "region aggregation first anchor must contain 6 or 8 elements",
-            ));
-        }
-    };
-
-    let operator = first.get_item(operator_position)?;
-    let normalized = PyTuple::new(
-        py,
-        [
-            first.get_item(0)?,
-            first.get_item(1)?,
-            first.get_item(2)?,
-            first.get_item(3)?,
-            operator.clone(),
-        ],
-    )?;
-    let range = parse_any_range_predicate(&normalized, true)?;
-    range.validate_lengths().map_err(PyValueError::new_err)?;
-    if let Some(values) = left_output_positions.as_ref() {
-        if values.as_array().len() != range.left_len() {
-            return Err(PyValueError::new_err(
-                "left output positions must match the left value length",
-            ));
-        }
-    }
-    if let Some(values) = right_output_positions.as_ref() {
-        if values.as_array().len() != range.right_len() {
-            return Err(PyValueError::new_err(
-                "right output positions must match the right value length",
-            ));
-        }
-    }
-
-    Ok(ParsedAggregationAnchor {
-        range,
-        operator,
-        left_output_positions,
-        right_output_positions,
-    })
-}
-
-/// Normalize the first aggregation predicate to the five-field region-anchor
-/// form and parse its named aggregation metadata once.
+/// Parse the first two region aggregation anchors once.
 ///
-/// # Arguments
-///
-/// * `py` - Active Python interpreter token used to create the normalized
-///   temporary list and tuple.
-/// * `predicates` - Full predicate list. The first item is the first region
-///   anchor, the second item is the second five-field region anchor, and any
-///   later items are copied unchanged as residual filters.
-///
-/// # Returns
-///
-/// A temporary predicate list suitable for [`regions::parse_and_align`]. The
-/// returned list borrows the original NumPy arrays; it does not copy values.
-///
-/// # Errors
-///
-/// Returns `ValueError` when the first anchor does not contain six or eight
-/// fields, when the ordering flag is not boolean, or when the second anchor
-/// does not contain five fields. The output maps are not copied into the
-/// normalized tuple because region construction does not need them.
-fn normalized_predicates<'py>(
-    py: Python<'py>,
-    predicates: &Bound<'py, PyList>,
-) -> PyResult<PreparedPredicates<'py>> {
+/// The returned request keeps the first anchor's output maps alongside its
+/// typed range data and keeps the second typed range separately. Later
+/// residual predicates remain in the original Python list and are parsed by
+/// the shared residual parser only for extended aggregation.
+fn parse_region_anchors<'py>(predicates: &Bound<'py, PyList>) -> PyResult<PreparedPredicates<'py>> {
     let first_item = predicates.get_item(0)?;
     let first = first_item.cast::<PyTuple>()?;
     let second_item = predicates.get_item(1)?;
     let second = second_item.cast::<PyTuple>()?;
-    let parsed_first = parse_aggregation_anchor(py, first)?;
-    if second.len() != 5 {
-        return Err(PyValueError::new_err(
-            "region aggregation second anchor must contain 5 elements",
-        ));
-    }
-    let normalized = PyList::empty(py);
-    // Keep the original NumPy arrays borrowed. This creates only a small
-    // tuple/list wrapper; it does not copy the join columns or index labels.
-    normalized.append(PyTuple::new(
-        py,
-        [
-            first.get_item(0)?,
-            first.get_item(1)?,
-            first.get_item(2)?,
-            first.get_item(3)?,
-            parsed_first.operator.clone(),
-        ],
-    )?)?;
-    normalized.append(second)?;
-    for item in predicates.iter().skip(2) {
-        // Residual predicates remain unchanged. They are parsed later and
-        // evaluated against the aligned physical positions during the sweep.
-        normalized.append(item)?;
-    }
+    let parsed_first = parse_aggregation_range_anchor(first, true)?;
+    let parsed_second = parse_aggregation_range_anchor(second, false)?;
     Ok(PreparedPredicates {
-        predicates: normalized,
         first: parsed_first,
+        second: parsed_second.range,
     })
 }
 
@@ -256,9 +130,12 @@ fn normalized_predicates<'py>(
 /// accumulator slots, and `source_len` is the length of the values read by
 /// the accumulator.
 fn aggregation_layout<'py>(
-    first: &'py ParsedAggregationAnchor<'py>,
+    first: &'py ParsedAggregationRangeAnchor<'py>,
     reverse: bool,
 ) -> (Option<ArrayView1<'py, i64>>, usize, usize) {
+    // The ordering flag is validated by the parser and intentionally does not
+    // affect region traversal: PyJanitor supplies the sorted right layout.
+    let _ordering_flag_was_validated = first.ordered;
     let output_positions = if reverse {
         first
             .right_output_positions
@@ -285,70 +162,30 @@ fn aggregation_layout<'py>(
     (output_positions, output_len, source_len)
 }
 
-/// Traverse all primary region candidates once and invoke a caller-supplied
-/// consumer for each `(left_position, right_position)` pair.
+/// Parse and align the two primary region anchors, then describe the selected
+/// aggregation direction.
 ///
-/// This is deliberately a small traversal helper rather than a generic
-/// sweep abstraction: it owns only the paper sweep's active map and duplicate
-/// chains. Exact aggregation supplies an unconditional consumer; extended
-/// aggregation supplies a consumer that evaluates residual predicates first.
-/// Both paths therefore share the difficult boundary and duplicate handling
-/// without hiding their different update semantics.
+/// Exact and extended aggregation intentionally keep separate candidate
+/// consumers, because only the extended path evaluates residual predicates.
+/// They should nevertheless share this setup: parsing the first anchor twice
+/// or calculating output/source lengths differently would make the two public
+/// entry points disagree on malformed input or mapped output layouts.
 ///
 /// # Arguments
 ///
-/// * `regions` - Two already-built and aligned primary region paths.
-/// * `consume` - Called once per candidate that satisfies both primary
-///   regions. It receives compact region coordinates, not source positions.
+/// * `predicates` - Predicate list whose first two entries are region anchors.
+/// # Returns
 ///
-/// # Errors
-///
-/// Returns an error if a query boundary is outside the right layout or moves
-/// backwards relative to the already-linked active suffix.
-fn sweep_aggregation_candidates<F>(
-    regions: &regions::AlignedRegions,
-    mut consume: F,
-) -> Result<(), String>
-where
-    F: FnMut(usize, usize),
-{
-    let queries = regions::sweep_queries(regions);
-    let mut active = BTreeMap::<i64, GroupState>::new();
-    // `next` links equal second-region labels. A signed sentinel is used
-    // because `GroupState` stores the chain head as `-1` when it is empty.
-    let mut next = vec![-1_i64; regions.right_index.len()];
-    let mut previous_end = regions.right_index.len();
-
-    // Queries arrive in descending first-region boundary order. Each newly
-    // exposed right slice is inserted once, so duplicate labels remain
-    // separate chain entries while the B-tree supplies second-region order.
-    for (start, left_position) in queries {
-        let start = checked_region_start(
-            i64::try_from(start).map_err(|_| "region start exceeds i64 capacity")?,
-            regions.right_index.len(),
-            previous_end,
-        )?;
-        let Some(start) = start else {
-            continue;
-        };
-        add_right_region(
-            ArrayView1::from(&regions.right_second[..]),
-            start,
-            previous_end,
-            &mut next,
-            &mut active,
-        );
-        previous_end = start;
-        for (_, group) in active.range(regions.left_second[left_position]..) {
-            let mut position = group.head;
-            while position >= 0 {
-                let right_position = position as usize;
-                consume(left_position, right_position);
-                position = next[right_position];
-            }
-        }
-    }
-    Ok(())
+/// The parsed anchors and aligned region paths. Output/source layout is
+/// calculated by each caller after this function returns so a borrowed output
+/// map remains tied to the parsed anchor rather than to a temporary tuple.
+fn prepare_region_aggregation<'py>(
+    predicates: &Bound<'py, PyList>,
+) -> PyResult<(PreparedPredicates<'py>, regions::AlignedRegions)> {
+    let prepared = parse_region_anchors(predicates)?;
+    let regions = regions::align_parsed(&prepared.first.range, &prepared.second)
+        .map_err(PyValueError::new_err)?;
+    Ok((prepared, regions))
 }
 
 /// Execute exact dual-region aggregation and build the standard Python result.
@@ -393,8 +230,8 @@ fn aggregate_regions_exact<'py>(
         ));
     }
 
-    let prepared = normalized_predicates(py, predicates)?;
-    let regions = regions::parse_and_align(&prepared.predicates)?;
+    let (prepared, regions) = prepare_region_aggregation(predicates)?;
+    let (output_positions, output_len, source_len) = aggregation_layout(&prepared.first, reverse);
     if regions.left_index.is_empty() || regions.right_index.is_empty() {
         return Ok(None);
     }
@@ -409,12 +246,11 @@ fn aggregate_regions_exact<'py>(
     // The optional maps label output slots. They do not replace the source
     // mappings in `regions`, which are needed when labels compact or reverse
     // the physical traversal layout.
-    let (output_positions, output_len, source_len) = aggregation_layout(&prepared.first, reverse);
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
 
     // The shared traversal supplies compact region coordinates. Translate
     // them back to source coordinates only at the accumulator boundary.
-    sweep_aggregation_candidates(&regions, |left_position, right_position| {
+    regions::traverse_candidates(&regions, |left_position, right_position| {
         if reverse {
             set.update(
                 regions.left_positions[left_position],
@@ -426,6 +262,7 @@ fn aggregate_regions_exact<'py>(
                 regions.left_positions[left_position],
             );
         }
+        true
     })
     .map_err(PyValueError::new_err)?;
 
@@ -502,8 +339,8 @@ fn aggregate_regions_extended<'py>(
     // Region construction reads only the first two anchors. It aligns their
     // left and right rows by original index labels, so the two independently
     // built region paths can be traversed together safely.
-    let prepared = normalized_predicates(py, predicates)?;
-    let regions = regions::parse_and_align(&prepared.predicates)?;
+    let (prepared, regions) = prepare_region_aggregation(predicates)?;
+    let (output_positions, output_len, source_len) = aggregation_layout(&prepared.first, reverse);
     if regions.left_index.is_empty() || regions.right_index.is_empty() {
         // At least one anchor has no surviving aligned rows. There can be no
         // aggregation event, so return the same no-match result as other
@@ -531,7 +368,6 @@ fn aggregate_regions_extended<'py>(
 
     // An eight-field first anchor carries compact output labels. These labels
     // are not the physical-to-local permutation used by `!=` aggregation.
-    let (output_positions, output_len, source_len) = aggregation_layout(&prepared.first, reverse);
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
 
     // Convert parsed residual predicates into cheap Rust-side views once.
@@ -541,7 +377,7 @@ fn aggregate_regions_extended<'py>(
     let metadata_views = metadata.as_deref().map(null_metadata_views);
     // The shared traversal handles primary-region candidates. This callback
     // keeps the extended-only residual filtering directly before the update.
-    sweep_aggregation_candidates(&regions, |left_position, right_position| {
+    regions::traverse_candidates(&regions, |left_position, right_position| {
         let passes = predicates_match_dispatch(
             &views,
             metadata_views.as_deref(),
@@ -561,6 +397,7 @@ fn aggregate_regions_extended<'py>(
                 );
             }
         }
+        true
     })
     .map_err(PyValueError::new_err)?;
 

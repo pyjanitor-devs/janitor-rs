@@ -1718,6 +1718,100 @@ fn extended_join<'py, T: numpy::Element + PartialOrd + Copy>(
     Ok(Some(result_dict(py, out_left, out_right, None, None)?))
 }
 
+/// Named range anchor for the single-anchor extended index path.
+struct ParsedExtendedRangeAnchor<'py, T: numpy::Element> {
+    left: PyReadonlyArray1<'py, T>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right: PyReadonlyArray1<'py, T>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    op: CompareOp,
+}
+
+/// Named null-aware `!=` anchor for the single-anchor extended index path.
+struct ParsedExtendedNotEqualAnchor<'py, T: numpy::Element> {
+    left: PyReadonlyArray1<'py, T>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    left_positions: PyReadonlyArray1<'py, i64>,
+    left_null_positions: Option<PyReadonlyArray1<'py, i64>>,
+    right: PyReadonlyArray1<'py, T>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    right_positions: PyReadonlyArray1<'py, i64>,
+    right_null_positions: Option<PyReadonlyArray1<'py, i64>>,
+    right_index_is_ordered: bool,
+    is_extension_array: bool,
+}
+
+enum ParsedExtendedAnchor<'py, T: numpy::Element> {
+    Range(ParsedExtendedRangeAnchor<'py, T>),
+    NotEqual(ParsedExtendedNotEqualAnchor<'py, T>),
+}
+
+/// Parse the first anchor for the single-anchor extended index API.
+///
+/// The accepted six-field range and eleven-field null-aware `!=` layouts are
+/// kept compatible with the Python API, but the wrapper passes named fields to
+/// the candidate builders after this boundary.
+fn parse_extended_anchor<'py, T: numpy::Element + PartialOrd + Copy>(
+    first: &Bound<'py, PyTuple>,
+) -> PyResult<ParsedExtendedAnchor<'py, T>> {
+    match first.len() {
+        6 => {
+            let op = CompareOp::try_from_str(first.get_item(5)?.extract::<&str>()?)?;
+            first.get_item(4)?.extract::<bool>()?;
+            if !matches!(
+                op,
+                CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+            ) {
+                return Err(PyValueError::new_err(
+                    "the first range predicate must use <, <=, >, or >=",
+                ));
+            }
+            Ok(ParsedExtendedAnchor::Range(ParsedExtendedRangeAnchor {
+                left: first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?,
+                left_index: first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+                right: first.get_item(2)?.extract::<PyReadonlyArray1<'py, T>>()?,
+                right_index: first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+                op,
+            }))
+        }
+        11 => {
+            let op = CompareOp::try_from_str(first.get_item(10)?.extract::<&str>()?)?;
+            if op != CompareOp::Ne {
+                return Err(PyValueError::new_err(
+                    "the first eleven-element predicate must use !=",
+                ));
+            }
+            let left_null_positions = if first.get_item(3)?.is_none() {
+                None
+            } else {
+                Some(first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+            };
+            let right_null_positions = if first.get_item(7)?.is_none() {
+                None
+            } else {
+                Some(first.get_item(7)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+            };
+            Ok(ParsedExtendedAnchor::NotEqual(
+                ParsedExtendedNotEqualAnchor {
+                    left: first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?,
+                    left_index: first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+                    left_positions: first.get_item(2)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+                    left_null_positions,
+                    right: first.get_item(4)?.extract::<PyReadonlyArray1<'py, T>>()?,
+                    right_index: first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+                    right_positions: first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+                    right_null_positions,
+                    right_index_is_ordered: first.get_item(8)?.extract::<bool>()?,
+                    is_extension_array: first.get_item(9)?.extract::<bool>()?,
+                },
+            ))
+        }
+        _ => Err(PyValueError::new_err(
+            "the first extended predicate must contain 6 or 11 elements",
+        )),
+    }
+}
+
 macro_rules! extended_join_function {
     ($name:ident, $type:ty) => {
         /// Build flat indices for a multi-predicate conditional join.
@@ -1772,82 +1866,33 @@ macro_rules! extended_join_function {
             }
             let first_item = predicates.get_item(0)?;
             let first = first_item.cast::<PyTuple>()?;
-            let first_op_position = if first.len() == 6 {
-                5
-            } else if first.len() == 11 {
-                10
-            } else {
-                return Err(PyValueError::new_err(
-                    "the first extended predicate must contain 6 or 11 elements",
-                ));
-            };
-            let first_op =
-                CompareOp::try_from_str(first.get_item(first_op_position)?.extract::<&str>()?)?;
-            if first_op == CompareOp::Ne {
-                if first.len() != 11 {
-                    return Err(PyValueError::new_err(
-                        "the first != predicate must contain 11 elements",
-                    ));
-                }
-                let first_left_null_positions = if first.get_item(3)?.is_none() {
-                    None
-                } else {
-                    Some(first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?)
-                };
-                let first_right_null_positions = if first.get_item(7)?.is_none() {
-                    None
-                } else {
-                    Some(first.get_item(7)?.extract::<PyReadonlyArray1<'py, i64>>()?)
-                };
-                // Fields eight and nine belong to the shared null-aware
-                // anchor contract. Field eight carries right-label ordering
-                // metadata and field nine identifies pandas extension-array
-                // semantics. The former is retained for contract alignment;
-                // the latter controls how null candidates are treated.
-                return extended_not_equal_join(
+            match parse_extended_anchor::<$type>(first)? {
+                ParsedExtendedAnchor::Range(anchor) => extended_join(
                     py,
                     predicates,
                     keep,
-                    first
-                        .get_item(0)?
-                        .extract::<PyReadonlyArray1<'py, $type>>()?,
-                    first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-                    first.get_item(2)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-                    first_left_null_positions,
-                    first
-                        .get_item(4)?
-                        .extract::<PyReadonlyArray1<'py, $type>>()?,
-                    first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-                    first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-                    first_right_null_positions,
-                    first.get_item(8)?.extract::<bool>()?,
-                    first.get_item(9)?.extract::<bool>()?,
-                );
+                    anchor.left,
+                    anchor.left_index,
+                    anchor.right,
+                    anchor.right_index,
+                    anchor.op,
+                ),
+                ParsedExtendedAnchor::NotEqual(anchor) => extended_not_equal_join(
+                    py,
+                    predicates,
+                    keep,
+                    anchor.left,
+                    anchor.left_index,
+                    anchor.left_positions,
+                    anchor.left_null_positions,
+                    anchor.right,
+                    anchor.right_index,
+                    anchor.right_positions,
+                    anchor.right_null_positions,
+                    anchor.right_index_is_ordered,
+                    anchor.is_extension_array,
+                ),
             }
-            if first.len() != 6 {
-                return Err(PyValueError::new_err(
-                    "the first range predicate must contain 6 elements",
-                ));
-            }
-            // The wrapper contract carries this flag even though the single
-            // extended kernel does not use it to choose a second window.
-            // Validate its type at the boundary so malformed tuples fail
-            // before candidate generation begins.
-            first.get_item(4)?.extract::<bool>()?;
-            extended_join(
-                py,
-                predicates,
-                keep,
-                first
-                    .get_item(0)?
-                    .extract::<PyReadonlyArray1<'py, $type>>()?,
-                first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-                first
-                    .get_item(2)?
-                    .extract::<PyReadonlyArray1<'py, $type>>()?,
-                first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-                first_op,
-            )
         }
     };
 }

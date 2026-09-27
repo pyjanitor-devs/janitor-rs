@@ -24,14 +24,13 @@
 //! calling these functions. Rust validates the tuple shape and lengths but
 //! does not sort the input.
 
-use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
 use crate::join_aggregation_helpers::aggregate_range_windows;
 use crate::range_join::build_any_windows;
-use crate::range_predicate::parse_any_range_predicate;
+use crate::range_predicate::parse_aggregation_range_anchor;
 
 /// Build and aggregate the per-row windows for a dual-range join.
 ///
@@ -57,88 +56,42 @@ pub(crate) fn aggregate_range_extended<'py>(
     let first_tuple = first_item.cast::<PyTuple>()?;
     let second_item = predicates.get_item(1)?;
     let second_tuple = second_item.cast::<PyTuple>()?;
-    if !matches!(first_tuple.len(), 6 | 8) || second_tuple.len() != 5 {
-        return Err(PyValueError::new_err(
-            "range extended aggregation has invalid anchor tuple lengths",
-        ));
-    }
-
-    // The aggregation form may carry output maps in fields five and six.
-    // Normalize only the first anchor to the five-field window form so the
-    // dtype dispatcher can use one parser for both index and aggregation
-    // paths; the maps remain borrowed separately below.
-    let first_window_tuple = if first_tuple.len() == 8 {
-        PyTuple::new(
-            py,
-            [
-                first_tuple.get_item(0)?,
-                first_tuple.get_item(1)?,
-                first_tuple.get_item(2)?,
-                first_tuple.get_item(3)?,
-                first_tuple.get_item(7)?,
-            ],
-        )?
-    } else {
-        PyTuple::new(
-            py,
-            [
-                first_tuple.get_item(0)?,
-                first_tuple.get_item(1)?,
-                first_tuple.get_item(2)?,
-                first_tuple.get_item(3)?,
-                first_tuple.get_item(5)?,
-            ],
-        )?
-    };
-    let first = parse_any_range_predicate(&first_window_tuple, true)?;
-    let second = parse_any_range_predicate(second_tuple, true)?;
+    let first = parse_aggregation_range_anchor(first_tuple, true)?;
+    let second = parse_aggregation_range_anchor(second_tuple, false)?;
     let (parsed, metadata) =
         crate::join_aggregation_helpers::residuals(py, predicates, false, true)?;
-    crate::predicate::check_predicate_lengths(&parsed, first.left_len(), first.right_len())?;
-    let windows = build_any_windows(&first, &second).map_err(PyValueError::new_err)?;
+    crate::predicate::check_predicate_lengths(
+        &parsed,
+        first.range.left_len(),
+        first.range.right_len(),
+    )?;
+    let windows = build_any_windows(&first.range, &second.range).map_err(PyValueError::new_err)?;
     if windows.left_index.is_empty() {
         return Ok(None);
     }
 
-    // Field four remains the shared ordering flag; it is not an output map.
-    let left_output_positions = if first_tuple.len() == 8 {
-        Some(
-            first_tuple
-                .get_item(5)?
-                .extract::<PyReadonlyArray1<'py, i64>>()?,
-        )
-    } else {
-        None
-    };
-    let right_output_positions = if first_tuple.len() == 8 {
-        Some(
-            first_tuple
-                .get_item(6)?
-                .extract::<PyReadonlyArray1<'py, i64>>()?,
-        )
-    } else {
-        None
-    };
     let output_positions = if reverse {
-        right_output_positions
+        first
+            .right_output_positions
             .as_ref()
             .map(|values| values.as_array())
     } else {
-        left_output_positions
+        first
+            .left_output_positions
             .as_ref()
             .map(|values| values.as_array())
     };
     let output_len = output_positions
         .map(|values| values.len())
         .unwrap_or(if reverse {
-            first.right_len()
+            first.range.right_len()
         } else {
-            first.left_len()
+            first.range.left_len()
         });
     let source_len = if reverse {
-        first.left_len()
+        first.range.left_len()
     } else {
-        first.right_len()
+        first.range.right_len()
     };
     aggregate_range_windows(
         py,

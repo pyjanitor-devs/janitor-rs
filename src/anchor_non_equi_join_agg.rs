@@ -19,6 +19,7 @@ use crate::op::CompareOp;
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, predicates_match_dispatch, PredicateView,
 };
+use crate::range_predicate::{parse_aggregation_range_anchor, AnyParsedRangePredicate};
 
 /// Build a lookup from original physical rows to compact aggregation slots.
 ///
@@ -1008,6 +1009,69 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
 /// Returns `(output_positions, matched, aggregation_arrays)` when
 /// `return_matched` is true, or `(output_positions, aggregation_arrays)` when
 /// it is false. Returns `None` when no candidate survives.
+/// Named representation of the thirteen-field null-aware `!=` aggregation
+/// anchor. The tuple layout is parsed once at the Python/Rust boundary; the
+/// traversal functions below consume these fields directly.
+struct ParsedNotEqualAggregationAnchor<'py, T: numpy::Element> {
+    left: PyReadonlyArray1<'py, T>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    left_positions: PyReadonlyArray1<'py, i64>,
+    left_null_positions: Option<PyReadonlyArray1<'py, i64>>,
+    right: PyReadonlyArray1<'py, T>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    right_positions: PyReadonlyArray1<'py, i64>,
+    right_null_positions: Option<PyReadonlyArray1<'py, i64>>,
+    left_output_positions: PyReadonlyArray1<'py, i64>,
+    right_output_positions: PyReadonlyArray1<'py, i64>,
+    is_extension_array: bool,
+}
+
+/// Parse the thirteen-field null-aware `!=` aggregation anchor once.
+fn parse_not_equal_aggregation_anchor<'py, T: numpy::Element>(
+    first: &Bound<'py, PyTuple>,
+) -> PyResult<ParsedNotEqualAggregationAnchor<'py, T>> {
+    if first.len() != 13 {
+        return Err(PyValueError::new_err(
+            "the first extended aggregation predicate must contain 13 elements",
+        ));
+    }
+    let op = CompareOp::try_from_str(first.get_item(12)?.extract::<&str>()?)?;
+    if op != CompareOp::Ne {
+        return Err(PyValueError::new_err(
+            "the thirteen-element aggregation predicate must use !=",
+        ));
+    }
+    let left_null_positions = if first.get_item(3)?.is_none() {
+        None
+    } else {
+        Some(first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+    };
+    let right_null_positions = if first.get_item(7)?.is_none() {
+        None
+    } else {
+        Some(first.get_item(7)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+    };
+    first.get_item(8)?.extract::<bool>()?;
+    let is_extension_array = first.get_item(9)?.extract::<bool>()?;
+    Ok(ParsedNotEqualAggregationAnchor {
+        left: first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?,
+        left_index: first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+        left_positions: first.get_item(2)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+        left_null_positions,
+        right: first.get_item(4)?.extract::<PyReadonlyArray1<'py, T>>()?,
+        right_index: first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+        right_positions: first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+        right_null_positions,
+        left_output_positions: first
+            .get_item(10)?
+            .extract::<PyReadonlyArray1<'py, i64>>()?,
+        right_output_positions: first
+            .get_item(11)?
+            .extract::<PyReadonlyArray1<'py, i64>>()?,
+        is_extension_array,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
     py: Python<'py>,
@@ -1029,107 +1093,72 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
             "single extended aggregation requires at least one predicate",
         ));
     }
-    // Aggregation has three supported anchor layouts:
-    //
-    // * 6 elements: the compact range contract;
-    // * 8 elements: the range contract plus trimmed output-position maps;
-    // * 13 elements: the null-aware `!=` aggregation contract.
-    //
-    // The 11-element `!=` tuple is intentionally absent. It is the index-only
-    // contract and lacks the maps needed to place aggregation results safely.
-    // Rejecting it here prevents identity-position output from appearing
-    // correct when the physical and compact layouts differ.
-    // The length check must happen before any field extraction because the
-    // field positions differ between range and null-aware `!=` tuples.
-    match first.len() {
-        6 | 8 | 13 => {}
-        _ => {
-            return Err(PyValueError::new_err(
-                "the first extended aggregation predicate must contain 6, 8, or 13 elements",
-            ));
-        }
-    }
-    // Every accepted anchor puts its comparator in the final field. Reading
-    // it once after structural validation keeps tuple-length handling separate
-    // from operator validation and avoids one bespoke opcode branch per shape.
-    let op = CompareOp::try_from_str(first.get_item(first.len() - 1)?.extract::<&str>()?)?;
-    if first.len() != 13 {
-        // Six- and eight-field tuples are range anchors. Equality is handled
-        // upstream, and `!=` requires the separate null-aware thirteen-field
-        // layout, so neither comparator is valid in this branch.
-        if !matches!(
-            op,
-            CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
-        ) {
-            return Err(PyValueError::new_err(
-                "the range aggregation predicate must use <, <=, >, or >=",
-            ));
-        }
-        // The ordering flag is part of the shared predicate tuple contract.
-        // Aggregation does not use its value: PyJanitor has already sorted the
-        // right-hand arrays before calling Rust. Extract it only to validate
-        // the tuple shape and field type.
-        first.get_item(4)?.extract::<bool>()?;
-        // The ordering flag is field four in both range forms. It is part of
-        // the shared tuple contract, but aggregation does not use its value:
-        // PyJanitor has already sorted the right arrays. Extracting it here
-        // validates only the field type.
-        let (left_output_positions, right_output_positions) = if first.len() == 8 {
-            // In the eight-element range form, fields 1 and 3 identify the
-            // predicate arrays' physical labels. Fields 5 and 6 identify the
-            // trimmed output layout used by aggregation and returned to
-            // Python; they must not be substituted for one another.
-            (
-                Some(first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?),
-                Some(first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?),
-            )
-        } else {
-            (None, None)
-        };
-        // The eight-field form describes a trimmed/reordered aggregation
-        // layout. Its maps are compact-slot -> physical-row mappings, so their
-        // lengths—not the label values—define the output domains. With six
-        // fields, the value-array lengths already describe identity layouts.
-        let (left_output_len, right_output_len) =
-            if let (Some(left_output_positions), Some(right_output_positions)) =
-                (&left_output_positions, &right_output_positions)
-            {
-                (left_output_positions.len()?, right_output_positions.len()?)
-            } else {
-                (
-                    first
-                        .get_item(0)?
-                        .extract::<PyReadonlyArray1<'py, T>>()?
-                        .len()?,
-                    first
-                        .get_item(2)?
-                        .extract::<PyReadonlyArray1<'py, T>>()?
-                        .len()?,
-                )
-            };
-        // Forward aggregation writes one result per left output slot; reverse
-        // aggregation writes one result per right output slot. Select only
-        // the map for the requested orientation and leave the other map for a
-        // separate reverse/forward call.
-        let calculation_output_positions = match (
-            reverse,
-            left_output_positions.as_ref(),
-            right_output_positions.as_ref(),
-        ) {
-            (true, _, Some(right_output_positions)) => Some(right_output_positions.as_array()),
-            (false, Some(left_output_positions), _) => Some(left_output_positions.as_array()),
-            _ => None,
-        };
-        // `run_range` builds the first window and applies every later
-        // predicate as a residual filter before updating aggregations.
-        return run_range(
+    if first.len() == 13 {
+        let anchor = parse_not_equal_aggregation_anchor::<T>(first)?;
+        return run_not_equal(
             py,
             predicates,
-            first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?,
-            first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-            first.get_item(2)?.extract::<PyReadonlyArray1<'py, T>>()?,
-            first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-            op,
+            anchor.left,
+            anchor.left_index,
+            anchor.left_positions,
+            anchor.left_null_positions,
+            anchor.right,
+            anchor.right_index,
+            anchor.right_positions,
+            anchor.right_null_positions,
+            anchor.left_output_positions,
+            anchor.right_output_positions,
+            anchor.is_extension_array,
+            aggregations,
+            return_matched,
+            reverse,
+        );
+    }
+
+    // Preserve the anchor aggregation API's established shape error before
+    // handing valid range forms to the shared named parser. In particular,
+    // an index-only eleven-field `!=` tuple must not be reported as a generic
+    // range-anchor error; callers rely on this contract when diagnosing a
+    // malformed extended aggregation request.
+    if !matches!(first.len(), 6 | 8) {
+        return Err(PyValueError::new_err(
+            "the first extended aggregation predicate must contain 6, 8, or 13 elements",
+        ));
+    }
+
+    let anchor = parse_aggregation_range_anchor(first, true)?;
+    let left_output_len = anchor
+        .left_output_positions
+        .as_ref()
+        .map(|values| values.len())
+        .transpose()?
+        .unwrap_or(anchor.range.left_len());
+    let right_output_len = anchor
+        .right_output_positions
+        .as_ref()
+        .map(|values| values.len())
+        .transpose()?
+        .unwrap_or(anchor.range.right_len());
+    let calculation_output_positions = if reverse {
+        anchor
+            .right_output_positions
+            .as_ref()
+            .map(|values| values.as_array())
+    } else {
+        anchor
+            .left_output_positions
+            .as_ref()
+            .map(|values| values.as_array())
+    };
+    match anchor.range {
+        AnyParsedRangePredicate::I64(value) => run_range(
+            py,
+            predicates,
+            value.left,
+            value.left_index,
+            value.right,
+            value.right_index,
+            value.op,
             aggregations,
             calculation_output_positions,
             if reverse {
@@ -1139,60 +1168,170 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
             },
             return_matched,
             reverse,
-        );
+        ),
+        AnyParsedRangePredicate::I32(value) => run_range(
+            py,
+            predicates,
+            value.left,
+            value.left_index,
+            value.right,
+            value.right_index,
+            value.op,
+            aggregations,
+            calculation_output_positions,
+            if reverse {
+                right_output_len
+            } else {
+                left_output_len
+            },
+            return_matched,
+            reverse,
+        ),
+        AnyParsedRangePredicate::I16(value) => run_range(
+            py,
+            predicates,
+            value.left,
+            value.left_index,
+            value.right,
+            value.right_index,
+            value.op,
+            aggregations,
+            calculation_output_positions,
+            if reverse {
+                right_output_len
+            } else {
+                left_output_len
+            },
+            return_matched,
+            reverse,
+        ),
+        AnyParsedRangePredicate::I8(value) => run_range(
+            py,
+            predicates,
+            value.left,
+            value.left_index,
+            value.right,
+            value.right_index,
+            value.op,
+            aggregations,
+            calculation_output_positions,
+            if reverse {
+                right_output_len
+            } else {
+                left_output_len
+            },
+            return_matched,
+            reverse,
+        ),
+        AnyParsedRangePredicate::U64(value) => run_range(
+            py,
+            predicates,
+            value.left,
+            value.left_index,
+            value.right,
+            value.right_index,
+            value.op,
+            aggregations,
+            calculation_output_positions,
+            if reverse {
+                right_output_len
+            } else {
+                left_output_len
+            },
+            return_matched,
+            reverse,
+        ),
+        AnyParsedRangePredicate::U32(value) => run_range(
+            py,
+            predicates,
+            value.left,
+            value.left_index,
+            value.right,
+            value.right_index,
+            value.op,
+            aggregations,
+            calculation_output_positions,
+            if reverse {
+                right_output_len
+            } else {
+                left_output_len
+            },
+            return_matched,
+            reverse,
+        ),
+        AnyParsedRangePredicate::U16(value) => run_range(
+            py,
+            predicates,
+            value.left,
+            value.left_index,
+            value.right,
+            value.right_index,
+            value.op,
+            aggregations,
+            calculation_output_positions,
+            if reverse {
+                right_output_len
+            } else {
+                left_output_len
+            },
+            return_matched,
+            reverse,
+        ),
+        AnyParsedRangePredicate::U8(value) => run_range(
+            py,
+            predicates,
+            value.left,
+            value.left_index,
+            value.right,
+            value.right_index,
+            value.op,
+            aggregations,
+            calculation_output_positions,
+            if reverse {
+                right_output_len
+            } else {
+                left_output_len
+            },
+            return_matched,
+            reverse,
+        ),
+        AnyParsedRangePredicate::F64(value) => run_range(
+            py,
+            predicates,
+            value.left,
+            value.left_index,
+            value.right,
+            value.right_index,
+            value.op,
+            aggregations,
+            calculation_output_positions,
+            if reverse {
+                right_output_len
+            } else {
+                left_output_len
+            },
+            return_matched,
+            reverse,
+        ),
+        AnyParsedRangePredicate::F32(value) => run_range(
+            py,
+            predicates,
+            value.left,
+            value.left_index,
+            value.right,
+            value.right_index,
+            value.op,
+            aggregations,
+            calculation_output_positions,
+            if reverse {
+                right_output_len
+            } else {
+                left_output_len
+            },
+            return_matched,
+            reverse,
+        ),
     }
-    // Reaching this point means the first tuple has thirteen fields. That
-    // layout is reserved for null-aware `!=`; accepting another comparator
-    // would interpret range metadata as null metadata.
-    if op != CompareOp::Ne {
-        return Err(PyValueError::new_err(
-            "the thirteen-element aggregation predicate must use !=",
-        ));
-    }
-    // Null-position fields are optional, but each field must be either Python
-    // None or an int64 array. These positions complete the filtered
-    // non-null positions to form the full physical row domain.
-    let left_null_positions = if first.get_item(3)?.is_none() {
-        None
-    } else {
-        Some(first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?)
-    };
-    let right_null_positions = if first.get_item(7)?.is_none() {
-        None
-    } else {
-        Some(first.get_item(7)?.extract::<PyReadonlyArray1<'py, i64>>()?)
-    };
-    // Output maps are mandatory for `!=` aggregation because filtered and
-    // sorted compact arrays may no longer be in physical order. Returning
-    // identity positions here would silently attach an aggregate to the
-    // wrong original row.
-    let left_output_positions = first
-        .get_item(10)?
-        .extract::<PyReadonlyArray1<'py, i64>>()?;
-    let right_output_positions = first
-        .get_item(11)?
-        .extract::<PyReadonlyArray1<'py, i64>>()?;
-    // `run_not_equal` generates strict less-than/greater-than and null pairs,
-    // checks every residual `!=` predicate, and updates aggregation state
-    // directly without materializing a pair list.
-    run_not_equal(
-        py,
-        predicates,
-        first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?,
-        first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        first.get_item(2)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        left_null_positions,
-        first.get_item(4)?.extract::<PyReadonlyArray1<'py, T>>()?,
-        first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        right_null_positions,
-        left_output_positions,
-        right_output_positions,
-        first.get_item(9)?.extract::<bool>()?,
-        aggregations,
-        return_matched,
-        reverse,
-    )
 }
 
 macro_rules! extended_aggregation_functions {

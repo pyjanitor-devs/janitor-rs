@@ -85,6 +85,143 @@ pub(crate) enum AnyParsedRangePredicate<'py> {
     F32(ParsedRangePredicate<'py, f32>),
 }
 
+/// A range anchor after parsing an aggregation tuple.
+///
+/// Aggregation tuples add an ordering flag and, in the eight-field form,
+/// output-position maps around the ordinary five-field range predicate. The
+/// kernel should not need to remember those numeric tuple positions, so this
+/// struct keeps the parsed range and metadata together.
+pub(crate) struct ParsedAggregationRangeAnchor<'py> {
+    /// Typed range data used by binary-search/window construction.
+    pub(crate) range: AnyParsedRangePredicate<'py>,
+    /// The public ordering flag, when the tuple carries one. Region and
+    /// range aggregation validate it but rely on PyJanitor for sorting.
+    pub(crate) ordered: Option<bool>,
+    /// Optional compact output labels for forward aggregation.
+    pub(crate) left_output_positions: Option<PyReadonlyArray1<'py, i64>>,
+    /// Optional compact output labels for reverse aggregation.
+    pub(crate) right_output_positions: Option<PyReadonlyArray1<'py, i64>>,
+}
+
+/// Parse one aggregation range anchor without exposing tuple positions to a
+/// kernel.
+///
+/// The first anchor uses the established six- or eight-field aggregation
+/// form. The second anchor uses the five-field range form because it does not
+/// carry output maps. All NumPy arrays remain borrowed through the returned
+/// request; no value or index column is copied.
+pub(crate) fn parse_aggregation_range_anchor<'py>(
+    tuple: &Bound<'py, PyTuple>,
+    first: bool,
+) -> PyResult<ParsedAggregationRangeAnchor<'py>> {
+    let (range, ordered, left_output_positions, right_output_positions) = if first {
+        let (operator_position, ordered, left_output_positions, right_output_positions) =
+            match tuple.len() {
+                6 => {
+                    let ordered = tuple.get_item(4)?.extract::<bool>()?;
+                    (5, Some(ordered), None, None)
+                }
+                8 => {
+                    let ordered = tuple.get_item(4)?.extract::<bool>()?;
+                    let left = tuple.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?;
+                    let right = tuple.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?;
+                    (7, Some(ordered), Some(left), Some(right))
+                }
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "aggregation first anchor must contain 6 or 8 elements",
+                    ));
+                }
+            };
+        let left = tuple.get_item(0)?;
+        let left_index = tuple.get_item(1)?;
+        let right = tuple.get_item(2)?;
+        let right_index = tuple.get_item(3)?;
+        let operator = tuple.get_item(operator_position)?;
+        (
+            parse_any_range_parts(&left, &left_index, &right, &right_index, &operator)?,
+            ordered,
+            left_output_positions,
+            right_output_positions,
+        )
+    } else {
+        if tuple.len() != 5 {
+            return Err(PyValueError::new_err(
+                "aggregation second anchor must contain 5 elements",
+            ));
+        }
+        (parse_any_range_predicate(tuple, true)?, None, None, None)
+    };
+
+    range.validate_lengths().map_err(PyValueError::new_err)?;
+    if let Some(values) = left_output_positions.as_ref() {
+        if values.as_array().len() != range.left_len() {
+            return Err(PyValueError::new_err(
+                "left output positions must match the left value length",
+            ));
+        }
+    }
+    if let Some(values) = right_output_positions.as_ref() {
+        if values.as_array().len() != range.right_len() {
+            return Err(PyValueError::new_err(
+                "right output positions must match the right value length",
+            ));
+        }
+    }
+
+    Ok(ParsedAggregationRangeAnchor {
+        range,
+        ordered,
+        left_output_positions,
+        right_output_positions,
+    })
+}
+
+/// Parse typed range fields that have already been extracted from a Python
+/// tuple.
+///
+/// This is the no-wrapper form used by aggregation parsers. It keeps tuple
+/// field access inside the parser boundary without allocating a normalized
+/// temporary Python tuple for the lower-level dtype dispatcher.
+pub(crate) fn parse_any_range_parts<'py>(
+    left: &Bound<'py, PyAny>,
+    left_index: &Bound<'py, PyAny>,
+    right: &Bound<'py, PyAny>,
+    right_index: &Bound<'py, PyAny>,
+    operator: &Bound<'py, PyAny>,
+) -> PyResult<AnyParsedRangePredicate<'py>> {
+    let dtype = left
+        .getattr("dtype")?
+        .getattr("name")?
+        .extract::<String>()?;
+    macro_rules! parse {
+        ($ty:ty, $variant:ident) => {
+            Ok(AnyParsedRangePredicate::$variant(ParsedRangePredicate {
+                left: left.extract::<PyReadonlyArray1<'py, $ty>>()?,
+                left_index: left_index.extract::<PyReadonlyArray1<'py, i64>>()?,
+                right: right.extract::<PyReadonlyArray1<'py, $ty>>()?,
+                right_index: right_index.extract::<PyReadonlyArray1<'py, i64>>()?,
+                op: CompareOp::try_from_str(operator.extract::<&str>()?)?,
+            }))
+        };
+    }
+    match dtype.as_str() {
+        "int64" => parse!(i64, I64),
+        "int32" => parse!(i32, I32),
+        "int16" => parse!(i16, I16),
+        "int8" => parse!(i8, I8),
+        "uint64" => parse!(u64, U64),
+        "uint32" => parse!(u32, U32),
+        "uint16" => parse!(u16, U16),
+        "uint8" => parse!(u8, U8),
+        "float64" => parse!(f64, F64),
+        "float32" => parse!(f32, F32),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported range predicate dtype: {other}"
+        ))),
+    }
+}
+
 impl AnyParsedRangePredicate<'_> {
     /// Validate that each value array has a matching index-label array.
     ///
@@ -353,4 +490,91 @@ fn parse_extended_range_predicate<'py, T: numpy::Element>(
         right_index,
         op,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::PyArray1;
+
+    type RangeArrays<'py> = (
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+    );
+
+    fn range_arrays<'py>(py: Python<'py>) -> RangeArrays<'py> {
+        (
+            PyArray1::from_vec(py, vec![1, 2]),
+            PyArray1::from_vec(py, vec![10, 11]),
+            PyArray1::from_vec(py, vec![2, 3, 4]),
+            PyArray1::from_vec(py, vec![20, 21, 22]),
+        )
+    }
+
+    #[test]
+    fn aggregation_parser_keeps_named_metadata_for_six_field_form() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let (left, left_index, right, right_index) = range_arrays(py);
+            let six = PyTuple::new(
+                py,
+                [
+                    left.clone().into_any(),
+                    left_index.clone().into_any(),
+                    right.clone().into_any(),
+                    right_index.clone().into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let parsed = parse_aggregation_range_anchor(&six, true)?;
+            assert_eq!(parsed.ordered, Some(true));
+            assert!(parsed.left_output_positions.is_none());
+            assert_eq!(parsed.range.left_len(), 2);
+            assert_eq!(parsed.range.right_len(), 3);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn aggregation_parser_rejects_bad_maps_and_ordering_flags() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let (left, left_index, right, right_index) = range_arrays(py);
+            let bad_map = PyArray1::from_vec(py, vec![100]);
+            let tuple = PyTuple::new(
+                py,
+                [
+                    left.clone().into_any(),
+                    left_index.clone().into_any(),
+                    right.clone().into_any(),
+                    right_index.clone().into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    bad_map.into_any(),
+                    PyArray1::from_vec(py, vec![200, 201, 202]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            assert!(parse_aggregation_range_anchor(&tuple, true).is_err());
+
+            let not_bool = PyTuple::new(
+                py,
+                [
+                    left.into_any(),
+                    left_index.into_any(),
+                    right.into_any(),
+                    right_index.into_any(),
+                    1_i64.into_pyobject(py)?.into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            assert!(parse_aggregation_range_anchor(&not_bool, true).is_err());
+            Ok(())
+        })
+        .unwrap();
+    }
 }
