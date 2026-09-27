@@ -1169,3 +1169,17 @@ source-array, or residual-predicate position.
 **Recommendation**: Preserve explicit compact-region-to-original-position
 mappings through alignment. Use those mappings for aggregation updates and
 residual predicate evaluation; keep the original lengths for validation.
+
+### [2026-09-27] Test typed window dispatch at its boundary
+
+**Context**: Reviewing the shared `AnyParsedRangePredicate::windows` dispatch
+used by dual-range index and aggregation paths.
+**Learning**: The dispatch must preserve the four half-open boundary forms:
+`<`/`<=` produce suffixes and `>`/>=` produce prefixes. Empty windows must be
+retained until row alignment, including boundaries at zero and at the right
+array length.
+
+**Recommendation**: Keep direct tests at the parsed-predicate boundary in
+addition to end-to-end legacy-path tests. Exercise every operator and both
+full/empty boundary cases so a dtype-dispatch change cannot silently alter
+window coordinates.

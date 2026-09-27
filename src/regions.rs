@@ -476,6 +476,13 @@ where
 /// Returns an error for `==` or `!=`, because those operators do not define a
 /// monotonic region boundary.
 fn region_boundaries(anchor: &AnyParsedRangePredicate<'_>) -> Result<RegionBoundary, String> {
+    // Keep this validation at the boundary-construction function as well as
+    // at the public parser boundary. The vectors below are parallel: labels
+    // indexes `left_index[position]` for every boundary and later alignment
+    // pairs each right label with a region value. A direct internal caller
+    // must therefore receive a normal error rather than a panic or silently
+    // shifted label pairing.
+    anchor.validate_lengths()?;
     macro_rules! build {
         ($predicate:expr) => {{
             let predicate = $predicate;
@@ -776,8 +783,6 @@ pub(crate) fn parse_and_align<'py>(predicates: &Bound<'py, PyList>) -> PyResult<
     // (left values, left IDs, right values, right IDs, operator).
     let first = parse_any_range_predicate(first, true)?;
     let second = parse_any_range_predicate(second, true)?;
-    first.validate_lengths().map_err(PyValueError::new_err)?;
-    second.validate_lengths().map_err(PyValueError::new_err)?;
     align(
         region_boundaries(&first).map_err(PyValueError::new_err)?,
         region_boundaries(&second).map_err(PyValueError::new_err)?,

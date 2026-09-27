@@ -487,6 +487,75 @@ mod tests {
     }
 
     #[test]
+    fn parsed_windows_dispatch_all_operators_and_boundary_cases() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left = PyArray1::from_vec(py, vec![2_i64]);
+            let left_index = PyArray1::from_vec(py, vec![10_i64]);
+            let right = PyArray1::from_vec(py, vec![1_i64, 2, 3]);
+            let right_index = PyArray1::from_vec(py, vec![20_i64, 21, 22]);
+
+            // `windows()` is the dtype-dispatch boundary used by the public
+            // dual-range paths. These expected half-open intervals document
+            // the binary-search convention for every supported operator:
+            // strict/inclusive less-than creates a suffix, while
+            // strict/inclusive greater-than creates a prefix.
+            for (operator, expected_start, expected_end) in
+                [("<", 2, 3), ("<=", 1, 3), (">", 0, 1), (">=", 0, 2)]
+            {
+                let predicate = PyTuple::new(
+                    py,
+                    [
+                        left.clone().into_any(),
+                        left_index.clone().into_any(),
+                        right.clone().into_any(),
+                        right_index.clone().into_any(),
+                        true.into_pyobject(py)?.to_owned().into_any(),
+                        operator.into_pyobject(py)?.into_any(),
+                    ],
+                )?;
+                let parsed = parse_any_range_predicate(&predicate, false)?;
+                let windows = parsed.windows(true).map_err(PyValueError::new_err)?;
+                assert_eq!(windows.left_positions, vec![0], "operator {operator}");
+                assert_eq!(windows.starts, vec![expected_start], "operator {operator}");
+                assert_eq!(windows.ends, vec![expected_end], "operator {operator}");
+                assert_eq!(windows.right_index, vec![20, 21, 22]);
+            }
+
+            // `retain_empty_windows` is intentional: alignment needs one
+            // window per logical left row, even when that row has no match.
+            // Check both the full suffix/prefix and empty suffix/prefix
+            // boundaries, which are the off-by-one cases most likely to be
+            // damaged by a dispatch refactor.
+            let boundary_left = PyArray1::from_vec(py, vec![0_i64, 4]);
+            let boundary_left_index = PyArray1::from_vec(py, vec![30_i64, 31]);
+            for (operator, expected_starts, expected_ends) in [
+                ("<", vec![0, 3], vec![3, 3]),
+                (">=", vec![0, 0], vec![0, 3]),
+            ] {
+                let predicate = PyTuple::new(
+                    py,
+                    [
+                        boundary_left.clone().into_any(),
+                        boundary_left_index.clone().into_any(),
+                        right.clone().into_any(),
+                        right_index.clone().into_any(),
+                        true.into_pyobject(py)?.to_owned().into_any(),
+                        operator.into_pyobject(py)?.into_any(),
+                    ],
+                )?;
+                let parsed = parse_any_range_predicate(&predicate, false)?;
+                let windows = parsed.windows(true).map_err(PyValueError::new_err)?;
+                assert_eq!(windows.left_positions, vec![0, 1], "operator {operator}");
+                assert_eq!(windows.starts, expected_starts, "operator {operator}");
+                assert_eq!(windows.ends, expected_ends, "operator {operator}");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn two_range_windows_drop_empty_intersections() {
         let left = Array1::from_vec(vec![2_i64]);
         let left_second = Array1::from_vec(vec![1_i64]);
