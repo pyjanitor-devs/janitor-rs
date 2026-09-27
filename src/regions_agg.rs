@@ -114,21 +114,10 @@ fn parse_region_anchors<'py>(predicates: &Bound<'py, PyList>) -> PyResult<Prepar
 /// Describe the output and source layouts for one aggregation direction.
 ///
 /// Region positions are compact traversal coordinates. The optional map is
-/// only the output metadata returned to Python; it does not change the
-/// physical source positions used by [`AggregationSet::update`].
-///
-/// # Arguments
-///
-/// * `first` - Parsed first anchor containing the optional output maps.
-/// * `reverse` - Aggregate left values into right output slots when `true`;
-///   otherwise aggregate right values into left output slots.
-///
-/// # Returns
-///
-/// `(output_positions, output_len, source_len)`, where `output_positions` is
-/// the map for the selected output side, `output_len` is the number of
-/// accumulator slots, and `source_len` is the length of the values read by
-/// the accumulator.
+/// only output metadata; it does not change the physical source positions
+/// used by [`AggregationSet::update`]. This remains local because returning
+/// a borrowed view from a shared anchor method would borrow the entire named
+/// anchor and prevent moving its independent typed range into dispatch.
 fn aggregation_layout<'py>(
     first: &'py ParsedAggregationRangeAnchor<'py>,
     reverse: bool,
@@ -262,7 +251,7 @@ fn aggregate_regions_exact<'py>(
                 regions.left_positions[left_position],
             );
         }
-        true
+        Ok(true)
     })
     .map_err(PyValueError::new_err)?;
 
@@ -397,7 +386,7 @@ fn aggregate_regions_extended<'py>(
                 );
             }
         }
-        true
+        Ok(true)
     })
     .map_err(PyValueError::new_err)?;
 

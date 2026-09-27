@@ -184,9 +184,10 @@ pub(crate) fn sweep_queries(regions: &AlignedRegions) -> Vec<(usize, usize)> {
 /// * `regions` - Aligned compact region paths. `right_first` is monotonic;
 ///   `right_second` may contain duplicates and need not be monotonic.
 /// * `visit` - Called with compact left and right region positions for every
-///   candidate satisfying both primary inequalities. Return `false` to stop
-///   visiting candidates for the current left row; `Keep::Any` uses this to
-///   stop after its first passing candidate.
+///   candidate satisfying both primary inequalities. Return `Ok(false)` to
+///   stop visiting candidates for the current left row; `Keep::Any` uses this
+///   to stop after its first passing candidate. Return `Err` to abort the
+///   entire sweep immediately.
 ///
 /// # Errors
 ///
@@ -195,7 +196,7 @@ pub(crate) fn sweep_queries(regions: &AlignedRegions) -> Vec<(usize, usize)> {
 /// linked right slice to be inserted twice and could create a cyclic chain.
 pub(crate) fn traverse_candidates<F>(regions: &AlignedRegions, mut visit: F) -> Result<(), String>
 where
-    F: FnMut(usize, usize) -> bool,
+    F: FnMut(usize, usize) -> Result<bool, String>,
 {
     let queries = sweep_queries(regions);
     let mut active = BTreeMap::<i64, GroupState>::new();
@@ -232,7 +233,7 @@ where
             let mut position = state.head;
             while position >= 0 {
                 let right_position = position as usize;
-                if !visit(left_position, right_position) {
+                if !visit(left_position, right_position)? {
                     break 'candidate_groups;
                 }
                 position = next[right_position];
@@ -281,21 +282,16 @@ where
     P: FnMut(usize, usize) -> bool,
 {
     let mut counts = vec![0_usize; regions.left_index.len()];
-    let mut overflow = false;
     // First pass: count final output pairs. Applying the callback here keeps
     // exact and extended paths on identical two-pass semantics.
     traverse_candidates(regions, |left_position, right_position| {
         if predicates_pass(left_position, right_position) {
-            match counts[left_position].checked_add(1) {
-                Some(count) => counts[left_position] = count,
-                None => overflow = true,
-            }
+            counts[left_position] = counts[left_position]
+                .checked_add(1)
+                .ok_or("region index result size exceeds platform capacity")?;
         }
-        true
+        Ok(true)
     })?;
-    if overflow {
-        return Err("region index result size exceeds platform capacity".to_owned());
-    }
 
     let mut offsets = vec![0_usize; counts.len() + 1];
     for (left_position, count) in counts.iter().copied().enumerate() {
@@ -320,7 +316,7 @@ where
             right_index[output_position] = regions.right_index[right_position];
             cursors[left_position] += 1;
         }
-        true
+        Ok(true)
     })?;
     Ok((left_index, right_index))
 }
@@ -351,37 +347,24 @@ where
 {
     let mut counts = vec![0_usize; regions.left_index.len()];
     let mut passing_pairs = Vec::<(usize, usize)>::new();
-    let mut overflow = false;
-    let mut allocation_error = false;
 
     // One sweep performs both primary-region traversal and residual filtering.
     // Store only passing candidates; rejected candidates never occupy the
     // intermediate buffer and never reach the output-sizing phase.
     traverse_candidates(regions, |left_position, right_position| {
         if predicates_pass(left_position, right_position) {
-            match counts[left_position].checked_add(1) {
-                Some(count) => counts[left_position] = count,
-                None => overflow = true,
+            counts[left_position] = counts[left_position]
+                .checked_add(1)
+                .ok_or("region index result size exceeds platform capacity")?;
+            if passing_pairs.len() == passing_pairs.capacity() {
+                passing_pairs
+                    .try_reserve(1)
+                    .map_err(|_| "region index result allocation failed".to_owned())?;
             }
-            if !overflow {
-                if passing_pairs.len() == passing_pairs.capacity()
-                    && passing_pairs.try_reserve(1).is_err()
-                {
-                    allocation_error = true;
-                }
-                if !allocation_error {
-                    passing_pairs.push((left_position, right_position));
-                }
-            }
+            passing_pairs.push((left_position, right_position));
         }
-        true
+        Ok(true)
     })?;
-    if overflow {
-        return Err("region index result size exceeds platform capacity".to_owned());
-    }
-    if allocation_error {
-        return Err("region index result allocation failed".to_owned());
-    }
 
     if passing_pairs.is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -447,12 +430,12 @@ where
     // contract that keep semantics see only complete predicate matches.
     traverse_candidates(regions, |left_position, right_position| {
         if !predicates_pass(left_position, right_position) {
-            return true;
+            return Ok(true);
         }
         match keep {
             Keep::Any if selected[left_position].is_none() => {
                 selected[left_position] = Some(right_position);
-                false
+                Ok(false)
             }
             Keep::First => {
                 selected[left_position] = match selected[left_position] {
@@ -464,7 +447,7 @@ where
                     }
                     Some(current) => Some(current),
                 };
-                true
+                Ok(true)
             }
             Keep::Last => {
                 selected[left_position] = match selected[left_position] {
@@ -476,10 +459,10 @@ where
                     }
                     Some(current) => Some(current),
                 };
-                true
+                Ok(true)
             }
             Keep::All => unreachable!("selected builder cannot receive Keep::All"),
-            Keep::Any => true,
+            Keep::Any => Ok(true),
         }
     })?;
 

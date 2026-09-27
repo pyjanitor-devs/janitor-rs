@@ -979,8 +979,8 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
 ///
 /// 8 fields:
 /// (left, left_index, right, right_index,
-///  left_output_positions, right_output_positions,
-///  right_index_is_ordered, comparator)
+///  right_index_is_ordered, left_output_positions,
+///  right_output_positions, comparator)
 ///
 /// 13 fields for `!=` aggregation:
 /// (left_values, left_index, left_positions, left_null_positions,
@@ -1141,6 +1141,13 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
         ));
     }
 
+    // This function is instantiated once per public NumPy dtype. The shared
+    // parser must inspect the tuple's runtime dtype so it can serve region
+    // and range callers, but this wrapper also has a compiled `T` contract.
+    // Extracting the first value array here preserves the old behavior: a
+    // call through the int64 wrapper with int32 predicate values fails at the
+    // Python boundary instead of silently selecting a different dispatch arm.
+    first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?;
     let anchor = parse_aggregation_range_anchor(first, true)?;
     let left_output_len = anchor
         .left_output_positions
@@ -1165,195 +1172,46 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
             .as_ref()
             .map(|values| values.as_array())
     };
+    let output_len = if reverse {
+        right_output_len
+    } else {
+        left_output_len
+    };
     // `run_range` is generic over the concrete NumPy element type, while the
-    // Python boundary gives us one runtime `AnyParsedRangePredicate`. Rust
-    // therefore needs one arm per supported dtype to recover the concrete
-    // type before calling the generic kernel. This repetition is deliberate:
-    // the arms make the dtype contract and ownership transfer visible, avoid
-    // converting columns into a common temporary dtype, and keep the hot path
-    // free of dynamic dispatch. A macro could shorten the source, but would
-    // hide the same type-specialized calls without changing runtime work.
+    // Python boundary gives us one runtime `AnyParsedRangePredicate`. The
+    // match recovers that concrete type without converting columns into a
+    // common temporary dtype or adding dynamic dispatch to the hot path.
+    // The small local macro removes argument-list drift between the ten dtype
+    // arms while leaving the type-specialized match visible at the boundary.
+    macro_rules! run_range_for {
+        ($value:expr) => {
+            run_range(
+                py,
+                predicates,
+                $value.left,
+                $value.left_index,
+                $value.right,
+                $value.right_index,
+                $value.op,
+                aggregations,
+                calculation_output_positions,
+                output_len,
+                return_matched,
+                reverse,
+            )
+        };
+    }
     match anchor.range {
-        AnyParsedRangePredicate::I64(value) => run_range(
-            py,
-            predicates,
-            value.left,
-            value.left_index,
-            value.right,
-            value.right_index,
-            value.op,
-            aggregations,
-            calculation_output_positions,
-            if reverse {
-                right_output_len
-            } else {
-                left_output_len
-            },
-            return_matched,
-            reverse,
-        ),
-        AnyParsedRangePredicate::I32(value) => run_range(
-            py,
-            predicates,
-            value.left,
-            value.left_index,
-            value.right,
-            value.right_index,
-            value.op,
-            aggregations,
-            calculation_output_positions,
-            if reverse {
-                right_output_len
-            } else {
-                left_output_len
-            },
-            return_matched,
-            reverse,
-        ),
-        AnyParsedRangePredicate::I16(value) => run_range(
-            py,
-            predicates,
-            value.left,
-            value.left_index,
-            value.right,
-            value.right_index,
-            value.op,
-            aggregations,
-            calculation_output_positions,
-            if reverse {
-                right_output_len
-            } else {
-                left_output_len
-            },
-            return_matched,
-            reverse,
-        ),
-        AnyParsedRangePredicate::I8(value) => run_range(
-            py,
-            predicates,
-            value.left,
-            value.left_index,
-            value.right,
-            value.right_index,
-            value.op,
-            aggregations,
-            calculation_output_positions,
-            if reverse {
-                right_output_len
-            } else {
-                left_output_len
-            },
-            return_matched,
-            reverse,
-        ),
-        AnyParsedRangePredicate::U64(value) => run_range(
-            py,
-            predicates,
-            value.left,
-            value.left_index,
-            value.right,
-            value.right_index,
-            value.op,
-            aggregations,
-            calculation_output_positions,
-            if reverse {
-                right_output_len
-            } else {
-                left_output_len
-            },
-            return_matched,
-            reverse,
-        ),
-        AnyParsedRangePredicate::U32(value) => run_range(
-            py,
-            predicates,
-            value.left,
-            value.left_index,
-            value.right,
-            value.right_index,
-            value.op,
-            aggregations,
-            calculation_output_positions,
-            if reverse {
-                right_output_len
-            } else {
-                left_output_len
-            },
-            return_matched,
-            reverse,
-        ),
-        AnyParsedRangePredicate::U16(value) => run_range(
-            py,
-            predicates,
-            value.left,
-            value.left_index,
-            value.right,
-            value.right_index,
-            value.op,
-            aggregations,
-            calculation_output_positions,
-            if reverse {
-                right_output_len
-            } else {
-                left_output_len
-            },
-            return_matched,
-            reverse,
-        ),
-        AnyParsedRangePredicate::U8(value) => run_range(
-            py,
-            predicates,
-            value.left,
-            value.left_index,
-            value.right,
-            value.right_index,
-            value.op,
-            aggregations,
-            calculation_output_positions,
-            if reverse {
-                right_output_len
-            } else {
-                left_output_len
-            },
-            return_matched,
-            reverse,
-        ),
-        AnyParsedRangePredicate::F64(value) => run_range(
-            py,
-            predicates,
-            value.left,
-            value.left_index,
-            value.right,
-            value.right_index,
-            value.op,
-            aggregations,
-            calculation_output_positions,
-            if reverse {
-                right_output_len
-            } else {
-                left_output_len
-            },
-            return_matched,
-            reverse,
-        ),
-        AnyParsedRangePredicate::F32(value) => run_range(
-            py,
-            predicates,
-            value.left,
-            value.left_index,
-            value.right,
-            value.right_index,
-            value.op,
-            aggregations,
-            calculation_output_positions,
-            if reverse {
-                right_output_len
-            } else {
-                left_output_len
-            },
-            return_matched,
-            reverse,
-        ),
+        AnyParsedRangePredicate::I64(value) => run_range_for!(value),
+        AnyParsedRangePredicate::I32(value) => run_range_for!(value),
+        AnyParsedRangePredicate::I16(value) => run_range_for!(value),
+        AnyParsedRangePredicate::I8(value) => run_range_for!(value),
+        AnyParsedRangePredicate::U64(value) => run_range_for!(value),
+        AnyParsedRangePredicate::U32(value) => run_range_for!(value),
+        AnyParsedRangePredicate::U16(value) => run_range_for!(value),
+        AnyParsedRangePredicate::U8(value) => run_range_for!(value),
+        AnyParsedRangePredicate::F64(value) => run_range_for!(value),
+        AnyParsedRangePredicate::F32(value) => run_range_for!(value),
     }
 }
 
@@ -1595,6 +1453,44 @@ mod extended_tests {
             let outputs_value = result.get_item(2)?;
             let outputs = outputs_value.cast::<PyList>()?;
             assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![70]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn range_aggregation_rejects_values_mismatched_with_compiled_wrapper_dtype() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![4_i32]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i32, 5]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let values = PyArray1::from_vec(py, vec![10_i64, 20]);
+            let mask = PyArray1::from_vec(py, vec![false, false]);
+            let aggregation = PyTuple::new(
+                py,
+                [
+                    values.into_any(),
+                    mask.into_any(),
+                    "sum".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let aggregations = PyList::new(py, [aggregation])?;
+            let error =
+                match single_join_extended_aggregate_int64(py, &predicates, &aggregations, true) {
+                    Ok(_) => panic!("the int64 wrapper must reject int32 range values"),
+                    Err(error) => error,
+                };
+            assert_eq!(error.get_type(py).name()?, "TypeError");
             Ok(())
         })
         .unwrap();
