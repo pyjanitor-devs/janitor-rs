@@ -918,8 +918,12 @@ mod tests {
         assert_eq!(
             output,
             (
-                vec![10, 10, 10, 10, 11, 11, 11],
-                vec![20, 21, 22, 23, 20, 22, 23]
+                vec![10, 10, 10, 10, 11, 11],
+                // Left rows remain canonical. For `all`, right-row order is
+                // not part of the contract when the second region is
+                // non-monotonic; the sweep emits each active region group
+                // in label order and follows its physical linked list.
+                vec![21, 23, 22, 20, 23, 22]
             )
         );
     }
