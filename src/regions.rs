@@ -52,24 +52,39 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::range_predicate::{parse_any_range_predicate, AnyParsedRangePredicate};
-/// Search boundary sequence for one primary inequality.
+
+/// The independently searched boundary sequence for one primary inequality.
 ///
-/// For `<`/`<=`, each boundary starts the matching right suffix. For `>`/>=`
-/// each boundary ends the matching right prefix and `reverse` records that
-/// orientation for region construction.
+/// A region join starts with two independent binary searches: one for each of
+/// its first two predicates. This value is the owned hand-off between those
+/// searches and the later label/alignment steps. Its vectors are parallel:
+/// entry `n` in `boundaries` belongs to the left identifier at entry `n` in
+/// `left_index`.
+///
+/// For `<`/`<=`, each boundary starts the matching right suffix. For `>`/`>=`,
+/// `region_boundaries` converts the matching-prefix length returned by
+/// `range_window` into the equivalent suffix start after the right side is
+/// traversed in reverse. That normalization lets `labels` use one algorithm
+/// for all four supported inequality operators.
+///
+/// The index arrays are intentionally owned rather than borrowed views. The
+/// parser temporarily borrows NumPy data while it performs the typed binary
+/// search, but `labels` may compact the left side and reverse the physical
+/// right layout. Keeping the identifiers in owned vectors means the internal
+/// region structs do not need Python lifetimes, and makes it explicit that
+/// these arrays are the metadata carried into the sweep. A borrowed-view
+/// optimization is possible later, but would thread lifetimes through the
+/// entire boundary, labeling, and alignment pipeline for little benefit
+/// relative to this short-lived copy.
 pub(crate) struct RegionBoundary {
-    /// One independently searched primary inequality before alignment.
-    ///
-    /// A `RegionBoundary` is temporary: the first and second anchors each
-    /// produce one, then [`align`] combines them by their original labels.
-    /// The fields below are parallel arrays until `labels` consumes them.
-    /// Original left-row identifiers paired with `boundaries`.
+    /// Original left-row identifiers paired positionally with `boundaries`.
     pub(crate) left_index: Vec<i64>,
-    /// Original right-row identifiers paired with the sorted right values.
+    /// Original right-row identifiers in the sorted physical order supplied
+    /// by PyJanitor. `labels` may reverse this vector for a `>`/`>=` anchor.
     pub(crate) right_index: Vec<i64>,
-    /// Physical right positions returned by the typed binary searches.
+    /// One suffix-start boundary for each original left row.
     pub(crate) boundaries: Vec<usize>,
-    /// Whether the anchor uses a greater-than orientation.
+    /// Whether the right layout must be reversed before labels are built.
     pub(crate) reverse: bool,
 }
 
@@ -431,21 +446,30 @@ where
 /// Build one monotonic boundary sequence from a typed primary anchor.
 ///
 /// For `<` and `<=`, each left value produces the beginning of an eligible
-/// right suffix. For `>` and `>=`, each left value produces the end of an
-/// eligible right prefix and the later label construction reverses that
-/// orientation. The binary search is delegated to [`range_window`], so the
-/// four operator variants retain the same boundary semantics as the existing
-/// range kernels.
+/// right suffix. For `>` and `>=`, [`range_window`] returns the number of
+/// eligible values in a right-hand prefix. Subtracting that count from the
+/// right length produces the suffix start in the reversed right layout. The
+/// binary search is delegated to [`range_window`], so the four operator
+/// variants retain the same boundary semantics as the existing range kernels.
 ///
 /// # Arguments
 ///
 /// * `anchor` - A parsed primary anchor whose right values are sorted in
 ///   ascending order and whose operator is `<`, `<=`, `>`, or `>=`.
 ///
+/// The index arrays in `anchor` are expected to be parallel to their value
+/// arrays. That contract is validated by the shared range-predicate parser
+/// before this function is called. PyJanitor also guarantees that the index
+/// labels are unique; alignment relies on that guarantee when it creates its
+/// lookup maps.
+///
 /// # Returns
 ///
 /// A [`RegionBoundary`] containing the original IDs, one binary-search
-/// boundary per left row, and the traversal orientation.
+/// boundary per left row, and the traversal orientation. The identifiers are
+/// copied into owned vectors deliberately: the returned object outlives the
+/// borrowed NumPy views used during the search and is subsequently consumed by
+/// `labels`, which may remove rows or reverse the right layout.
 ///
 /// # Errors
 ///
@@ -475,6 +499,11 @@ fn region_boundaries(anchor: &AnyParsedRangePredicate<'_>) -> Result<RegionBound
                 let (start, end) = range_window(*value, predicate.right.as_array(), predicate.op);
                 boundaries.push(if reverse { right_len - end } else { start });
             }
+            // The parsed arrays are borrowed Python/NumPy views. Copy only
+            // the identifier metadata here so the downstream region structs
+            // can compact and reorder it without carrying Python lifetimes.
+            // The value array itself is not copied: `range_window` searches
+            // it directly, and only the resulting boundary positions survive.
             Ok(RegionBoundary {
                 left_index: predicate.left_index.as_array().to_vec(),
                 right_index: predicate.right_index.as_array().to_vec(),
@@ -548,21 +577,23 @@ fn labels(boundary: RegionBoundary) -> LabeledRegions {
     let right_len = right_index.len();
     let mut right_positions = (0..right_len).collect::<Vec<_>>();
     if reverse {
-        // Binary search returned a matching prefix length. Reverse the
-        // physical right layout and convert that prefix length into the
-        // equivalent suffix start before any labels are built:
+        // `region_boundaries` already converted the greater-than prefix
+        // length into a suffix start. Here we only reverse the physical
+        // identifiers and their source-position map so that the normalized
+        // boundary refers to the reversed layout.
         //
-        //   prefix length p -> suffix start right_len - p
-        //
-        // Thus boundary 0 means "all right rows" and boundary right_len
-        // means "no right rows", with no special case later in this
-        // function.
+        // In the shared convention, boundary 0 means "all right rows" and
+        // boundary right_len means "no right rows". Having this convention
+        // before the cumulative pass avoids a separate reverse-anchor branch
+        // in every later sweep.
         right_index.reverse();
         right_positions.reverse();
     }
     // Each boundary marks where one left row's eligible right suffix begins.
     // Difference-style increments let us construct all right region labels
-    // in one cumulative pass.
+    // in one cumulative pass instead of visiting every right row once per
+    // left row. If several left rows have the same boundary, their increments
+    // naturally accumulate at the same position.
     let mut right_region = vec![0_i64; right_index.len()];
     for position in boundaries.iter().copied() {
         if position < right_region.len() {
@@ -647,7 +678,13 @@ pub(crate) fn align(
     let second = labels(second);
     // These maps turn original IDs into positions in the second anchor. They
     // are built once so alignment is linear instead of repeatedly scanning the
-    // second anchor for every first-anchor row.
+    // second anchor for every first-anchor row. The maps are lookup tables,
+    // not a second ordering operation: the first anchor remains the canonical
+    // output/traversal order, and the second anchor supplies labels by ID.
+    //
+    // PyJanitor guarantees unique index labels. Consequently each ID has one
+    // position in these maps; this function intentionally trusts that public
+    // contract rather than re-validating uniqueness in Rust.
     let second_left = second
         .left_index
         .iter()
@@ -660,6 +697,9 @@ pub(crate) fn align(
         .enumerate()
         .map(|(position, id)| (*id, position))
         .collect::<HashMap<_, _>>();
+    // Reserve the first anchor's sizes as upper bounds. Either anchor may have
+    // removed rows, so the final vectors can be smaller, but they cannot be
+    // larger than the first anchor's compact vectors.
     let mut output = AlignedRegions {
         left_index: Vec::with_capacity(first.left_index.len()),
         right_index: Vec::with_capacity(first.right_index.len()),
@@ -674,6 +714,8 @@ pub(crate) fn align(
     };
     // Keep the first anchor's left order as the canonical left-row order.
     // Look up the corresponding second region using the original left ID.
+    // The source-position mapping comes from the first anchor because residual
+    // predicates must read the original left value at that position.
     for (position, id) in first.left_index.iter().enumerate() {
         if let Some(&other) = second_left.get(id) {
             output.left_index.push(*id);
@@ -683,7 +725,11 @@ pub(crate) fn align(
         }
     }
     // Keep the first anchor's right order as the canonical physical right
-    // layout. The second region is reordered to that same layout by ID.
+    // layout. The second region is reordered to that same layout by ID. This
+    // is why `right_second` need not be monotonic: it is the second anchor's
+    // labels projected onto the first anchor's physical order. The sweep uses
+    // the first path for its monotonic query boundary and handles this second
+    // path with the ordered active structure.
     for (position, id) in first.right_index.iter().enumerate() {
         if let Some(&other) = second_right.get(id) {
             output.right_index.push(*id);
