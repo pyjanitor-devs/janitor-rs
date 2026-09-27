@@ -26,6 +26,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
+use crate::aggs::ensure_equal_lengths_core;
 use crate::anchor_non_equi_join::build_range_core_with_labels;
 use crate::join_common::SingleJoinResult;
 use crate::op::CompareOp;
@@ -94,20 +95,15 @@ impl AnyParsedRangePredicate<'_> {
                 let predicate = $predicate;
                 let left_len = predicate.left.as_array().len();
                 let left_index_len = predicate.left_index.as_array().len();
-                if left_len != left_index_len {
-                    return Err(format!(
-                        "left values and left index must have equal lengths ({} != {})",
-                        left_len, left_index_len
-                    ));
-                }
+                ensure_equal_lengths_core("left values", left_len, "left index", left_index_len)?;
                 let right_len = predicate.right.as_array().len();
                 let right_index_len = predicate.right_index.as_array().len();
-                if right_len != right_index_len {
-                    return Err(format!(
-                        "right values and right index must have equal lengths ({} != {})",
-                        right_len, right_index_len
-                    ));
-                }
+                ensure_equal_lengths_core(
+                    "right values",
+                    right_len,
+                    "right index",
+                    right_index_len,
+                )?;
                 Ok(())
             }};
         }

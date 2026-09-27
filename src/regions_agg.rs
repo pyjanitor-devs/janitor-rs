@@ -41,6 +41,15 @@
 //! already sorted the right layout. The output-position arrays are returned to
 //! Python and are also shape-checked against the source arrays. The second
 //! anchor always uses the five-field region form.
+//!
+//! The eight-field output maps have the same tuple position as the other
+//! aggregation families, but their meaning is kernel-specific. Region and
+//! range aggregation use the map as the compact output-position labels that
+//! accompany the result. The `!=` aggregation family in
+//! `anchor_non_equi_join_agg.rs` instead treats its maps as a complete
+//! physical-row-to-compact-slot permutation because its source arrays have
+//! been filtered and reordered. Regions must not apply that permutation logic
+//! to these maps.
 
 use std::collections::BTreeMap;
 
@@ -228,6 +237,106 @@ fn normalized_predicates<'py>(
     })
 }
 
+/// Describe the output and source layouts for one aggregation direction.
+///
+/// Region positions are compact traversal coordinates. The optional map is
+/// only the output metadata returned to Python; it does not change the
+/// physical source positions used by [`AggregationSet::update`].
+///
+/// # Arguments
+///
+/// * `first` - Parsed first anchor containing the optional output maps.
+/// * `reverse` - Aggregate left values into right output slots when `true`;
+///   otherwise aggregate right values into left output slots.
+///
+/// # Returns
+///
+/// `(output_positions, output_len, source_len)`, where `output_positions` is
+/// the map for the selected output side, `output_len` is the number of
+/// accumulator slots, and `source_len` is the length of the values read by
+/// the accumulator.
+fn aggregation_layout<'py>(
+    first: &'py ParsedAggregationAnchor<'py>,
+    reverse: bool,
+) -> (Option<ArrayView1<'py, i64>>, usize, usize) {
+    let output_positions = if reverse {
+        first
+            .right_output_positions
+            .as_ref()
+            .map(|values| values.as_array())
+    } else {
+        first
+            .left_output_positions
+            .as_ref()
+            .map(|values| values.as_array())
+    };
+    let output_len = output_positions
+        .map(|values| values.len())
+        .unwrap_or(if reverse {
+            first.range.right_len()
+        } else {
+            first.range.left_len()
+        });
+    let source_len = if reverse {
+        first.range.left_len()
+    } else {
+        first.range.right_len()
+    };
+    (output_positions, output_len, source_len)
+}
+
+/// Traverse all primary region candidates once and invoke a caller-supplied
+/// consumer for each `(left_position, right_position)` pair.
+///
+/// This is deliberately a small traversal helper rather than a generic
+/// sweep abstraction: it owns only the paper sweep's active map and duplicate
+/// chains. Exact aggregation supplies an unconditional consumer; extended
+/// aggregation supplies a consumer that evaluates residual predicates first.
+/// Both paths therefore share the difficult boundary and duplicate handling
+/// without hiding their different update semantics.
+///
+/// # Arguments
+///
+/// * `regions` - Two already-built and aligned primary region paths.
+/// * `consume` - Called once per candidate that satisfies both primary
+///   regions. It receives compact region coordinates, not source positions.
+fn sweep_aggregation_candidates<F>(regions: &regions::AlignedRegions, mut consume: F)
+where
+    F: FnMut(usize, usize),
+{
+    let queries = regions::sweep_queries(regions);
+    let mut active = BTreeMap::<i64, GroupState>::new();
+    // `next` links equal second-region labels. A signed sentinel is used
+    // because `GroupState` stores the chain head as `-1` when it is empty.
+    let mut next = vec![-1_i64; regions.right_index.len()];
+    let mut previous_end = regions.right_index.len();
+
+    // Queries arrive in descending first-region boundary order. Each newly
+    // exposed right slice is inserted once, so duplicate labels remain
+    // separate chain entries while the B-tree supplies second-region order.
+    for (start, left_position) in queries {
+        if start >= regions.right_index.len() {
+            continue;
+        }
+        add_right_region(
+            ArrayView1::from(&regions.right_second[..]),
+            start,
+            previous_end,
+            &mut next,
+            &mut active,
+        );
+        previous_end = start;
+        for (_, group) in active.range(regions.left_second[left_position]..) {
+            let mut position = group.head;
+            while position >= 0 {
+                let right_position = position as usize;
+                consume(left_position, right_position);
+                position = next[right_position];
+            }
+        }
+    }
+}
+
 /// Execute exact dual-region aggregation and build the standard Python result.
 ///
 /// Only the first two predicates are accepted. Both are converted into region
@@ -283,80 +392,27 @@ fn aggregate_regions_exact<'py>(
         ));
     }
 
-    // The optional maps are labels for the output rows returned to Python.
-    // They do not replace the source-position mappings in `regions`: an empty
-    // region row may mean that compact region position 0 belongs to original
-    // source position 1.
-    let left_output_positions = prepared.first.left_output_positions.as_ref();
-    let right_output_positions = prepared.first.right_output_positions.as_ref();
-    let output_positions = if reverse {
-        right_output_positions
-            .as_ref()
-            .map(|values| values.as_array())
-    } else {
-        left_output_positions
-            .as_ref()
-            .map(|values| values.as_array())
-    };
-    let output_len = output_positions
-        .map(|values| values.len())
-        .unwrap_or(if reverse {
-            prepared.first.range.right_len()
-        } else {
-            prepared.first.range.left_len()
-        });
-    let source_len = if reverse {
-        prepared.first.range.left_len()
-    } else {
-        prepared.first.range.right_len()
-    };
+    // The optional maps label output slots. They do not replace the source
+    // mappings in `regions`, which are needed when labels compact or reverse
+    // the physical traversal layout.
+    let (output_positions, output_len, source_len) = aggregation_layout(&prepared.first, reverse);
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
 
-    // Process queries from larger first-region starts to smaller starts. The
-    // active right suffix therefore grows leftward and each right row enters
-    // the map only once. `left_position` and `right_position` below are region
-    // coordinates until the explicit mapping is applied at `set.update`.
-    let queries = regions::sweep_queries(&regions);
-    let mut active = BTreeMap::<i64, GroupState>::new();
-    // `next` is a linked list for duplicate second-region labels. `-1` means
-    // that a physical right position is the last item in its chain.
-    let mut next = vec![-1_i64; regions.right_index.len()];
-    let mut previous_end = regions.right_index.len();
-    for (start, left_position) in queries {
-        if start >= regions.right_index.len() {
-            continue;
+    // The shared traversal supplies compact region coordinates. Translate
+    // them back to source coordinates only at the accumulator boundary.
+    sweep_aggregation_candidates(&regions, |left_position, right_position| {
+        if reverse {
+            set.update(
+                regions.left_positions[left_position],
+                regions.right_positions[right_position],
+            );
+        } else {
+            set.update(
+                regions.right_positions[right_position],
+                regions.left_positions[left_position],
+            );
         }
-        add_right_region(
-            ArrayView1::from(&regions.right_second[..]),
-            start,
-            previous_end,
-            &mut next,
-            &mut active,
-        );
-        previous_end = start;
-        for (_, group) in active.range(regions.left_second[left_position]..) {
-            let mut position = group.head;
-            while position >= 0 {
-                let right_position = position as usize;
-                // `AggregationSet::update` takes source position first and
-                // output position second. Reverse aggregation swaps the
-                // logical sides, but both positions still need translation
-                // from region coordinates to original source coordinates.
-                if reverse {
-                    set.update(
-                        regions.left_positions[left_position],
-                        regions.right_positions[right_position],
-                    );
-                } else {
-                    set.update(
-                        regions.right_positions[right_position],
-                        regions.left_positions[left_position],
-                    );
-                }
-                position = next[right_position];
-            }
-        }
-    }
+    });
 
     if set.is_empty() {
         return Ok(None);
@@ -458,38 +514,9 @@ fn aggregate_regions_extended<'py>(
         ));
     }
 
-    // An eight-field first anchor carries output labels for the compact source
-    // layout. The left map is returned for forward aggregation and the right
-    // map for reverse aggregation. Six-field anchors use an implicit identity
-    // output layout.
-    let left_output_positions = prepared.first.left_output_positions.as_ref();
-    let right_output_positions = prepared.first.right_output_positions.as_ref();
-    let output_positions = if reverse {
-        right_output_positions
-            .as_ref()
-            .map(|values| values.as_array())
-    } else {
-        left_output_positions
-            .as_ref()
-            .map(|values| values.as_array())
-    };
-    // `output_len` is the number of rows receiving results. Forward output
-    // has one slot per left row; reverse output has one slot per right row.
-    // When a compact map exists, its length is the authoritative slot count.
-    let output_len = output_positions
-        .map(|values| values.len())
-        .unwrap_or(if reverse {
-            prepared.first.range.right_len()
-        } else {
-            prepared.first.range.left_len()
-        });
-    // `source_len` is the length of the values being aggregated. It is the
-    // right side in forward mode and the left side in reverse mode.
-    let source_len = if reverse {
-        prepared.first.range.left_len()
-    } else {
-        prepared.first.range.right_len()
-    };
+    // An eight-field first anchor carries compact output labels. These labels
+    // are not the physical-to-local permutation used by `!=` aggregation.
+    let (output_positions, output_len, source_len) = aggregation_layout(&prepared.first, reverse);
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
 
     // Convert parsed residual predicates into cheap Rust-side views once.
@@ -497,76 +524,29 @@ fn aggregate_regions_extended<'py>(
     // touching Python objects.
     let views: Vec<_> = parsed.iter().map(Predicate::view).collect();
     let metadata_views = metadata.as_deref().map(null_metadata_views);
-    // Each query is `(first_region_start, left_position)`, where both the
-    // start and left position are region coordinates. Queries are sorted by
-    // descending start so the active right suffix only grows leftward and
-    // every right position is inserted at most once.
-    let queries = regions::sweep_queries(&regions);
-    let mut active = BTreeMap::<i64, GroupState>::new();
-    // `next[position]` links equal second-region values together. `-1`
-    // is the end-of-chain sentinel; this is why the value is signed.
-    let mut next = vec![-1_i64; regions.right_index.len()];
-    let mut previous_end = regions.right_index.len();
-
-    // The first two predicates have already become regions. Every candidate
-    // is now checked explicitly against the residual filters before it
-    // updates aggregation state.
-    for (start, left_position) in queries {
-        if start >= regions.right_index.len() {
-            // The first inequality has no eligible right position for
-            // this left row. There is nothing to add or aggregate.
-            continue;
-        }
-        // Add only the newly exposed section between `start` and the
-        // previous query boundary. `add_right_region` inserts positions
-        // into the ordered map, preserving duplicates via linked chains.
-        add_right_region(
-            ArrayView1::from(&regions.right_second[..]),
-            start,
-            previous_end,
-            &mut next,
-            &mut active,
+    // The shared traversal handles primary-region candidates. This callback
+    // keeps the extended-only residual filtering directly before the update.
+    sweep_aggregation_candidates(&regions, |left_position, right_position| {
+        let passes = predicates_match_dispatch(
+            &views,
+            metadata_views.as_deref(),
+            regions.left_positions[left_position],
+            regions.right_positions[right_position],
         );
-        previous_end = start;
-        // Every map key in this range satisfies the second inequality.
-        // The value is a GroupState pointing to all physical right rows
-        // carrying that region label.
-        for (_, group) in active.range(regions.left_second[left_position]..) {
-            let mut position = group.head;
-            while position >= 0 {
-                let right_position = position as usize;
-                // Primary regions only produce candidates. Residual
-                // predicates are checked after translating both positions back
-                // to the source arrays and before any accumulator changes.
-                let passes = predicates_match_dispatch(
-                    &views,
-                    metadata_views.as_deref(),
+        if passes {
+            if reverse {
+                set.update(
                     regions.left_positions[left_position],
                     regions.right_positions[right_position],
                 );
-                if passes {
-                    // AggregationSet expects (source_position,
-                    // output_position). Reverse mode swaps those roles, while
-                    // the explicit mappings correct compacted/reversed paths.
-                    if reverse {
-                        set.update(
-                            regions.left_positions[left_position],
-                            regions.right_positions[right_position],
-                        );
-                    } else {
-                        set.update(
-                            regions.right_positions[right_position],
-                            regions.left_positions[left_position],
-                        );
-                    }
-                }
-                // Follow the duplicate chain. Different right rows may
-                // share one region number and must remain separate
-                // aggregation events.
-                position = next[right_position];
+            } else {
+                set.update(
+                    regions.right_positions[right_position],
+                    regions.left_positions[left_position],
+                );
             }
         }
-    }
+    });
 
     if set.is_empty() {
         // The region sweep may find candidates, but null masks or residual
@@ -834,6 +814,35 @@ mod tests {
                     vec![true, false, true, false],
                     vec![100, 0, 300, 0]
                 )
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reverse_anchor_boundary_zero_and_full_prefix_are_handled() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // With right values [1, 2, 3], `>=` has an empty prefix for left
+            // value 0 (boundary 0) and a full prefix for left value 3
+            // (boundary right_len). Both rows must retain their correct
+            // semantics after the reverse layout normalization.
+            let predicates = dual_predicates(py, vec![0, 3], vec![1, 2, 3], ">=", "<=")?;
+            let forward_inputs = aggregation(py, vec![10, 20, 30])?;
+            let forward = region_aggregate(py, &predicates, &forward_inputs, true)?
+                .expect("the full-prefix row should aggregate");
+            assert_eq!(
+                result_parts(&forward)?,
+                (vec![0, 1], vec![false, true], vec![0, 30])
+            );
+
+            let reverse_inputs = aggregation(py, vec![100, 300])?;
+            let reverse = region_aggregate_reverse(py, &predicates, &reverse_inputs, true)?
+                .expect("the full-prefix row should aggregate in reverse");
+            assert_eq!(
+                result_parts(&reverse)?,
+                (vec![0, 1, 2], vec![false, false, true], vec![0, 0, 300])
             );
             Ok(())
         })
