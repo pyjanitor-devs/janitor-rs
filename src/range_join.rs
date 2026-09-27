@@ -806,7 +806,7 @@ mod tests {
                     PyArray1::from_vec(py, vec![100_i64]).into_any(),
                     PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
                     PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
-                    true.into_pyobject(py)?.to_owned().into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
                     "<".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
@@ -817,7 +817,7 @@ mod tests {
                     PyArray1::from_vec(py, vec![100_i64]).into_any(),
                     PyArray1::from_vec(py, vec![0.0_f64, 2.0, 4.0, 6.0]).into_any(),
                     PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
-                    true.into_pyobject(py)?.to_owned().into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
                     ">".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
@@ -857,7 +857,7 @@ mod tests {
                                 PyArray1::from_vec(py, left_index.clone()).into_any(),
                                 PyArray1::from_vec(py, first_right.clone()).into_any(),
                                 PyArray1::from_vec(py, right_index.clone()).into_any(),
-                                true.into_pyobject(py)?.to_owned().into_any(),
+                                false.into_pyobject(py)?.to_owned().into_any(),
                                 first_operator.into_pyobject(py)?.into_any(),
                             ],
                         )?)?;
@@ -868,7 +868,7 @@ mod tests {
                                 PyArray1::from_vec(py, left_index.clone()).into_any(),
                                 PyArray1::from_vec(py, second_right.clone()).into_any(),
                                 PyArray1::from_vec(py, right_index.clone()).into_any(),
-                                true.into_pyobject(py)?.to_owned().into_any(),
+                                false.into_pyobject(py)?.to_owned().into_any(),
                                 second_operator.into_pyobject(py)?.into_any(),
                             ],
                         )?)?;
@@ -900,7 +900,7 @@ mod tests {
                     PyArray1::from_vec(py, vec![101_i64]).into_any(),
                     PyArray1::from_vec(py, first_right).into_any(),
                     PyArray1::from_vec(py, right_index).into_any(),
-                    true.into_pyobject(py)?.to_owned().into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
                     "<=".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
@@ -911,7 +911,7 @@ mod tests {
                     PyArray1::from_vec(py, vec![101_i64]).into_any(),
                     PyArray1::from_vec(py, second_right).into_any(),
                     PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
-                    true.into_pyobject(py)?.to_owned().into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
                     ">".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
@@ -966,7 +966,7 @@ mod tests {
                             PyArray1::from_vec(py, left_index.clone()).into_any(),
                             PyArray1::from_vec(py, right.clone()).into_any(),
                             PyArray1::from_vec(py, right_index.clone()).into_any(),
-                            true.into_pyobject(py)?.to_owned().into_any(),
+                            false.into_pyobject(py)?.to_owned().into_any(),
                             operator.into_pyobject(py)?.into_any(),
                         ],
                     )?)?;
