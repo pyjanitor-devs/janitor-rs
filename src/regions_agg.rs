@@ -54,18 +54,25 @@ fn normalized_predicates<'py>(
     predicates: &Bound<'py, PyList>,
 ) -> PyResult<Bound<'py, PyList>> {
     // Aggregation anchors may contain two extra arrays after the four data
-    // arrays: one map for forward output slots and one for reverse output
-    // slots. Region construction does not use those maps, so it expects the
-    // ordinary five-field anchor ending in the comparison operator.
+    // arrays: one output-position map for each direction. Region construction
+    // does not use those maps, so it expects the ordinary five-field anchor.
     let first_item = predicates.get_item(0)?;
     let first = first_item.cast::<PyTuple>()?;
     let second_item = predicates.get_item(1)?;
     let second = second_item.cast::<PyTuple>()?;
-    // Six fields means the operator is at position five. Eight fields means
-    // positions five and six are output maps, so the operator moves to seven.
     let first_op = match first.len() {
-        6 => first.get_item(5)?,
-        8 => first.get_item(7)?,
+        6 => {
+            // The ordering flag is owned by PyJanitor, but its type remains
+            // part of the public tuple contract and must be validated.
+            first.get_item(4)?.extract::<bool>()?;
+            first.get_item(5)?
+        }
+        8 => {
+            // Eight-field anchors place the two output maps at positions
+            // four and five, followed by the ordering flag and operator.
+            first.get_item(6)?.extract::<bool>()?;
+            first.get_item(7)?
+        }
         _ => {
             return Err(PyValueError::new_err(
                 "region aggregation first anchor must contain 6 or 8 elements",
@@ -157,12 +164,12 @@ fn aggregate_regions_exact<'py>(
     // slots expected by PyJanitor. Without maps, positions are identity
     // ordered and the original physical lengths define the output domain.
     let left_output_positions = if first.len() == 8 {
-        Some(first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+        Some(first.get_item(4)?.extract::<PyReadonlyArray1<'py, i64>>()?)
     } else {
         None
     };
     let right_output_positions = if first.len() == 8 {
-        Some(first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+        Some(first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?)
     } else {
         None
     };
@@ -175,6 +182,20 @@ fn aggregate_regions_exact<'py>(
             .as_ref()
             .map(|values| values.as_array())
     };
+    if let Some(values) = left_output_positions.as_ref() {
+        if values.len()? != regions.left_len {
+            return Err(PyValueError::new_err(
+                "left output positions must match the left value length",
+            ));
+        }
+    }
+    if let Some(values) = right_output_positions.as_ref() {
+        if values.len()? != regions.right_len {
+            return Err(PyValueError::new_err(
+                "right output positions must match the right value length",
+            ));
+        }
+    }
     let output_len = output_positions
         .map(|values| values.len())
         .unwrap_or(if reverse {
@@ -229,9 +250,15 @@ fn aggregate_regions_exact<'py>(
                 // `AggregationSet::update` takes source position first and
                 // output position second. Reverse aggregation swaps them.
                 if reverse {
-                    set.update(left_position, right_position);
+                    set.update(
+                        regions.left_positions[left_position],
+                        regions.right_positions[right_position],
+                    );
                 } else {
-                    set.update(right_position, left_position);
+                    set.update(
+                        regions.right_positions[right_position],
+                        regions.left_positions[left_position],
+                    );
                 }
                 position = next[right_position];
             }
@@ -329,7 +356,7 @@ fn aggregate_regions_extended<'py>(
     // Residual predicates use physical positions directly in the hot loop.
     // Therefore their arrays must describe the same aligned layouts as the
     // two region paths.
-    check_predicate_lengths(&parsed, regions.left_index.len(), regions.right_index.len())?;
+    check_predicate_lengths(&parsed, regions.left_len, regions.right_len)?;
     // Parse aggregation requests once before entering the sweep. The set
     // owns output accumulators while borrowing the source NumPy arrays.
     let inputs = parse_inputs(aggregations)?;
@@ -343,12 +370,12 @@ fn aggregate_regions_extended<'py>(
     // is used for forward aggregation and the right map for reverse
     // aggregation. Six-field anchors already use identity positions.
     let left_output_positions = if first.len() == 8 {
-        Some(first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+        Some(first.get_item(4)?.extract::<PyReadonlyArray1<'py, i64>>()?)
     } else {
         None
     };
     let right_output_positions = if first.len() == 8 {
-        Some(first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+        Some(first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?)
     } else {
         None
     };
@@ -364,6 +391,20 @@ fn aggregate_regions_extended<'py>(
     // `output_len` is the number of rows receiving results. Forward output
     // has one slot per left row; reverse output has one slot per right row.
     // When a compact map exists, its length is the authoritative slot count.
+    if let Some(values) = left_output_positions.as_ref() {
+        if values.len()? != regions.left_len {
+            return Err(PyValueError::new_err(
+                "left output positions must match the left value length",
+            ));
+        }
+    }
+    if let Some(values) = right_output_positions.as_ref() {
+        if values.len()? != regions.right_len {
+            return Err(PyValueError::new_err(
+                "right output positions must match the right value length",
+            ));
+        }
+    }
     let output_len = output_positions
         .map(|values| values.len())
         .unwrap_or(if reverse {
@@ -439,16 +480,22 @@ fn aggregate_regions_extended<'py>(
                 let passes = predicates_match_dispatch(
                     &views,
                     metadata_views.as_deref(),
-                    left_position,
-                    right_position,
+                    regions.left_positions[left_position],
+                    regions.right_positions[right_position],
                 );
                 if passes {
                     // AggregationSet expects (source_position,
                     // output_position). Reverse mode swaps those roles.
                     if reverse {
-                        set.update(left_position, right_position);
+                        set.update(
+                            regions.left_positions[left_position],
+                            regions.right_positions[right_position],
+                        );
                     } else {
-                        set.update(right_position, left_position);
+                        set.update(
+                            regions.right_positions[right_position],
+                            regions.left_positions[left_position],
+                        );
                     }
                 }
                 // Follow the duplicate chain. Different right rows may

@@ -42,6 +42,48 @@ pub(crate) enum AnyParsedRangePredicate<'py> {
 }
 
 impl AnyParsedRangePredicate<'_> {
+    /// Validate that each value array has a matching index-label array.
+    ///
+    /// Region construction uses values and labels independently while it
+    /// builds paths, so malformed tuples must be rejected before that code
+    /// performs positional indexing.
+    pub(crate) fn validate_lengths(&self) -> Result<(), String> {
+        macro_rules! validate {
+            ($predicate:expr) => {{
+                let predicate = $predicate;
+                let left_len = predicate.left.as_array().len();
+                let left_index_len = predicate.left_index.as_array().len();
+                if left_len != left_index_len {
+                    return Err(format!(
+                        "left values and left index must have equal lengths ({} != {})",
+                        left_len, left_index_len
+                    ));
+                }
+                let right_len = predicate.right.as_array().len();
+                let right_index_len = predicate.right_index.as_array().len();
+                if right_len != right_index_len {
+                    return Err(format!(
+                        "right values and right index must have equal lengths ({} != {})",
+                        right_len, right_index_len
+                    ));
+                }
+                Ok(())
+            }};
+        }
+        match self {
+            Self::I64(value) => validate!(value),
+            Self::I32(value) => validate!(value),
+            Self::I16(value) => validate!(value),
+            Self::I8(value) => validate!(value),
+            Self::U64(value) => validate!(value),
+            Self::U32(value) => validate!(value),
+            Self::U16(value) => validate!(value),
+            Self::U8(value) => validate!(value),
+            Self::F64(value) => validate!(value),
+            Self::F32(value) => validate!(value),
+        }
+    }
+
     /// Build ordinary half-open windows for this anchor.
     ///
     /// `include_right_index` controls whether the right labels are retained in

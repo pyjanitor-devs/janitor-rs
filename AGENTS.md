@@ -1157,3 +1157,15 @@ the definition of a dual-range join.
 **Recommendation**: Keep PyJanitor responsible for null filtering, sorting,
 and physical alignment of the right layouts. Let Rust search each anchor using
 its supplied value representation, then intersect only the positional windows.
+
+### [2026-09-27] Region traversal positions are not source positions
+
+**Context**: Reviewing dual-region aggregation and residual filtering.
+**Learning**: Region construction removes left rows with empty primary regions
+and reverses the physical right layout for a greater-than first anchor. A
+region position therefore cannot be used directly as an aggregation output,
+source-array, or residual-predicate position.
+
+**Recommendation**: Preserve explicit compact-region-to-original-position
+mappings through alignment. Use those mappings for aggregation updates and
+residual predicate evaluation; keep the original lengths for validation.

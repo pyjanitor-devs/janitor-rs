@@ -53,6 +53,15 @@ pub(crate) struct AlignedRegions {
     pub(crate) right_first: Vec<i64>,
     /// Second primary region number for each right row; may be non-monotonic.
     pub(crate) right_second: Vec<i64>,
+    /// Original left-array position for each aligned left region position.
+    pub(crate) left_positions: Vec<usize>,
+    /// Original right-array position for each aligned right region position.
+    /// Greater-than anchors reverse this mapping for traversal.
+    pub(crate) right_positions: Vec<usize>,
+    /// Number of left rows before impossible region rows are removed.
+    pub(crate) left_len: usize,
+    /// Number of right rows before region traversal reorders the layout.
+    pub(crate) right_len: usize,
 }
 
 /// Find the first right-region position satisfying left <= right.
@@ -553,10 +562,21 @@ fn region_boundaries(anchor: &AnyParsedRangePredicate<'_>) -> Result<RegionBound
 ///
 /// # Returns
 ///
-/// `(left_index, left_region, right_index, right_region)`, with empty-window
-/// left rows removed and reverse-oriented right regions normalized for the
-/// sweep.
-fn labels(boundary: RegionBoundary) -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>) {
+/// A [`LabeledRegions`] value with empty-window left rows removed,
+/// reverse-oriented right regions normalized for the sweep, and mappings back
+/// to the original value-array positions.
+struct LabeledRegions {
+    left_index: Vec<i64>,
+    left_region: Vec<i64>,
+    left_positions: Vec<usize>,
+    right_index: Vec<i64>,
+    right_region: Vec<i64>,
+    right_positions: Vec<usize>,
+    left_len: usize,
+    right_len: usize,
+}
+
+fn labels(boundary: RegionBoundary) -> LabeledRegions {
     let RegionBoundary {
         left_index: original_left_index,
         mut right_index,
@@ -583,14 +603,19 @@ fn labels(boundary: RegionBoundary) -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>) 
     }
     let mut left_index = Vec::new();
     let mut left_region = Vec::new();
+    let mut left_positions = Vec::new();
     for (position, boundary) in boundaries.iter().enumerate() {
         // A boundary at or beyond the right length has no matching right
         // position, so that left row is removed before alignment.
         if *boundary < right_region.len() {
             left_index.push(original_left_index[position]);
             left_region.push(right_region[*boundary]);
+            left_positions.push(position);
         }
     }
+    let left_len = original_left_index.len();
+    let right_len = right_index.len();
+    let mut right_positions = (0..right_len).collect::<Vec<_>>();
     if reverse {
         // Greater-than anchors were built as prefixes. Reverse their right
         // layout so the matching prefix becomes a matching suffix. Reversing
@@ -601,6 +626,7 @@ fn labels(boundary: RegionBoundary) -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>) 
         let maximum = right_region.iter().copied().max().unwrap_or(0);
         right_index.reverse();
         right_region.reverse();
+        right_positions.reverse();
         for value in &mut right_region {
             *value = maximum - *value;
         }
@@ -618,7 +644,16 @@ fn labels(boundary: RegionBoundary) -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>) 
         right_region.windows(2).all(|pair| pair[0] <= pair[1]),
         "right region path must be monotonic nondecreasing"
     );
-    (left_index, left_region, right_index, right_region)
+    LabeledRegions {
+        left_index,
+        left_region,
+        left_positions,
+        right_index,
+        right_region,
+        right_positions,
+        left_len,
+        right_len,
+    }
 }
 
 /// Align two primary region sets by their original left and right IDs.
@@ -652,13 +687,13 @@ pub(crate) fn align(
     // are built once so alignment is linear instead of repeatedly scanning the
     // second anchor for every first-anchor row.
     let second_left = second
-        .0
+        .left_index
         .iter()
         .enumerate()
         .map(|(position, id)| (*id, position))
         .collect::<HashMap<_, _>>();
     let second_right = second
-        .2
+        .right_index
         .iter()
         .enumerate()
         .map(|(position, id)| (*id, position))
@@ -670,23 +705,29 @@ pub(crate) fn align(
         left_second: Vec::new(),
         right_first: Vec::new(),
         right_second: Vec::new(),
+        left_positions: Vec::new(),
+        right_positions: Vec::new(),
+        left_len: first.left_len,
+        right_len: first.right_len,
     };
     // Keep the first anchor's left order as the canonical left-row order.
     // Look up the corresponding second region using the original left ID.
-    for (position, id) in first.0.iter().enumerate() {
+    for (position, id) in first.left_index.iter().enumerate() {
         if let Some(&other) = second_left.get(id) {
             output.left_index.push(*id);
-            output.left_first.push(first.1[position]);
-            output.left_second.push(second.1[other]);
+            output.left_first.push(first.left_region[position]);
+            output.left_second.push(second.left_region[other]);
+            output.left_positions.push(first.left_positions[position]);
         }
     }
     // Keep the first anchor's right order as the canonical physical right
     // layout. The second region is reordered to that same layout by ID.
-    for (position, id) in first.2.iter().enumerate() {
+    for (position, id) in first.right_index.iter().enumerate() {
         if let Some(&other) = second_right.get(id) {
             output.right_index.push(*id);
-            output.right_first.push(first.3[position]);
-            output.right_second.push(second.3[other]);
+            output.right_first.push(first.right_region[position]);
+            output.right_second.push(second.right_region[other]);
+            output.right_positions.push(first.right_positions[position]);
         }
     }
     Ok(output)
@@ -720,6 +761,8 @@ pub(crate) fn parse_and_align<'py>(predicates: &Bound<'py, PyList>) -> PyResult<
     // (left values, left IDs, right values, right IDs, operator).
     let first = parse_any_range_predicate(first, true)?;
     let second = parse_any_range_predicate(second, true)?;
+    first.validate_lengths().map_err(PyValueError::new_err)?;
+    second.validate_lengths().map_err(PyValueError::new_err)?;
     align(
         region_boundaries(&first).map_err(PyValueError::new_err)?,
         region_boundaries(&second).map_err(PyValueError::new_err)?,
@@ -745,13 +788,18 @@ fn build_regions_indices<'py>(
     // Residual arrays must have the same physical left/right lengths as the
     // aligned regions because their positions are used directly in the hot
     // traversal loop.
-    check_predicate_lengths(&parsed, regions.left_index.len(), regions.right_index.len())?;
+    check_predicate_lengths(&parsed, regions.left_len, regions.right_len)?;
     let views: Vec<_> = parsed.iter().map(Predicate::view).collect();
     let metadata_views = metadata.as_deref().map(null_metadata_views);
     // The matcher closure is called only for primary candidates. `keep` is
     // applied by traversal after this closure has exhausted all residuals.
     let (left_index, right_index) = build_indices_extended(&regions, keep, |left, right| {
-        predicates_match_dispatch(&views, metadata_views.as_deref(), left, right)
+        predicates_match_dispatch(
+            &views,
+            metadata_views.as_deref(),
+            regions.left_positions[left],
+            regions.right_positions[right],
+        )
     })
     .map_err(PyValueError::new_err)?;
     if left_index.is_empty() {
@@ -865,6 +913,10 @@ mod tests {
             left_second: vec![1, 2],
             right_first: vec![1, 2, 3, 4],
             right_second,
+            left_positions: vec![0, 1],
+            right_positions: vec![0, 1, 2, 3],
+            left_len: 2,
+            right_len: 4,
         }
     }
 
@@ -885,17 +937,38 @@ mod tests {
             (true, vec![0, 2]),  // >
             (true, vec![1, 3]),  // >=
         ] {
-            let (_, _, _, right_region) = labels(RegionBoundary {
+            let labeled = labels(RegionBoundary {
                 left_index: vec![10, 11],
                 right_index: vec![20, 21, 22, 23],
                 boundaries,
                 reverse,
             });
-            assert!(
-                right_region.windows(2).all(|pair| pair[0] <= pair[1]),
-                "right region path was not monotonic: {right_region:?}"
-            );
+            assert!(labeled
+                .right_region
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1]));
         }
+    }
+
+    #[test]
+    fn labels_keep_original_positions_when_rows_are_removed_or_reversed() {
+        let forward = labels(RegionBoundary {
+            left_index: vec![10, 11],
+            right_index: vec![20, 21, 22],
+            boundaries: vec![3, 1],
+            reverse: false,
+        });
+        assert_eq!(forward.left_positions, vec![1]);
+        assert_eq!(forward.right_positions, vec![0, 1, 2]);
+
+        let reverse = labels(RegionBoundary {
+            left_index: vec![10, 11],
+            right_index: vec![20, 21, 22],
+            boundaries: vec![0, 2],
+            reverse: true,
+        });
+        assert_eq!(reverse.left_positions, vec![0, 1]);
+        assert_eq!(reverse.right_positions, vec![2, 1, 0]);
     }
 
     #[test]
