@@ -611,7 +611,13 @@ fn labels(boundary: RegionBoundary) -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>) 
     // `sweep_queries` uses binary search over the first right-region path.
     // This is the invariant that makes that search valid for all four
     // inequality operators, including the normalized greater-than paths.
-    debug_assert!(right_region.windows(2).all(|pair| pair[0] <= pair[1]));
+    // This is a correctness-critical invariant: `sweep_queries` performs a
+    // binary search over this path. Keep the assertion in release builds so
+    // an internal construction bug cannot silently produce wrong matches.
+    assert!(
+        right_region.windows(2).all(|pair| pair[0] <= pair[1]),
+        "right region path must be monotonic nondecreasing"
+    );
     (left_index, left_region, right_index, right_region)
 }
 
