@@ -79,7 +79,7 @@ pub(crate) fn sweep_queries(regions: &AlignedRegions) -> Vec<(usize, usize)> {
         .collect::<Vec<_>>();
     // Process larger starts first. The active right suffix can then grow
     // leftward as later queries require more right rows.
-    queries.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    queries.sort_unstable_by_key(|left| std::cmp::Reverse(left.0));
     queries
 }
 
@@ -416,8 +416,8 @@ fn build_selected_indices(regions: &AlignedRegions, keep: Keep) -> (Vec<i64>, Ve
 
     let mut left_index = Vec::new();
     let mut right_index = Vec::new();
-    for left_position in 0..regions.left_index.len() {
-        if let Some(right_position) = selected[left_position] {
+    for (left_position, right_position) in selected.into_iter().enumerate() {
+        if let Some(right_position) = right_position {
             left_index.push(regions.left_index[left_position]);
             right_index.push(regions.right_index[right_position]);
         }
@@ -718,8 +718,8 @@ pub(crate) fn parse_and_align<'py>(predicates: &Bound<'py, PyList>) -> PyResult<
     let second = second_item.cast::<PyTuple>()?;
     // `extended=true` selects the five-element anchor form:
     // (left values, left IDs, right values, right IDs, operator).
-    let first = parse_any_range_predicate(&first, true)?;
-    let second = parse_any_range_predicate(&second, true)?;
+    let first = parse_any_range_predicate(first, true)?;
+    let second = parse_any_range_predicate(second, true)?;
     align(
         region_boundaries(&first).map_err(PyValueError::new_err)?,
         region_boundaries(&second).map_err(PyValueError::new_err)?,
