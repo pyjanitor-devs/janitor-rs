@@ -344,6 +344,30 @@ mod tests {
             )?;
             let aggregations = PyList::new(py, [aggregation])?;
             assert!(range_join_aggregate(py, &predicates, &aggregations, true,)?.is_none());
+
+            let empty = PyList::empty(py);
+            empty.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, Vec::<i64>::new()).into_any(),
+                    PyArray1::from_vec(py, Vec::<i64>::new()).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 2]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 11]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            empty.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, Vec::<i64>::new()).into_any(),
+                    PyArray1::from_vec(py, Vec::<i64>::new()).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 2]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 11]).into_any(),
+                    "<=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            assert!(range_join_aggregate(py, &empty, &aggregations, false)?.is_none());
             Ok(())
         })
         .unwrap();
@@ -406,6 +430,475 @@ mod tests {
                 outputs.get_item(0)?.extract::<Vec<i64>>()?,
                 vec![0, 0, 4, 4]
             );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn range_aggregation_covers_all_operations_maps_nulls_and_return_modes() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            // The first anchor is integer-valued and the second is float-
+            // valued.  Each right value array is independently sorted, but
+            // both use the same physical right labels.  The intersection is
+            // right positions [2, 4) for left row 0 and [3, 4) for row 1.
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![2_i64, 6]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64, 101]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
+                    PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 0]).into_any(),
+                    PyArray1::from_vec(py, vec![3_i64, 2, 1, 0]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![3.0_f64, 5.0]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64, 101]).into_any(),
+                    PyArray1::from_vec(py, vec![0.0_f64, 2.0, 4.0, 6.0]).into_any(),
+                    PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
+                    "<=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+
+            let values = PyArray1::from_vec(py, vec![10_i64, 20, 30, 40]);
+            let nulls = PyArray1::from_vec(py, vec![false, true, false, false]);
+            let aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "prod".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "min".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "max".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            nulls.clone().into_any(),
+                            "count".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            "size".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+
+            let result = range_join_aggregate(py, &predicates, &aggregations, true)?
+                .expect("the exact range aggregation has matches");
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![1, 0]);
+            assert_eq!(
+                result.get_item(1)?.extract::<Vec<bool>>()?,
+                vec![true, true]
+            );
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![70, 40]);
+            assert_eq!(outputs.get_item(1)?.extract::<Vec<i64>>()?, vec![1200, 40]);
+            // min/max return source positions, not source values.
+            assert_eq!(outputs.get_item(2)?.extract::<Vec<i64>>()?, vec![2, 3]);
+            assert_eq!(outputs.get_item(3)?.extract::<Vec<i64>>()?, vec![3, 3]);
+            assert_eq!(outputs.get_item(4)?.extract::<Vec<i64>>()?, vec![2, 1]);
+            assert_eq!(outputs.get_item(5)?.extract::<Vec<i64>>()?, vec![2, 1]);
+
+            // Reverse aggregation consumes left values and writes one slot
+            // for every right row.  The nontrivial right output map must be
+            // returned unchanged, while null left value 6 is skipped by
+            // value-based operations but still counts for `size`.
+            let left_values = PyArray1::from_vec(py, vec![2_i64, 6]);
+            let left_nulls = PyArray1::from_vec(py, vec![false, true]);
+            let reverse_aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            left_values.clone().into_any(),
+                            left_nulls.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            left_values.clone().into_any(),
+                            left_nulls.clone().into_any(),
+                            "prod".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            left_values.clone().into_any(),
+                            left_nulls.clone().into_any(),
+                            "min".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            left_values.clone().into_any(),
+                            left_nulls.clone().into_any(),
+                            "max".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            left_nulls.clone().into_any(),
+                            "count".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            "size".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+            let result =
+                range_join_aggregate_reverse(py, &predicates, &reverse_aggregations, false)?
+                    .expect("the reverse range aggregation has matches");
+            assert_eq!(result.len(), 2);
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![3, 2, 1, 0]);
+            let outputs_item = result.get_item(1)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(
+                outputs.get_item(0)?.extract::<Vec<i64>>()?,
+                vec![0, 0, 2, 2]
+            );
+            assert_eq!(
+                outputs.get_item(1)?.extract::<Vec<i64>>()?,
+                vec![1, 1, 2, 2]
+            );
+            assert_eq!(
+                outputs.get_item(2)?.extract::<Vec<i64>>()?,
+                vec![-1, -1, 0, 0]
+            );
+            assert_eq!(
+                outputs.get_item(3)?.extract::<Vec<i64>>()?,
+                vec![-1, -1, 0, 0]
+            );
+            assert_eq!(
+                outputs.get_item(4)?.extract::<Vec<i64>>()?,
+                vec![0, 0, 1, 1]
+            );
+            assert_eq!(
+                outputs.get_item(5)?.extract::<Vec<i64>>()?,
+                vec![0, 0, 1, 2]
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn extended_range_aggregation_filters_before_forward_and_reverse_updates() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            // The two range anchors produce the same candidates as the
+            // exact test above. The residual `<` removes the row-1 candidate
+            // and is evaluated before any aggregation update.
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![2_i64, 6]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64, 101]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
+                    PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![3_i64, 5]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64, 101]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 2, 4, 6]).into_any(),
+                    PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
+                    "<=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![2_i64, 6]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 3, 5, 6]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let values = PyArray1::from_vec(py, vec![10_i64, 20, 30, 40]);
+            let nulls = PyArray1::from_vec(py, vec![false, true, false, false]);
+            let aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            nulls.clone().into_any(),
+                            "count".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            "size".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+
+            let result = range_join_extended_aggregate(py, &predicates, &aggregations, false)?
+                .expect("the residual leaves one left row with matches");
+            assert_eq!(result.len(), 2);
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0, 1]);
+            let outputs_item = result.get_item(1)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![70, 0]);
+            assert_eq!(outputs.get_item(1)?.extract::<Vec<i64>>()?, vec![2, 0]);
+            assert_eq!(outputs.get_item(2)?.extract::<Vec<i64>>()?, vec![2, 0]);
+
+            let left_values = PyArray1::from_vec(py, vec![2_i64, 6]);
+            let left_nulls = PyArray1::from_vec(py, vec![false, true]);
+            let reverse_aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            left_values.clone().into_any(),
+                            left_nulls.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            left_nulls.clone().into_any(),
+                            "count".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            "size".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+            let result = range_join_extended_aggregate_reverse(
+                py,
+                &predicates,
+                &reverse_aggregations,
+                true,
+            )?
+            .expect("the residual leaves reverse matches");
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0, 1, 2, 3]);
+            assert_eq!(
+                result.get_item(1)?.extract::<Vec<bool>>()?,
+                vec![false, false, true, true]
+            );
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(
+                outputs.get_item(0)?.extract::<Vec<i64>>()?,
+                vec![0, 0, 2, 2]
+            );
+            assert_eq!(
+                outputs.get_item(1)?.extract::<Vec<i64>>()?,
+                vec![0, 0, 1, 1]
+            );
+            assert_eq!(
+                outputs.get_item(2)?.extract::<Vec<i64>>()?,
+                vec![0, 0, 1, 1]
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn range_aggregation_supports_unsigned_and_float_sources() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 3, 5]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![3_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 2, 4]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                    "<=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let mask = PyArray1::from_vec(py, vec![false, false, false]);
+            let unsigned = PyArray1::from_vec(py, vec![1_u32, 2, 3]);
+            let floats = PyArray1::from_vec(py, vec![1.5_f64, 2.5, 3.5]);
+            let aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            unsigned.into_any(),
+                            mask.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            floats.into_any(),
+                            mask.into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+            let result = range_join_aggregate(py, &predicates, &aggregations, true)?
+                .expect("mixed aggregation sources should match");
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<u64>>()?, vec![3]);
+            assert_eq!(outputs.get_item(1)?.extract::<Vec<f64>>()?, vec![3.5]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn range_aggregation_rejects_malformed_tuples_and_parallel_lengths() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let malformed = PyList::empty(py);
+            malformed.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            malformed.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let aggregation = PyList::new(
+                py,
+                [PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![false]).into_any(),
+                        "sum".into_pyobject(py)?.into_any(),
+                    ],
+                )?],
+            )?;
+            let error = range_join_aggregate(py, &malformed, &aggregation, true).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("range extended aggregation has invalid anchor tuple lengths"));
+
+            let mismatched = PyList::empty(py);
+            mismatched.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            mismatched.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let error = range_join_aggregate(py, &mismatched, &aggregation, true).unwrap_err();
+            assert!(error.to_string().contains("left and left_index"));
             Ok(())
         })
         .unwrap();
