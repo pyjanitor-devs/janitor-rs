@@ -646,12 +646,17 @@ fn region_boundaries(anchor: &AnyParsedRangePredicate<'_>) -> Result<RegionBound
             }
             let reverse = matches!(predicate.op, CompareOp::Gt | CompareOp::Ge);
             let mut boundaries = Vec::with_capacity(predicate.left.as_array().len());
+            let right_len = predicate.right.as_array().len();
             for value in predicate.left.as_array().iter() {
-                // `range_window` performs the typed binary search. For a
-                // less-than anchor we keep the suffix start; for a
-                // greater-than anchor we keep the prefix end.
+                // `range_window` performs the typed binary search. Less-than
+                // anchors already return a suffix start. Greater-than
+                // anchors return an eligible prefix length; convert it to
+                // the suffix start in the reversed right layout now. This
+                // gives `labels` one uniform boundary convention:
+                // boundary 0 means all right rows, and boundary right_len
+                // means no right rows.
                 let (start, end) = range_window(*value, predicate.right.as_array(), predicate.op);
-                boundaries.push(if reverse { end } else { start });
+                boundaries.push(if reverse { right_len - end } else { start });
             }
             Ok(RegionBoundary {
                 left_index: predicate.left_index.as_array().to_vec(),
@@ -702,17 +707,19 @@ struct LabeledRegions {
 ///
 /// # How labels are built
 ///
-/// `boundaries` is treated as a set of increments. An increment at position
+/// `boundaries` is treated as a set of suffix starts. An increment at position
 /// `p` means that the right-side region number changes starting at `p`.
 /// Cumulative summation turns those increments into one label per physical
-/// right row. A left row reads the label at its boundary. If the boundary is
-/// outside the right array, that left row has no possible match and is omitted
-/// from the compact left path.
+/// right row. A left row reads the label at its boundary. A boundary equal to
+/// the right length describes an empty suffix and is omitted from the compact
+/// left path.
 ///
-/// For a greater-than anchor, the right layout is reversed and labels are
-/// complemented. This turns a matching prefix into a matching suffix while
-/// preserving the strict/inclusive distinction. `right_positions` records
-/// that the new region position `0` came from the old source position
+/// `region_boundaries` has already normalized greater-than anchors into this
+/// same representation: a binary-search prefix length `p` becomes the
+/// reversed-layout suffix start `right_len - p`, and `right_index` is reversed
+/// before this function builds labels. Consequently, this function has one
+/// boundary rule for all four inequality operators. `right_positions` records
+/// that reversed position `0` came from original source position
 /// `right_len - 1`.
 fn labels(boundary: RegionBoundary) -> LabeledRegions {
     let RegionBoundary {
@@ -721,9 +728,24 @@ fn labels(boundary: RegionBoundary) -> LabeledRegions {
         boundaries,
         reverse,
     } = boundary;
-    // Each boundary marks where one left row's eligible right region begins
-    // (or ends for a reversed anchor). Difference-style increments let us
-    // construct all right region labels in one cumulative pass.
+    let right_len = right_index.len();
+    let mut right_positions = (0..right_len).collect::<Vec<_>>();
+    if reverse {
+        // Binary search returned a matching prefix length. Reverse the
+        // physical right layout and convert that prefix length into the
+        // equivalent suffix start before any labels are built:
+        //
+        //   prefix length p -> suffix start right_len - p
+        //
+        // Thus boundary 0 means "all right rows" and boundary right_len
+        // means "no right rows", with no special case later in this
+        // function.
+        right_index.reverse();
+        right_positions.reverse();
+    }
+    // Each boundary marks where one left row's eligible right suffix begins.
+    // Difference-style increments let us construct all right region labels
+    // in one cumulative pass.
     let mut right_region = vec![0_i64; right_index.len()];
     for position in boundaries.iter().copied() {
         if position < right_region.len() {
@@ -749,39 +771,9 @@ fn labels(boundary: RegionBoundary) -> LabeledRegions {
             left_index.push(original_left_index[position]);
             left_region.push(right_region[*boundary]);
             left_positions.push(position);
-        } else if reverse && *boundary == right_region.len() && !right_region.is_empty() {
-            // A greater-than-or-equal prefix may end exactly at the right
-            // length.  That means the prefix contains every right row, not
-            // that the left row has no candidates.  There is no element at
-            // `boundary` to index, so use the label immediately after the
-            // final prefix element.  The reverse normalization below turns
-            // this into the minimum label of the reversed right suffix.
-            left_index.push(original_left_index[position]);
-            left_region.push(right_region[right_region.len() - 1] + 1);
-            left_positions.push(position);
         }
     }
     let left_len = original_left_index.len();
-    let right_len = right_index.len();
-    let mut right_positions = (0..right_len).collect::<Vec<_>>();
-    if reverse {
-        // Greater-than anchors were built as prefixes. Reverse their right
-        // layout so the matching prefix becomes a matching suffix. Reversing
-        // alone would make the region labels descend, so complement every
-        // label around the largest right label. The left threshold needs one
-        // extra step: this preserves the strict/inclusive distinction and
-        // prevents an excluded equal boundary from becoming a match.
-        let maximum = right_region.iter().copied().max().unwrap_or(0);
-        right_index.reverse();
-        right_region.reverse();
-        right_positions.reverse();
-        for value in &mut right_region {
-            *value = maximum - *value;
-        }
-        for value in &mut left_region {
-            *value = maximum - *value + 1;
-        }
-    }
     // `sweep_queries` uses binary search over the first right-region path.
     // This is the invariant that makes that search valid for all four
     // inequality operators, including the normalized greater-than paths.
