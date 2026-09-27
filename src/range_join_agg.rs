@@ -30,7 +30,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
 use crate::join_aggregation_helpers::aggregate_range_windows;
-use crate::range_join::{build_any_windows, parse_any_range_predicate};
+use crate::range_join::build_any_windows;
+use crate::range_predicate::parse_any_range_predicate;
 
 /// Build and aggregate the per-row windows for a dual-range join.
 ///

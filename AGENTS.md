@@ -383,6 +383,14 @@ work, while one width-eight query makes that regression obvious.
 
 ## Learned Patterns
 
+- Region aggregation consumes every pair passing the primary and residual
+  predicates. `Keep` selection semantics (`all`, `first`, `last`, `any`) apply
+  only to index-returning paths and must not be part of the aggregation API.
+- The streaming primary-region sweep currently belongs in `regions_agg.rs`,
+  because aggregation is its only consumer. Keep index-generation sweeps
+  specialized until a later abstraction pass demonstrates a shared helper
+  without obscuring their two-pass allocation and selection behavior.
+
 <!--
 This section is for agents to record new learnings.
 Add entries in the format:
@@ -1149,3 +1157,29 @@ the definition of a dual-range join.
 **Recommendation**: Keep PyJanitor responsible for null filtering, sorting,
 and physical alignment of the right layouts. Let Rust search each anchor using
 its supplied value representation, then intersect only the positional windows.
+
+### [2026-09-27] Region traversal positions are not source positions
+
+**Context**: Reviewing dual-region aggregation and residual filtering.
+**Learning**: Region construction removes left rows with empty primary regions
+and reverses the physical right layout for a greater-than first anchor. A
+region position therefore cannot be used directly as an aggregation output,
+source-array, or residual-predicate position.
+
+**Recommendation**: Preserve explicit compact-region-to-original-position
+mappings through alignment. Use those mappings for aggregation updates and
+residual predicate evaluation; keep the original lengths for validation.
+
+### [2026-09-27] Test typed window dispatch at its boundary
+
+**Context**: Reviewing the shared `AnyParsedRangePredicate::windows` dispatch
+used by dual-range index and aggregation paths.
+**Learning**: The dispatch must preserve the four half-open boundary forms:
+`<`/`<=` produce suffixes and `>`/>=` produce prefixes. Empty windows must be
+retained until row alignment, including boundaries at zero and at the right
+array length.
+
+**Recommendation**: Keep direct tests at the parsed-predicate boundary in
+addition to end-to-end legacy-path tests. Exercise every operator and both
+full/empty boundary cases so a dtype-dispatch change cannot silently alter
+window coordinates.

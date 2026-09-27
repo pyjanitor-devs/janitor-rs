@@ -5,7 +5,6 @@
 //! reuse the same primitive and perform their additional filtering elsewhere.
 
 use numpy::ndarray::{Array1, ArrayView1};
-use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -13,11 +12,14 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use crate::aggs::ensure_equal_lengths_core;
 use crate::aggs::max::max_starts_ends::max_start_end_core_no_nulls;
 use crate::aggs::min::min_starts_ends::min_start_end_core_no_nulls;
+#[cfg(test)]
 use crate::anchor_non_equi_join::build_range_core_with_labels;
 use crate::join_candidate_materialization::materialize_range_candidates;
 use crate::join_common::{result_dict, Keep, SingleJoinResult};
+#[cfg(test)]
 use crate::op::CompareOp;
 use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
+use crate::range_predicate::{parse_any_range_predicate, AnyParsedRangePredicate};
 
 /// A typed range predicate used by the basic two-range kernel.
 ///
@@ -172,6 +174,14 @@ pub(crate) fn intersect_windows(
     Ok(result)
 }
 
+/// Build dual-range windows while dispatching each anchor independently.
+pub(crate) fn build_any_windows(
+    first: &AnyParsedRangePredicate<'_>,
+    second: &AnyParsedRangePredicate<'_>,
+) -> Result<SingleJoinResult, String> {
+    intersect_windows(first.windows(true)?, second.windows(false)?)
+}
+
 /// Select one label from each arbitrary dual-range window.
 ///
 /// Unlike a single non-equi join, a dual-range join can produce an interior
@@ -297,257 +307,6 @@ pub(crate) fn choose_range_windows(
         output_right.push(label);
     }
     Ok((output_left, output_right))
-}
-
-/// Keep the extracted NumPy owners alive while borrowed views are used.
-///
-/// ELI5: `ArrayView1` is only a window into an array; it does not own the
-/// array. The owners therefore have to live in this struct until the window
-/// calculation has finished.
-pub(crate) struct ParsedRangePredicate<'py, T: numpy::Element> {
-    pub(crate) left: PyReadonlyArray1<'py, T>,
-    pub(crate) left_index: PyReadonlyArray1<'py, i64>,
-    pub(crate) right: PyReadonlyArray1<'py, T>,
-    pub(crate) right_index: PyReadonlyArray1<'py, i64>,
-    pub(crate) op: CompareOp,
-}
-
-/// A range predicate whose concrete NumPy dtype is selected at runtime.
-///
-/// The two anchors in a dual-range join do not need the same dtype. Each one
-/// is parsed into its own variant, searched with its own typed
-/// `partition_point`, and converted to an untyped positional window before
-/// the two windows are intersected.
-pub(crate) enum AnyParsedRangePredicate<'py> {
-    I64(ParsedRangePredicate<'py, i64>),
-    I32(ParsedRangePredicate<'py, i32>),
-    I16(ParsedRangePredicate<'py, i16>),
-    I8(ParsedRangePredicate<'py, i8>),
-    U64(ParsedRangePredicate<'py, u64>),
-    U32(ParsedRangePredicate<'py, u32>),
-    U16(ParsedRangePredicate<'py, u16>),
-    U8(ParsedRangePredicate<'py, u8>),
-    F64(ParsedRangePredicate<'py, f64>),
-    F32(ParsedRangePredicate<'py, f32>),
-}
-
-impl AnyParsedRangePredicate<'_> {
-    /// Build this anchor's positional windows without exposing its dtype.
-    fn windows(&self, include_right_index: bool) -> Result<SingleJoinResult, String> {
-        macro_rules! build {
-            ($predicate:expr) => {{
-                let predicate = $predicate;
-                build_range_core_with_labels(
-                    predicate.left.as_array(),
-                    predicate.left_index.as_array(),
-                    predicate.right.as_array(),
-                    predicate.right_index.as_array(),
-                    true,
-                    predicate.op,
-                    include_right_index,
-                    true,
-                )
-            }};
-        }
-        match self {
-            Self::I64(value) => build!(value),
-            Self::I32(value) => build!(value),
-            Self::I16(value) => build!(value),
-            Self::I8(value) => build!(value),
-            Self::U64(value) => build!(value),
-            Self::U32(value) => build!(value),
-            Self::U16(value) => build!(value),
-            Self::U8(value) => build!(value),
-            Self::F64(value) => build!(value),
-            Self::F32(value) => build!(value),
-        }
-    }
-
-    pub(crate) fn left_len(&self) -> usize {
-        match self {
-            Self::I64(value) => value.left.as_array().len(),
-            Self::I32(value) => value.left.as_array().len(),
-            Self::I16(value) => value.left.as_array().len(),
-            Self::I8(value) => value.left.as_array().len(),
-            Self::U64(value) => value.left.as_array().len(),
-            Self::U32(value) => value.left.as_array().len(),
-            Self::U16(value) => value.left.as_array().len(),
-            Self::U8(value) => value.left.as_array().len(),
-            Self::F64(value) => value.left.as_array().len(),
-            Self::F32(value) => value.left.as_array().len(),
-        }
-    }
-
-    pub(crate) fn right_len(&self) -> usize {
-        match self {
-            Self::I64(value) => value.right.as_array().len(),
-            Self::I32(value) => value.right.as_array().len(),
-            Self::I16(value) => value.right.as_array().len(),
-            Self::I8(value) => value.right.as_array().len(),
-            Self::U64(value) => value.right.as_array().len(),
-            Self::U32(value) => value.right.as_array().len(),
-            Self::U16(value) => value.right.as_array().len(),
-            Self::U8(value) => value.right.as_array().len(),
-            Self::F64(value) => value.right.as_array().len(),
-            Self::F32(value) => value.right.as_array().len(),
-        }
-    }
-}
-
-/// Parse one range anchor using the dtype of that anchor's own value arrays.
-pub(crate) fn parse_any_range_predicate<'py>(
-    tuple: &Bound<'py, PyTuple>,
-    extended: bool,
-) -> PyResult<AnyParsedRangePredicate<'py>> {
-    let dtype = tuple
-        .get_item(0)?
-        .getattr("dtype")?
-        .getattr("name")?
-        .extract::<String>()?;
-
-    macro_rules! parse {
-        ($ty:ty, $variant:ident) => {
-            if extended {
-                Ok(AnyParsedRangePredicate::$variant(
-                    parse_extended_range_predicate::<$ty>(tuple)?,
-                ))
-            } else {
-                Ok(AnyParsedRangePredicate::$variant(parse_range_predicate::<
-                    $ty,
-                >(tuple)?))
-            }
-        };
-    }
-
-    match dtype.as_str() {
-        "int64" => parse!(i64, I64),
-        "int32" => parse!(i32, I32),
-        "int16" => parse!(i16, I16),
-        "int8" => parse!(i8, I8),
-        "uint64" => parse!(u64, U64),
-        "uint32" => parse!(u32, U32),
-        "uint16" => parse!(u16, U16),
-        "uint8" => parse!(u8, U8),
-        "float64" => parse!(f64, F64),
-        "float32" => parse!(f32, F32),
-        other => Err(PyValueError::new_err(format!(
-            "unsupported range predicate dtype: {other}"
-        ))),
-    }
-}
-
-/// Build dual-range windows while dispatching each anchor independently.
-pub(crate) fn build_any_windows(
-    first: &AnyParsedRangePredicate<'_>,
-    second: &AnyParsedRangePredicate<'_>,
-) -> Result<SingleJoinResult, String> {
-    intersect_windows(first.windows(true)?, second.windows(false)?)
-}
-
-/// Parse the six-element basic range tuple.
-///
-/// The tuple is `(left, left_index, right, right_index,
-/// right_index_is_ordered, comparator)`. Values are expected to be non-null
-/// and sorted on the right side before this function is called. Rust trusts
-/// that preparation. The ordering flag is part of the shared wrapper
-/// contract, not an aggregation input: its value is validated but not used
-/// to choose an aggregation algorithm. Arbitrary-window `first`/`last`
-/// selection uses range extrema instead of prefix/suffix tables.
-///
-/// # Errors
-///
-/// Returns `ValueError` for the wrong tuple length or an invalid comparator,
-/// and propagates Python extraction errors for incompatible array dtypes.
-///
-/// # Arguments
-///
-/// * `tuple` - The six-element Python tuple at the Rust boundary. The first
-///   four fields are aligned value/label arrays, field four is the shared
-///   ordering flag (validated but ignored by aggregation), and the final
-///   field is the string comparator.
-///
-/// # Returns
-///
-/// A parsed predicate that owns borrowed Python array handles for the duration
-/// of window construction. The ordering flag is intentionally not stored:
-/// arbitrary dual-range selection uses exact interval extrema.
-pub(crate) fn parse_range_predicate<'py, T: numpy::Element>(
-    tuple: &Bound<'py, PyTuple>,
-) -> PyResult<ParsedRangePredicate<'py, T>> {
-    if tuple.len() != 6 {
-        return Err(PyValueError::new_err(
-            "range predicates must contain 6 elements",
-        ));
-    }
-    let left = tuple.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?;
-    let left_index = tuple.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?;
-    let right = tuple.get_item(2)?.extract::<PyReadonlyArray1<'py, T>>()?;
-    let right_index = tuple.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?;
-    // The ordering flag is part of the shared predicate tuple contract.
-    // Aggregation does not use its value: PyJanitor has already sorted the
-    // right-hand arrays before calling Rust. Extract it only to validate the
-    // tuple shape and field type.
-    tuple.get_item(4)?.extract::<bool>()?;
-    let op = CompareOp::try_from_str(tuple.get_item(5)?.extract::<&str>()?)?;
-    Ok(ParsedRangePredicate {
-        left,
-        left_index,
-        right,
-        right_index,
-        op,
-    })
-}
-
-/// Parse one of the two range anchors for the range-led extended API.
-///
-/// Extended joins do not use `right_index_is_ordered`: residual filtering can
-/// remove arbitrary candidates before `first`/`last` selection. Their anchor
-/// tuples therefore contain only `(left, left_index, right, right_index, op)`.
-/// The first two predicates still must have ascending right value arrays;
-/// additional predicates are parsed and applied as residual filters after the
-/// two windows have been intersected.
-///
-/// # Arguments
-///
-/// * `tuple` - A five-element tuple containing left values, left labels, right
-///   values, right labels, and a range comparator. This internal extended
-///   form is distinct from the six-element public range tuple because the
-///   extended path does not use the ordering flag.
-///
-/// # Returns
-///
-/// A borrowed [`ParsedRangePredicate`] retaining the Python array owners
-/// while the range windows are built.
-///
-/// # Errors
-///
-/// Returns `ValueError` for the wrong tuple length or an invalid comparator,
-/// and propagates Python extraction errors for incompatible array dtypes.
-///
-/// # Returns
-///
-/// A parsed range predicate whose arrays remain borrowed from the Python tuple
-/// while the dual-range extended operation constructs and filters windows.
-pub(crate) fn parse_extended_range_predicate<'py, T: numpy::Element>(
-    tuple: &Bound<'py, PyTuple>,
-) -> PyResult<ParsedRangePredicate<'py, T>> {
-    if tuple.len() != 5 {
-        return Err(PyValueError::new_err(
-            "extended range predicates must contain 5 elements",
-        ));
-    }
-    let left = tuple.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?;
-    let left_index = tuple.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?;
-    let right = tuple.get_item(2)?.extract::<PyReadonlyArray1<'py, T>>()?;
-    let right_index = tuple.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?;
-    let op = CompareOp::try_from_str(tuple.get_item(4)?.extract::<&str>()?)?;
-    Ok(ParsedRangePredicate {
-        left,
-        left_index,
-        right,
-        right_index,
-        op,
-    })
 }
 
 /// Build indices for a dual-range join from two per-row windows.
@@ -725,6 +484,75 @@ mod tests {
         assert_eq!(result.left_index, vec![10, 11]);
         assert_eq!(result.starts, vec![2, 5]);
         assert_eq!(result.ends, vec![8, 8]);
+    }
+
+    #[test]
+    fn parsed_windows_dispatch_all_operators_and_boundary_cases() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left = PyArray1::from_vec(py, vec![2_i64]);
+            let left_index = PyArray1::from_vec(py, vec![10_i64]);
+            let right = PyArray1::from_vec(py, vec![1_i64, 2, 3]);
+            let right_index = PyArray1::from_vec(py, vec![20_i64, 21, 22]);
+
+            // `windows()` is the dtype-dispatch boundary used by the public
+            // dual-range paths. These expected half-open intervals document
+            // the binary-search convention for every supported operator:
+            // strict/inclusive less-than creates a suffix, while
+            // strict/inclusive greater-than creates a prefix.
+            for (operator, expected_start, expected_end) in
+                [("<", 2, 3), ("<=", 1, 3), (">", 0, 1), (">=", 0, 2)]
+            {
+                let predicate = PyTuple::new(
+                    py,
+                    [
+                        left.clone().into_any(),
+                        left_index.clone().into_any(),
+                        right.clone().into_any(),
+                        right_index.clone().into_any(),
+                        true.into_pyobject(py)?.to_owned().into_any(),
+                        operator.into_pyobject(py)?.into_any(),
+                    ],
+                )?;
+                let parsed = parse_any_range_predicate(&predicate, false)?;
+                let windows = parsed.windows(true).map_err(PyValueError::new_err)?;
+                assert_eq!(windows.left_positions, vec![0], "operator {operator}");
+                assert_eq!(windows.starts, vec![expected_start], "operator {operator}");
+                assert_eq!(windows.ends, vec![expected_end], "operator {operator}");
+                assert_eq!(windows.right_index, vec![20, 21, 22]);
+            }
+
+            // `retain_empty_windows` is intentional: alignment needs one
+            // window per logical left row, even when that row has no match.
+            // Check both the full suffix/prefix and empty suffix/prefix
+            // boundaries, which are the off-by-one cases most likely to be
+            // damaged by a dispatch refactor.
+            let boundary_left = PyArray1::from_vec(py, vec![0_i64, 4]);
+            let boundary_left_index = PyArray1::from_vec(py, vec![30_i64, 31]);
+            for (operator, expected_starts, expected_ends) in [
+                ("<", vec![0, 3], vec![3, 3]),
+                (">=", vec![0, 0], vec![0, 3]),
+            ] {
+                let predicate = PyTuple::new(
+                    py,
+                    [
+                        boundary_left.clone().into_any(),
+                        boundary_left_index.clone().into_any(),
+                        right.clone().into_any(),
+                        right_index.clone().into_any(),
+                        true.into_pyobject(py)?.to_owned().into_any(),
+                        operator.into_pyobject(py)?.into_any(),
+                    ],
+                )?;
+                let parsed = parse_any_range_predicate(&predicate, false)?;
+                let windows = parsed.windows(true).map_err(PyValueError::new_err)?;
+                assert_eq!(windows.left_positions, vec![0, 1], "operator {operator}");
+                assert_eq!(windows.starts, expected_starts, "operator {operator}");
+                assert_eq!(windows.ends, expected_ends, "operator {operator}");
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
