@@ -730,3 +730,196 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(region_extended_aggregate_reverse, m)?)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::PyArray1;
+
+    fn aggregation<'py>(py: Python<'py>, values: Vec<i64>) -> PyResult<Bound<'py, PyList>> {
+        let values = PyArray1::from_vec(py, values);
+        let mask = PyArray1::from_vec(py, vec![false; values.len()?]);
+        let request = PyTuple::new(
+            py,
+            [
+                values.into_any(),
+                mask.into_any(),
+                "sum".into_pyobject(py)?.into_any(),
+            ],
+        )?;
+        PyList::new(py, [request])
+    }
+
+    fn dual_predicates<'py>(
+        py: Python<'py>,
+        first_left: Vec<i64>,
+        first_right: Vec<i64>,
+        first_op: &str,
+        second_op: &str,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let predicates = PyList::empty(py);
+        let left_index = PyArray1::from_vec(py, (0..first_left.len() as i64).collect());
+        let right_index = PyArray1::from_vec(py, (0..first_right.len() as i64).collect());
+        predicates.append(PyTuple::new(
+            py,
+            [
+                PyArray1::from_vec(py, first_left.clone()).into_any(),
+                left_index.clone().into_any(),
+                PyArray1::from_vec(py, first_right.clone()).into_any(),
+                right_index.clone().into_any(),
+                true.into_pyobject(py)?.to_owned().into_any(),
+                first_op.into_pyobject(py)?.into_any(),
+            ],
+        )?)?;
+        predicates.append(PyTuple::new(
+            py,
+            [
+                PyArray1::from_vec(py, first_left).into_any(),
+                left_index.into_any(),
+                PyArray1::from_vec(py, first_right).into_any(),
+                right_index.into_any(),
+                second_op.into_pyobject(py)?.into_any(),
+            ],
+        )?)?;
+        Ok(predicates)
+    }
+
+    fn result_parts<'py>(
+        result: &Bound<'py, PyTuple>,
+    ) -> PyResult<(Vec<i64>, Vec<bool>, Vec<i64>)> {
+        let positions = result.get_item(0)?.extract::<Vec<i64>>()?;
+        let matched = result.get_item(1)?.extract::<Vec<bool>>()?;
+        let outputs = result
+            .get_item(2)?
+            .cast::<PyList>()?
+            .get_item(0)?
+            .extract::<Vec<i64>>()?;
+        Ok((positions, matched, outputs))
+    }
+
+    #[test]
+    fn greater_than_anchors_aggregate_forward_and_reverse() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = dual_predicates(py, vec![1, 3], vec![1, 2, 3, 4], ">=", "<=")?;
+
+            let forward_inputs = aggregation(py, vec![10, 20, 30, 40])?;
+            let forward = region_aggregate(py, &predicates, &forward_inputs, true)?
+                .expect("greater-than forward aggregation should match");
+            assert_eq!(
+                result_parts(&forward)?,
+                (vec![0, 1], vec![true, true], vec![10, 30])
+            );
+
+            let reverse_inputs = aggregation(py, vec![100, 300])?;
+            let reverse = region_aggregate_reverse(py, &predicates, &reverse_inputs, true)?
+                .expect("greater-than reverse aggregation should match");
+            assert_eq!(
+                result_parts(&reverse)?,
+                (
+                    vec![0, 1, 2, 3],
+                    vec![true, false, true, false],
+                    vec![100, 0, 300, 0]
+                )
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn eight_field_anchor_preserves_maps_when_a_left_row_is_dropped() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            let left = PyArray1::from_vec(py, vec![4_i64, 1]);
+            let left_index = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let right = PyArray1::from_vec(py, vec![1_i64, 2, 3]);
+            let right_index = PyArray1::from_vec(py, vec![0_i64, 1, 2]);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    left.clone().into_any(),
+                    left_index.clone().into_any(),
+                    right.clone().into_any(),
+                    right_index.clone().into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    PyArray1::from_vec(py, vec![100_i64, 200]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                    "<=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    left.into_any(),
+                    left_index.into_any(),
+                    right.into_any(),
+                    right_index.into_any(),
+                    ">=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+
+            let forward_inputs = aggregation(py, vec![10, 20, 30])?;
+            let forward = region_aggregate(py, &predicates, &forward_inputs, true)?
+                .expect("mapped forward aggregation should match");
+            assert_eq!(
+                result_parts(&forward)?,
+                (vec![100, 200], vec![false, true], vec![0, 10])
+            );
+
+            let reverse_inputs = aggregation(py, vec![4, 8])?;
+            let reverse = region_aggregate_reverse(py, &predicates, &reverse_inputs, true)?
+                .expect("mapped reverse aggregation should match");
+            assert_eq!(
+                result_parts(&reverse)?,
+                (vec![10, 20, 30], vec![true, false, false], vec![8, 0, 0])
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn residuals_use_source_positions_after_reversal() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // Left row zero has no `>=` candidate and is removed from the
+            // compact region path. Left row one matches right source position
+            // zero. The residual values distinguish source position zero from
+            // its reversed traversal position three.
+            let predicates = dual_predicates(py, vec![0, 1], vec![1, 2, 3, 4], ">=", "<=")?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![100_i64, 200]).into_any(),
+                    PyArray1::from_vec(py, vec![200_i64, 99, 98, 97]).into_any(),
+                    "==".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+
+            let forward_inputs = aggregation(py, vec![10, 20, 30, 40])?;
+            let forward = region_extended_aggregate(py, &predicates, &forward_inputs, true)?
+                .expect("residual forward aggregation should match");
+            assert_eq!(
+                result_parts(&forward)?,
+                (vec![0, 1], vec![false, true], vec![0, 10])
+            );
+
+            let reverse_inputs = aggregation(py, vec![100, 200])?;
+            let reverse =
+                region_extended_aggregate_reverse(py, &predicates, &reverse_inputs, true)?
+                    .expect("residual reverse aggregation should match");
+            assert_eq!(
+                result_parts(&reverse)?,
+                (
+                    vec![0, 1, 2, 3],
+                    vec![true, false, false, false],
+                    vec![200, 0, 0, 0]
+                )
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+}
