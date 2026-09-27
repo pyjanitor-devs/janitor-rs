@@ -55,7 +55,7 @@ use std::collections::BTreeMap;
 
 use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
 use crate::join_aggregation_helpers::residuals;
-use crate::multi_join_indices::common::{add_right_region, GroupState};
+use crate::multi_join_indices::common::{add_right_region, checked_region_start, GroupState};
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, predicates_match_dispatch, Predicate,
 };
@@ -300,7 +300,15 @@ fn aggregation_layout<'py>(
 /// * `regions` - Two already-built and aligned primary region paths.
 /// * `consume` - Called once per candidate that satisfies both primary
 ///   regions. It receives compact region coordinates, not source positions.
-fn sweep_aggregation_candidates<F>(regions: &regions::AlignedRegions, mut consume: F)
+///
+/// # Errors
+///
+/// Returns an error if a query boundary is outside the right layout or moves
+/// backwards relative to the already-linked active suffix.
+fn sweep_aggregation_candidates<F>(
+    regions: &regions::AlignedRegions,
+    mut consume: F,
+) -> Result<(), String>
 where
     F: FnMut(usize, usize),
 {
@@ -315,9 +323,14 @@ where
     // exposed right slice is inserted once, so duplicate labels remain
     // separate chain entries while the B-tree supplies second-region order.
     for (start, left_position) in queries {
-        if start >= regions.right_index.len() {
+        let start = checked_region_start(
+            i64::try_from(start).map_err(|_| "region start exceeds i64 capacity")?,
+            regions.right_index.len(),
+            previous_end,
+        )?;
+        let Some(start) = start else {
             continue;
-        }
+        };
         add_right_region(
             ArrayView1::from(&regions.right_second[..]),
             start,
@@ -335,6 +348,7 @@ where
             }
         }
     }
+    Ok(())
 }
 
 /// Execute exact dual-region aggregation and build the standard Python result.
@@ -412,7 +426,8 @@ fn aggregate_regions_exact<'py>(
                 regions.left_positions[left_position],
             );
         }
-    });
+    })
+    .map_err(PyValueError::new_err)?;
 
     if set.is_empty() {
         return Ok(None);
@@ -546,7 +561,8 @@ fn aggregate_regions_extended<'py>(
                 );
             }
         }
-    });
+    })
+    .map_err(PyValueError::new_err)?;
 
     if set.is_empty() {
         // The region sweep may find candidates, but null masks or residual

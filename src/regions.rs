@@ -40,7 +40,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::anchor_non_equi_join::range_window;
 use crate::join_common::{result_dict, Keep};
-use crate::multi_join_indices::common::{add_right_region, GroupState};
+use crate::multi_join_indices::common::{add_right_region, checked_region_start, GroupState};
 use crate::op::CompareOp;
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
@@ -210,9 +210,14 @@ where
     // First pass: count final output pairs. Applying the callback here keeps
     // exact and extended paths on identical two-pass semantics.
     for (start, left_position) in queries.iter().copied() {
-        if start >= regions.right_index.len() {
+        let start = checked_region_start(
+            i64::try_from(start).map_err(|_| "region start exceeds i64 capacity")?,
+            regions.right_index.len(),
+            previous_end,
+        )?;
+        let Some(start) = start else {
             continue;
-        }
+        };
         // Grow the active suffix exactly as in the second pass.
         add_right_region(
             ArrayView1::from(&regions.right_second[..]),
@@ -257,9 +262,14 @@ where
     // Second pass: write directly into the final output arrays. The cursor
     // for each left row starts at that row's offset and advances independently.
     for (start, left_position) in queries.iter().copied() {
-        if start >= regions.right_index.len() {
+        let start = checked_region_start(
+            i64::try_from(start).map_err(|_| "region start exceeds i64 capacity")?,
+            regions.right_index.len(),
+            previous_end,
+        )?;
+        let Some(start) = start else {
             continue;
-        }
+        };
         add_right_region(
             ArrayView1::from(&regions.right_second[..]),
             start,
@@ -299,11 +309,16 @@ where
 /// At most one original-index pair per left row. `first` and `last` compare
 /// original right labels, while `any` stops at the first passing traversal
 /// candidate.
+///
+/// # Errors
+///
+/// Returns an error if the sweep boundary sequence violates the shared
+/// `add_right_region` ordering invariant.
 fn build_selected_indices<P>(
     regions: &AlignedRegions,
     keep: Keep,
     mut predicates_pass: P,
-) -> (Vec<i64>, Vec<i64>)
+) -> Result<(Vec<i64>, Vec<i64>), String>
 where
     P: FnMut(usize, usize) -> bool,
 {
@@ -318,9 +333,14 @@ where
     // Filter candidates before applying first/last/any. This preserves the
     // contract that keep semantics see only complete predicate matches.
     for (start, left_position) in queries {
-        if start >= regions.right_index.len() {
+        let start = checked_region_start(
+            i64::try_from(start).map_err(|_| "region start exceeds i64 capacity")?,
+            regions.right_index.len(),
+            previous_end,
+        )?;
+        let Some(start) = start else {
             continue;
-        }
+        };
         add_right_region(
             ArrayView1::from(&regions.right_second[..]),
             start,
@@ -380,7 +400,7 @@ where
             right_index.push(regions.right_index[right_position]);
         }
     }
-    (left_index, right_index)
+    Ok((left_index, right_index))
 }
 
 /// Build original-index pairs from exactly two aligned primary regions.
@@ -404,7 +424,7 @@ pub(crate) fn build_indices(
     if keep == Keep::All {
         return build_all_indices(regions, |_, _| true);
     }
-    Ok(build_selected_indices(regions, keep, |_, _| true))
+    build_selected_indices(regions, keep, |_, _| true)
 }
 
 /// Build original-index pairs from aligned regions and residual predicates.
@@ -439,7 +459,7 @@ where
     if keep == Keep::All {
         build_all_indices(regions, predicates_pass)
     } else {
-        Ok(build_selected_indices(regions, keep, predicates_pass))
+        build_selected_indices(regions, keep, predicates_pass)
     }
 }
 
