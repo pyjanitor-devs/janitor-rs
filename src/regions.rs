@@ -149,11 +149,14 @@ pub(crate) fn sweep_queries(regions: &AlignedRegions) -> Vec<(usize, usize)> {
     queries
 }
 
-/// Materialize an exact two-range `all` result directly from two sweeps.
+/// Materialize an `all` result directly from two sweeps.
 ///
 /// # Arguments
 ///
-/// * `regions` - Aligned primary regions with no residual predicates.
+/// * `regions` - Aligned primary regions.
+/// * `predicates_pass` - Callback receiving compact region positions and
+///   returning whether the candidate survives residual predicates. The exact
+///   two-range path supplies a callback that always returns `true`.
 ///
 /// # Returns
 ///
@@ -176,21 +179,26 @@ pub(crate) fn sweep_queries(regions: &AlignedRegions) -> Vec<(usize, usize)> {
 ///
 /// The first sweep counts matches per left row and computes offsets. The
 /// second sweep writes directly into the final index buffers, so no candidate
-/// positions buffer is needed for the exact two-range case.
-fn build_all_indices(regions: &AlignedRegions) -> Result<(Vec<i64>, Vec<i64>), String> {
+/// positions buffer is needed.
+fn build_all_indices<P>(
+    regions: &AlignedRegions,
+    mut predicates_pass: P,
+) -> Result<(Vec<i64>, Vec<i64>), String>
+where
+    P: FnMut(usize, usize) -> bool,
+{
     let queries = sweep_queries(regions);
     let mut counts = vec![0_usize; regions.left_index.len()];
-    let mut overflow = false;
     let mut active = BTreeMap::<i64, GroupState>::new();
     let mut next = vec![-1_i64; regions.right_index.len()];
     let mut previous_end = regions.right_index.len();
-    // First pass: count final output pairs. Since this is the exact two-range
-    // path, there are no residual predicates to evaluate here.
+    // First pass: count final output pairs. Applying the callback here keeps
+    // exact and extended paths on identical two-pass semantics.
     for (start, left_position) in queries.iter().copied() {
         if start >= regions.right_index.len() {
             continue;
         }
-        // Grow the active suffix exactly as in the extended candidate sweep.
+        // Grow the active suffix exactly as in the second pass.
         add_right_region(
             ArrayView1::from(&regions.right_second[..]),
             start,
@@ -203,16 +211,15 @@ fn build_all_indices(regions: &AlignedRegions) -> Result<(Vec<i64>, Vec<i64>), S
         for (_, state) in active.range(regions.left_second[left_position]..) {
             let mut position = state.head;
             while position >= 0 {
-                match counts[left_position].checked_add(1) {
-                    Some(count) => counts[left_position] = count,
-                    None => overflow = true,
+                let right_position = position as usize;
+                if predicates_pass(left_position, right_position) {
+                    counts[left_position] = counts[left_position]
+                        .checked_add(1)
+                        .ok_or("region index result size exceeds platform capacity")?;
                 }
-                position = next[position as usize];
+                position = next[right_position];
             }
         }
-    }
-    if overflow {
-        return Err("region index result size exceeds platform capacity".to_owned());
     }
 
     let mut offsets = vec![0_usize; counts.len() + 1];
@@ -250,121 +257,6 @@ fn build_all_indices(regions: &AlignedRegions) -> Result<(Vec<i64>, Vec<i64>), S
             let mut position = state.head;
             while position >= 0 {
                 let right_position = position as usize;
-                let output_position = cursors[left_position];
-                left_index[output_position] = regions.left_index[left_position];
-                right_index[output_position] = regions.right_index[right_position];
-                cursors[left_position] += 1;
-                position = next[right_position];
-            }
-        }
-    }
-    Ok((left_index, right_index))
-}
-
-/// Materialize extended `all` results by filtering inside two sweeps.
-///
-/// # Arguments
-///
-/// * `regions` - Aligned primary region paths.
-/// * `predicates_pass` - Callback receiving compact region positions and
-///   returning whether all residual predicates pass. The caller is responsible
-///   for translating positions through the mappings in `regions`.
-///
-/// # Returns
-///
-/// Original index-label pairs in canonical left-row order. Residual failures
-/// are excluded before counts, offsets, or output allocation are finalized.
-///
-/// # Errors
-///
-/// Returns an error on checked count/offset overflow.
-fn build_all_indices_extended<P>(
-    regions: &AlignedRegions,
-    mut predicates_pass: P,
-) -> Result<(Vec<i64>, Vec<i64>), String>
-where
-    P: FnMut(usize, usize) -> bool,
-{
-    let queries = sweep_queries(regions);
-    // `counts[left]` will count only complete matches: both primary regions
-    // must pass and every residual predicate must pass too.
-    let mut counts = vec![0_usize; regions.left_index.len()];
-    let mut active = BTreeMap::<i64, GroupState>::new();
-    let mut next = vec![-1_i64; regions.right_index.len()];
-    let mut previous_end = regions.right_index.len();
-
-    // First pass: count only candidates that pass every residual predicate.
-    // The active map handles the primary predicates; the callback handles the
-    // remaining predicates for each physical left/right pair.
-    for (start, left_position) in queries.iter().copied() {
-        if start >= regions.right_index.len() {
-            continue;
-        }
-        add_right_region(
-            ArrayView1::from(&regions.right_second[..]),
-            start,
-            previous_end,
-            &mut next,
-            &mut active,
-        );
-        previous_end = start;
-        for (_, state) in active.range(regions.left_second[left_position]..) {
-            // `state.head` starts a linked list of duplicate right positions.
-            // Follow `next` so duplicates are counted individually.
-            let mut position = state.head;
-            while position >= 0 {
-                let right_position = position as usize;
-                if predicates_pass(left_position, right_position) {
-                    counts[left_position] = counts[left_position]
-                        .checked_add(1)
-                        .ok_or("region index result size exceeds platform capacity")?;
-                }
-                position = next[right_position];
-            }
-        }
-    }
-
-    let mut offsets = vec![0_usize; counts.len() + 1];
-    // Turn counts into contiguous output ranges, one range per left row.
-    for (left_position, count) in counts.iter().copied().enumerate() {
-        offsets[left_position + 1] = offsets[left_position]
-            .checked_add(count)
-            .ok_or("region index result size exceeds platform capacity")?;
-    }
-    let total = offsets[regions.left_index.len()];
-    if total == 0 {
-        // No candidate survived the residual filters, so there is no second
-        // sweep or output allocation to perform.
-        return Ok((Vec::new(), Vec::new()));
-    }
-
-    let mut left_index = vec![0_i64; total];
-    let mut right_index = vec![0_i64; total];
-    let mut cursors = offsets[..regions.left_index.len()].to_vec();
-    active.clear();
-    next.fill(-1);
-    previous_end = regions.right_index.len();
-
-    // Second pass: rebuild the chains, reapply residuals, and write directly
-    // into the exact output slice belonging to each left row. Residuals are
-    // intentionally evaluated again instead of retaining every candidate.
-    for (start, left_position) in queries.iter().copied() {
-        if start >= regions.right_index.len() {
-            continue;
-        }
-        add_right_region(
-            ArrayView1::from(&regions.right_second[..]),
-            start,
-            previous_end,
-            &mut next,
-            &mut active,
-        );
-        previous_end = start;
-        for (_, state) in active.range(regions.left_second[left_position]..) {
-            // Walk every duplicate position in this qualifying region value.
-            let mut position = state.head;
-            while position >= 0 {
-                let right_position = position as usize;
                 if predicates_pass(left_position, right_position) {
                     let output_position = cursors[left_position];
                     left_index[output_position] = regions.left_index[left_position];
@@ -378,7 +270,7 @@ where
     Ok((left_index, right_index))
 }
 
-/// Materialize extended `first`, `last`, or `any` results in one sweep.
+/// Materialize `first`, `last`, or `any` results in one sweep.
 ///
 /// # Arguments
 ///
@@ -392,7 +284,7 @@ where
 /// At most one original-index pair per left row. `first` and `last` compare
 /// original right labels, while `any` stops at the first passing traversal
 /// candidate.
-fn build_selected_indices_extended<P>(
+fn build_selected_indices<P>(
     regions: &AlignedRegions,
     keep: Keep,
     mut predicates_pass: P,
@@ -463,81 +355,10 @@ where
         }
     }
 
-    let mut left_index = Vec::new();
-    let mut right_index = Vec::new();
+    let mut left_index = Vec::with_capacity(selected.len());
+    let mut right_index = Vec::with_capacity(selected.len());
     // The sweep order is not left-row order, so materialize selected rows by
     // walking `selected` in canonical left order.
-    for (left_position, right_position) in selected.into_iter().enumerate() {
-        if let Some(right_position) = right_position {
-            left_index.push(regions.left_index[left_position]);
-            right_index.push(regions.right_index[right_position]);
-        }
-    }
-    (left_index, right_index)
-}
-
-/// Materialize `first`, `last`, or `any` for exactly two range predicates.
-///
-/// This is the no-residual fast path. Because the two primary inequalities are
-/// the complete predicate set, every candidate reported by the region sweep
-/// is immediately eligible for `keep` selection.
-///
-/// This path has no residual predicate callback. `first` and `last` select by
-/// original right index label, while `any` returns the first candidate found
-/// by the sweep.
-fn build_selected_indices(regions: &AlignedRegions, keep: Keep) -> (Vec<i64>, Vec<i64>) {
-    let queries = sweep_queries(regions);
-    let mut selected = vec![None; regions.left_index.len()];
-    let mut active = BTreeMap::<i64, GroupState>::new();
-    let mut next = vec![-1_i64; regions.right_index.len()];
-    let mut previous_end = regions.right_index.len();
-
-    // One sweep is enough for selected modes. Store only the chosen physical
-    // right position for each left row; the final label lookup is O(1).
-    for (start, left_position) in queries {
-        if start >= regions.right_index.len() {
-            continue;
-        }
-        add_right_region(
-            ArrayView1::from(&regions.right_second[..]),
-            start,
-            previous_end,
-            &mut next,
-            &mut active,
-        );
-        previous_end = start;
-        for (_, state) in active.range(regions.left_second[left_position]..) {
-            let mut position = state.head;
-            while position >= 0 {
-                let right_position = position as usize;
-                selected[left_position] = match (keep, selected[left_position]) {
-                    (Keep::Any, None) => Some(right_position),
-                    (Keep::Any, current) => current,
-                    (Keep::First, None) => Some(right_position),
-                    (Keep::First, Some(current)) => Some(
-                        if regions.right_index[right_position] < regions.right_index[current] {
-                            right_position
-                        } else {
-                            current
-                        },
-                    ),
-                    (Keep::Last, None) => Some(right_position),
-                    (Keep::Last, Some(current)) => Some(
-                        if regions.right_index[right_position] > regions.right_index[current] {
-                            right_position
-                        } else {
-                            current
-                        },
-                    ),
-                    (Keep::All, _) => unreachable!(),
-                };
-                position = next[right_position];
-            }
-        }
-    }
-
-    let mut left_index = Vec::new();
-    let mut right_index = Vec::new();
     for (left_position, right_position) in selected.into_iter().enumerate() {
         if let Some(right_position) = right_position {
             left_index.push(regions.left_index[left_position]);
@@ -566,9 +387,9 @@ pub(crate) fn build_indices(
     keep: Keep,
 ) -> Result<(Vec<i64>, Vec<i64>), String> {
     if keep == Keep::All {
-        return build_all_indices(regions);
+        return build_all_indices(regions, |_, _| true);
     }
-    Ok(build_selected_indices(regions, keep))
+    Ok(build_selected_indices(regions, keep, |_, _| true))
 }
 
 /// Build original-index pairs from aligned regions and residual predicates.
@@ -601,13 +422,9 @@ where
     P: FnMut(usize, usize) -> bool,
 {
     if keep == Keep::All {
-        build_all_indices_extended(regions, predicates_pass)
+        build_all_indices(regions, predicates_pass)
     } else {
-        Ok(build_selected_indices_extended(
-            regions,
-            keep,
-            predicates_pass,
-        ))
+        Ok(build_selected_indices(regions, keep, predicates_pass))
     }
 }
 
@@ -761,9 +578,9 @@ fn labels(boundary: RegionBoundary) -> LabeledRegions {
             right_region[position] += right_region[position - 1];
         }
     }
-    let mut left_index = Vec::new();
-    let mut left_region = Vec::new();
-    let mut left_positions = Vec::new();
+    let mut left_index = Vec::with_capacity(boundaries.len());
+    let mut left_region = Vec::with_capacity(boundaries.len());
+    let mut left_positions = Vec::with_capacity(boundaries.len());
     for (position, boundary) in boundaries.iter().enumerate() {
         // A boundary at or beyond the right length has no matching right
         // position, so that left row is removed before alignment.
@@ -844,14 +661,14 @@ pub(crate) fn align(
         .map(|(position, id)| (*id, position))
         .collect::<HashMap<_, _>>();
     let mut output = AlignedRegions {
-        left_index: Vec::new(),
-        right_index: Vec::new(),
-        left_first: Vec::new(),
-        left_second: Vec::new(),
-        right_first: Vec::new(),
-        right_second: Vec::new(),
-        left_positions: Vec::new(),
-        right_positions: Vec::new(),
+        left_index: Vec::with_capacity(first.left_index.len()),
+        right_index: Vec::with_capacity(first.right_index.len()),
+        left_first: Vec::with_capacity(first.left_index.len()),
+        left_second: Vec::with_capacity(first.left_index.len()),
+        right_first: Vec::with_capacity(first.right_index.len()),
+        right_second: Vec::with_capacity(first.right_index.len()),
+        left_positions: Vec::with_capacity(first.left_index.len()),
+        right_positions: Vec::with_capacity(first.right_index.len()),
         left_len: first.left_len,
         right_len: first.right_len,
     };
@@ -1081,20 +898,18 @@ mod tests {
 
     #[test]
     fn every_inequality_orientation_produces_an_increasing_right_path() {
-        // For right values [1, 2, 3, 4] and left values [1, 3], these are
-        // the boundaries returned by `range_window`:
+        // These are normalized suffix starts, not raw greater-than prefix
+        // ends. `region_boundaries` converts a reverse prefix length `p` to
+        // `right_len - p` before calling `labels`.
         //
-        // * `<`  => first right value strictly greater: [1, 3]
-        // * `<=` => first right value greater/equal:   [0, 2]
-        // * `>`  => first right value greater/equal ends prefix: [0, 2]
-        // * `>=` => first right value strictly greater ends prefix: [1, 3]
-        //
-        // The greater-than cases use the reverse normalization in `labels`.
+        // Every path is now built in the same suffix coordinate system, so
+        // the monotonicity assertion is testing the actual post-refactor
+        // representation used by the sweep.
         for (reverse, boundaries) in [
             (false, vec![1, 3]), // <
             (false, vec![0, 2]), // <=
-            (true, vec![0, 2]),  // >
-            (true, vec![1, 3]),  // >=
+            (true, vec![0, 2]),  // normalized >
+            (true, vec![1, 3]),  // normalized >=
         ] {
             let labeled = labels(RegionBoundary {
                 left_index: vec![10, 11],
@@ -1110,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn labels_keep_original_positions_when_rows_are_removed_or_reversed() {
+    fn labels_keep_original_positions_with_normalized_boundaries() {
         let forward = labels(RegionBoundary {
             left_index: vec![10, 11],
             right_index: vec![20, 21, 22],
@@ -1120,6 +935,9 @@ mod tests {
         assert_eq!(forward.left_positions, vec![1]);
         assert_eq!(forward.right_positions, vec![0, 1, 2]);
 
+        // Reverse boundaries are already `right_len - prefix_length`; labels
+        // only reverses the physical right layout and does not transform the
+        // boundary a second time.
         let reverse = labels(RegionBoundary {
             left_index: vec![10, 11],
             right_index: vec![20, 21, 22],

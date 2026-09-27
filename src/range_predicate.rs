@@ -33,6 +33,13 @@ use crate::op::CompareOp;
 
 /// One typed range anchor after parsing.
 ///
+/// The fields intentionally retain owned `PyReadonlyArray1` handles instead
+/// of storing only borrowed `ArrayView1` values. The handles keep the Python
+/// NumPy owners alive for the entire Rust kernel call; a view alone would
+/// carry the element lifetime but would not keep the Python objects alive
+/// across the dispatch and region/window construction steps. The views are
+/// created only inside the short typed operations that consume this struct.
+///
 /// The five-element extended tuple is
 /// `(left_values, left_index, right_values, right_index, operator)`. The
 /// six-element basic tuple inserts a boolean `right_index_is_ordered` before
