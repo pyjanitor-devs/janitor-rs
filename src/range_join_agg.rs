@@ -1001,4 +1001,80 @@ mod tests {
         })
         .unwrap();
     }
+
+    #[test]
+    fn forward_aggregation_skips_a_null_inside_a_matching_window() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            // Both anchors include right position one.  Its source value is
+            // null, so it must count toward `size` and matching metadata but
+            // must not contribute to `sum` or `count`.
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64, 3, 5]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 2, 4]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                    "<=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+
+            let values = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
+            let nulls = PyArray1::from_vec(py, vec![false, true, false]);
+            let aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            nulls.clone().into_any(),
+                            "count".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            "size".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+            let result = range_join_aggregate(py, &predicates, &aggregations, true)?
+                .expect("the null lies inside the matching window");
+            // Forward aggregation writes one slot per left row; the source
+            // left label is 100, whose compact output position is zero.
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0]);
+            assert_eq!(result.get_item(1)?.extract::<Vec<bool>>()?, vec![true]);
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![30]);
+            assert_eq!(outputs.get_item(1)?.extract::<Vec<i64>>()?, vec![1]);
+            assert_eq!(outputs.get_item(2)?.extract::<Vec<i64>>()?, vec![2]);
+            Ok(())
+        })
+        .unwrap();
+    }
 }

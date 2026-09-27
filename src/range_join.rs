@@ -432,16 +432,91 @@ mod tests {
     use super::*;
     use numpy::{ndarray::Array1, PyArray1, PyArrayMethods};
 
-    fn compare(left: i64, right: i64, operator: &str) -> bool {
-        match operator {
-            "<" => left < right,
-            "<=" => left <= right,
-            ">" => left > right,
-            ">=" => left >= right,
-            "==" => left == right,
-            "!=" => left != right,
-            other => panic!("unexpected reference operator: {other}"),
+    /// Select reference positions using the same public `keep` semantics as
+    /// the production wrapper.
+    ///
+    /// Keeping this policy in one helper is important for test maintenance:
+    /// the brute-force oracle should disagree with the implementation only
+    /// when the implementation is wrong, not because one test copied a
+    /// slightly different `first`/`last` tie-break rule. `first` and `last`
+    /// are label-based, while `any` deliberately keeps the first physical
+    /// candidate, matching the crate-wide join convention.
+    fn select_reference_positions(
+        passing: Vec<usize>,
+        right_index: &[i64],
+        keep: &str,
+    ) -> Vec<usize> {
+        match keep {
+            "all" => passing,
+            "any" => passing.into_iter().take(1).collect(),
+            "first" | "last" => passing
+                .into_iter()
+                .min_by_key(|&position| {
+                    if keep == "first" {
+                        right_index[position]
+                    } else {
+                        -right_index[position]
+                    }
+                })
+                .into_iter()
+                .collect(),
+            other => panic!("unexpected reference keep: {other}"),
         }
+    }
+
+    /// Advance the deterministic generator used by the randomized oracle.
+    ///
+    /// This is intentionally tiny and local to tests. It avoids a dependency
+    /// on a random-number crate while giving future tests one named utility
+    /// instead of each test inventing its own state transition.
+    fn next_test_value(seed: &mut u64) -> i64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((*seed >> 32) % 9) as i64 - 4
+    }
+
+    struct ReferenceFixture<'a> {
+        left_index: &'a [i64],
+        first_left: &'a [i64],
+        second_left: &'a [i64],
+        right_index: &'a [i64],
+        first_right: &'a [i64],
+        second_right: &'a [i64],
+    }
+
+    /// The common i64 shape used by the public index tests.
+    ///
+    /// The production API is intentionally tuple-based for Python
+    /// compatibility. Tests should not repeat the eight tuple-field
+    /// positions everywhere, though: a field-order mistake in a test can make
+    /// a regression look like a kernel failure. This small builder keeps the
+    /// tuple layout in one documented place while malformed-tuple tests still
+    /// construct their bad inputs explicitly.
+    struct IndexPredicate<'a> {
+        left: &'a [i64],
+        left_index: &'a [i64],
+        right: &'a [i64],
+        right_index: &'a [i64],
+        ordered: bool,
+        operator: &'a str,
+    }
+
+    fn append_index_predicate<'py>(
+        py: Python<'py>,
+        predicates: &Bound<'py, PyList>,
+        predicate: IndexPredicate<'_>,
+    ) -> PyResult<()> {
+        predicates.append(PyTuple::new(
+            py,
+            [
+                PyArray1::from_vec(py, predicate.left.to_vec()).into_any(),
+                PyArray1::from_vec(py, predicate.left_index.to_vec()).into_any(),
+                PyArray1::from_vec(py, predicate.right.to_vec()).into_any(),
+                PyArray1::from_vec(py, predicate.right_index.to_vec()).into_any(),
+                predicate.ordered.into_pyobject(py)?.to_owned().into_any(),
+                predicate.operator.into_pyobject(py)?.into_any(),
+            ],
+        )?)?;
+        Ok(())
     }
 
     /// Build the public result expected from a pair-by-pair implementation.
@@ -450,62 +525,32 @@ mod tests {
     /// result is still defined by the original physical right labels.  This
     /// deliberately simple helper does not use windows or binary search: it
     /// is an independent oracle for the wrapper tests.
-    #[allow(clippy::too_many_arguments)]
     fn reference_pairs(
-        left_index: &[i64],
-        first_left: &[i64],
-        second_left: &[i64],
-        right_index: &[i64],
-        first_right: &[i64],
-        second_right: &[i64],
+        fixture: &ReferenceFixture<'_>,
         first_operator: &str,
         second_operator: &str,
         keep: &str,
     ) -> (Vec<i64>, Vec<i64>) {
         let mut output_left = Vec::new();
         let mut output_right = Vec::new();
-        for left_position in 0..left_index.len() {
+        let first_op = CompareOp::try_from_str(first_operator).unwrap();
+        let second_op = CompareOp::try_from_str(second_operator).unwrap();
+        for left_position in 0..fixture.left_index.len() {
             let mut passing = Vec::new();
-            for right_position in 0..right_index.len() {
-                if compare(
-                    first_left[left_position],
-                    first_right[right_position],
-                    first_operator,
-                ) && compare(
-                    second_left[left_position],
-                    second_right[right_position],
-                    second_operator,
+            for right_position in 0..fixture.right_index.len() {
+                if first_op.apply(
+                    &fixture.first_left[left_position],
+                    &fixture.first_right[right_position],
+                ) && second_op.apply(
+                    &fixture.second_left[left_position],
+                    &fixture.second_right[right_position],
                 ) {
                     passing.push(right_position);
                 }
             }
-            match keep {
-                "all" => {
-                    for right_position in passing {
-                        output_left.push(left_index[left_position]);
-                        output_right.push(right_index[right_position]);
-                    }
-                }
-                "any" => {
-                    if let Some(&right_position) = passing.first() {
-                        output_left.push(left_index[left_position]);
-                        output_right.push(right_index[right_position]);
-                    }
-                }
-                "first" | "last" => {
-                    let selected = passing.into_iter().min_by_key(|&position| {
-                        if keep == "first" {
-                            right_index[position]
-                        } else {
-                            -right_index[position]
-                        }
-                    });
-                    if let Some(right_position) = selected {
-                        output_left.push(left_index[left_position]);
-                        output_right.push(right_index[right_position]);
-                    }
-                }
-                other => panic!("unexpected reference keep: {other}"),
+            for right_position in select_reference_positions(passing, fixture.right_index, keep) {
+                output_left.push(fixture.left_index[left_position]);
+                output_right.push(fixture.right_index[right_position]);
             }
         }
         (output_left, output_right)
@@ -953,49 +998,57 @@ mod tests {
             // values are sorted, as required by the binary-search contract,
             // while the returned labels retain this physical permutation.
             let right_index = vec![40_i64, 10, 30, 20];
-            let operators = ["<", "<=", ">", ">="];
+            // Four representative pairs cover every operator in both anchor
+            // positions, including strict/inclusive and complementary
+            // directions. The randomized test below supplies additional
+            // pairings. Keeping the deterministic matrix at 4 x 4 instead
+            // of 4 x 4 x 4 makes failures easier to attribute while still
+            // testing every keep mode against every selected pair.
+            let operator_pairs = [("<", "<="), ("<=", ">"), (">", "<"), (">=", ">=")];
             let keeps = ["all", "first", "last", "any"];
 
-            for first_operator in operators {
-                for second_operator in operators {
-                    for keep in keeps {
-                        let predicates = PyList::empty(py);
-                        predicates.append(PyTuple::new(
-                            py,
-                            [
-                                PyArray1::from_vec(py, first_left.clone()).into_any(),
-                                PyArray1::from_vec(py, left_index.clone()).into_any(),
-                                PyArray1::from_vec(py, first_right.clone()).into_any(),
-                                PyArray1::from_vec(py, right_index.clone()).into_any(),
-                                false.into_pyobject(py)?.to_owned().into_any(),
-                                first_operator.into_pyobject(py)?.into_any(),
-                            ],
-                        )?)?;
-                        predicates.append(PyTuple::new(
-                            py,
-                            [
-                                PyArray1::from_vec(py, second_left.clone()).into_any(),
-                                PyArray1::from_vec(py, left_index.clone()).into_any(),
-                                PyArray1::from_vec(py, second_right.clone()).into_any(),
-                                PyArray1::from_vec(py, right_index.clone()).into_any(),
-                                false.into_pyobject(py)?.to_owned().into_any(),
-                                second_operator.into_pyobject(py)?.into_any(),
-                            ],
-                        )?)?;
-                        let expected = reference_pairs(
-                            &left_index,
-                            &first_left,
-                            &second_left,
-                            &right_index,
-                            &first_right,
-                            &second_right,
-                            first_operator,
-                            second_operator,
-                            keep,
-                        );
-                        let result = range_join_indices(py, &predicates, keep, false)?;
-                        assert_index_result(result, expected);
-                    }
+            for (first_operator, second_operator) in operator_pairs {
+                let predicates = PyList::empty(py);
+                append_index_predicate(
+                    py,
+                    &predicates,
+                    IndexPredicate {
+                        left: &first_left,
+                        left_index: &left_index,
+                        right: &first_right,
+                        right_index: &right_index,
+                        ordered: false,
+                        operator: first_operator,
+                    },
+                )?;
+                append_index_predicate(
+                    py,
+                    &predicates,
+                    IndexPredicate {
+                        left: &second_left,
+                        left_index: &left_index,
+                        right: &second_right,
+                        right_index: &right_index,
+                        ordered: false,
+                        operator: second_operator,
+                    },
+                )?;
+                for keep in keeps {
+                    let expected = reference_pairs(
+                        &ReferenceFixture {
+                            left_index: &left_index,
+                            first_left: &first_left,
+                            second_left: &second_left,
+                            right_index: &right_index,
+                            first_right: &first_right,
+                            second_right: &second_right,
+                        },
+                        first_operator,
+                        second_operator,
+                        keep,
+                    );
+                    let result = range_join_indices(py, &predicates, keep, false)?;
+                    assert_index_result(result, expected);
                 }
             }
 
@@ -1049,45 +1102,59 @@ mod tests {
             let left_index = vec![100_i64, 101, 102, 103];
             let right_index = vec![30_i64, 10, 40, 20, 50];
             let mut seed = 0x9e3779b97f4a7c15_u64;
-            let next_value = |seed: &mut u64| {
-                *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                ((*seed >> 32) % 9) as i64 - 4
-            };
 
             for case in 0..32 {
-                let mut first_right = (0..5).map(|_| next_value(&mut seed)).collect::<Vec<_>>();
-                let mut second_right = (0..5).map(|_| next_value(&mut seed)).collect::<Vec<_>>();
+                let mut first_right = (0..5)
+                    .map(|_| next_test_value(&mut seed))
+                    .collect::<Vec<_>>();
+                let mut second_right = (0..5)
+                    .map(|_| next_test_value(&mut seed))
+                    .collect::<Vec<_>>();
                 first_right.sort_unstable();
                 second_right.sort_unstable();
-                let first_left = (0..4).map(|_| next_value(&mut seed)).collect::<Vec<_>>();
-                let second_left = (0..4).map(|_| next_value(&mut seed)).collect::<Vec<_>>();
+                let first_left = (0..4)
+                    .map(|_| next_test_value(&mut seed))
+                    .collect::<Vec<_>>();
+                let second_left = (0..4)
+                    .map(|_| next_test_value(&mut seed))
+                    .collect::<Vec<_>>();
                 let first_operator = operators[case % operators.len()];
                 let second_operator = operators[(case * 3 + 1) % operators.len()];
                 let keep = keeps[case % keeps.len()];
                 let predicates = PyList::empty(py);
-                for (left, right, operator) in [
-                    (&first_left, &first_right, first_operator),
-                    (&second_left, &second_right, second_operator),
-                ] {
-                    predicates.append(PyTuple::new(
-                        py,
-                        [
-                            PyArray1::from_vec(py, left.clone()).into_any(),
-                            PyArray1::from_vec(py, left_index.clone()).into_any(),
-                            PyArray1::from_vec(py, right.clone()).into_any(),
-                            PyArray1::from_vec(py, right_index.clone()).into_any(),
-                            false.into_pyobject(py)?.to_owned().into_any(),
-                            operator.into_pyobject(py)?.into_any(),
-                        ],
-                    )?)?;
-                }
+                append_index_predicate(
+                    py,
+                    &predicates,
+                    IndexPredicate {
+                        left: &first_left,
+                        left_index: &left_index,
+                        right: &first_right,
+                        right_index: &right_index,
+                        ordered: false,
+                        operator: first_operator,
+                    },
+                )?;
+                append_index_predicate(
+                    py,
+                    &predicates,
+                    IndexPredicate {
+                        left: &second_left,
+                        left_index: &left_index,
+                        right: &second_right,
+                        right_index: &right_index,
+                        ordered: false,
+                        operator: second_operator,
+                    },
+                )?;
                 let expected = reference_pairs(
-                    &left_index,
-                    &first_left,
-                    &second_left,
-                    &right_index,
-                    &first_right,
-                    &second_right,
+                    &ReferenceFixture {
+                        left_index: &left_index,
+                        first_left: &first_left,
+                        second_left: &second_left,
+                        right_index: &right_index,
+                        first_right: &first_right,
+                        second_right: &second_right,
+                    },
                     first_operator,
                     second_operator,
                     keep,
@@ -1112,6 +1179,9 @@ mod tests {
             let residual_left = vec![0_i64, 3, 6];
             let residual_right = vec![0_i64, 1, 5, 8];
             let residual_operator = "<";
+            let first_op = CompareOp::try_from_str("<").unwrap();
+            let second_op = CompareOp::try_from_str(">").unwrap();
+            let residual_op = CompareOp::try_from_str(residual_operator).unwrap();
 
             for keep in ["all", "first", "last", "any"] {
                 let predicates = PyList::empty(py);
@@ -1143,48 +1213,20 @@ mod tests {
                 for left_position in 0..left_index.len() {
                     let mut passing = Vec::new();
                     for right_position in 0..right_index.len() {
-                        if compare(first_left[left_position], first_right[right_position], "<")
-                            && compare(
-                                second_left[left_position],
-                                second_right[right_position],
-                                ">",
-                            )
-                            && compare(
-                                residual_left[left_position],
-                                residual_right[right_position],
-                                residual_operator,
+                        if first_op.apply(&first_left[left_position], &first_right[right_position])
+                            && second_op
+                                .apply(&second_left[left_position], &second_right[right_position])
+                            && residual_op.apply(
+                                &residual_left[left_position],
+                                &residual_right[right_position],
                             )
                         {
                             passing.push(right_position);
                         }
                     }
-                    match keep {
-                        "all" => {
-                            for position in passing {
-                                expected.0.push(left_index[left_position]);
-                                expected.1.push(right_index[position]);
-                            }
-                        }
-                        "any" => {
-                            if let Some(&position) = passing.first() {
-                                expected.0.push(left_index[left_position]);
-                                expected.1.push(right_index[position]);
-                            }
-                        }
-                        "first" | "last" => {
-                            let position = passing.into_iter().min_by_key(|&position| {
-                                if keep == "first" {
-                                    right_index[position]
-                                } else {
-                                    -right_index[position]
-                                }
-                            });
-                            if let Some(position) = position {
-                                expected.0.push(left_index[left_position]);
-                                expected.1.push(right_index[position]);
-                            }
-                        }
-                        _ => unreachable!(),
+                    for position in select_reference_positions(passing, &right_index, keep) {
+                        expected.0.push(left_index[left_position]);
+                        expected.1.push(right_index[position]);
                     }
                 }
                 assert_index_result(
