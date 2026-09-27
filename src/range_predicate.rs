@@ -46,13 +46,20 @@ use crate::op::CompareOp;
 /// `operator`; that flag is validated by the parser but sorting is owned by
 /// PyJanitor.
 pub(crate) struct ParsedRangePredicate<'py, T: numpy::Element> {
-    /// Left-side query values. There is one value for each logical left row.
+    /// Left-side query values. There is one value for each logical left row;
+    /// this array is not necessarily sorted because PyJanitor may sort each
+    /// anchor independently before alignment.
     pub(crate) left: PyReadonlyArray1<'py, T>,
-    /// Original labels or positional identifiers for the left rows.
+    /// Original labels or physical positions paired with `left`. Region code
+    /// uses these labels to align independent anchors and uses the resulting
+    /// position maps when residual predicates read source arrays.
     pub(crate) left_index: PyReadonlyArray1<'py, i64>,
-    /// Sorted right-side values searched by the range kernel.
+    /// Sorted right-side values searched by the binary-search kernel. The
+    /// parser deliberately does not sort this array; the caller owns that
+    /// preparation contract.
     pub(crate) right: PyReadonlyArray1<'py, T>,
-    /// Original labels or positional identifiers paired with `right`.
+    /// Original labels or physical positions paired with the sorted right
+    /// values. Sorting the values does not change these labels' identity.
     pub(crate) right_index: PyReadonlyArray1<'py, i64>,
     /// Comparison operator for this anchor.
     pub(crate) op: CompareOp,
@@ -63,7 +70,8 @@ pub(crate) struct ParsedRangePredicate<'py, T: numpy::Element> {
 /// The two anchors may use different dtypes, but the left and right value
 /// arrays within one anchor must share a dtype.
 pub(crate) enum AnyParsedRangePredicate<'py> {
-    /// A signed 64-bit anchor.
+    /// A signed 64-bit anchor. Each variant keeps the concrete type so the
+    /// binary search and aggregation loops remain statically typed.
     I64(ParsedRangePredicate<'py, i64>),
     /// A signed 32-bit anchor.
     I32(ParsedRangePredicate<'py, i32>),
@@ -85,7 +93,220 @@ pub(crate) enum AnyParsedRangePredicate<'py> {
     F32(ParsedRangePredicate<'py, f32>),
 }
 
+/// A range anchor after parsing an aggregation tuple.
+///
+/// Aggregation tuples add an ordering flag and, in the eight-field form,
+/// output-position maps around the ordinary five-field range predicate. The
+/// kernel should not need to remember those numeric tuple positions, so this
+/// struct keeps the parsed range and metadata together.
+pub(crate) struct ParsedAggregationRangeAnchor<'py> {
+    /// Typed range data used by binary-search/window construction.
+    pub(crate) range: AnyParsedRangePredicate<'py>,
+    /// The public ordering flag, when the tuple carries one. Region and
+    /// range aggregation validate it but rely on PyJanitor for sorting.
+    pub(crate) ordered: Option<bool>,
+    /// Optional compact output labels for forward aggregation. These describe
+    /// the output layout returned to Python; they are not source-position
+    /// maps for reading aggregation values.
+    pub(crate) left_output_positions: Option<PyReadonlyArray1<'py, i64>>,
+    /// Optional compact output labels for reverse aggregation. The reverse
+    /// accumulator still reads source positions from the aligned region maps.
+    pub(crate) right_output_positions: Option<PyReadonlyArray1<'py, i64>>,
+}
+
+/// Parse one aggregation range anchor without exposing tuple positions to a
+/// kernel.
+///
+/// The first anchor uses the established six- or eight-field aggregation
+/// form. The second anchor uses the five-field range form because it does not
+/// carry output maps:
+///
+/// ```text
+/// first, six:  (left, left_index, right, right_index, ordered, op)
+/// first, eight:(left, left_index, right, right_index, ordered,
+///              left_output_positions, right_output_positions, op)
+/// second:     (left, left_index, right, right_index, op)
+/// ```
+///
+/// All NumPy arrays remain borrowed through the returned request; no value or
+/// index column is copied. This function is the only place where aggregation
+/// code should interpret those numeric tuple positions.
+///
+/// # Arguments
+///
+/// * `tuple` - One Python predicate tuple in one of the forms above.
+/// * `first` - `true` for the output-bearing first anchor; `false` for the
+///   five-field second anchor.
+///
+/// # Errors
+///
+/// Returns `ValueError` for malformed tuple lengths, non-boolean ordering
+/// flags, unsupported dtypes/operators, unequal value/index lengths, or
+/// output maps whose lengths do not match their source arrays.
+pub(crate) fn parse_aggregation_range_anchor<'py>(
+    tuple: &Bound<'py, PyTuple>,
+    first: bool,
+) -> PyResult<ParsedAggregationRangeAnchor<'py>> {
+    // The first tuple has metadata that the second tuple does not. Parse the
+    // shape and metadata before touching values so malformed output maps are
+    // reported at the public boundary rather than during result assembly.
+    let (range, ordered, left_output_positions, right_output_positions) = if first {
+        let (operator_position, ordered, left_output_positions, right_output_positions) =
+            match tuple.len() {
+                6 => {
+                    let ordered = tuple.get_item(4)?.extract::<bool>()?;
+                    (5, Some(ordered), None, None)
+                }
+                8 => {
+                    let ordered = tuple.get_item(4)?.extract::<bool>()?;
+                    let left = tuple.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?;
+                    let right = tuple.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?;
+                    (7, Some(ordered), Some(left), Some(right))
+                }
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "aggregation first anchor must contain 6 or 8 elements",
+                    ));
+                }
+            };
+        let left = tuple.get_item(0)?;
+        let left_index = tuple.get_item(1)?;
+        let right = tuple.get_item(2)?;
+        let right_index = tuple.get_item(3)?;
+        let operator = tuple.get_item(operator_position)?;
+        (
+            parse_any_range_parts(&left, &left_index, &right, &right_index, &operator)?,
+            ordered,
+            left_output_positions,
+            right_output_positions,
+        )
+    } else {
+        if tuple.len() != 5 {
+            return Err(PyValueError::new_err(
+                "aggregation second anchor must contain 5 elements",
+            ));
+        }
+        (parse_any_range_predicate(tuple, true)?, None, None, None)
+    };
+
+    // Operator validation intentionally precedes length validation. Equality
+    // and inequality are legal residual predicates, but cannot define the
+    // monotonic boundary required by a range window or region anchor.
+    range
+        .validate_range_operator()
+        .map_err(PyValueError::new_err)?;
+    // Validate both value/index pairs before region construction can compact
+    // rows or reverse the right layout. This prevents a malformed tuple from
+    // becoming a positional panic in labels or alignment.
+    range.validate_lengths().map_err(PyValueError::new_err)?;
+    if let Some(values) = left_output_positions.as_ref() {
+        if values.as_array().len() != range.left_len() {
+            return Err(PyValueError::new_err(
+                "left output positions must match the left value length",
+            ));
+        }
+    }
+    if let Some(values) = right_output_positions.as_ref() {
+        if values.as_array().len() != range.right_len() {
+            return Err(PyValueError::new_err(
+                "right output positions must match the right value length",
+            ));
+        }
+    }
+
+    Ok(ParsedAggregationRangeAnchor {
+        range,
+        ordered,
+        left_output_positions,
+        right_output_positions,
+    })
+}
+
+/// Parse typed range fields that have already been extracted from a Python
+/// tuple.
+///
+/// This is the no-wrapper form used by aggregation parsers. It keeps tuple
+/// field access inside the parser boundary without allocating a normalized
+/// temporary Python tuple for the lower-level dtype dispatcher.
+pub(crate) fn parse_any_range_parts<'py>(
+    left: &Bound<'py, PyAny>,
+    left_index: &Bound<'py, PyAny>,
+    right: &Bound<'py, PyAny>,
+    right_index: &Bound<'py, PyAny>,
+    operator: &Bound<'py, PyAny>,
+) -> PyResult<AnyParsedRangePredicate<'py>> {
+    // Dtype dispatch is based on the left values. The extraction of the right
+    // values uses that same concrete type, so a left/right dtype mismatch is
+    // rejected by PyO3 instead of being silently coerced.
+    let dtype = left
+        .getattr("dtype")?
+        .getattr("name")?
+        .extract::<String>()?;
+    let op = CompareOp::try_from_str(operator.extract::<&str>()?)?;
+    macro_rules! parse {
+        ($ty:ty, $variant:ident) => {
+            Ok(AnyParsedRangePredicate::$variant(ParsedRangePredicate {
+                left: left.extract::<PyReadonlyArray1<'py, $ty>>()?,
+                left_index: left_index.extract::<PyReadonlyArray1<'py, i64>>()?,
+                right: right.extract::<PyReadonlyArray1<'py, $ty>>()?,
+                right_index: right_index.extract::<PyReadonlyArray1<'py, i64>>()?,
+                op,
+            }))
+        };
+    }
+    match dtype.as_str() {
+        "int64" => parse!(i64, I64),
+        "int32" => parse!(i32, I32),
+        "int16" => parse!(i16, I16),
+        "int8" => parse!(i8, I8),
+        "uint64" => parse!(u64, U64),
+        "uint32" => parse!(u32, U32),
+        "uint16" => parse!(u16, U16),
+        "uint8" => parse!(u8, U8),
+        "float64" => parse!(f64, F64),
+        "float32" => parse!(f32, F32),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported range predicate dtype: {other}"
+        ))),
+    }
+}
+
 impl AnyParsedRangePredicate<'_> {
+    /// Validate that this parsed anchor can define a monotonic range region.
+    ///
+    /// Equality and inequality do not produce one monotonic boundary, so they
+    /// are valid only as residual predicates, never as an aggregation or
+    /// region anchor. Keeping this check on the named representation ensures
+    /// both six/eight-field first anchors and five-field second anchors use
+    /// the same error and validation rule.
+    pub(crate) fn validate_range_operator(&self) -> Result<(), String> {
+        // This check is deliberately separate from CompareOp parsing: parsing
+        // answers “is this a known operator?”, while this method answers “is
+        // it an operator that can produce one monotonic search boundary?”
+        macro_rules! validate {
+            ($predicate:expr) => {
+                if matches!($predicate.op, CompareOp::Eq | CompareOp::Ne) {
+                    return Err(
+                        "the range aggregation predicate must use <, <=, >, or >=".to_owned()
+                    );
+                }
+            };
+        }
+        match self {
+            Self::I64(value) => validate!(value),
+            Self::I32(value) => validate!(value),
+            Self::I16(value) => validate!(value),
+            Self::I8(value) => validate!(value),
+            Self::U64(value) => validate!(value),
+            Self::U32(value) => validate!(value),
+            Self::U16(value) => validate!(value),
+            Self::U8(value) => validate!(value),
+            Self::F64(value) => validate!(value),
+            Self::F32(value) => validate!(value),
+        }
+        Ok(())
+    }
+
     /// Validate that each value array has a matching index-label array.
     ///
     /// Region construction uses values and labels independently while it
@@ -241,116 +462,149 @@ pub(crate) fn parse_any_range_predicate<'py>(
     tuple: &Bound<'py, PyTuple>,
     extended: bool,
 ) -> PyResult<AnyParsedRangePredicate<'py>> {
-    let dtype = tuple
-        .get_item(0)?
-        .getattr("dtype")?
-        .getattr("name")?
-        .extract::<String>()?;
-
-    macro_rules! parse {
-        ($ty:ty, $variant:ident) => {
-            if extended {
-                Ok(AnyParsedRangePredicate::$variant(
-                    parse_extended_range_predicate::<$ty>(tuple)?,
-                ))
-            } else {
-                Ok(AnyParsedRangePredicate::$variant(parse_range_predicate::<
-                    $ty,
-                >(tuple)?))
-            }
-        };
+    if extended {
+        if tuple.len() != 5 {
+            return Err(PyValueError::new_err(
+                "extended range predicates must contain 5 elements",
+            ));
+        }
+        return parse_any_range_parts(
+            &tuple.get_item(0)?,
+            &tuple.get_item(1)?,
+            &tuple.get_item(2)?,
+            &tuple.get_item(3)?,
+            &tuple.get_item(4)?,
+        );
     }
-
-    match dtype.as_str() {
-        "int64" => parse!(i64, I64),
-        "int32" => parse!(i32, I32),
-        "int16" => parse!(i16, I16),
-        "int8" => parse!(i8, I8),
-        "uint64" => parse!(u64, U64),
-        "uint32" => parse!(u32, U32),
-        "uint16" => parse!(u16, U16),
-        "uint8" => parse!(u8, U8),
-        "float64" => parse!(f64, F64),
-        "float32" => parse!(f32, F32),
-        other => Err(PyValueError::new_err(format!(
-            "unsupported range predicate dtype: {other}"
-        ))),
-    }
-}
-
-/// Parse the six-element basic range-anchor tuple.
-///
-/// # Arguments
-///
-/// * `tuple` - `(left, left_index, right, right_index,
-///   right_index_is_ordered, operator)` with matching value dtypes.
-///
-/// # Returns
-///
-/// A typed borrowed predicate retaining the NumPy arrays for the caller's
-/// search operation.
-///
-/// # Errors
-///
-/// Returns a Python error for an invalid tuple length, array dtype, ordering
-/// flag, comparator, or value/index dtype conversion.
-fn parse_range_predicate<'py, T: numpy::Element>(
-    tuple: &Bound<'py, PyTuple>,
-) -> PyResult<ParsedRangePredicate<'py, T>> {
     if tuple.len() != 6 {
         return Err(PyValueError::new_err(
             "range predicates must contain 6 elements",
         ));
     }
-    let left = tuple.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?;
-    let left_index = tuple.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?;
-    let right = tuple.get_item(2)?.extract::<PyReadonlyArray1<'py, T>>()?;
-    let right_index = tuple.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?;
     tuple.get_item(4)?.extract::<bool>()?;
-    let op = CompareOp::try_from_str(tuple.get_item(5)?.extract::<&str>()?)?;
-    Ok(ParsedRangePredicate {
-        left,
-        left_index,
-        right,
-        right_index,
-        op,
-    })
+    parse_any_range_parts(
+        &tuple.get_item(0)?,
+        &tuple.get_item(1)?,
+        &tuple.get_item(2)?,
+        &tuple.get_item(3)?,
+        &tuple.get_item(5)?,
+    )
 }
 
-/// Parse the five-element range-anchor tuple used by extended joins.
-///
-/// # Arguments
-///
-/// * `tuple` - `(left, left_index, right, right_index, operator)`.
-///
-/// # Returns
-///
-/// A typed borrowed predicate retaining the NumPy arrays for the caller's
-/// search operation.
-///
-/// # Errors
-///
-/// Returns a Python error for an invalid tuple length, array dtype, or
-/// comparator. Parallel-array lengths are checked by
-/// [`AnyParsedRangePredicate::validate_lengths`] before region construction.
-fn parse_extended_range_predicate<'py, T: numpy::Element>(
-    tuple: &Bound<'py, PyTuple>,
-) -> PyResult<ParsedRangePredicate<'py, T>> {
-    if tuple.len() != 5 {
-        return Err(PyValueError::new_err(
-            "extended range predicates must contain 5 elements",
-        ));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::PyArray1;
+
+    type RangeArrays<'py> = (
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+    );
+
+    fn range_arrays<'py>(py: Python<'py>) -> RangeArrays<'py> {
+        (
+            PyArray1::from_vec(py, vec![1, 2]),
+            PyArray1::from_vec(py, vec![10, 11]),
+            PyArray1::from_vec(py, vec![2, 3, 4]),
+            PyArray1::from_vec(py, vec![20, 21, 22]),
+        )
     }
-    let left = tuple.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?;
-    let left_index = tuple.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?;
-    let right = tuple.get_item(2)?.extract::<PyReadonlyArray1<'py, T>>()?;
-    let right_index = tuple.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?;
-    let op = CompareOp::try_from_str(tuple.get_item(4)?.extract::<&str>()?)?;
-    Ok(ParsedRangePredicate {
-        left,
-        left_index,
-        right,
-        right_index,
-        op,
-    })
+
+    #[test]
+    fn aggregation_parser_keeps_named_metadata_for_six_field_form() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let (left, left_index, right, right_index) = range_arrays(py);
+            let six = PyTuple::new(
+                py,
+                [
+                    left.clone().into_any(),
+                    left_index.clone().into_any(),
+                    right.clone().into_any(),
+                    right_index.clone().into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let parsed = parse_aggregation_range_anchor(&six, true)?;
+            assert_eq!(parsed.ordered, Some(true));
+            assert!(parsed.left_output_positions.is_none());
+            assert_eq!(parsed.range.left_len(), 2);
+            assert_eq!(parsed.range.right_len(), 3);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn aggregation_parser_rejects_bad_maps_and_ordering_flags() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let (left, left_index, right, right_index) = range_arrays(py);
+            let bad_map = PyArray1::from_vec(py, vec![100]);
+            let tuple = PyTuple::new(
+                py,
+                [
+                    left.clone().into_any(),
+                    left_index.clone().into_any(),
+                    right.clone().into_any(),
+                    right_index.clone().into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    bad_map.into_any(),
+                    PyArray1::from_vec(py, vec![200, 201, 202]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            assert!(parse_aggregation_range_anchor(&tuple, true).is_err());
+
+            let not_bool = PyTuple::new(
+                py,
+                [
+                    left.into_any(),
+                    left_index.into_any(),
+                    right.into_any(),
+                    right_index.into_any(),
+                    1_i64.into_pyobject(py)?.into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            assert!(parse_aggregation_range_anchor(&not_bool, true).is_err());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn aggregation_parser_rejects_equality_and_inequality_anchors() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            for operator in ["==", "!="] {
+                let (left, left_index, right, right_index) = range_arrays(py);
+                let tuple = PyTuple::new(
+                    py,
+                    [
+                        left.into_any(),
+                        left_index.into_any(),
+                        right.into_any(),
+                        right_index.into_any(),
+                        true.into_pyobject(py)?.to_owned().into_any(),
+                        operator.into_pyobject(py)?.into_any(),
+                    ],
+                )?;
+                let error = match parse_aggregation_range_anchor(&tuple, true) {
+                    Ok(_) => panic!("non-range operators must be rejected at parsing"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error.to_string(),
+                    "ValueError: the range aggregation predicate must use <, <=, >, or >="
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
 }

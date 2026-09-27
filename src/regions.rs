@@ -150,6 +150,10 @@ fn first_eligible(values: &[i64], left: i64) -> usize {
 /// query uses the existing binary-search window helper. Sorting costs
 /// `O(left_rows log left_rows)`.
 pub(crate) fn sweep_queries(regions: &AlignedRegions) -> Vec<(usize, usize)> {
+    // A query is `(first_region_start, left_position)`. The start is a
+    // position in the physical right layout, not a dataframe label. For
+    // example, a start of 3 means “right positions 3..right_len may satisfy
+    // the first anchor”; it says nothing about the right row's index value.
     // Each query stores `(first_region_start, left_position)`. The start is
     // the first right position that can satisfy the first primary predicate.
     let mut queries = regions
@@ -162,6 +166,88 @@ pub(crate) fn sweep_queries(regions: &AlignedRegions) -> Vec<(usize, usize)> {
     // leftward as later queries require more right rows.
     queries.sort_unstable_by_key(|left| std::cmp::Reverse(left.0));
     queries
+}
+
+/// Visit every candidate reported by the two aligned primary regions.
+///
+/// This is the paper's right-region sweep. The first region determines the
+/// earliest eligible right position for each left row. Queries are processed
+/// from the largest boundary to the smallest boundary, so each right row is
+/// added to the active map exactly once. The map is ordered by the second
+/// region label; its range therefore applies the second primary predicate.
+/// Duplicate second labels remain separate because each map value is a linked
+/// chain of physical right positions.
+///
+/// Keeping this traversal in one place is important: index construction and
+/// aggregation must agree on the boundary guard, duplicate handling, and
+/// sentinel-chain termination. Their callbacks differ only in what they do
+/// after a candidate has survived both primary regions.
+///
+/// # Arguments
+///
+/// * `regions` - Aligned compact region paths. `right_first` is monotonic;
+///   `right_second` may contain duplicates and need not be monotonic.
+/// * `visit` - Called with compact left and right region positions for every
+///   candidate satisfying both primary inequalities. Return `Ok(false)` to
+///   stop visiting candidates for the current left row; `Keep::Any` uses this
+///   to stop after its first passing candidate. Return `Err` to abort the
+///   entire sweep immediately.
+///
+/// # Errors
+///
+/// Returns an error if a sweep boundary is outside the right layout or is
+/// greater than the previous boundary. The latter would cause a previously
+/// linked right slice to be inserted twice and could create a cyclic chain.
+pub(crate) fn traverse_candidates<F>(regions: &AlignedRegions, mut visit: F) -> Result<(), String>
+where
+    F: FnMut(usize, usize) -> Result<bool, String>,
+{
+    let queries = sweep_queries(regions);
+    let mut active = BTreeMap::<i64, GroupState>::new();
+    // `next` is a linked-list tape. Each right position points to the next
+    // position with the same second-region label; -1 means chain end.
+    let mut next = vec![-1_i64; regions.right_index.len()];
+    let mut previous_end = regions.right_index.len();
+
+    for (start, left_position) in queries {
+        // `checked_region_start` validates both the array boundary and the
+        // descending-order assumption required by `add_right_region`.
+        let start = checked_region_start(
+            i64::try_from(start).map_err(|_| "region start exceeds i64 capacity")?,
+            regions.right_index.len(),
+            previous_end,
+        )?;
+        let Some(start) = start else {
+            // No right row can satisfy the first primary inequality for this
+            // left row. There is no candidate to visit.
+            continue;
+        };
+        add_right_region(
+            ArrayView1::from(&regions.right_second[..]),
+            start,
+            previous_end,
+            &mut next,
+            &mut active,
+        );
+        previous_end = start;
+
+        // Only groups at or above the left second-region label satisfy the
+        // second inequality. Walk every duplicate in each qualifying chain.
+        // ELI5: the B-tree tells us which labelled buckets qualify; the
+        // linked list inside each bucket tells us which individual right rows
+        // belong to that bucket. We need both because labels can repeat.
+        'candidate_groups: for (_, state) in active.range(regions.left_second[left_position]..) {
+            let mut position = state.head;
+            while position >= 0 {
+                let right_position = position as usize;
+                if !visit(left_position, right_position)? {
+                    break 'candidate_groups;
+                }
+                position = next[right_position];
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Materialize an `all` result directly from two sweeps.
@@ -202,47 +288,22 @@ fn build_all_indices<P>(
 where
     P: FnMut(usize, usize) -> bool,
 {
-    let queries = sweep_queries(regions);
     let mut counts = vec![0_usize; regions.left_index.len()];
-    let mut active = BTreeMap::<i64, GroupState>::new();
-    let mut next = vec![-1_i64; regions.right_index.len()];
-    let mut previous_end = regions.right_index.len();
     // First pass: count final output pairs. Applying the callback here keeps
     // exact and extended paths on identical two-pass semantics.
-    for (start, left_position) in queries.iter().copied() {
-        let start = checked_region_start(
-            i64::try_from(start).map_err(|_| "region start exceeds i64 capacity")?,
-            regions.right_index.len(),
-            previous_end,
-        )?;
-        let Some(start) = start else {
-            continue;
-        };
-        // Grow the active suffix exactly as in the second pass.
-        add_right_region(
-            ArrayView1::from(&regions.right_second[..]),
-            start,
-            previous_end,
-            &mut next,
-            &mut active,
-        );
-        previous_end = start;
-        // Report all second-region values satisfying the second predicate.
-        for (_, state) in active.range(regions.left_second[left_position]..) {
-            let mut position = state.head;
-            while position >= 0 {
-                let right_position = position as usize;
-                if predicates_pass(left_position, right_position) {
-                    counts[left_position] = counts[left_position]
-                        .checked_add(1)
-                        .ok_or("region index result size exceeds platform capacity")?;
-                }
-                position = next[right_position];
-            }
+    traverse_candidates(regions, |left_position, right_position| {
+        if predicates_pass(left_position, right_position) {
+            counts[left_position] = counts[left_position]
+                .checked_add(1)
+                .ok_or("region index result size exceeds platform capacity")?;
         }
-    }
+        Ok(true)
+    })?;
 
     let mut offsets = vec![0_usize; counts.len() + 1];
+    // `offsets[row]..offsets[row + 1]` is the final output bucket for one
+    // compact left row. The sweep visits rows by boundary order, so these
+    // buckets are what restore the caller's canonical left-row order.
     for (left_position, count) in counts.iter().copied().enumerate() {
         offsets[left_position + 1] = offsets[left_position]
             .checked_add(count)
@@ -256,42 +317,19 @@ where
     let mut left_index = vec![0_i64; total];
     let mut right_index = vec![0_i64; total];
     let mut cursors = offsets[..regions.left_index.len()].to_vec();
-    active.clear();
-    next.fill(-1);
-    previous_end = regions.right_index.len();
+    // Each cursor starts at its row's bucket and advances only within that
+    // bucket. Therefore no sorting is needed after the second sweep.
     // Second pass: write directly into the final output arrays. The cursor
     // for each left row starts at that row's offset and advances independently.
-    for (start, left_position) in queries.iter().copied() {
-        let start = checked_region_start(
-            i64::try_from(start).map_err(|_| "region start exceeds i64 capacity")?,
-            regions.right_index.len(),
-            previous_end,
-        )?;
-        let Some(start) = start else {
-            continue;
-        };
-        add_right_region(
-            ArrayView1::from(&regions.right_second[..]),
-            start,
-            previous_end,
-            &mut next,
-            &mut active,
-        );
-        previous_end = start;
-        for (_, state) in active.range(regions.left_second[left_position]..) {
-            let mut position = state.head;
-            while position >= 0 {
-                let right_position = position as usize;
-                if predicates_pass(left_position, right_position) {
-                    let output_position = cursors[left_position];
-                    left_index[output_position] = regions.left_index[left_position];
-                    right_index[output_position] = regions.right_index[right_position];
-                    cursors[left_position] += 1;
-                }
-                position = next[right_position];
-            }
+    traverse_candidates(regions, |left_position, right_position| {
+        if predicates_pass(left_position, right_position) {
+            let output_position = cursors[left_position];
+            left_index[output_position] = regions.left_index[left_position];
+            right_index[output_position] = regions.right_index[right_position];
+            cursors[left_position] += 1;
         }
-    }
+        Ok(true)
+    })?;
     Ok((left_index, right_index))
 }
 
@@ -319,53 +357,26 @@ fn build_all_indices_extended<P>(
 where
     P: FnMut(usize, usize) -> bool,
 {
-    let queries = sweep_queries(regions);
     let mut counts = vec![0_usize; regions.left_index.len()];
     let mut passing_pairs = Vec::<(usize, usize)>::new();
-    let mut active = BTreeMap::<i64, GroupState>::new();
-    let mut next = vec![-1_i64; regions.right_index.len()];
-    let mut previous_end = regions.right_index.len();
 
     // One sweep performs both primary-region traversal and residual filtering.
     // Store only passing candidates; rejected candidates never occupy the
     // intermediate buffer and never reach the output-sizing phase.
-    for (start, left_position) in queries {
-        let start = checked_region_start(
-            i64::try_from(start).map_err(|_| "region start exceeds i64 capacity")?,
-            regions.right_index.len(),
-            previous_end,
-        )?;
-        let Some(start) = start else {
-            continue;
-        };
-        add_right_region(
-            ArrayView1::from(&regions.right_second[..]),
-            start,
-            previous_end,
-            &mut next,
-            &mut active,
-        );
-        previous_end = start;
-
-        for (_, state) in active.range(regions.left_second[left_position]..) {
-            let mut position = state.head;
-            while position >= 0 {
-                let right_position = position as usize;
-                if predicates_pass(left_position, right_position) {
-                    counts[left_position] = counts[left_position]
-                        .checked_add(1)
-                        .ok_or("region index result size exceeds platform capacity")?;
-                    if passing_pairs.len() == passing_pairs.capacity() {
-                        passing_pairs
-                            .try_reserve(1)
-                            .map_err(|_| "region index result allocation failed".to_owned())?;
-                    }
-                    passing_pairs.push((left_position, right_position));
-                }
-                position = next[right_position];
+    traverse_candidates(regions, |left_position, right_position| {
+        if predicates_pass(left_position, right_position) {
+            counts[left_position] = counts[left_position]
+                .checked_add(1)
+                .ok_or("region index result size exceeds platform capacity")?;
+            if passing_pairs.len() == passing_pairs.capacity() {
+                passing_pairs
+                    .try_reserve(1)
+                    .map_err(|_| "region index result allocation failed".to_owned())?;
             }
+            passing_pairs.push((left_position, right_position));
         }
-    }
+        Ok(true)
+    })?;
 
     if passing_pairs.is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -423,73 +434,57 @@ fn build_selected_indices<P>(
 where
     P: FnMut(usize, usize) -> bool,
 {
-    let queries = sweep_queries(regions);
     // A selected result needs at most one physical right position per left
     // row, so this vector is much smaller than an all-match result.
     let mut selected = vec![None; regions.left_index.len()];
-    let mut active = BTreeMap::<i64, GroupState>::new();
-    let mut next = vec![-1_i64; regions.right_index.len()];
-    let mut previous_end = regions.right_index.len();
 
     // Filter candidates before applying first/last/any. This preserves the
     // contract that keep semantics see only complete predicate matches.
-    for (start, left_position) in queries {
-        let start = checked_region_start(
-            i64::try_from(start).map_err(|_| "region start exceeds i64 capacity")?,
-            regions.right_index.len(),
-            previous_end,
-        )?;
-        let Some(start) = start else {
-            continue;
-        };
-        add_right_region(
-            ArrayView1::from(&regions.right_second[..]),
-            start,
-            previous_end,
-            &mut next,
-            &mut active,
-        );
-        previous_end = start;
-        // The map range enforces the second primary predicate. Each GroupState
-        // then supplies every physical right position for one region value.
-        'candidate_groups: for (_, state) in active.range(regions.left_second[left_position]..) {
-            let mut position = state.head;
-            while position >= 0 {
-                let right_position = position as usize;
-                if !predicates_pass(left_position, right_position) {
-                    // A primary candidate that fails a residual predicate is
-                    // invisible to first/last/any and cannot be selected.
-                    position = next[right_position];
-                    continue;
-                }
-                if keep == Keep::Any {
-                    // Any can stop immediately after the first complete match
-                    // for this left row.
-                    selected[left_position] = Some(right_position);
-                    break 'candidate_groups;
-                }
-                selected[left_position] = match selected[left_position] {
-                    // First passing candidate becomes the initial selection.
-                    None => Some(right_position),
-                    Some(current) if keep == Keep::First => Some(
-                        if regions.right_index[right_position] < regions.right_index[current] {
-                            right_position
-                        } else {
-                            current
-                        },
-                    ),
-                    Some(current) => Some(
-                        if regions.right_index[right_position] > regions.right_index[current] {
-                            right_position
-                        } else {
-                            current
-                        },
-                    ),
-                };
-                position = next[right_position];
-            }
+    traverse_candidates(regions, |left_position, right_position| {
+        if !predicates_pass(left_position, right_position) {
+            return Ok(true);
         }
-    }
+        match keep {
+            Keep::Any if selected[left_position].is_none() => {
+                // Returning `Ok(false)` stops the shared traversal for this
+                // left row only. The outer sweep still processes every other
+                // left row.
+                selected[left_position] = Some(right_position);
+                Ok(false)
+            }
+            Keep::First => {
+                // “First” means the smallest original right label, not the
+                // first physical candidate encountered in the non-monotonic
+                // second-region path.
+                selected[left_position] = match selected[left_position] {
+                    None => Some(right_position),
+                    Some(current)
+                        if regions.right_index[right_position] < regions.right_index[current] =>
+                    {
+                        Some(right_position)
+                    }
+                    Some(current) => Some(current),
+                };
+                Ok(true)
+            }
+            Keep::Last => {
+                // “Last” follows the same rule in the opposite direction:
+                // compare original labels, not traversal order.
+                selected[left_position] = match selected[left_position] {
+                    None => Some(right_position),
+                    Some(current)
+                        if regions.right_index[right_position] > regions.right_index[current] =>
+                    {
+                        Some(right_position)
+                    }
+                    Some(current) => Some(current),
+                };
+                Ok(true)
+            }
+            Keep::All => unreachable!("selected builder cannot receive Keep::All"),
+            Keep::Any => Ok(true),
+        }
+    })?;
 
     let mut left_index = Vec::with_capacity(selected.len());
     let mut right_index = Vec::with_capacity(selected.len());
@@ -867,6 +862,19 @@ pub(crate) fn align(
         }
     }
     Ok(output)
+}
+
+/// Build aligned regions from two anchors that were already parsed by a
+/// caller-specific boundary parser.
+///
+/// Aggregation callers use this entry point so their named aggregation anchor
+/// is parsed exactly once. Index callers can continue using
+/// [`parse_and_align`], which owns parsing of the public five-field tuples.
+pub(crate) fn align_parsed(
+    first: &AnyParsedRangePredicate<'_>,
+    second: &AnyParsedRangePredicate<'_>,
+) -> Result<AlignedRegions, String> {
+    align(region_boundaries(first)?, region_boundaries(second)?)
 }
 
 /// Parse and align the first two predicates in a dual or multi-predicate join.

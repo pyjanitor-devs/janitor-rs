@@ -19,6 +19,7 @@ use crate::op::CompareOp;
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, predicates_match_dispatch, PredicateView,
 };
+use crate::range_predicate::{parse_aggregation_range_anchor, AnyParsedRangePredicate};
 
 /// Build a lookup from original physical rows to compact aggregation slots.
 ///
@@ -978,8 +979,8 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
 ///
 /// 8 fields:
 /// (left, left_index, right, right_index,
-///  left_output_positions, right_output_positions,
-///  right_index_is_ordered, comparator)
+///  right_index_is_ordered, left_output_positions,
+///  right_output_positions, comparator)
 ///
 /// 13 fields for `!=` aggregation:
 /// (left_values, left_index, left_positions, left_null_positions,
@@ -1008,6 +1009,105 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
 /// Returns `(output_positions, matched, aggregation_arrays)` when
 /// `return_matched` is true, or `(output_positions, aggregation_arrays)` when
 /// it is false. Returns `None` when no candidate survives.
+/// Named representation of the thirteen-field null-aware `!=` aggregation
+/// anchor.
+///
+/// This intentionally does not reuse [`ParsedAggregationRangeAnchor`]. A
+/// range anchor has two value arrays and one comparator. The `!=` anchor has a
+/// different physical contract: its value arrays have already had nulls
+/// removed, its position arrays map those filtered values back to the full
+/// source layout, its optional null-position arrays describe the excluded
+/// rows, and its output maps describe a compact/reordered result layout.
+/// Combining both contracts into one struct would turn these required fields
+/// into a collection of unrelated `Option`s and make it easier to use a
+/// filtered position as though it were a source position.
+///
+/// The tuple layout is parsed once at the Python/Rust boundary; traversal
+/// functions below consume these named fields directly. Keeping the parser
+/// separate still gives both families the same important property: tuple
+/// positions are confined to one boundary function rather than scattered
+/// through the hot loop.
+struct ParsedNotEqualAggregationAnchor<'py, T: numpy::Element> {
+    left: PyReadonlyArray1<'py, T>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    left_positions: PyReadonlyArray1<'py, i64>,
+    left_null_positions: Option<PyReadonlyArray1<'py, i64>>,
+    right: PyReadonlyArray1<'py, T>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    right_positions: PyReadonlyArray1<'py, i64>,
+    right_null_positions: Option<PyReadonlyArray1<'py, i64>>,
+    left_output_positions: PyReadonlyArray1<'py, i64>,
+    right_output_positions: PyReadonlyArray1<'py, i64>,
+    is_extension_array: bool,
+}
+
+/// Parse the thirteen-field null-aware `!=` aggregation anchor once.
+///
+/// The parser validates the operator and boolean metadata before borrowing
+/// the arrays. The value arrays are filtered non-null arrays, so their
+/// physical position arrays and optional null-position arrays are part of the
+/// contract; treating a filtered offset as a full-frame position would write
+/// aggregation results into the wrong source row.
+///
+/// # Arguments
+///
+/// * `first` - The thirteen-field first predicate tuple.
+///
+/// # Errors
+///
+/// Returns `ValueError` when the tuple length, operator, boolean metadata, or
+/// any typed array field does not match the `!=` aggregation contract.
+fn parse_not_equal_aggregation_anchor<'py, T: numpy::Element>(
+    first: &Bound<'py, PyTuple>,
+) -> PyResult<ParsedNotEqualAggregationAnchor<'py, T>> {
+    if first.len() != 13 {
+        return Err(PyValueError::new_err(
+            "the first extended aggregation predicate must contain 13 elements",
+        ));
+    }
+    let op = CompareOp::try_from_str(first.get_item(12)?.extract::<&str>()?)?;
+    if op != CompareOp::Ne {
+        return Err(PyValueError::new_err(
+            "the thirteen-element aggregation predicate must use !=",
+        ));
+    }
+    // `None` means the caller has no null partition. An empty NumPy array is
+    // different but has the same zero-row contribution; preserve both forms
+    // because the caller's metadata shape is meaningful.
+    let left_null_positions = if first.get_item(3)?.is_none() {
+        None
+    } else {
+        Some(first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+    };
+    let right_null_positions = if first.get_item(7)?.is_none() {
+        None
+    } else {
+        Some(first.get_item(7)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+    };
+    // Field 8 is retained for tuple compatibility and validated even though
+    // aggregation consumes every passing candidate and does not use ordering
+    // to select first/last rows.
+    first.get_item(8)?.extract::<bool>()?;
+    let is_extension_array = first.get_item(9)?.extract::<bool>()?;
+    Ok(ParsedNotEqualAggregationAnchor {
+        left: first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?,
+        left_index: first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+        left_positions: first.get_item(2)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+        left_null_positions,
+        right: first.get_item(4)?.extract::<PyReadonlyArray1<'py, T>>()?,
+        right_index: first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+        right_positions: first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?,
+        right_null_positions,
+        left_output_positions: first
+            .get_item(10)?
+            .extract::<PyReadonlyArray1<'py, i64>>()?,
+        right_output_positions: first
+            .get_item(11)?
+            .extract::<PyReadonlyArray1<'py, i64>>()?,
+        is_extension_array,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
     py: Python<'py>,
@@ -1029,170 +1129,117 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
             "single extended aggregation requires at least one predicate",
         ));
     }
-    // Aggregation has three supported anchor layouts:
-    //
-    // * 6 elements: the compact range contract;
-    // * 8 elements: the range contract plus trimmed output-position maps;
-    // * 13 elements: the null-aware `!=` aggregation contract.
-    //
-    // The 11-element `!=` tuple is intentionally absent. It is the index-only
-    // contract and lacks the maps needed to place aggregation results safely.
-    // Rejecting it here prevents identity-position output from appearing
-    // correct when the physical and compact layouts differ.
-    // The length check must happen before any field extraction because the
-    // field positions differ between range and null-aware `!=` tuples.
-    match first.len() {
-        6 | 8 | 13 => {}
-        _ => {
-            return Err(PyValueError::new_err(
-                "the first extended aggregation predicate must contain 6, 8, or 13 elements",
-            ));
-        }
-    }
-    // Every accepted anchor puts its comparator in the final field. Reading
-    // it once after structural validation keeps tuple-length handling separate
-    // from operator validation and avoids one bespoke opcode branch per shape.
-    let op = CompareOp::try_from_str(first.get_item(first.len() - 1)?.extract::<&str>()?)?;
-    if first.len() != 13 {
-        // Six- and eight-field tuples are range anchors. Equality is handled
-        // upstream, and `!=` requires the separate null-aware thirteen-field
-        // layout, so neither comparator is valid in this branch.
-        if !matches!(
-            op,
-            CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
-        ) {
-            return Err(PyValueError::new_err(
-                "the range aggregation predicate must use <, <=, >, or >=",
-            ));
-        }
-        // The ordering flag is part of the shared predicate tuple contract.
-        // Aggregation does not use its value: PyJanitor has already sorted the
-        // right-hand arrays before calling Rust. Extract it only to validate
-        // the tuple shape and field type.
-        first.get_item(4)?.extract::<bool>()?;
-        // The ordering flag is field four in both range forms. It is part of
-        // the shared tuple contract, but aggregation does not use its value:
-        // PyJanitor has already sorted the right arrays. Extracting it here
-        // validates only the field type.
-        let (left_output_positions, right_output_positions) = if first.len() == 8 {
-            // In the eight-element range form, fields 1 and 3 identify the
-            // predicate arrays' physical labels. Fields 5 and 6 identify the
-            // trimmed output layout used by aggregation and returned to
-            // Python; they must not be substituted for one another.
-            (
-                Some(first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?),
-                Some(first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?),
-            )
-        } else {
-            (None, None)
-        };
-        // The eight-field form describes a trimmed/reordered aggregation
-        // layout. Its maps are compact-slot -> physical-row mappings, so their
-        // lengths—not the label values—define the output domains. With six
-        // fields, the value-array lengths already describe identity layouts.
-        let (left_output_len, right_output_len) =
-            if let (Some(left_output_positions), Some(right_output_positions)) =
-                (&left_output_positions, &right_output_positions)
-            {
-                (left_output_positions.len()?, right_output_positions.len()?)
-            } else {
-                (
-                    first
-                        .get_item(0)?
-                        .extract::<PyReadonlyArray1<'py, T>>()?
-                        .len()?,
-                    first
-                        .get_item(2)?
-                        .extract::<PyReadonlyArray1<'py, T>>()?
-                        .len()?,
-                )
-            };
-        // Forward aggregation writes one result per left output slot; reverse
-        // aggregation writes one result per right output slot. Select only
-        // the map for the requested orientation and leave the other map for a
-        // separate reverse/forward call.
-        let calculation_output_positions = match (
-            reverse,
-            left_output_positions.as_ref(),
-            right_output_positions.as_ref(),
-        ) {
-            (true, _, Some(right_output_positions)) => Some(right_output_positions.as_array()),
-            (false, Some(left_output_positions), _) => Some(left_output_positions.as_array()),
-            _ => None,
-        };
-        // `run_range` builds the first window and applies every later
-        // predicate as a residual filter before updating aggregations.
-        return run_range(
+    if first.len() == 13 {
+        // The thirteen-field shape is a distinct null-aware `!=` protocol.
+        // Dispatch it before range-shape validation so its specialized maps
+        // and null partitions cannot be mistaken for range output metadata.
+        let anchor = parse_not_equal_aggregation_anchor::<T>(first)?;
+        return run_not_equal(
             py,
             predicates,
-            first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?,
-            first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-            first.get_item(2)?.extract::<PyReadonlyArray1<'py, T>>()?,
-            first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-            op,
+            anchor.left,
+            anchor.left_index,
+            anchor.left_positions,
+            anchor.left_null_positions,
+            anchor.right,
+            anchor.right_index,
+            anchor.right_positions,
+            anchor.right_null_positions,
+            anchor.left_output_positions,
+            anchor.right_output_positions,
+            anchor.is_extension_array,
             aggregations,
-            calculation_output_positions,
-            if reverse {
-                right_output_len
-            } else {
-                left_output_len
-            },
             return_matched,
             reverse,
         );
     }
-    // Reaching this point means the first tuple has thirteen fields. That
-    // layout is reserved for null-aware `!=`; accepting another comparator
-    // would interpret range metadata as null metadata.
-    if op != CompareOp::Ne {
+
+    // Preserve the anchor aggregation API's established shape error before
+    // handing valid range forms to the shared named parser. In particular,
+    // an index-only eleven-field `!=` tuple must not be reported as a generic
+    // range-anchor error; callers rely on this contract when diagnosing a
+    // malformed extended aggregation request.
+    if !matches!(first.len(), 6 | 8) {
         return Err(PyValueError::new_err(
-            "the thirteen-element aggregation predicate must use !=",
+            "the first extended aggregation predicate must contain 6, 8, or 13 elements",
         ));
     }
-    // Null-position fields are optional, but each field must be either Python
-    // None or an int64 array. These positions complete the filtered
-    // non-null positions to form the full physical row domain.
-    let left_null_positions = if first.get_item(3)?.is_none() {
-        None
+
+    // This function is instantiated once per public NumPy dtype. The shared
+    // parser must inspect the tuple's runtime dtype so it can serve region
+    // and range callers, but this wrapper also has a compiled `T` contract.
+    // Extracting the first value array here preserves the old behavior: a
+    // call through the int64 wrapper with int32 predicate values fails at the
+    // Python boundary instead of silently selecting a different dispatch arm.
+    // This is an intentional second boundary check: parse_any_range_parts
+    // chooses a runtime variant for shared callers, while this wrapper must
+    // reject a tuple whose dtype disagrees with the exported function name.
+    first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?;
+    let anchor = parse_aggregation_range_anchor(first, true)?;
+    let left_output_len = anchor
+        .left_output_positions
+        .as_ref()
+        .map(|values| values.len())
+        .transpose()?
+        .unwrap_or(anchor.range.left_len());
+    let right_output_len = anchor
+        .right_output_positions
+        .as_ref()
+        .map(|values| values.len())
+        .transpose()?
+        .unwrap_or(anchor.range.right_len());
+    let calculation_output_positions = if reverse {
+        anchor
+            .right_output_positions
+            .as_ref()
+            .map(|values| values.as_array())
     } else {
-        Some(first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+        anchor
+            .left_output_positions
+            .as_ref()
+            .map(|values| values.as_array())
     };
-    let right_null_positions = if first.get_item(7)?.is_none() {
-        None
+    let output_len = if reverse {
+        right_output_len
     } else {
-        Some(first.get_item(7)?.extract::<PyReadonlyArray1<'py, i64>>()?)
+        left_output_len
     };
-    // Output maps are mandatory for `!=` aggregation because filtered and
-    // sorted compact arrays may no longer be in physical order. Returning
-    // identity positions here would silently attach an aggregate to the
-    // wrong original row.
-    let left_output_positions = first
-        .get_item(10)?
-        .extract::<PyReadonlyArray1<'py, i64>>()?;
-    let right_output_positions = first
-        .get_item(11)?
-        .extract::<PyReadonlyArray1<'py, i64>>()?;
-    // `run_not_equal` generates strict less-than/greater-than and null pairs,
-    // checks every residual `!=` predicate, and updates aggregation state
-    // directly without materializing a pair list.
-    run_not_equal(
-        py,
-        predicates,
-        first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?,
-        first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        first.get_item(2)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        left_null_positions,
-        first.get_item(4)?.extract::<PyReadonlyArray1<'py, T>>()?,
-        first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        right_null_positions,
-        left_output_positions,
-        right_output_positions,
-        first.get_item(9)?.extract::<bool>()?,
-        aggregations,
-        return_matched,
-        reverse,
-    )
+    // `run_range` is generic over the concrete NumPy element type, while the
+    // Python boundary gives us one runtime `AnyParsedRangePredicate`. The
+    // match recovers that concrete type without converting columns into a
+    // common temporary dtype or adding dynamic dispatch to the hot path.
+    // The small local macro removes argument-list drift between the ten dtype
+    // arms while leaving the type-specialized match visible at the boundary.
+    macro_rules! run_range_for {
+        ($value:expr) => {
+            run_range(
+                py,
+                predicates,
+                $value.left,
+                $value.left_index,
+                $value.right,
+                $value.right_index,
+                $value.op,
+                aggregations,
+                calculation_output_positions,
+                output_len,
+                return_matched,
+                reverse,
+            )
+        };
+    }
+    match anchor.range {
+        AnyParsedRangePredicate::I64(value) => run_range_for!(value),
+        AnyParsedRangePredicate::I32(value) => run_range_for!(value),
+        AnyParsedRangePredicate::I16(value) => run_range_for!(value),
+        AnyParsedRangePredicate::I8(value) => run_range_for!(value),
+        AnyParsedRangePredicate::U64(value) => run_range_for!(value),
+        AnyParsedRangePredicate::U32(value) => run_range_for!(value),
+        AnyParsedRangePredicate::U16(value) => run_range_for!(value),
+        AnyParsedRangePredicate::U8(value) => run_range_for!(value),
+        AnyParsedRangePredicate::F64(value) => run_range_for!(value),
+        AnyParsedRangePredicate::F32(value) => run_range_for!(value),
+    }
 }
 
 macro_rules! extended_aggregation_functions {
@@ -1433,6 +1480,44 @@ mod extended_tests {
             let outputs_value = result.get_item(2)?;
             let outputs = outputs_value.cast::<PyList>()?;
             assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![70]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn range_aggregation_rejects_values_mismatched_with_compiled_wrapper_dtype() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![4_i32]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i32, 5]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let values = PyArray1::from_vec(py, vec![10_i64, 20]);
+            let mask = PyArray1::from_vec(py, vec![false, false]);
+            let aggregation = PyTuple::new(
+                py,
+                [
+                    values.into_any(),
+                    mask.into_any(),
+                    "sum".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let aggregations = PyList::new(py, [aggregation])?;
+            let error =
+                match single_join_extended_aggregate_int64(py, &predicates, &aggregations, true) {
+                    Ok(_) => panic!("the int64 wrapper must reject int32 range values"),
+                    Err(error) => error,
+                };
+            assert_eq!(error.get_type(py).name()?, "TypeError");
             Ok(())
         })
         .unwrap();
