@@ -28,7 +28,6 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
-use crate::aggs::ensure_equal_lengths_core;
 use crate::join_aggregation_helpers::aggregate_range_windows;
 use crate::range_join::build_any_windows;
 use crate::range_predicate::parse_aggregation_range_anchor;
@@ -874,7 +873,7 @@ mod tests {
             let error = range_join_aggregate(py, &malformed, &aggregation, true).unwrap_err();
             assert!(error
                 .to_string()
-                .contains("range extended aggregation has invalid anchor tuple lengths"));
+                .contains("aggregation first anchor must contain 6 or 8 elements"));
 
             let bad_maps = PyList::empty(py);
             bad_maps.append(PyTuple::new(
@@ -927,7 +926,9 @@ mod tests {
                 ],
             )?)?;
             let error = range_join_aggregate(py, &mismatched, &aggregation, true).unwrap_err();
-            assert!(error.to_string().contains("left and left_index"));
+            assert!(error
+                .to_string()
+                .contains("left values and left index must have equal lengths"));
             Ok(())
         })
         .unwrap();
