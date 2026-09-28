@@ -432,6 +432,142 @@ mod tests {
     use super::*;
     use numpy::{ndarray::Array1, PyArray1, PyArrayMethods};
 
+    /// Select reference positions using the same public `keep` semantics as
+    /// the production wrapper.
+    ///
+    /// Keeping this policy in one helper is important for test maintenance:
+    /// the brute-force oracle should disagree with the implementation only
+    /// when the implementation is wrong, not because one test copied a
+    /// slightly different `first`/`last` tie-break rule. `first` and `last`
+    /// are label-based, while `any` deliberately keeps the first physical
+    /// candidate, matching the crate-wide join convention.
+    fn select_reference_positions(
+        passing: Vec<usize>,
+        right_index: &[i64],
+        keep: &str,
+    ) -> Vec<usize> {
+        match keep {
+            "all" => passing,
+            "any" => passing.into_iter().take(1).collect(),
+            "first" | "last" => passing
+                .into_iter()
+                .min_by_key(|&position| {
+                    if keep == "first" {
+                        right_index[position]
+                    } else {
+                        -right_index[position]
+                    }
+                })
+                .into_iter()
+                .collect(),
+            other => panic!("unexpected reference keep: {other}"),
+        }
+    }
+
+    /// Advance the deterministic generator used by the randomized oracle.
+    ///
+    /// This is intentionally tiny and local to tests. It avoids a dependency
+    /// on a random-number crate while giving future tests one named utility
+    /// instead of each test inventing its own state transition.
+    fn next_test_value(seed: &mut u64) -> i64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((*seed >> 32) % 9) as i64 - 4
+    }
+
+    struct ReferenceFixture<'a> {
+        left_index: &'a [i64],
+        first_left: &'a [i64],
+        second_left: &'a [i64],
+        right_index: &'a [i64],
+        first_right: &'a [i64],
+        second_right: &'a [i64],
+    }
+
+    /// The common i64 shape used by the public index tests.
+    ///
+    /// The production API is intentionally tuple-based for Python
+    /// compatibility. Tests should not repeat the eight tuple-field
+    /// positions everywhere, though: a field-order mistake in a test can make
+    /// a regression look like a kernel failure. This small builder keeps the
+    /// tuple layout in one documented place while malformed-tuple tests still
+    /// construct their bad inputs explicitly.
+    struct IndexPredicate<'a> {
+        left: &'a [i64],
+        left_index: &'a [i64],
+        right: &'a [i64],
+        right_index: &'a [i64],
+        ordered: bool,
+        operator: &'a str,
+    }
+
+    fn append_index_predicate<'py>(
+        py: Python<'py>,
+        predicates: &Bound<'py, PyList>,
+        predicate: IndexPredicate<'_>,
+    ) -> PyResult<()> {
+        predicates.append(PyTuple::new(
+            py,
+            [
+                PyArray1::from_vec(py, predicate.left.to_vec()).into_any(),
+                PyArray1::from_vec(py, predicate.left_index.to_vec()).into_any(),
+                PyArray1::from_vec(py, predicate.right.to_vec()).into_any(),
+                PyArray1::from_vec(py, predicate.right_index.to_vec()).into_any(),
+                predicate.ordered.into_pyobject(py)?.to_owned().into_any(),
+                predicate.operator.into_pyobject(py)?.into_any(),
+            ],
+        )?)?;
+        Ok(())
+    }
+
+    /// Build the public result expected from a pair-by-pair implementation.
+    ///
+    /// The optimized range path searches sorted values, but its public
+    /// result is still defined by the original physical right labels.  This
+    /// deliberately simple helper does not use windows or binary search: it
+    /// is an independent oracle for the wrapper tests.
+    fn reference_pairs(
+        fixture: &ReferenceFixture<'_>,
+        first_operator: &str,
+        second_operator: &str,
+        keep: &str,
+    ) -> (Vec<i64>, Vec<i64>) {
+        let mut output_left = Vec::new();
+        let mut output_right = Vec::new();
+        let first_op = CompareOp::try_from_str(first_operator).unwrap();
+        let second_op = CompareOp::try_from_str(second_operator).unwrap();
+        for left_position in 0..fixture.left_index.len() {
+            let mut passing = Vec::new();
+            for right_position in 0..fixture.right_index.len() {
+                if first_op.apply(
+                    &fixture.first_left[left_position],
+                    &fixture.first_right[right_position],
+                ) && second_op.apply(
+                    &fixture.second_left[left_position],
+                    &fixture.second_right[right_position],
+                ) {
+                    passing.push(right_position);
+                }
+            }
+            for right_position in select_reference_positions(passing, fixture.right_index, keep) {
+                output_left.push(fixture.left_index[left_position]);
+                output_right.push(fixture.right_index[right_position]);
+            }
+        }
+        (output_left, output_right)
+    }
+
+    fn assert_index_result<'py>(
+        result: Option<Bound<'py, PyDict>>,
+        expected: (Vec<i64>, Vec<i64>),
+    ) {
+        if expected.0.is_empty() {
+            assert!(result.is_none(), "expected no matching pairs");
+        } else {
+            let result = result.expect("expected matching pairs");
+            assert_eq!(read_pair(&result), expected);
+        }
+    }
+
     fn read_pair<'py>(result: &Bound<'py, PyDict>) -> (Vec<i64>, Vec<i64>) {
         let left = result
             .get_item("left_index")
@@ -715,7 +851,7 @@ mod tests {
                     PyArray1::from_vec(py, vec![100_i64]).into_any(),
                     PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
                     PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
-                    true.into_pyobject(py)?.to_owned().into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
                     "<".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
@@ -726,7 +862,7 @@ mod tests {
                     PyArray1::from_vec(py, vec![100_i64]).into_any(),
                     PyArray1::from_vec(py, vec![0.0_f64, 2.0, 4.0, 6.0]).into_any(),
                     PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
-                    true.into_pyobject(py)?.to_owned().into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
                     ">".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
@@ -734,6 +870,465 @@ mod tests {
             let result = range_join_indices(py, &predicates, "all", false)?
                 .expect("the mixed-dtype windows should intersect");
             assert_eq!(read_pair(&result), (vec![100, 100], vec![10, 30]));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn public_range_indices_dispatch_every_anchor_dtype() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            macro_rules! check_dtype {
+                ($ty:ty) => {{
+                    let predicates = PyList::empty(py);
+                    predicates.append(PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, vec![2 as $ty]).into_any(),
+                            PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                            PyArray1::from_vec(py, vec![1 as $ty, 3 as $ty, 5 as $ty]).into_any(),
+                            PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                            true.into_pyobject(py)?.to_owned().into_any(),
+                            "<".into_pyobject(py)?.into_any(),
+                        ],
+                    )?)?;
+                    predicates.append(PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, vec![2 as $ty]).into_any(),
+                            PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                            PyArray1::from_vec(py, vec![0 as $ty, 2 as $ty, 4 as $ty]).into_any(),
+                            PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                            true.into_pyobject(py)?.to_owned().into_any(),
+                            ">=".into_pyobject(py)?.into_any(),
+                        ],
+                    )?)?;
+                    let result = range_join_indices(py, &predicates, "all", false)?
+                        .expect("every supported dtype should dispatch");
+                    assert_eq!(read_pair(&result), (vec![100], vec![20]));
+                    Ok::<(), PyErr>(())
+                }};
+            }
+
+            check_dtype!(i64)?;
+            check_dtype!(i32)?;
+            check_dtype!(i16)?;
+            check_dtype!(i8)?;
+            check_dtype!(u64)?;
+            check_dtype!(u32)?;
+            check_dtype!(u16)?;
+            check_dtype!(u8)?;
+            check_dtype!(f64)?;
+            check_dtype!(f32)?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn public_range_indices_handles_infinite_and_nan_anchor_values() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // Infinity is an ordinary ordered endpoint: every finite value
+            // is below positive infinity, and negative infinity is the first
+            // value in an ascending right layout.  This checks the two
+            // boundary values without relying on a finite sentinel.
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![f64::INFINITY]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![f64::NEG_INFINITY, 0.0, f64::INFINITY]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    ">=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![f64::INFINITY]).into_any(),
+                    PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![f64::NEG_INFINITY, 0.0, f64::INFINITY]).into_any(),
+                    PyArray1::from_vec(py, vec![10_i64, 20, 30]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    ">".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let result = range_join_indices(py, &predicates, "all", false)?
+                .expect("infinite endpoints should produce matches");
+            assert_eq!(read_pair(&result), (vec![100, 100], vec![10, 20]));
+
+            // NaN is not part of the sorted-range contract, but it can cross
+            // the Python boundary.  The binary-search kernels deliberately
+            // document that exact NaN parity is unspecified; this regression
+            // only requires the public path to reject neither nor panic.
+            let nan_predicates = PyList::empty(py);
+            for operator in ["<", ">="] {
+                nan_predicates.append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![f64::NAN]).into_any(),
+                        PyArray1::from_vec(py, vec![100_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![-1.0_f64, 1.0]).into_any(),
+                        PyArray1::from_vec(py, vec![10_i64, 20]).into_any(),
+                        true.into_pyobject(py)?.to_owned().into_any(),
+                        operator.into_pyobject(py)?.into_any(),
+                    ],
+                )?)?;
+            }
+            let _ = range_join_indices(py, &nan_predicates, "all", false)?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn public_range_indices_match_reference_for_all_orientations_and_keeps() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let first_left = vec![0_i64, 3, 6];
+            let second_left = vec![5_i64, 4, 7];
+            let left_index = vec![101_i64, 99, 55];
+            let first_right = vec![1_i64, 3, 3, 7];
+            let second_right = vec![0_i64, 2, 4, 6];
+            // The labels are intentionally not sorted by value. The right
+            // values are sorted, as required by the binary-search contract,
+            // while the returned labels retain this physical permutation.
+            let right_index = vec![40_i64, 10, 30, 20];
+            // Four representative pairs cover every operator in both anchor
+            // positions, including strict/inclusive and complementary
+            // directions. The randomized test below supplies additional
+            // pairings. Keeping the deterministic matrix at 4 x 4 instead
+            // of 4 x 4 x 4 makes failures easier to attribute while still
+            // testing every keep mode against every selected pair.
+            let operator_pairs = [("<", "<="), ("<=", ">"), (">", "<"), (">=", ">=")];
+            let keeps = ["all", "first", "last", "any"];
+
+            for (first_operator, second_operator) in operator_pairs {
+                let predicates = PyList::empty(py);
+                append_index_predicate(
+                    py,
+                    &predicates,
+                    IndexPredicate {
+                        left: &first_left,
+                        left_index: &left_index,
+                        right: &first_right,
+                        right_index: &right_index,
+                        ordered: false,
+                        operator: first_operator,
+                    },
+                )?;
+                append_index_predicate(
+                    py,
+                    &predicates,
+                    IndexPredicate {
+                        left: &second_left,
+                        left_index: &left_index,
+                        right: &second_right,
+                        right_index: &right_index,
+                        ordered: false,
+                        operator: second_operator,
+                    },
+                )?;
+                for keep in keeps {
+                    let expected = reference_pairs(
+                        &ReferenceFixture {
+                            left_index: &left_index,
+                            first_left: &first_left,
+                            second_left: &second_left,
+                            right_index: &right_index,
+                            first_right: &first_right,
+                            second_right: &second_right,
+                        },
+                        first_operator,
+                        second_operator,
+                        keep,
+                    );
+                    let result = range_join_indices(py, &predicates, keep, false)?;
+                    assert_index_result(result, expected);
+                }
+            }
+
+            // Building blocks are the unmaterialized public form. They retain
+            // one row per surviving left window and expose positional bounds
+            // rather than selected labels.
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![3_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![101_i64]).into_any(),
+                    PyArray1::from_vec(py, first_right).into_any(),
+                    PyArray1::from_vec(py, right_index).into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
+                    "<=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![4_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![101_i64]).into_any(),
+                    PyArray1::from_vec(py, second_right).into_any(),
+                    PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
+                    ">".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let blocks = range_join_indices(py, &predicates, "all", true)?
+                .expect("the building-block windows should be non-empty");
+            assert_eq!(
+                blocks.get_item("starts")?.unwrap().extract::<Vec<i64>>()?,
+                vec![1]
+            );
+            assert_eq!(
+                blocks.get_item("ends")?.unwrap().extract::<Vec<i64>>()?,
+                vec![2]
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn randomized_range_indices_match_bruteforce_reference() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let operators = ["<", "<=", ">", ">="];
+            let keeps = ["all", "first", "last", "any"];
+            let left_index = vec![100_i64, 101, 102, 103];
+            let right_index = vec![30_i64, 10, 40, 20, 50];
+            let mut seed = 0x9e3779b97f4a7c15_u64;
+
+            for case in 0..32 {
+                let mut first_right = (0..5)
+                    .map(|_| next_test_value(&mut seed))
+                    .collect::<Vec<_>>();
+                let mut second_right = (0..5)
+                    .map(|_| next_test_value(&mut seed))
+                    .collect::<Vec<_>>();
+                first_right.sort_unstable();
+                second_right.sort_unstable();
+                let first_left = (0..4)
+                    .map(|_| next_test_value(&mut seed))
+                    .collect::<Vec<_>>();
+                let second_left = (0..4)
+                    .map(|_| next_test_value(&mut seed))
+                    .collect::<Vec<_>>();
+                let first_operator = operators[case % operators.len()];
+                let second_operator = operators[(case * 3 + 1) % operators.len()];
+                let keep = keeps[case % keeps.len()];
+                let predicates = PyList::empty(py);
+                append_index_predicate(
+                    py,
+                    &predicates,
+                    IndexPredicate {
+                        left: &first_left,
+                        left_index: &left_index,
+                        right: &first_right,
+                        right_index: &right_index,
+                        ordered: false,
+                        operator: first_operator,
+                    },
+                )?;
+                append_index_predicate(
+                    py,
+                    &predicates,
+                    IndexPredicate {
+                        left: &second_left,
+                        left_index: &left_index,
+                        right: &second_right,
+                        right_index: &right_index,
+                        ordered: false,
+                        operator: second_operator,
+                    },
+                )?;
+                let expected = reference_pairs(
+                    &ReferenceFixture {
+                        left_index: &left_index,
+                        first_left: &first_left,
+                        second_left: &second_left,
+                        right_index: &right_index,
+                        first_right: &first_right,
+                        second_right: &second_right,
+                    },
+                    first_operator,
+                    second_operator,
+                    keep,
+                );
+                assert_index_result(range_join_indices(py, &predicates, keep, false)?, expected);
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn extended_range_indices_filter_reference_candidates_before_keep() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let first_left = vec![0_i64, 3, 6];
+            let second_left = vec![5_i64, 4, 7];
+            let left_index = vec![101_i64, 99, 55];
+            let first_right = vec![1_i64, 3, 3, 7];
+            let second_right = vec![0_i64, 2, 4, 6];
+            let right_index = vec![40_i64, 10, 30, 20];
+            let residual_left = vec![0_i64, 3, 6];
+            let residual_right = vec![0_i64, 1, 5, 8];
+            let residual_operator = "<";
+            let first_op = CompareOp::try_from_str("<").unwrap();
+            let second_op = CompareOp::try_from_str(">").unwrap();
+            let residual_op = CompareOp::try_from_str(residual_operator).unwrap();
+
+            for keep in ["all", "first", "last", "any"] {
+                let predicates = PyList::empty(py);
+                for (left, left_index_values, right, operator) in [
+                    (&first_left, &left_index, &first_right, "<"),
+                    (&second_left, &left_index, &second_right, ">"),
+                ] {
+                    predicates.append(PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, left.clone()).into_any(),
+                            PyArray1::from_vec(py, left_index_values.clone()).into_any(),
+                            PyArray1::from_vec(py, right.clone()).into_any(),
+                            PyArray1::from_vec(py, right_index.clone()).into_any(),
+                            operator.into_pyobject(py)?.into_any(),
+                        ],
+                    )?)?;
+                }
+                predicates.append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, residual_left.clone()).into_any(),
+                        PyArray1::from_vec(py, residual_right.clone()).into_any(),
+                        residual_operator.into_pyobject(py)?.into_any(),
+                    ],
+                )?)?;
+
+                let mut expected = (Vec::new(), Vec::new());
+                for left_position in 0..left_index.len() {
+                    let mut passing = Vec::new();
+                    for right_position in 0..right_index.len() {
+                        if first_op.apply(&first_left[left_position], &first_right[right_position])
+                            && second_op
+                                .apply(&second_left[left_position], &second_right[right_position])
+                            && residual_op.apply(
+                                &residual_left[left_position],
+                                &residual_right[right_position],
+                            )
+                        {
+                            passing.push(right_position);
+                        }
+                    }
+                    for position in select_reference_positions(passing, &right_index, keep) {
+                        expected.0.push(left_index[left_position]);
+                        expected.1.push(right_index[position]);
+                    }
+                }
+                assert_index_result(
+                    range_join_extended_indices(py, &predicates, keep)?,
+                    expected,
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn range_index_wrappers_reject_malformed_tuples_and_parallel_lengths() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let malformed = PyList::empty(py);
+            malformed.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            malformed.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let error = range_join_indices(py, &malformed, "all", false).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("range predicates must contain 6 elements"));
+
+            let mismatched = PyList::empty(py);
+            for (left_index, operator) in [(vec![0_i64, 1], "<"), (vec![0_i64], ">")] {
+                mismatched.append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                        PyArray1::from_vec(py, left_index).into_any(),
+                        PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                        true.into_pyobject(py)?.to_owned().into_any(),
+                        operator.into_pyobject(py)?.into_any(),
+                    ],
+                )?)?;
+            }
+            let error = range_join_indices(py, &mismatched, "all", false).unwrap_err();
+            assert!(error.to_string().contains("left and left_index"));
+
+            let extended_malformed = PyList::empty(py);
+            extended_malformed.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    true.into_pyobject(py)?.to_owned().into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            extended_malformed.append(PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            let error = range_join_extended_indices(py, &extended_malformed, "all").unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("extended range anchors must contain 5 elements"));
+
+            let empty = PyList::empty(py);
+            for operator in ["<", ">"] {
+                empty.append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, Vec::<i64>::new()).into_any(),
+                        PyArray1::from_vec(py, Vec::<i64>::new()).into_any(),
+                        PyArray1::from_vec(py, vec![1_i64, 2]).into_any(),
+                        PyArray1::from_vec(py, vec![10_i64, 11]).into_any(),
+                        true.into_pyobject(py)?.to_owned().into_any(),
+                        operator.into_pyobject(py)?.into_any(),
+                    ],
+                )?)?;
+            }
+            assert!(range_join_indices(py, &empty, "all", false)?.is_none());
             Ok(())
         })
         .unwrap();
