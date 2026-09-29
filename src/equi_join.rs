@@ -55,7 +55,11 @@ fn build_dense_right_metadata(
     } else {
         Vec::new()
     };
-    let mut counts = vec![0; code_count];
+    let mut counts: Vec<usize> = if keep == Keep::All {
+        vec![0; code_count]
+    } else {
+        Vec::new()
+    };
     for (position, &code) in right_codes.iter().enumerate() {
         if code < -1 {
             return Err("right codes must be greater than or equal to -1".to_owned());
@@ -64,7 +68,11 @@ fn build_dense_right_metadata(
             continue;
         }
         let code = usize::try_from(code).map_err(|_| "invalid right code")?;
-        counts[code] += 1;
+        if keep == Keep::All {
+            counts[code] = counts[code]
+                .checked_add(1)
+                .ok_or("equi join right metadata is too large")?;
+        }
         if keep == Keep::Any && any[code] == usize::MAX {
             any[code] = position;
         }
@@ -117,6 +125,31 @@ fn build_dense_right_metadata(
     })
 }
 
+fn matching_count(metadata: &DenseRightMetadata, code: usize, keep: Keep) -> Option<usize> {
+    match keep {
+        Keep::Any => metadata
+            .any
+            .get(code)
+            .filter(|&&position| position != usize::MAX)
+            .map(|_| 1),
+        Keep::First => metadata
+            .first
+            .get(code)
+            .filter(|&&position| position != usize::MAX)
+            .map(|_| 1),
+        Keep::Last => metadata
+            .last
+            .get(code)
+            .filter(|&&position| position != usize::MAX)
+            .map(|_| 1),
+        Keep::All => metadata
+            .counts
+            .get(code)
+            .copied()
+            .filter(|&count| count > 0),
+    }
+}
+
 fn build_duplicate_equi_pairs_core(
     left_index: ArrayView1<'_, i64>,
     left_indexer: ArrayView1<'_, i64>,
@@ -148,12 +181,8 @@ fn build_duplicate_equi_pairs_core(
             continue;
         }
         let code = usize::try_from(code).map_err(|_| "invalid left code")?;
-        if code >= metadata.counts.len() || metadata.counts[code] == 0 {
+        let Some(count) = matching_count(&metadata, code, keep) else {
             continue;
-        }
-        let count = match keep {
-            Keep::All => metadata.counts[code],
-            Keep::Any | Keep::First | Keep::Last => 1,
         };
         output_len = output_len
             .checked_add(count)
@@ -171,7 +200,7 @@ fn build_duplicate_equi_pairs_core(
             continue;
         }
         let code = usize::try_from(code).map_err(|_| "invalid left code")?;
-        if code >= metadata.counts.len() || metadata.counts[code] == 0 {
+        if matching_count(&metadata, code, keep).is_none() {
             continue;
         }
         let positions = match keep {
