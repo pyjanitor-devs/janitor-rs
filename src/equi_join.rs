@@ -23,12 +23,6 @@ fn build_dense_right_metadata(
     right_index: ArrayView1<'_, i64>,
     right_codes: ArrayView1<'_, i64>,
 ) -> Result<DenseRightMetadata, String> {
-    ensure_equal_lengths_core(
-        "right index",
-        right_index.len(),
-        "duplicate codes",
-        right_codes.len(),
-    )?;
     let code_count = right_codes
         .iter()
         .copied()
@@ -90,6 +84,12 @@ fn build_duplicate_equi_pairs_core(
         left_index.len(),
         "equi indexer",
         left_indexer.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "right index",
+        right_index.len(),
+        "duplicate codes",
+        right_codes.len(),
     )?;
     let metadata = build_dense_right_metadata(right_index, right_codes)?;
 
