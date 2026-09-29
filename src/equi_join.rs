@@ -3,10 +3,6 @@
 //! PyJanitor owns scalar/MultiIndex construction, `get_indexer`, factorization,
 //! null semantics, sorting, and the mapping from sorted physical positions to
 //! original right positions. This file owns only duplicate-right equi matching.
-//!
-//! PyJanitor owns scalar/MultiIndex construction, `get_indexer`, factorization,
-//! null semantics, sorting, and the mapping from sorted physical positions to
-//! original right positions. This file owns only duplicate-right equi matching.
 
 use crate::aggs::ensure_equal_lengths_core;
 use crate::join_common::Keep;
@@ -14,13 +10,6 @@ use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-
-/// Materialized labels from the sorted physical right layout.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct EquiPairs {
-    pub left: Vec<i64>,
-    pub right: Vec<i64>,
-}
 
 #[derive(Debug)]
 struct DenseRightMetadata {
@@ -95,7 +84,7 @@ fn build_duplicate_equi_pairs_core(
     right_index: ArrayView1<'_, i64>,
     right_codes: ArrayView1<'_, i64>,
     keep: Keep,
-) -> Result<Option<EquiPairs>, String> {
+) -> Result<Option<(Vec<i64>, Vec<i64>)>, String> {
     ensure_equal_lengths_core(
         "left index",
         left_index.len(),
@@ -103,13 +92,37 @@ fn build_duplicate_equi_pairs_core(
         left_indexer.len(),
     )?;
     let metadata = build_dense_right_metadata(right_index, right_codes)?;
-    let mut output = EquiPairs::default();
+
+    let mut output_len = 0_usize;
     for row in 0..left_indexer.len() {
         let code = left_indexer[row];
         if code < -1 {
             return Err("left codes must be greater than or equal to -1".to_owned());
         }
         if code == -1 {
+            continue;
+        }
+        let code = usize::try_from(code).map_err(|_| "invalid left code")?;
+        if code >= metadata.groups.len() || metadata.groups[code].is_empty() {
+            continue;
+        }
+        let count = match keep {
+            Keep::All => metadata.groups[code].len(),
+            Keep::Any | Keep::First | Keep::Last => 1,
+        };
+        output_len = output_len
+            .checked_add(count)
+            .ok_or("equi join output is too large")?;
+    }
+    if output_len == 0 {
+        return Ok(None);
+    }
+
+    let mut left_output = Vec::with_capacity(output_len);
+    let mut right_output = Vec::with_capacity(output_len);
+    for row in 0..left_indexer.len() {
+        let code = left_indexer[row];
+        if code < 0 {
             continue;
         }
         let code = usize::try_from(code).map_err(|_| "invalid left code")?;
@@ -123,15 +136,13 @@ fn build_duplicate_equi_pairs_core(
             Keep::All => metadata.groups[code].as_slice(),
         };
         for &position in positions {
-            output.left.push(left_index[row]);
-            output.right.push(right_index[position]);
+            left_output.push(left_index[row]);
+            right_output.push(right_index[position]);
         }
     }
-    if output.left.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(output))
-    }
+    debug_assert_eq!(left_output.len(), output_len);
+    debug_assert_eq!(right_output.len(), output_len);
+    Ok(Some((left_output, right_output)))
 }
 
 /// Build indices for a pure equi join with duplicate right keys.
@@ -158,7 +169,9 @@ pub fn equi_join_indices<'py>(
     )
     .map_err(PyValueError::new_err)?;
     pairs
-        .map(|pairs| crate::join_common::result_dict(py, pairs.left, pairs.right, None, None))
+        .map(|(left_output, right_output)| {
+            crate::join_common::result_dict(py, left_output, right_output, None, None)
+        })
         .transpose()
 }
 
@@ -202,7 +215,7 @@ mod tests {
             Keep::Any,
         )
         .unwrap();
-        assert_eq!(any.unwrap().right, vec![12, 5]);
+        assert_eq!(any.unwrap().1, vec![12, 5]);
 
         let first = build_duplicate_equi_pairs_core(
             left_index.view(),
@@ -212,7 +225,7 @@ mod tests {
             Keep::First,
         )
         .unwrap();
-        assert_eq!(first.unwrap().right, vec![9, 5]);
+        assert_eq!(first.unwrap().1, vec![9, 5]);
 
         let last = build_duplicate_equi_pairs_core(
             left_index.view(),
@@ -222,7 +235,7 @@ mod tests {
             Keep::Last,
         )
         .unwrap();
-        assert_eq!(last.unwrap().right, vec![12, 5]);
+        assert_eq!(last.unwrap().1, vec![12, 5]);
 
         let all = build_duplicate_equi_pairs_core(
             left_index.view(),
@@ -232,7 +245,7 @@ mod tests {
             Keep::All,
         )
         .unwrap();
-        assert_eq!(all.unwrap().right, vec![12, 9, 5]);
+        assert_eq!(all.unwrap().1, vec![12, 9, 5]);
     }
 
     #[test]
