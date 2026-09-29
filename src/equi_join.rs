@@ -8,6 +8,7 @@
 //! null semantics, sorting, and the mapping from sorted physical positions to
 //! original right positions. This file owns only duplicate-right equi matching.
 
+use crate::aggs::ensure_equal_lengths_core;
 use crate::join_common::Keep;
 use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
@@ -33,9 +34,12 @@ fn build_dense_right_metadata(
     right_index: ArrayView1<'_, i64>,
     right_codes: ArrayView1<'_, i64>,
 ) -> Result<DenseRightMetadata, String> {
-    if right_index.len() != right_codes.len() {
-        return Err("right index and duplicate codes must have equal lengths".to_owned());
-    }
+    ensure_equal_lengths_core(
+        "right index",
+        right_index.len(),
+        "duplicate codes",
+        right_codes.len(),
+    )?;
     let code_count = right_codes
         .iter()
         .copied()
@@ -92,9 +96,12 @@ fn build_duplicate_equi_pairs_core(
     right_codes: ArrayView1<'_, i64>,
     keep: Keep,
 ) -> Result<Option<EquiPairs>, String> {
-    if left_index.len() != left_indexer.len() {
-        return Err("left index and equi indexer must have equal lengths".to_owned());
-    }
+    ensure_equal_lengths_core(
+        "left index",
+        left_index.len(),
+        "equi indexer",
+        left_indexer.len(),
+    )?;
     let metadata = build_dense_right_metadata(right_index, right_codes)?;
     let mut output = EquiPairs::default();
     for row in 0..left_indexer.len() {
