@@ -3,6 +3,7 @@ mod aggs;
 mod anchor_non_equi_join;
 mod anchor_non_equi_join_agg;
 mod bin_search;
+mod equi_join;
 mod index_builder;
 mod join_aggregation_helpers;
 mod join_candidate_materialization;
