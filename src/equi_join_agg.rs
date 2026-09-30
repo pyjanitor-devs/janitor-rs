@@ -13,66 +13,14 @@ use pyo3::types::{PyList, PyTuple};
 use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
 use crate::aggs::ensure_equal_lengths_core;
 use crate::equi_join::{
-    append_range_residuals, build_dense_right_metadata, build_equi_range_windows,
-    DenseRightMetadata,
+    append_range_residuals, build_dense_right_metadata, build_equi_range_windows, decode_equi_code,
+    equi_candidate_slice, parse_equi_range_predicates, validate_equi_range_predicate_count,
 };
 use crate::join_common::Keep;
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
     predicates_match_dispatch, Predicate,
 };
-use crate::range_predicate::parse_any_range_parts;
-
-/// Return the duplicate-right physical positions for one left equi code.
-///
-/// Without range windows, the complete code group is returned. With a range
-/// window, the group is already sorted by physical position, so two binary
-/// searches restrict it to the half-open interval `[start, end)`. The returned
-/// slice borrows the shared `positions` buffer and does not allocate.
-///
-/// # Arguments
-///
-/// * `code` - Dense equi-key code from one entry in `left_indexer`.
-/// * `counts` - Number of physical right positions stored for each code.
-/// * `offsets` - Flat-buffer boundaries for each code.
-/// * `positions` - Flat physical right positions grouped by code.
-/// * `windows` - Optional per-left-row `(starts, ends)` range windows.
-/// * `row` - Left physical row whose range window should be used.
-/// * `right_len` - Number of physical rows in the right layout.
-///
-/// # Errors
-///
-/// Returns an error when the selected range window ends beyond the physical
-/// right layout. Empty or inverted windows produce an empty candidate slice.
-fn candidate_slice<'a>(
-    code: usize,
-    counts: &[usize],
-    offsets: &[usize],
-    positions: &'a [usize],
-    windows: Option<(&[usize], &[usize])>,
-    row: usize,
-    right_len: usize,
-) -> Result<&'a [usize], String> {
-    if counts.get(code).copied().unwrap_or(0) == 0 {
-        return Ok(&[]);
-    }
-    let start = offsets[code];
-    let end = offsets[code + 1];
-    let group = &positions[start..end];
-    let Some((starts, ends)) = windows else {
-        return Ok(group);
-    };
-    if ends[row] > right_len {
-        return Err("equi aggregation range window is out of bounds".to_owned());
-    }
-    if starts[row] >= ends[row] {
-        return Ok(&[]);
-    }
-    let first = group.partition_point(|&position| position < starts[row]);
-    let last = group.partition_point(|&position| position < ends[row]);
-    Ok(&group[first..last])
-}
-
 /// Aggregate an equi-led join without materializing matching pairs.
 ///
 /// PyJanitor supplies arrays in one shared physical coordinate system. The
@@ -105,8 +53,10 @@ fn candidate_slice<'a>(
 ///   right equi keys are unique; `Some` means duplicate-key metadata is
 ///   required. Codes must be `-1` or nonnegative.
 /// * `range_predicates` - Zero, one, or two three-field tuples containing
-///   `(left_values, right_values, operator)`. Their right values must share
-///   the physical layout described by `right_index`.
+///   `(left_values, right_values, operator)`. With duplicate right keys, the
+///   tuples are used as range windows. With unique right keys, they are
+///   evaluated as residual predicates. Their right values must share the
+///   physical layout described by `right_index`.
 /// * `residual_predicates` - Remaining predicate tuples, including ordinary
 ///   three-field comparisons and six-field null-aware `!=` comparisons.
 /// * `aggregations` - Non-empty Rust aggregation specifications prepared by
@@ -140,13 +90,6 @@ pub fn equi_join_aggregate<'py>(
     let left_index_values = left_index_array.as_array();
     let right_index_values = right_index_array.as_array();
     let left_indexer = left_indexer.as_array();
-    ensure_equal_lengths_core(
-        "left index",
-        left_index_values.len(),
-        "equi indexer",
-        left_indexer.len(),
-    )
-    .map_err(PyValueError::new_err)?;
 
     let inputs = parse_inputs(aggregations)?;
     if inputs.is_empty() {
@@ -154,6 +97,14 @@ pub fn equi_join_aggregate<'py>(
             "at least one aggregation is required",
         ));
     }
+    validate_equi_range_predicate_count(range_predicates.len())?;
+    ensure_equal_lengths_core(
+        "left index",
+        left_index_values.len(),
+        "equi indexer",
+        left_indexer.len(),
+    )
+    .map_err(PyValueError::new_err)?;
     let output_len = if reverse {
         right_index_values.len()
     } else {
@@ -175,26 +126,7 @@ pub fn equi_join_aggregate<'py>(
         )
         .map_err(PyValueError::new_err)?;
         let (parsed, metadata) = parse_predicates_with_nulls_strings(py, residual_predicates)?;
-        let ranges = range_predicates
-            .iter()
-            .map(|item| {
-                let tuple = item
-                    .cast::<PyTuple>()
-                    .map_err(|_| PyValueError::new_err("each equi range must be a tuple"))?;
-                if tuple.len() != 3 {
-                    return Err(PyValueError::new_err(
-                        "equi range predicates must contain 3 elements",
-                    ));
-                }
-                parse_any_range_parts(
-                    &tuple.get_item(0)?,
-                    left_index,
-                    &tuple.get_item(1)?,
-                    right_index,
-                    &tuple.get_item(2)?,
-                )
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+        let ranges = parse_equi_range_predicates(range_predicates, left_index, right_index)?;
         let windows = build_equi_range_windows(&ranges).map_err(PyValueError::new_err)?;
         let groups =
             build_dense_right_metadata(right_index_values, right_codes.as_array(), Keep::All)
@@ -213,35 +145,16 @@ pub fn equi_join_aggregate<'py>(
         .as_ref()
         .map(|(starts, ends)| (starts.as_slice(), ends.as_slice()));
 
-    if let Some(DenseRightMetadata {
-        counts,
-        offsets,
-        positions,
-        ..
-    }) = groups
-    {
+    if let Some(groups) = groups {
         for row in 0..left_indexer.len() {
-            let code = left_indexer[row];
-            if code < -1 {
-                return Err(PyValueError::new_err(
-                    "left codes must be greater than or equal to -1",
-                ));
-            }
-            if code == -1 {
+            let Some(code) =
+                decode_equi_code(left_indexer[row], "left").map_err(PyValueError::new_err)?
+            else {
                 continue;
-            }
-            let code =
-                usize::try_from(code).map_err(|_| PyValueError::new_err("invalid left code"))?;
-            let candidates = candidate_slice(
-                code,
-                &counts,
-                &offsets,
-                &positions,
-                windows,
-                row,
-                right_index_values.len(),
-            )
-            .map_err(PyValueError::new_err)?;
+            };
+            let candidates =
+                equi_candidate_slice(code, &groups, windows, row, right_index_values.len())
+                    .map_err(PyValueError::new_err)?;
             for &right_position in candidates {
                 if !predicates_match_dispatch(
                     &views,
@@ -260,17 +173,12 @@ pub fn equi_join_aggregate<'py>(
         }
     } else {
         for row in 0..left_indexer.len() {
-            let code = left_indexer[row];
-            if code < -1 {
-                return Err(PyValueError::new_err(
-                    "left codes must be greater than or equal to -1",
-                ));
-            }
-            if code == -1 {
+            let Some(code) =
+                decode_equi_code(left_indexer[row], "left").map_err(PyValueError::new_err)?
+            else {
                 continue;
-            }
-            let right_position = usize::try_from(code)
-                .map_err(|_| PyValueError::new_err("invalid unique-right position"))?;
+            };
+            let right_position = code;
             if right_position >= right_index_values.len()
                 || !predicates_match_dispatch(
                     &views,
@@ -328,6 +236,63 @@ mod tests {
             ],
         )?;
         PyList::new(py, [aggregation])
+    }
+
+    fn all_aggregations<'py>(py: Python<'py>, values: Vec<i64>) -> PyResult<Bound<'py, PyList>> {
+        let values = PyArray1::from_vec(py, values);
+        let nulls = PyArray1::from_vec(py, vec![false; values.len()?]);
+        PyList::new(
+            py,
+            [
+                PyTuple::new(
+                    py,
+                    [
+                        values.clone().into_any(),
+                        nulls.clone().into_any(),
+                        "sum".into_pyobject(py)?.into_any(),
+                    ],
+                )?,
+                PyTuple::new(
+                    py,
+                    [
+                        values.clone().into_any(),
+                        nulls.clone().into_any(),
+                        "prod".into_pyobject(py)?.into_any(),
+                    ],
+                )?,
+                PyTuple::new(
+                    py,
+                    [
+                        values.clone().into_any(),
+                        nulls.clone().into_any(),
+                        "min".into_pyobject(py)?.into_any(),
+                    ],
+                )?,
+                PyTuple::new(
+                    py,
+                    [
+                        values.clone().into_any(),
+                        nulls.clone().into_any(),
+                        "max".into_pyobject(py)?.into_any(),
+                    ],
+                )?,
+                PyTuple::new(
+                    py,
+                    [
+                        "*".into_pyobject(py)?.into_any(),
+                        nulls.into_any(),
+                        "count".into_pyobject(py)?.into_any(),
+                    ],
+                )?,
+                PyTuple::new(
+                    py,
+                    [
+                        "*".into_pyobject(py)?.into_any(),
+                        "size".into_pyobject(py)?.into_any(),
+                    ],
+                )?,
+            ],
+        )
     }
 
     fn empty_predicates<'py>(py: Python<'py>) -> Bound<'py, PyList> {
@@ -502,6 +467,205 @@ mod tests {
             let values_item = result.get_item(2)?;
             let values = values_item.cast::<PyList>()?;
             assert_eq!(values.get_item(0)?.extract::<Vec<i64>>()?, vec![20]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn duplicate_equi_aggregation_supports_all_operations_without_matched() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![10_i64, 11]);
+            let right_index = PyArray1::from_vec(py, vec![20_i64, 21, 22]);
+            let left_indexer = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let right_codes = PyArray1::from_vec(py, vec![0_i64, 1, 0]);
+            let result = equi_join_aggregate(
+                py,
+                &left_index,
+                &right_index,
+                left_indexer.readonly(),
+                Some(right_codes.readonly()),
+                &empty_predicates(py),
+                &empty_predicates(py),
+                &all_aggregations(py, vec![2, 3, 4])?,
+                false,
+                false,
+            )?
+            .expect("duplicate equi candidates should aggregate");
+
+            assert_eq!(result.len(), 2);
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![10, 11]);
+            let outputs_item = result.get_item(1)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![6, 3]);
+            assert_eq!(outputs.get_item(1)?.extract::<Vec<i64>>()?, vec![8, 3]);
+            assert_eq!(outputs.get_item(2)?.extract::<Vec<i64>>()?, vec![0, 1]);
+            assert_eq!(outputs.get_item(3)?.extract::<Vec<i64>>()?, vec![2, 1]);
+            assert_eq!(outputs.get_item(4)?.extract::<Vec<i64>>()?, vec![2, 1]);
+            assert_eq!(outputs.get_item(5)?.extract::<Vec<i64>>()?, vec![2, 1]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn unique_equi_aggregation_applies_range_as_a_residual() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![10_i64]);
+            let right_index = PyArray1::from_vec(py, vec![20_i64, 21]);
+            let left_indexer = PyArray1::from_vec(py, vec![1_i64]);
+            let ranges = PyList::new(
+                py,
+                [PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                        PyArray1::from_vec(py, vec![1_i64, 3]).into_any(),
+                        "<".into_pyobject(py)?.into_any(),
+                    ],
+                )?],
+            )?;
+            let result = equi_join_aggregate(
+                py,
+                &left_index,
+                &right_index,
+                left_indexer.readonly(),
+                None,
+                &ranges,
+                &empty_predicates(py),
+                &sum_aggregation(py, vec![9])?,
+                true,
+                true,
+            )?
+            .expect("the unique equi candidate should satisfy the range");
+
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![20, 21]);
+            assert_eq!(
+                result.get_item(1)?.extract::<Vec<bool>>()?,
+                vec![false, true]
+            );
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![0, 9]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn duplicate_equi_reverse_aggregation_intersects_two_ranges() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![10_i64]);
+            let right_index = PyArray1::from_vec(py, vec![20_i64, 21, 22, 23]);
+            let left_indexer = PyArray1::from_vec(py, vec![0_i64]);
+            let right_codes = PyArray1::from_vec(py, vec![0_i64, 0, 0, 0]);
+            let ranges = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                            PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
+                            "<".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, vec![3_i64]).into_any(),
+                            PyArray1::from_vec(py, vec![0_i64, 2, 4, 6]).into_any(),
+                            "<=".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+            let result = equi_join_aggregate(
+                py,
+                &left_index,
+                &right_index,
+                left_indexer.readonly(),
+                Some(right_codes.readonly()),
+                &ranges,
+                &empty_predicates(py),
+                &sum_aggregation(py, vec![9])?,
+                true,
+                true,
+            )?
+            .expect("the two ranges should leave two reverse candidates");
+
+            assert_eq!(
+                result.get_item(0)?.extract::<Vec<i64>>()?,
+                vec![20, 21, 22, 23]
+            );
+            assert_eq!(
+                result.get_item(1)?.extract::<Vec<bool>>()?,
+                vec![false, false, true, true]
+            );
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(
+                outputs.get_item(0)?.extract::<Vec<i64>>()?,
+                vec![0, 0, 9, 9]
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn equi_aggregation_rejects_malformed_duplicate_codes() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let error = equi_join_aggregate(
+                py,
+                &PyArray1::from_vec(py, vec![10_i64]),
+                &PyArray1::from_vec(py, vec![20_i64]),
+                PyArray1::from_vec(py, vec![0_i64]).readonly(),
+                Some(PyArray1::from_vec(py, vec![i64::MAX]).readonly()),
+                &empty_predicates(py),
+                &empty_predicates(py),
+                &sum_aggregation(py, vec![5])?,
+                true,
+                false,
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("right code exceeds the right index length"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn equi_aggregation_checks_empty_aggregations_before_lengths() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![10_i64]);
+            let right_index = PyArray1::from_vec(py, vec![20_i64]);
+            let left_indexer = PyArray1::from_vec(py, Vec::<i64>::new());
+            let aggregations = PyList::empty(py);
+            let error = equi_join_aggregate(
+                py,
+                &left_index,
+                &right_index,
+                left_indexer.readonly(),
+                None,
+                &empty_predicates(py),
+                &empty_predicates(py),
+                &aggregations,
+                true,
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "ValueError: at least one aggregation is required"
+            );
             Ok(())
         })
         .unwrap();

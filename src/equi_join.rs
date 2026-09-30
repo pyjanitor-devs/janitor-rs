@@ -66,6 +66,33 @@ pub(crate) struct DenseRightMetadata {
 /// Optional materialized label pairs returned by an equi join.
 type EquiPairs = Option<(Vec<i64>, Vec<i64>)>;
 
+/// Decode an equi code while preserving `-1` as the no-match sentinel.
+///
+/// The caller supplies the side name so errors remain useful at the Python
+/// boundary. All nonnegative codes are returned as physical-position or
+/// metadata indexes; callers still apply any side-specific upper-bound check.
+pub(crate) fn decode_equi_code(code: i64, side: &str) -> Result<Option<usize>, String> {
+    if code < -1 {
+        return Err(format!("{side} codes must be greater than or equal to -1"));
+    }
+    if code == -1 {
+        return Ok(None);
+    }
+    usize::try_from(code)
+        .map(Some)
+        .map_err(|_| format!("invalid {side} code"))
+}
+
+/// Validate the public equi-join range-predicate contract.
+pub(crate) fn validate_equi_range_predicate_count(count: usize) -> PyResult<()> {
+    if count > 2 {
+        return Err(PyValueError::new_err(
+            "equi range path accepts at most two range predicates",
+        ));
+    }
+    Ok(())
+}
+
 /// Optional half-open range windows aligned one-for-one to left rows.
 pub(crate) type RangeWindows = Option<(Vec<usize>, Vec<usize>)>;
 
@@ -120,13 +147,8 @@ pub(crate) fn build_dense_right_metadata(
     // Validate every code before deriving `code_count`. In particular, an
     // attacker-controlled i64::MAX must be rejected before it can become a
     // vector length and trigger an enormous allocation.
-    for &code in right_codes {
-        if code < -1 {
-            return Err("right codes must be greater than or equal to -1".to_owned());
-        }
-        if code >= 0 {
-            let code = usize::try_from(code)
-                .map_err(|_| "right code cannot be represented as a physical position")?;
+    for &raw_code in right_codes {
+        if let Some(code) = decode_equi_code(raw_code, "right")? {
             if code >= right_index.len() {
                 return Err("right code exceeds the right index length".to_owned());
             }
@@ -151,6 +173,9 @@ pub(crate) fn build_dense_right_metadata(
         .unwrap_or(0);
     // Allocate only the selected mode's single-position metadata. Keeping the
     // other vectors empty avoids storing three copies of equivalent lookups.
+    // `usize::MAX` is an impossible physical position: valid positions are
+    // strictly less than `right_index.len()`, and an allocated array cannot
+    // have `usize::MAX` elements. It therefore safely represents "not set".
     let mut any = if keep == Keep::Any {
         vec![usize::MAX; code_count]
     } else {
@@ -173,11 +198,9 @@ pub(crate) fn build_dense_right_metadata(
     } else {
         Vec::new()
     };
-    // First pass: validate codes and collect the mode-specific summary.
+    // Collect the mode-specific summary. The validation pass above already
+    // established the code invariant, so this pass does not re-check it.
     for (position, &code) in right_codes.iter().enumerate() {
-        if code < -1 {
-            return Err("right codes must be greater than or equal to -1".to_owned());
-        }
         if code == -1 {
             continue;
         }
@@ -326,14 +349,9 @@ fn build_duplicate_equi_pairs_core(
         let mut left_output = Vec::with_capacity(left_indexer.len());
         let mut right_output = Vec::with_capacity(left_indexer.len());
         for row in 0..left_indexer.len() {
-            let code = left_indexer[row];
-            if code < -1 {
-                return Err("left codes must be greater than or equal to -1".to_owned());
-            }
-            if code == -1 {
+            let Some(code) = decode_equi_code(left_indexer[row], "left")? else {
                 continue;
-            }
-            let code = usize::try_from(code).map_err(|_| "invalid left code")?;
+            };
             let selected = match keep {
                 Keep::Any => metadata.any.get(code),
                 Keep::First => metadata.first.get(code),
@@ -362,14 +380,9 @@ fn build_duplicate_equi_pairs_core(
     // this exact sizing pass.
     let mut output_len = 0_usize;
     for row in 0..left_indexer.len() {
-        let code = left_indexer[row];
-        if code < -1 {
-            return Err("left codes must be greater than or equal to -1".to_owned());
-        }
-        if code == -1 {
+        let Some(code) = decode_equi_code(left_indexer[row], "left")? else {
             continue;
-        }
-        let code = usize::try_from(code).map_err(|_| "invalid left code")?;
+        };
         let Some(count) = matching_count(&metadata, code, keep) else {
             continue;
         };
@@ -387,11 +400,9 @@ fn build_duplicate_equi_pairs_core(
     // stores physical right positions; `right_index[position]` converts each
     // selected physical position to the label returned to Python.
     for row in 0..left_indexer.len() {
-        let code = left_indexer[row];
-        if code < 0 {
+        let Some(code) = decode_equi_code(left_indexer[row], "left")? else {
             continue;
-        }
-        let code = usize::try_from(code).map_err(|_| "invalid left code")?;
+        };
         if matching_count(&metadata, code, keep).is_none() {
             continue;
         }
@@ -439,14 +450,11 @@ fn build_duplicate_equi_blocks_core(
     let mut matched = false;
 
     for &left_code in left_indexer {
-        if left_code < -1 {
-            return Err("left codes must be greater than or equal to -1".to_owned());
-        }
-        if left_code != -1 {
-            let code = usize::try_from(left_code).map_err(|_| "invalid left code")?;
-            if metadata.counts.get(code).copied().unwrap_or(0) > 0 {
-                matched = true;
-            }
+        let Some(code) = decode_equi_code(left_code, "left")? else {
+            continue;
+        };
+        if metadata.counts.get(code).copied().unwrap_or(0) > 0 {
+            matched = true;
         }
     }
 
@@ -480,6 +488,34 @@ fn build_duplicate_equi_blocks_core(
 /// least `target`.
 fn lower_bound(values: &[usize], target: usize) -> usize {
     values.partition_point(|&value| value < target)
+}
+
+/// Parse the three-field range tuples used by the equi entry points.
+pub(crate) fn parse_equi_range_predicates<'py>(
+    range_predicates: &Bound<'py, PyList>,
+    left_index: &Bound<'py, PyAny>,
+    right_index: &Bound<'py, PyAny>,
+) -> PyResult<Vec<AnyParsedRangePredicate<'py>>> {
+    range_predicates
+        .iter()
+        .map(|item| {
+            let tuple = item
+                .cast::<PyTuple>()
+                .map_err(|_| PyValueError::new_err("each equi range must be a tuple"))?;
+            if tuple.len() != 3 {
+                return Err(PyValueError::new_err(
+                    "equi range predicates must contain 3 elements",
+                ));
+            }
+            parse_any_range_parts(
+                &tuple.get_item(0)?,
+                left_index,
+                &tuple.get_item(1)?,
+                right_index,
+                &tuple.get_item(2)?,
+            )
+        })
+        .collect()
 }
 
 /// Build one range predicate's half-open physical windows.
@@ -562,6 +598,41 @@ pub(crate) fn build_equi_range_windows<'py>(
     Ok(Some((starts, ends)))
 }
 
+/// Return the physical right positions for one equi code after its range
+/// window has been applied.
+///
+/// The returned slice borrows the dense metadata and remains ordered by
+/// physical right position. Empty or unknown code groups return an empty
+/// slice; invalid range windows return an error.
+pub(crate) fn equi_candidate_slice<'a>(
+    code: usize,
+    metadata: &'a DenseRightMetadata,
+    windows: Option<(&[usize], &[usize])>,
+    row: usize,
+    right_len: usize,
+) -> Result<&'a [usize], String> {
+    if metadata.counts.get(code).copied().unwrap_or(0) == 0 {
+        return Ok(&[]);
+    }
+    let Some(&group_start) = metadata.offsets.get(code) else {
+        return Ok(&[]);
+    };
+    let group_end = metadata.offsets[code + 1];
+    let group = &metadata.positions[group_start..group_end];
+    let Some((starts, ends)) = windows else {
+        return Ok(group);
+    };
+    if ends[row] > right_len {
+        return Err("equi range window is out of bounds".to_owned());
+    }
+    if starts[row] >= ends[row] {
+        return Ok(&[]);
+    }
+    let first = lower_bound(group, starts[row]);
+    let last = lower_bound(group, ends[row]);
+    Ok(&group[first..last])
+}
+
 /// Visit duplicate-right equi candidates that survive the range window and
 /// residual predicates for one left row.
 ///
@@ -583,39 +654,15 @@ fn visit_filtered_equi_candidates<F>(
 where
     F: FnMut(usize),
 {
-    if left_code < -1 {
-        return Err("left codes must be greater than or equal to -1".to_owned());
-    }
-    if left_code == -1 {
+    let Some(code) = decode_equi_code(left_code, "left")? else {
         return Ok(0);
-    }
-    let code = usize::try_from(left_code).map_err(|_| "invalid left code")?;
+    };
     if metadata.counts.get(code).copied().unwrap_or(0) == 0 {
         return Ok(0);
     }
-    let Some(&group_start) = metadata.offsets.get(code) else {
-        return Ok(0);
-    };
-    let group_end = metadata.offsets[code + 1];
-    let group = &metadata.positions[group_start..group_end];
-    let (first, last) = if let Some((starts, ends)) = windows {
-        if ends[row] > right_len {
-            return Err("equi range window is out of bounds".to_owned());
-        }
-        if starts[row] >= ends[row] {
-            return Ok(0);
-        }
-        (
-            lower_bound(group, starts[row]),
-            lower_bound(group, ends[row]),
-        )
-    } else {
-        // No range predicates means the entire equi-code slice is eligible.
-        // Do not allocate synthetic full-right windows in this case.
-        (0, group.len())
-    };
+    let group = equi_candidate_slice(code, metadata, windows, row, right_len)?;
     let mut count = 0_usize;
-    for &right_position in &group[first..last] {
+    for &right_position in group {
         if !predicates_match_dispatch(predicates, null_metadata, row, right_position) {
             continue;
         }
@@ -717,31 +764,14 @@ fn build_filtered_duplicate_equi_pairs_core(
         return Ok(Some((left_output, right_output)));
     }
 
-    // Keep::All must know the exact result size before allocating the output
-    // arrays. This is the deliberately two-pass path: the first pass counts
-    // matches and the second pass fills the arrays.
-    let mut output_len = 0_usize;
-    for row in 0..left_indexer.len() {
-        let row_count = visit_filtered_equi_candidates(
-            row,
-            left_indexer[row],
-            metadata,
-            windows,
-            right_index.len(),
-            predicates,
-            null_metadata,
-            |_| {},
-        )?;
-        output_len = output_len
-            .checked_add(row_count)
-            .ok_or("equi join result size exceeds platform capacity")?;
-    }
-    if output_len == 0 {
-        return Ok(None);
-    }
-
-    let mut left_output = Vec::with_capacity(output_len);
-    let mut right_output = Vec::with_capacity(output_len);
+    // Keep::All can produce an arbitrary number of pairs per left row. Use the
+    // left-row count as an initial capacity estimate and materialize each
+    // surviving pair during one traversal. Re-running range searches and
+    // residual predicates merely to discover the exact final length is more
+    // expensive than occasional vector growth when predicates are selective
+    // or costly.
+    let mut left_output = Vec::with_capacity(left_indexer.len());
+    let mut right_output = Vec::with_capacity(left_indexer.len());
     for row in 0..left_indexer.len() {
         visit_filtered_equi_candidates(
             row,
@@ -762,8 +792,10 @@ fn build_filtered_duplicate_equi_pairs_core(
             },
         )?;
     }
-    debug_assert_eq!(left_output.len(), output_len);
-    debug_assert_eq!(right_output.len(), output_len);
+    if left_output.is_empty() {
+        return Ok(None);
+    }
+    debug_assert_eq!(left_output.len(), right_output.len());
     Ok(Some((left_output, right_output)))
 }
 
@@ -788,14 +820,9 @@ fn build_filtered_unique_equi_pairs_core(
     let mut left_output = Vec::with_capacity(left_indexer.len());
     let mut right_output = Vec::with_capacity(left_indexer.len());
     for row in 0..left_indexer.len() {
-        let code = left_indexer[row];
-        if code < -1 {
-            return Err("left codes must be greater than or equal to -1".to_owned());
-        }
-        if code == -1 {
+        let Some(right_position) = decode_equi_code(left_indexer[row], "left")? else {
             continue;
-        }
-        let right_position = usize::try_from(code).map_err(|_| "invalid unique-right position")?;
+        };
         if right_position >= right_index.len()
             || !predicates_match_dispatch(predicates, null_metadata, row, right_position)
         {
@@ -882,11 +909,7 @@ pub fn equi_join_filtered_indices<'py>(
     let keep = Keep::parse(keep)?;
     let left_index_array = left_index.extract::<PyReadonlyArray1<'py, i64>>()?;
     let right_index_array = right_index.extract::<PyReadonlyArray1<'py, i64>>()?;
-    if range_predicates.len() > 2 {
-        return Err(PyValueError::new_err(
-            "equi range path accepts at most two range predicates",
-        ));
-    }
+    validate_equi_range_predicate_count(range_predicates.len())?;
 
     let (parsed, metadata) = if right_equi_codes.is_none() {
         let combined = append_range_residuals(py, range_predicates, residual_predicates)?;
@@ -910,26 +933,7 @@ pub fn equi_join_filtered_indices<'py>(
             right_codes.as_array().len(),
         )
         .map_err(PyValueError::new_err)?;
-        let ranges = range_predicates
-            .iter()
-            .map(|item| {
-                let tuple = item
-                    .cast::<PyTuple>()
-                    .map_err(|_| PyValueError::new_err("each equi range must be a tuple"))?;
-                if tuple.len() != 3 {
-                    return Err(PyValueError::new_err(
-                        "equi range predicates must contain 3 elements",
-                    ));
-                }
-                parse_any_range_parts(
-                    &tuple.get_item(0)?,
-                    left_index,
-                    &tuple.get_item(1)?,
-                    right_index,
-                    &tuple.get_item(2)?,
-                )
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+        let ranges = parse_equi_range_predicates(range_predicates, left_index, right_index)?;
         let range_windows = build_equi_range_windows(&ranges).map_err(PyValueError::new_err)?;
         let windows = range_windows
             .as_ref()
