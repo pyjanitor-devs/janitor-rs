@@ -253,9 +253,48 @@ fn build_duplicate_equi_pairs_core(
     )?;
     let metadata = build_dense_right_metadata(right_index, right_codes, keep)?;
 
+    // The single-match modes emit at most one result per left row. Their
+    // metadata already identifies the selected right position, so an exact
+    // sizing pass would only repeat the left-side scan. Allocate an upper
+    // bound and materialize each result in one pass instead.
+    if keep != Keep::All {
+        let mut left_output = Vec::with_capacity(left_indexer.len());
+        let mut right_output = Vec::with_capacity(left_indexer.len());
+        for row in 0..left_indexer.len() {
+            let code = left_indexer[row];
+            if code < -1 {
+                return Err("left codes must be greater than or equal to -1".to_owned());
+            }
+            if code == -1 {
+                continue;
+            }
+            let code = usize::try_from(code).map_err(|_| "invalid left code")?;
+            let selected = match keep {
+                Keep::Any => metadata.any.get(code),
+                Keep::First => metadata.first.get(code),
+                Keep::Last => metadata.last.get(code),
+                Keep::All => unreachable!("non-All branch selected Keep::All"),
+            }
+            .copied()
+            .filter(|&position| position != usize::MAX);
+            let Some(position) = selected else {
+                continue;
+            };
+            left_output.push(left_index[row]);
+            right_output.push(right_index[position]);
+        }
+        if left_output.is_empty() {
+            return Ok(None);
+        }
+        debug_assert_eq!(left_output.len(), right_output.len());
+        return Ok(Some((left_output, right_output)));
+    }
+
     // First pass: calculate the exact number of output pairs. This lets the
     // second pass allocate both result vectors once, with no growth or
-    // reallocation during matching.
+    // reallocation during matching. Keep::All is the only mode that can emit
+    // more than one result per left row, so it is the only mode that needs
+    // this exact sizing pass.
     let mut output_len = 0_usize;
     for row in 0..left_indexer.len() {
         let code = left_indexer[row];
@@ -479,10 +518,63 @@ fn build_filtered_duplicate_equi_pairs_core(
         ensure_equal_lengths_core("equi ends", ends.len(), "left indexer", left_indexer.len())?;
     }
 
+    // A non-All keep emits at most one result for each left row. It does not
+    // need the exact result length, so select the result while visiting the
+    // candidates and evaluate residual predicates only once.
+    if keep != Keep::All {
+        let mut left_output = Vec::with_capacity(left_indexer.len());
+        let mut right_output = Vec::with_capacity(left_indexer.len());
+        for row in 0..left_indexer.len() {
+            let mut selected = None;
+            visit_filtered_equi_candidates(
+                row,
+                left_indexer[row],
+                metadata,
+                windows,
+                right_index.len(),
+                predicates,
+                null_metadata,
+                |right_position| match keep {
+                    Keep::Any => {
+                        if selected.is_none() {
+                            selected = Some(right_position);
+                        }
+                    }
+                    Keep::First => {
+                        if selected.is_none()
+                            || right_index[right_position] < right_index[selected.unwrap()]
+                        {
+                            selected = Some(right_position);
+                        }
+                    }
+                    Keep::Last => {
+                        if selected.is_none()
+                            || right_index[right_position] > right_index[selected.unwrap()]
+                        {
+                            selected = Some(right_position);
+                        }
+                    }
+                    Keep::All => unreachable!("non-All branch selected Keep::All"),
+                },
+            )?;
+            if let Some(right_position) = selected {
+                left_output.push(left_index[row]);
+                right_output.push(right_index[right_position]);
+            }
+        }
+        if left_output.is_empty() {
+            return Ok(None);
+        }
+        debug_assert_eq!(left_output.len(), right_output.len());
+        return Ok(Some((left_output, right_output)));
+    }
+
+    // Keep::All must know the exact result size before allocating the output
+    // arrays. This is the deliberately two-pass path: the first pass counts
+    // matches and the second pass fills the arrays.
     let mut output_len = 0_usize;
     for row in 0..left_indexer.len() {
-        let mut row_count = 0;
-        visit_filtered_equi_candidates(
+        let row_count = visit_filtered_equi_candidates(
             row,
             left_indexer[row],
             metadata,
@@ -490,15 +582,10 @@ fn build_filtered_duplicate_equi_pairs_core(
             right_index.len(),
             predicates,
             null_metadata,
-            |_| row_count += 1,
+            |_| {},
         )?;
-        let emitted = if keep == Keep::All {
-            row_count
-        } else {
-            usize::from(row_count > 0)
-        };
         output_len = output_len
-            .checked_add(emitted)
+            .checked_add(row_count)
             .ok_or("equi join result size exceeds platform capacity")?;
     }
     if output_len == 0 {
@@ -508,7 +595,6 @@ fn build_filtered_duplicate_equi_pairs_core(
     let mut left_output = Vec::with_capacity(output_len);
     let mut right_output = Vec::with_capacity(output_len);
     for row in 0..left_indexer.len() {
-        let mut selected = None;
         visit_filtered_equi_candidates(
             row,
             left_indexer[row],
@@ -522,31 +608,11 @@ fn build_filtered_duplicate_equi_pairs_core(
                     left_output.push(left_index[row]);
                     right_output.push(right_index[right_position]);
                 }
-                Keep::Any => {
-                    if selected.is_none() {
-                        selected = Some(right_position);
-                    }
-                }
-                Keep::First => {
-                    if selected.is_none()
-                        || right_index[right_position] < right_index[selected.unwrap()]
-                    {
-                        selected = Some(right_position);
-                    }
-                }
-                Keep::Last => {
-                    if selected.is_none()
-                        || right_index[right_position] > right_index[selected.unwrap()]
-                    {
-                        selected = Some(right_position);
-                    }
+                Keep::Any | Keep::First | Keep::Last => {
+                    unreachable!("Keep::All branch is the only branch used here")
                 }
             },
         )?;
-        if let Some(right_position) = selected {
-            left_output.push(left_index[row]);
-            right_output.push(right_index[right_position]);
-        }
     }
     debug_assert_eq!(left_output.len(), output_len);
     debug_assert_eq!(right_output.len(), output_len);
@@ -571,7 +637,8 @@ fn build_filtered_unique_equi_pairs_core(
         "equi indexer",
         left_indexer.len(),
     )?;
-    let mut output_len = 0_usize;
+    let mut left_output = Vec::with_capacity(left_indexer.len());
+    let mut right_output = Vec::with_capacity(left_indexer.len());
     for row in 0..left_indexer.len() {
         let code = left_indexer[row];
         if code < -1 {
@@ -586,32 +653,13 @@ fn build_filtered_unique_equi_pairs_core(
         {
             continue;
         }
-        output_len = output_len
-            .checked_add(1)
-            .ok_or("equi join result size exceeds platform capacity")?;
-    }
-    if output_len == 0 {
-        return Ok(None);
-    }
-
-    let mut left_output = Vec::with_capacity(output_len);
-    let mut right_output = Vec::with_capacity(output_len);
-    for row in 0..left_indexer.len() {
-        let code = left_indexer[row];
-        if code < 0 {
-            continue;
-        }
-        let right_position = usize::try_from(code).map_err(|_| "invalid unique-right position")?;
-        if right_position >= right_index.len()
-            || !predicates_match_dispatch(predicates, null_metadata, row, right_position)
-        {
-            continue;
-        }
         left_output.push(left_index[row]);
         right_output.push(right_index[right_position]);
     }
-    debug_assert_eq!(left_output.len(), output_len);
-    debug_assert_eq!(right_output.len(), output_len);
+    if left_output.is_empty() {
+        return Ok(None);
+    }
+    debug_assert_eq!(left_output.len(), right_output.len());
     Ok(Some((left_output, right_output)))
 }
 
