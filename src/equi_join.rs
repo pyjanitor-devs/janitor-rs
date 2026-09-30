@@ -326,8 +326,6 @@ fn build_equi_range_bounds<'py>(
 ) -> Result<(Vec<usize>, Vec<usize>), String> {
     range.validate_range_operator()?;
     range.validate_lengths()?;
-    ensure_equal_lengths_core("range left", range.left_len(), "left indexer", left_len)?;
-    ensure_equal_lengths_core("range right", range.right_len(), "right index", right_len)?;
 
     macro_rules! build_bounds {
         ($predicate:expr) => {{
