@@ -33,8 +33,15 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+/// Dense lookup metadata for factorized right-side equi keys.
+///
+/// Each nonnegative factorization code is a direct index into the metadata
+/// vectors. The `All` representation stores every physical right position for
+/// a code in one flat buffer; `offsets[code]..offsets[code + 1]` identifies the
+/// corresponding slice. The single-position vectors are used by materialized
+/// joins with `Keep::Any`, `Keep::First`, or `Keep::Last`.
 #[derive(Debug)]
-struct DenseRightMetadata {
+pub(crate) struct DenseRightMetadata {
     /// Dense code-to-physical-position metadata for one right layout.
     ///
     /// First and Last select by the emitted right label in right_index.
@@ -49,18 +56,18 @@ struct DenseRightMetadata {
     /// when `keep == Last`.
     last: Vec<usize>,
     /// Number of physical right rows for each code when `keep == All`.
-    counts: Vec<usize>,
+    pub(crate) counts: Vec<usize>,
     /// Boundaries into `positions` when `keep == All`.
-    offsets: Vec<usize>,
+    pub(crate) offsets: Vec<usize>,
     /// Flattened physical right positions grouped by code when `keep == All`.
-    positions: Vec<usize>,
+    pub(crate) positions: Vec<usize>,
 }
 
 /// Optional materialized label pairs returned by an equi join.
 type EquiPairs = Option<(Vec<i64>, Vec<i64>)>;
 
 /// Optional half-open range windows aligned one-for-one to left rows.
-type RangeWindows = Option<(Vec<usize>, Vec<usize>)>;
+pub(crate) type RangeWindows = Option<(Vec<usize>, Vec<usize>)>;
 
 /// Building blocks for a pure duplicate-right equi join.
 struct EquiBlocks {
@@ -97,7 +104,7 @@ struct EquiBlocks {
 ///
 /// Returns an error if a code is below `-1`, cannot be represented as a
 /// physical position, or if metadata sizes would overflow `usize`.
-fn build_dense_right_metadata(
+pub(crate) fn build_dense_right_metadata(
     right_index: ArrayView1<'_, i64>,
     right_codes: ArrayView1<'_, i64>,
     keep: Keep,
@@ -457,7 +464,7 @@ fn lower_bound(values: &[usize], target: usize) -> usize {
 /// sorted by PyJanitor. This helper performs only validation and typed binary
 /// searches; it does not copy index labels or construct a building-block
 /// result.
-fn build_equi_range_bounds<'py>(
+pub(crate) fn build_equi_range_bounds<'py>(
     range: &AnyParsedRangePredicate<'py>,
 ) -> Result<(Vec<usize>, Vec<usize>), String> {
     range.validate_range_operator()?;
@@ -502,7 +509,7 @@ fn build_equi_range_bounds<'py>(
 /// place when both ranges share the same physical right layout.
 /// When `ranges` is empty, it returns `None` rather than allocating synthetic
 /// full-right windows.
-fn build_equi_range_windows<'py>(
+pub(crate) fn build_equi_range_windows<'py>(
     ranges: &[AnyParsedRangePredicate<'py>],
 ) -> Result<RangeWindows, String> {
     if ranges.len() > 2 {
@@ -786,7 +793,7 @@ fn build_filtered_unique_equi_pairs_core(
 /// predicate is simply another filter. The range tuple carries only its value
 /// arrays and operator; the global index arrays provide the shared physical
 /// coordinate system.
-fn append_range_residuals<'py>(
+pub(crate) fn append_range_residuals<'py>(
     py: Python<'py>,
     ranges: &Bound<'py, PyList>,
     residuals: &Bound<'py, PyList>,

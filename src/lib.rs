@@ -4,6 +4,7 @@ mod anchor_non_equi_join;
 mod anchor_non_equi_join_agg;
 mod bin_search;
 mod equi_join;
+mod equi_join_agg;
 mod index_builder;
 mod join_aggregation_helpers;
 mod join_candidate_materialization;
@@ -268,6 +269,7 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     multi_join_indices::register(m)?;
     index_builder::register(m)?;
     equi_join::register(m)?;
+    equi_join_agg::register(m)?;
     anchor_non_equi_join::register(m)?;
     range_join::register(m)?;
     range_join_agg::register(m)?;
@@ -305,6 +307,7 @@ mod registration_tests {
                 "equi_join_indices",                 // equi_join
                 "equi_join_building_blocks",         // equi_join
                 "equi_join_filtered_indices",        // equi_join
+                "equi_join_aggregate",               // equi_join_agg
                 "compute_sum_start_int64",           // aggs::sum
                 "compute_sum_rev_start_int64",       // aggs::sum_rev
                 "compute_min_start_int64",           // aggs::min
@@ -342,11 +345,11 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (826 exports across the retained leaf
+    /// `register`, as of this PR (827 exports across the retained leaf
     /// modules).
     /// Bump this alongside any PR that intentionally adds or removes an
     /// export.
-    const EXPECTED_EXPORT_COUNT: usize = 826;
+    const EXPECTED_EXPORT_COUNT: usize = 827;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
