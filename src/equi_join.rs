@@ -777,12 +777,7 @@ fn build_filtered_duplicate_equi_pairs_core(
         for &code in left_indexer.iter() {
             if let Some(code) = decode_equi_code(code, "left equi")? {
                 output_capacity = output_capacity
-                    .checked_add(
-                        *metadata
-                            .counts
-                            .get(code)
-                            .ok_or("left equi code exceeds right metadata")?,
-                    )
+                    .checked_add(metadata.counts.get(code).copied().unwrap_or(0))
                     .ok_or("equi join output is too large")?;
             }
         }
@@ -1183,6 +1178,28 @@ mod tests {
         assert_eq!(blocks.left_indexer, vec![3, 1, -1]);
         assert_eq!(blocks.offsets, vec![0, 0, 1, 1, 3]);
         assert_eq!(blocks.positions, vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn duplicate_equi_unfiltered_out_of_range_left_code_is_no_match() {
+        let right_index = array![10_i64];
+        let right_codes = array![0_i64];
+        let metadata =
+            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
+
+        let result = build_filtered_duplicate_equi_pairs_core(
+            array![20_i64].view(),
+            array![1_i64].view(),
+            right_index.view(),
+            &metadata,
+            None,
+            &[],
+            None,
+            Keep::All,
+        )
+        .unwrap();
+
+        assert!(result.is_none());
     }
 
     #[test]
