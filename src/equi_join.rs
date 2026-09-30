@@ -322,7 +322,6 @@ fn lower_bound(values: &[usize], target: usize) -> usize {
 fn build_equi_range_bounds<'py>(
     range: &AnyParsedRangePredicate<'py>,
     left_len: usize,
-    right_len: usize,
 ) -> Result<(Vec<usize>, Vec<usize>), String> {
     range.validate_range_operator()?;
     range.validate_lengths()?;
@@ -371,7 +370,6 @@ fn build_equi_range_bounds<'py>(
 fn build_equi_range_windows<'py>(
     ranges: &[AnyParsedRangePredicate<'py>],
     left_len: usize,
-    right_len: usize,
 ) -> Result<Option<(Vec<usize>, Vec<usize>)>, String> {
     if ranges.len() > 2 {
         return Err("equi range path accepts at most two range predicates".to_owned());
@@ -380,11 +378,11 @@ fn build_equi_range_windows<'py>(
         return Ok(None);
     }
 
-    let first = build_equi_range_bounds(&ranges[0], left_len, right_len)?;
+    let first = build_equi_range_bounds(&ranges[0], left_len)?;
     let mut starts = first.0;
     let mut ends = first.1;
     if let Some(second) = ranges.get(1) {
-        let second = build_equi_range_bounds(second, left_len, right_len)?;
+        let second = build_equi_range_bounds(second, left_len)?;
         for row in 0..left_len {
             starts[row] = starts[row].max(second.0[row]);
             ends[row] = ends[row].min(second.1[row]);
@@ -733,12 +731,8 @@ pub fn equi_join_filtered_indices<'py>(
                 )
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let range_windows = build_equi_range_windows(
-            &ranges,
-            left_index_array.as_array().len(),
-            right_index_array.as_array().len(),
-        )
-        .map_err(PyValueError::new_err)?;
+        let range_windows = build_equi_range_windows(&ranges, left_index_array.as_array().len())
+            .map_err(PyValueError::new_err)?;
         let windows = range_windows
             .as_ref()
             .map(|(starts, ends)| (starts.as_slice(), ends.as_slice()));
