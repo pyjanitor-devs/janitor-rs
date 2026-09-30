@@ -714,8 +714,8 @@ fn append_range_residuals<'py>(
 /// * `right_index` - Global int64 right labels in the physical order used by
 ///   `right_codes` and all range/residual right arrays.
 /// * `left_indexer` - Dense equi codes for left rows; `-1` means no match.
-/// * `original_right_positions` - Optional dense right codes, one per right
-///   row. `None` selects the unique-right fast path.
+/// * `right_equi_codes` - Optional dense right equi codes, one per right row.
+///   `None` selects the unique-right fast path.
 /// * `range_predicates` - Zero, one, or two three-field range tuples.
 /// * `residual_predicates` - Remaining three- or six-field predicate tuples.
 /// * `keep` - One of `"any"`, `"first"`, `"last"`, or `"all"`.
@@ -725,7 +725,7 @@ pub fn equi_join_filtered_indices<'py>(
     left_index: &Bound<'py, PyAny>,
     right_index: &Bound<'py, PyAny>,
     left_indexer: PyReadonlyArray1<'py, i64>,
-    original_right_positions: Option<PyReadonlyArray1<'py, i64>>,
+    right_equi_codes: Option<PyReadonlyArray1<'py, i64>>,
     range_predicates: &Bound<'py, PyList>,
     residual_predicates: &Bound<'py, PyList>,
     keep: &str,
@@ -739,7 +739,7 @@ pub fn equi_join_filtered_indices<'py>(
         ));
     }
 
-    let (parsed, metadata) = if original_right_positions.is_none() {
+    let (parsed, metadata) = if right_equi_codes.is_none() {
         let combined = append_range_residuals(py, range_predicates, residual_predicates)?;
         parse_predicates_with_nulls_strings(py, &combined)?
     } else {
@@ -753,7 +753,7 @@ pub fn equi_join_filtered_indices<'py>(
     let views: Vec<_> = parsed.iter().map(Predicate::view).collect();
     let metadata_views = metadata.as_deref().map(null_metadata_views);
 
-    let pairs = if let Some(right_codes) = original_right_positions {
+    let pairs = if let Some(right_codes) = right_equi_codes {
         ensure_equal_lengths_core(
             "right index",
             right_index_array.as_array().len(),
@@ -826,10 +826,9 @@ pub fn equi_join_filtered_indices<'py>(
 /// duplicate-right case, where Python has already factorized the right equi
 /// values and computed the left indexer.
 ///
-/// `original_right_positions` is the established Python-side name for the
-/// right code array. Despite that name, its entries are dense factorization
-/// codes, not emitted right labels. The emitted labels come from `right_index`.
-/// Both right arrays use the same physical row order.
+/// `right_equi_codes` contains dense factorization codes, not emitted right
+/// labels. The emitted labels come from `right_index`. Both right arrays use
+/// the same physical row order.
 ///
 /// # Arguments
 ///
@@ -838,8 +837,8 @@ pub fn equi_join_filtered_indices<'py>(
 /// * `right_index` - Original right labels in physical right-row order.
 /// * `left_indexer` - Dense right-key codes returned by the left lookup;
 ///   `-1` means no equi match.
-/// * `original_right_positions` - Dense right factorization codes, aligned
-///   one-for-one with `right_index`; `-1` entries are ignored.
+/// * `right_equi_codes` - Dense right factorization codes, aligned one-for-one
+///   with `right_index`; `-1` entries are ignored.
 /// * `keep` - String form of the shared `Keep` mode: `"any"`, `"first"`,
 ///   `"last"`, or `"all"`.
 ///
@@ -859,7 +858,7 @@ pub fn equi_join_indices<'py>(
     left_index: PyReadonlyArray1<'py, i64>,
     right_index: PyReadonlyArray1<'py, i64>,
     left_indexer: PyReadonlyArray1<'py, i64>,
-    original_right_positions: PyReadonlyArray1<'py, i64>,
+    right_equi_codes: PyReadonlyArray1<'py, i64>,
     keep: &str,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
     let keep = Keep::parse(keep)?;
@@ -867,7 +866,7 @@ pub fn equi_join_indices<'py>(
         left_index.as_array(),
         left_indexer.as_array(),
         right_index.as_array(),
-        original_right_positions.as_array(),
+        right_equi_codes.as_array(),
         keep,
     )
     .map_err(PyValueError::new_err)?;
