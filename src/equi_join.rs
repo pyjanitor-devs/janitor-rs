@@ -28,13 +28,18 @@ use crate::predicate::{
     predicates_match_dispatch, Predicate,
 };
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
-use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
+use numpy::{ndarray::ArrayView1, PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 #[derive(Debug)]
 struct DenseRightMetadata {
+    /// Dense code-to-physical-position metadata for one right layout.
+    ///
+    /// First and Last select by the emitted right label in right_index.
+    /// Any selects the first physical position encountered. All preserves
+    /// physical right-row order inside each code's flat position slice.
     /// One physical right position for each code when `keep == Any`.
     any: Vec<usize>,
     /// The physical right position with the smallest right label for each
@@ -51,11 +56,20 @@ struct DenseRightMetadata {
     positions: Vec<usize>,
 }
 
-/// Optional pair arrays returned by an equi join.
+/// Optional materialized label pairs returned by an equi join.
 type EquiPairs = Option<(Vec<i64>, Vec<i64>)>;
 
-/// Optional half-open range windows aligned to left rows.
+/// Optional half-open range windows aligned one-for-one to left rows.
 type RangeWindows = Option<(Vec<usize>, Vec<usize>)>;
+
+/// Building blocks for a pure duplicate-right equi join.
+struct EquiBlocks {
+    left_index: Vec<i64>,
+    right_index: Vec<i64>,
+    left_indexer: Vec<i64>,
+    offsets: Vec<i64>,
+    positions: Vec<i64>,
+}
 
 /// Build the right-side lookup metadata needed by one `Keep` mode.
 ///
@@ -234,6 +248,20 @@ fn matching_count(metadata: &DenseRightMetadata, code: usize, keep: Keep) -> Opt
     }
 }
 
+/// Materialize a duplicate-right pure equi join.
+///
+/// The right metadata is keyed by dense factorization code. left_indexer
+/// supplies one such code per left row, with -1 meaning no candidate.
+/// First and Last compare emitted right labels; All emits physical right-row
+/// order within each code group.
+///
+/// # Arguments
+///
+/// * left_index - Public left labels aligned with left_indexer.
+/// * left_indexer - Dense right-key codes for left rows.
+/// * right_index - Public right labels in physical right-row order.
+/// * right_codes - Dense right-key codes aligned with right_index.
+/// * keep - Requested output selection mode.
 fn build_duplicate_equi_pairs_core(
     left_index: ArrayView1<'_, i64>,
     left_indexer: ArrayView1<'_, i64>,
@@ -350,6 +378,71 @@ fn build_duplicate_equi_pairs_core(
     debug_assert_eq!(left_output.len(), output_len);
     debug_assert_eq!(right_output.len(), output_len);
     Ok(Some((left_output, right_output)))
+}
+
+/// Build equi-match building blocks without materializing label pairs.
+///
+/// The returned offsets and positions are code-level metadata. They describe
+/// physical right positions, while left_index and right_index retain the
+/// public labels needed by downstream PyJanitor code.
+fn build_duplicate_equi_blocks_core(
+    left_index: ArrayView1<'_, i64>,
+    left_indexer: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    right_equi_codes: ArrayView1<'_, i64>,
+) -> Result<Option<EquiBlocks>, String> {
+    ensure_equal_lengths_core(
+        "left index",
+        left_index.len(),
+        "equi indexer",
+        left_indexer.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "right index",
+        right_index.len(),
+        "right equi codes",
+        right_equi_codes.len(),
+    )?;
+
+    let metadata = build_dense_right_metadata(right_index, right_equi_codes, Keep::All)?;
+    let mut matched = false;
+
+    for &left_code in left_indexer {
+        if left_code < -1 {
+            return Err("left codes must be greater than or equal to -1".to_owned());
+        }
+        if left_code != -1 {
+            let code = usize::try_from(left_code).map_err(|_| "invalid left code")?;
+            if metadata.counts.get(code).copied().unwrap_or(0) > 0 {
+                matched = true;
+            }
+        }
+    }
+
+    if !matched {
+        return Ok(None);
+    }
+    let offsets = metadata
+        .offsets
+        .iter()
+        .copied()
+        .map(|offset| i64::try_from(offset).map_err(|_| "equi join offsets exceed int64 capacity"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let positions = metadata
+        .positions
+        .iter()
+        .copied()
+        .map(|position| {
+            i64::try_from(position).map_err(|_| "right position exceeds int64 capacity")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(EquiBlocks {
+        left_index: left_index.to_vec(),
+        right_index: right_index.to_vec(),
+        left_indexer: left_indexer.to_vec(),
+        offsets,
+        positions,
+    }))
 }
 
 /// Find the first element in a sorted physical-position slice that is at
@@ -505,6 +598,16 @@ where
 
 /// Materialize duplicate-right equi candidates after range and residual
 /// filtering.
+///
+/// All left-side inputs use one row coordinate system. The left indexer,
+/// optional windows, and predicate views must therefore have one entry per
+/// left row. The right index and metadata use one shared physical right
+/// coordinate system.
+///
+/// Keep::Any selects the first surviving physical candidate, while
+/// Keep::First and Keep::Last select the surviving candidate with the
+/// smallest or largest emitted right label. Keep::All preserves every
+/// surviving physical candidate.
 #[allow(clippy::too_many_arguments)]
 fn build_filtered_duplicate_equi_pairs_core(
     left_index: ArrayView1<'_, i64>,
@@ -516,6 +619,12 @@ fn build_filtered_duplicate_equi_pairs_core(
     null_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
     keep: Keep,
 ) -> Result<EquiPairs, String> {
+    ensure_equal_lengths_core(
+        "left index",
+        left_index.len(),
+        "equi indexer",
+        left_indexer.len(),
+    )?;
     if let Some((starts, ends)) = windows {
         ensure_equal_lengths_core(
             "equi starts",
@@ -886,8 +995,51 @@ pub fn equi_join_indices<'py>(
         .transpose()
 }
 
+/// Build pure duplicate-right equi-join blocks for PyJanitor.
+///
+/// Unlike [`equi_join_indices`], this function does not materialize one pair
+/// for every matching left/right row. It returns the original labels, the
+/// original left indexer, and right-code metadata:
+///
+/// ```text
+/// positions[offsets[code] .. offsets[code + 1]]
+/// ```
+///
+/// `None` means no left equi code matched a non-empty right group. PyJanitor
+/// receives the dictionary unchanged; `keep`, ranges, residuals, and
+/// aggregation do not belong on this path.
+#[pyfunction]
+pub fn equi_join_building_blocks<'py>(
+    py: Python<'py>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    left_indexer: PyReadonlyArray1<'py, i64>,
+    right_equi_codes: PyReadonlyArray1<'py, i64>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let blocks = build_duplicate_equi_blocks_core(
+        left_index.as_array(),
+        left_indexer.as_array(),
+        right_index.as_array(),
+        right_equi_codes.as_array(),
+    )
+    .map_err(PyValueError::new_err)?;
+
+    blocks
+        .map(|blocks| {
+            let result = PyDict::new(py);
+            result.set_item("left_index", PyArray1::from_vec(py, blocks.left_index))?;
+            result.set_item("right_index", PyArray1::from_vec(py, blocks.right_index))?;
+            result.set_item("left_indexer", PyArray1::from_vec(py, blocks.left_indexer))?;
+            result.set_item("offsets", PyArray1::from_vec(py, blocks.offsets))?;
+            result.set_item("positions", PyArray1::from_vec(py, blocks.positions))?;
+            Ok(result)
+        })
+        .transpose()
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(equi_join_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(equi_join_building_blocks, m)?)?;
     m.add_function(wrap_pyfunction!(equi_join_filtered_indices, m)?)?;
     Ok(())
 }
@@ -961,6 +1113,24 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_equi_builds_per_left_offsets_and_positions() {
+        let blocks = build_duplicate_equi_blocks_core(
+            array![10_i64, 11, 12].view(),
+            array![3_i64, 1, -1].view(),
+            array![12_i64, 5, 9, 7].view(),
+            array![3_i64, 1, 3, -1].view(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(blocks.left_index, vec![10, 11, 12]);
+        assert_eq!(blocks.right_index, vec![12, 5, 9, 7]);
+        assert_eq!(blocks.left_indexer, vec![3, 1, -1]);
+        assert_eq!(blocks.offsets, vec![0, 0, 1, 1, 3]);
+        assert_eq!(blocks.positions, vec![1, 0, 2]);
+    }
+
+    #[test]
     fn duplicate_equi_range_uses_binary_searched_code_slice() {
         let right_index = array![12_i64, 5, 9, 7, 3];
         let right_codes = array![3_i64, 1, 3, 3, 1];
@@ -1011,6 +1181,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(last.unwrap().1, vec![90]);
+
+        let any = build_filtered_duplicate_equi_pairs_core(
+            array![10_i64].view(),
+            array![2_i64].view(),
+            right_index.view(),
+            &metadata,
+            Some((&[1][..], &[4][..])),
+            &[],
+            None,
+            Keep::Any,
+        )
+        .unwrap();
+        assert_eq!(any.unwrap().1, vec![50]);
+
+        let all = build_filtered_duplicate_equi_pairs_core(
+            array![10_i64].view(),
+            array![2_i64].view(),
+            right_index.view(),
+            &metadata,
+            Some((&[1][..], &[4][..])),
+            &[],
+            None,
+            Keep::All,
+        )
+        .unwrap();
+        assert_eq!(all.unwrap().1, vec![50, 90, 70]);
     }
 
     #[test]
@@ -1113,5 +1309,84 @@ mod tests {
         .unwrap();
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn duplicate_equi_residual_keeps_only_surviving_candidates() {
+        let right_index = array![10_i64, 20];
+        let right_codes = array![0_i64, 0];
+        let metadata =
+            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
+        let left_values = array![1_i64];
+        let right_values = array![1_i64, 2];
+        let predicates = vec![PredicateView::I64(
+            left_values.view(),
+            right_values.view(),
+            CompareOp::Eq,
+        )];
+
+        let result = build_filtered_duplicate_equi_pairs_core(
+            array![1_i64].view(),
+            array![0_i64].view(),
+            right_index.view(),
+            &metadata,
+            None,
+            &predicates,
+            None,
+            Keep::All,
+        )
+        .unwrap();
+
+        assert_eq!(result.unwrap().1, vec![10]);
+    }
+
+    #[test]
+    fn duplicate_equi_filtered_validates_left_alignment() {
+        let right_index = array![10_i64];
+        let right_codes = array![0_i64];
+        let metadata =
+            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
+
+        let error = build_filtered_duplicate_equi_pairs_core(
+            array![1_i64].view(),
+            array![0_i64, 0].view(),
+            right_index.view(),
+            &metadata,
+            None,
+            &[],
+            None,
+            Keep::All,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "left index and equi indexer must have equal lengths; got 1 and 2"
+        );
+    }
+
+    #[test]
+    fn duplicate_equi_filtered_validates_window_alignment() {
+        let right_index = array![10_i64];
+        let right_codes = array![0_i64];
+        let metadata =
+            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
+
+        let error = build_filtered_duplicate_equi_pairs_core(
+            array![1_i64].view(),
+            array![0_i64].view(),
+            right_index.view(),
+            &metadata,
+            Some((&[0, 0][..], &[1][..])),
+            &[],
+            None,
+            Keep::All,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "equi starts and left indexer must have equal lengths; got 2 and 1"
+        );
     }
 }
