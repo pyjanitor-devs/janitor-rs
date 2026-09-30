@@ -21,12 +21,13 @@
 //! per distinct equi key.
 
 use crate::aggs::ensure_equal_lengths_core;
-use crate::join_common::{Keep, SingleJoinResult};
+use crate::anchor_non_equi_join::range_window;
+use crate::join_common::Keep;
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
     predicates_match_dispatch, Predicate,
 };
-use crate::range_predicate::{parse_any_range_predicate, AnyParsedRangePredicate};
+use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -331,38 +332,51 @@ fn build_equi_range_windows<'py>(
         return Ok((vec![0; left_len], vec![right_len; left_len]));
     }
 
-    let build = |range: &AnyParsedRangePredicate<'py>| -> Result<SingleJoinResult, String> {
+    let build = |range: &AnyParsedRangePredicate<'py>| -> Result<(Vec<usize>, Vec<usize>), String> {
         range.validate_range_operator()?;
         range.validate_lengths()?;
         ensure_equal_lengths_core("range left", range.left_len(), "left indexer", left_len)?;
         ensure_equal_lengths_core("range right", range.right_len(), "right index", right_len)?;
-        if right_len == 0 {
-            return Ok(SingleJoinResult {
-                left_positions: (0..left_len).collect(),
-                left_index: Vec::new(),
-                right_index: Vec::new(),
-                starts: vec![0; left_len],
-                ends: vec![0; left_len],
-            });
+        macro_rules! build_bounds {
+            ($predicate:expr) => {{
+                let predicate = $predicate;
+                let left = predicate.left.as_array();
+                let right = predicate.right.as_array();
+                if right.is_empty() {
+                    return Ok((vec![0; left_len], vec![0; left_len]));
+                }
+                let mut starts = Vec::with_capacity(left_len);
+                let mut ends = Vec::with_capacity(left_len);
+                for &value in left {
+                    let (start, end) = range_window(value, right, predicate.op);
+                    starts.push(start);
+                    ends.push(end);
+                }
+                Ok((starts, ends))
+            }};
         }
-        let windows = range.windows(true)?;
-        ensure_equal_lengths_core(
-            "range windows",
-            windows.starts.len(),
-            "left indexer",
-            left_len,
-        )?;
-        Ok(windows)
+        match range {
+            AnyParsedRangePredicate::I64(predicate) => build_bounds!(predicate),
+            AnyParsedRangePredicate::I32(predicate) => build_bounds!(predicate),
+            AnyParsedRangePredicate::I16(predicate) => build_bounds!(predicate),
+            AnyParsedRangePredicate::I8(predicate) => build_bounds!(predicate),
+            AnyParsedRangePredicate::U64(predicate) => build_bounds!(predicate),
+            AnyParsedRangePredicate::U32(predicate) => build_bounds!(predicate),
+            AnyParsedRangePredicate::U16(predicate) => build_bounds!(predicate),
+            AnyParsedRangePredicate::U8(predicate) => build_bounds!(predicate),
+            AnyParsedRangePredicate::F64(predicate) => build_bounds!(predicate),
+            AnyParsedRangePredicate::F32(predicate) => build_bounds!(predicate),
+        }
     };
 
     let first = build(&ranges[0])?;
-    let mut starts = first.starts;
-    let mut ends = first.ends;
+    let mut starts = first.0;
+    let mut ends = first.1;
     if let Some(second) = ranges.get(1) {
         let second = build(second)?;
         for row in 0..left_len {
-            starts[row] = starts[row].max(second.starts[row]);
-            ends[row] = ends[row].min(second.ends[row]);
+            starts[row] = starts[row].max(second.0[row]);
+            ends[row] = ends[row].min(second.1[row]);
         }
     }
     Ok((starts, ends))
@@ -580,12 +594,12 @@ fn build_filtered_unique_equi_pairs_core(
     Ok(Some((left_output, right_output)))
 }
 
-/// Convert five-field range tuples into ordinary residual tuples.
+/// Copy three-field range tuples into ordinary residual tuples.
 ///
 /// The unique-right path has one equi candidate per left row, so a range
-/// predicate is simply another filter. The range tuple additionally carries
-/// aligned index arrays for window construction; residual matching needs only
-/// its value arrays and operator.
+/// predicate is simply another filter. The range tuple carries only its value
+/// arrays and operator; the global index arrays provide the shared physical
+/// coordinate system.
 fn append_range_residuals<'py>(
     py: Python<'py>,
     ranges: &Bound<'py, PyList>,
@@ -594,15 +608,12 @@ fn append_range_residuals<'py>(
     let combined = PyList::empty(py);
     for item in ranges.iter() {
         let tuple = item.cast::<PyTuple>()?;
-        if tuple.len() != 5 {
+        if tuple.len() != 3 {
             return Err(PyValueError::new_err(
-                "equi range predicates must contain 5 elements",
+                "equi range predicates must contain 3 elements",
             ));
         }
-        combined.append(PyTuple::new(
-            py,
-            [tuple.get_item(0)?, tuple.get_item(2)?, tuple.get_item(4)?],
-        )?)?;
+        combined.append(item)?;
     }
     for item in residuals.iter() {
         combined.append(item)?;
@@ -612,10 +623,10 @@ fn append_range_residuals<'py>(
 
 /// Build equi-join indices with optional range and residual predicates.
 ///
-/// Range tuples use the existing five-field representation:
+/// Range tuples use the PyJanitor three-field representation:
 ///
 /// ```text
-/// (left_values, left_index, right_values, right_index, operator)
+/// (left_values, right_values, operator)
 /// ```
 ///
 /// Residual tuples use the existing three- or six-field representation parsed
@@ -626,11 +637,24 @@ fn append_range_residuals<'py>(
 /// keys build dense physical-position metadata; range windows are binary
 /// searched inside the matching equi-code slice before residual predicates and
 /// `keep` are applied.
+///
+/// # Arguments
+///
+/// * `left_index` - Global int64 left labels, aligned with `left_indexer` and
+///   all range/residual left arrays.
+/// * `right_index` - Global int64 right labels in the physical order used by
+///   `right_codes` and all range/residual right arrays.
+/// * `left_indexer` - Dense equi codes for left rows; `-1` means no match.
+/// * `original_right_positions` - Optional dense right codes, one per right
+///   row. `None` selects the unique-right fast path.
+/// * `range_predicates` - Zero, one, or two three-field range tuples.
+/// * `residual_predicates` - Remaining three- or six-field predicate tuples.
+/// * `keep` - One of `"any"`, `"first"`, `"last"`, or `"all"`.
 #[pyfunction]
 pub fn equi_join_filtered_indices<'py>(
     py: Python<'py>,
-    left_index: PyReadonlyArray1<'py, i64>,
-    right_index: PyReadonlyArray1<'py, i64>,
+    left_index: &Bound<'py, PyAny>,
+    right_index: &Bound<'py, PyAny>,
     left_indexer: PyReadonlyArray1<'py, i64>,
     original_right_positions: Option<PyReadonlyArray1<'py, i64>>,
     range_predicates: &Bound<'py, PyList>,
@@ -638,6 +662,8 @@ pub fn equi_join_filtered_indices<'py>(
     keep: &str,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
     let keep = Keep::parse(keep)?;
+    let left_index_array = left_index.extract::<PyReadonlyArray1<'py, i64>>()?;
+    let right_index_array = right_index.extract::<PyReadonlyArray1<'py, i64>>()?;
     if range_predicates.len() > 2 {
         return Err(PyValueError::new_err(
             "equi range path accepts at most two range predicates",
@@ -652,8 +678,8 @@ pub fn equi_join_filtered_indices<'py>(
     };
     check_predicate_lengths(
         &parsed,
-        left_index.as_array().len(),
-        right_index.as_array().len(),
+        left_index_array.as_array().len(),
+        right_index_array.as_array().len(),
     )?;
     let views: Vec<_> = parsed.iter().map(Predicate::view).collect();
     let metadata_views = metadata.as_deref().map(null_metadata_views);
@@ -661,7 +687,7 @@ pub fn equi_join_filtered_indices<'py>(
     let pairs = if let Some(right_codes) = original_right_positions {
         ensure_equal_lengths_core(
             "right index",
-            right_index.as_array().len(),
+            right_index_array.as_array().len(),
             "duplicate codes",
             right_codes.as_array().len(),
         )
@@ -672,27 +698,36 @@ pub fn equi_join_filtered_indices<'py>(
                 let tuple = item
                     .cast::<PyTuple>()
                     .map_err(|_| PyValueError::new_err("each equi range must be a tuple"))?;
-                if tuple.len() != 5 {
+                if tuple.len() != 3 {
                     return Err(PyValueError::new_err(
-                        "equi range predicates must contain 5 elements",
+                        "equi range predicates must contain 3 elements",
                     ));
                 }
-                parse_any_range_predicate(tuple, true)
+                parse_any_range_parts(
+                    &tuple.get_item(0)?,
+                    left_index,
+                    &tuple.get_item(1)?,
+                    right_index,
+                    &tuple.get_item(2)?,
+                )
             })
             .collect::<PyResult<Vec<_>>>()?;
         let (starts, ends) = build_equi_range_windows(
             &ranges,
-            left_index.as_array().len(),
-            right_index.as_array().len(),
+            left_index_array.as_array().len(),
+            right_index_array.as_array().len(),
         )
         .map_err(PyValueError::new_err)?;
-        let metadata =
-            build_dense_right_metadata(right_index.as_array(), right_codes.as_array(), Keep::All)
-                .map_err(PyValueError::new_err)?;
+        let metadata = build_dense_right_metadata(
+            right_index_array.as_array(),
+            right_codes.as_array(),
+            Keep::All,
+        )
+        .map_err(PyValueError::new_err)?;
         build_filtered_duplicate_equi_pairs_core(
-            left_index.as_array(),
+            left_index_array.as_array(),
             left_indexer.as_array(),
-            right_index.as_array(),
+            right_index_array.as_array(),
             &metadata,
             &starts,
             &ends,
@@ -703,9 +738,9 @@ pub fn equi_join_filtered_indices<'py>(
         .map_err(PyValueError::new_err)?
     } else {
         build_filtered_unique_equi_pairs_core(
-            left_index.as_array(),
+            left_index_array.as_array(),
             left_indexer.as_array(),
-            right_index.as_array(),
+            right_index_array.as_array(),
             &views,
             metadata_views.as_deref(),
         )
