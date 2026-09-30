@@ -142,12 +142,12 @@ pub(crate) fn build_dense_right_metadata(
         .max()
         .map(|code| {
             usize::try_from(code)
-                .map_err(|_| "right code cannot be represented as a metadata slot")?
+                .map_err(|_| "right code is too large for the right index")?
                 .checked_add(1)
-                .ok_or("right code cannot be represented as a metadata slot")
+                .ok_or("right code is too large for the right index")
         })
         .transpose()
-        .map_err(|_| "right code cannot be represented as a metadata slot")?
+        .map_err(|_| "right code is too large for the right index")?
         .unwrap_or(0);
     // Allocate only the selected mode's single-position metadata. Keeping the
     // other vectors empty avoids storing three copies of equivalent lookups.
