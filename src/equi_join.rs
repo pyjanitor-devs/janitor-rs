@@ -627,7 +627,7 @@ fn append_range_residuals<'py>(
 /// searched inside the matching equi-code slice before residual predicates and
 /// `keep` are applied.
 #[pyfunction]
-pub fn equi_join_range_indices<'py>(
+pub fn equi_join_filtered_indices<'py>(
     py: Python<'py>,
     left_index: PyReadonlyArray1<'py, i64>,
     right_index: PyReadonlyArray1<'py, i64>,
@@ -779,7 +779,7 @@ pub fn equi_join_indices<'py>(
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(equi_join_indices, m)?)?;
-    m.add_function(wrap_pyfunction!(equi_join_range_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(equi_join_filtered_indices, m)?)?;
     Ok(())
 }
 

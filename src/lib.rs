@@ -303,7 +303,7 @@ mod registration_tests {
                 "aggregate_batch_no_range_reverse",  // reverse no-range compare
                 "repeat_index",                      // index_builder
                 "equi_join_indices",                 // equi_join
-                "equi_join_range_indices",           // equi_join
+                "equi_join_filtered_indices",        // equi_join
                 "compute_sum_start_int64",           // aggs::sum
                 "compute_sum_rev_start_int64",       // aggs::sum_rev
                 "compute_min_start_int64",           // aggs::min
