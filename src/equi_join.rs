@@ -775,7 +775,7 @@ fn build_filtered_duplicate_equi_pairs_core(
     let output_capacity = if windows.is_none() && predicates.is_empty() {
         let mut output_capacity = 0usize;
         for &code in left_indexer.iter() {
-            if let Some(code) = decode_equi_code(code, "left equi")? {
+            if let Some(code) = decode_equi_code(code, "left")? {
                 output_capacity = output_capacity
                     .checked_add(metadata.counts.get(code).copied().unwrap_or(0))
                     .ok_or("equi join output is too large")?;
