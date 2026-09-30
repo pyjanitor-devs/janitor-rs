@@ -331,9 +331,6 @@ fn build_equi_range_bounds<'py>(
             let predicate = $predicate;
             let left = predicate.left.as_array();
             let right = predicate.right.as_array();
-            if right.is_empty() {
-                return Ok((vec![0; left_len], vec![0; left_len]));
-            }
             let mut starts = Vec::with_capacity(left_len);
             let mut ends = Vec::with_capacity(left_len);
             for &value in left {
