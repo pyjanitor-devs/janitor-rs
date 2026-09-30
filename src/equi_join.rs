@@ -21,11 +21,16 @@
 //! per distinct equi key.
 
 use crate::aggs::ensure_equal_lengths_core;
-use crate::join_common::Keep;
+use crate::join_common::{Keep, SingleJoinResult};
+use crate::predicate::{
+    check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
+    predicates_match_dispatch, Predicate,
+};
+use crate::range_predicate::{parse_any_range_predicate, AnyParsedRangePredicate};
 use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 #[derive(Debug)]
 struct DenseRightMetadata {
@@ -301,6 +306,419 @@ fn build_duplicate_equi_pairs_core(
     Ok(Some((left_output, right_output)))
 }
 
+/// Find the first element in a sorted physical-position slice that is at
+/// least `target`.
+fn lower_bound(values: &[usize], target: usize) -> usize {
+    values.partition_point(|&value| value < target)
+}
+
+/// Build one or two range windows without dropping empty left rows.
+///
+/// The existing dual-range materializer removes empty windows because that is
+/// convenient for ordinary range joins. Equi matching cannot do that: the
+/// `left_indexer` remains aligned to the original left rows. This helper keeps
+/// one `[start, end)` pair per left row and intersects the second range in
+/// place when both ranges share the same physical right layout.
+fn build_equi_range_windows<'py>(
+    ranges: &[AnyParsedRangePredicate<'py>],
+    left_len: usize,
+    right_len: usize,
+) -> Result<(Vec<usize>, Vec<usize>), String> {
+    if ranges.len() > 2 {
+        return Err("equi range path accepts at most two range predicates".to_owned());
+    }
+    if ranges.is_empty() {
+        return Ok((vec![0; left_len], vec![right_len; left_len]));
+    }
+
+    let build = |range: &AnyParsedRangePredicate<'py>| -> Result<SingleJoinResult, String> {
+        range.validate_range_operator()?;
+        range.validate_lengths()?;
+        ensure_equal_lengths_core("range left", range.left_len(), "left indexer", left_len)?;
+        ensure_equal_lengths_core("range right", range.right_len(), "right index", right_len)?;
+        if right_len == 0 {
+            return Ok(SingleJoinResult {
+                left_positions: (0..left_len).collect(),
+                left_index: Vec::new(),
+                right_index: Vec::new(),
+                starts: vec![0; left_len],
+                ends: vec![0; left_len],
+            });
+        }
+        let windows = range.windows(true)?;
+        ensure_equal_lengths_core(
+            "range windows",
+            windows.starts.len(),
+            "left indexer",
+            left_len,
+        )?;
+        Ok(windows)
+    };
+
+    let first = build(&ranges[0])?;
+    let mut starts = first.starts;
+    let mut ends = first.ends;
+    if let Some(second) = ranges.get(1) {
+        let second = build(second)?;
+        for row in 0..left_len {
+            starts[row] = starts[row].max(second.starts[row]);
+            ends[row] = ends[row].min(second.ends[row]);
+        }
+    }
+    Ok((starts, ends))
+}
+
+/// Visit duplicate-right equi candidates that survive the range window and
+/// residual predicates for one left row.
+///
+/// The right positions for one code are sorted physical positions. Two lower
+/// bounds therefore reduce the code slice to the intersection with the
+/// row's half-open range window before residual predicates are evaluated.
+fn visit_filtered_equi_candidates<F>(
+    row: usize,
+    left_code: i64,
+    metadata: &DenseRightMetadata,
+    starts: &[usize],
+    ends: &[usize],
+    right_len: usize,
+    predicates: &[crate::predicate::PredicateView<'_>],
+    null_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
+    mut visit: F,
+) -> Result<usize, String>
+where
+    F: FnMut(usize),
+{
+    if left_code < -1 {
+        return Err("left codes must be greater than or equal to -1".to_owned());
+    }
+    if left_code == -1 || starts[row] >= ends[row] {
+        return Ok(0);
+    }
+    if ends[row] > right_len {
+        return Err("equi range window is out of bounds".to_owned());
+    }
+    let code = usize::try_from(left_code).map_err(|_| "invalid left code")?;
+    if metadata.counts.get(code).copied().unwrap_or(0) == 0 {
+        return Ok(0);
+    }
+    let Some(&group_start) = metadata.offsets.get(code) else {
+        return Ok(0);
+    };
+    let group_end = metadata.offsets[code + 1];
+    let group = &metadata.positions[group_start..group_end];
+    let first = lower_bound(group, starts[row]);
+    let last = lower_bound(group, ends[row]);
+    let mut count = 0_usize;
+    for &right_position in &group[first..last] {
+        if !predicates_match_dispatch(predicates, null_metadata, row, right_position) {
+            continue;
+        }
+        count = count
+            .checked_add(1)
+            .ok_or("equi join result size exceeds platform capacity")?;
+        visit(right_position);
+    }
+    Ok(count)
+}
+
+/// Materialize duplicate-right equi candidates after range and residual
+/// filtering.
+fn build_filtered_duplicate_equi_pairs_core(
+    left_index: ArrayView1<'_, i64>,
+    left_indexer: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    metadata: &DenseRightMetadata,
+    starts: &[usize],
+    ends: &[usize],
+    predicates: &[crate::predicate::PredicateView<'_>],
+    null_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
+    keep: Keep,
+) -> Result<Option<(Vec<i64>, Vec<i64>)>, String> {
+    ensure_equal_lengths_core(
+        "equi starts",
+        starts.len(),
+        "left indexer",
+        left_indexer.len(),
+    )?;
+    ensure_equal_lengths_core("equi ends", ends.len(), "left indexer", left_indexer.len())?;
+
+    let mut output_len = 0_usize;
+    for row in 0..left_indexer.len() {
+        let mut row_count = 0;
+        visit_filtered_equi_candidates(
+            row,
+            left_indexer[row],
+            metadata,
+            starts,
+            ends,
+            right_index.len(),
+            predicates,
+            null_metadata,
+            |_| row_count += 1,
+        )?;
+        let emitted = if keep == Keep::All {
+            row_count
+        } else {
+            usize::from(row_count > 0)
+        };
+        output_len = output_len
+            .checked_add(emitted)
+            .ok_or("equi join result size exceeds platform capacity")?;
+    }
+    if output_len == 0 {
+        return Ok(None);
+    }
+
+    let mut left_output = Vec::with_capacity(output_len);
+    let mut right_output = Vec::with_capacity(output_len);
+    for row in 0..left_indexer.len() {
+        let mut selected = None;
+        visit_filtered_equi_candidates(
+            row,
+            left_indexer[row],
+            metadata,
+            starts,
+            ends,
+            right_index.len(),
+            predicates,
+            null_metadata,
+            |right_position| match keep {
+                Keep::All => {
+                    left_output.push(left_index[row]);
+                    right_output.push(right_index[right_position]);
+                }
+                Keep::Any => {
+                    if selected.is_none() {
+                        selected = Some(right_position);
+                    }
+                }
+                Keep::First => {
+                    if selected.is_none()
+                        || right_index[right_position] < right_index[selected.unwrap()]
+                    {
+                        selected = Some(right_position);
+                    }
+                }
+                Keep::Last => {
+                    if selected.is_none()
+                        || right_index[right_position] > right_index[selected.unwrap()]
+                    {
+                        selected = Some(right_position);
+                    }
+                }
+            },
+        )?;
+        if let Some(right_position) = selected {
+            left_output.push(left_index[row]);
+            right_output.push(right_index[right_position]);
+        }
+    }
+    debug_assert_eq!(left_output.len(), output_len);
+    debug_assert_eq!(right_output.len(), output_len);
+    Ok(Some((left_output, right_output)))
+}
+
+/// Materialize the unique-right path after residual filtering.
+///
+/// A unique right equi indexer contains at most one physical right candidate
+/// per left row. Range predicates are supplied as residual predicates on this
+/// path, so no range windows or duplicate-position metadata are required.
+fn build_filtered_unique_equi_pairs_core(
+    left_index: ArrayView1<'_, i64>,
+    left_indexer: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    predicates: &[crate::predicate::PredicateView<'_>],
+    null_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
+) -> Result<Option<(Vec<i64>, Vec<i64>)>, String> {
+    ensure_equal_lengths_core(
+        "left index",
+        left_index.len(),
+        "equi indexer",
+        left_indexer.len(),
+    )?;
+    let mut output_len = 0_usize;
+    for row in 0..left_indexer.len() {
+        let code = left_indexer[row];
+        if code < -1 {
+            return Err("left codes must be greater than or equal to -1".to_owned());
+        }
+        if code == -1 {
+            continue;
+        }
+        let right_position = usize::try_from(code).map_err(|_| "invalid unique-right position")?;
+        if right_position >= right_index.len()
+            || !predicates_match_dispatch(predicates, null_metadata, row, right_position)
+        {
+            continue;
+        }
+        output_len = output_len
+            .checked_add(1)
+            .ok_or("equi join result size exceeds platform capacity")?;
+    }
+    if output_len == 0 {
+        return Ok(None);
+    }
+
+    let mut left_output = Vec::with_capacity(output_len);
+    let mut right_output = Vec::with_capacity(output_len);
+    for row in 0..left_indexer.len() {
+        let code = left_indexer[row];
+        if code < 0 {
+            continue;
+        }
+        let right_position = usize::try_from(code).map_err(|_| "invalid unique-right position")?;
+        if right_position >= right_index.len()
+            || !predicates_match_dispatch(predicates, null_metadata, row, right_position)
+        {
+            continue;
+        }
+        left_output.push(left_index[row]);
+        right_output.push(right_index[right_position]);
+    }
+    debug_assert_eq!(left_output.len(), output_len);
+    debug_assert_eq!(right_output.len(), output_len);
+    Ok(Some((left_output, right_output)))
+}
+
+/// Convert five-field range tuples into ordinary residual tuples.
+///
+/// The unique-right path has one equi candidate per left row, so a range
+/// predicate is simply another filter. The range tuple additionally carries
+/// aligned index arrays for window construction; residual matching needs only
+/// its value arrays and operator.
+fn append_range_residuals<'py>(
+    py: Python<'py>,
+    ranges: &Bound<'py, PyList>,
+    residuals: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyList>> {
+    let combined = PyList::empty(py);
+    for item in ranges.iter() {
+        let tuple = item.cast::<PyTuple>()?;
+        if tuple.len() != 5 {
+            return Err(PyValueError::new_err(
+                "equi range predicates must contain 5 elements",
+            ));
+        }
+        combined.append(PyTuple::new(
+            py,
+            [tuple.get_item(0)?, tuple.get_item(2)?, tuple.get_item(4)?],
+        )?)?;
+    }
+    for item in residuals.iter() {
+        combined.append(item)?;
+    }
+    Ok(combined)
+}
+
+/// Build equi-join indices with optional range and residual predicates.
+///
+/// Range tuples use the existing five-field representation:
+///
+/// ```text
+/// (left_values, left_index, right_values, right_index, operator)
+/// ```
+///
+/// Residual tuples use the existing three- or six-field representation parsed
+/// by [`parse_predicates_with_nulls_strings`]. The six-field form is reserved
+/// for null-aware `!=` and retains the repository's existing null semantics.
+///
+/// Unique right keys use one direct candidate per left row. Duplicate right
+/// keys build dense physical-position metadata; range windows are binary
+/// searched inside the matching equi-code slice before residual predicates and
+/// `keep` are applied.
+#[pyfunction]
+pub fn equi_join_range_indices<'py>(
+    py: Python<'py>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    left_indexer: PyReadonlyArray1<'py, i64>,
+    original_right_positions: Option<PyReadonlyArray1<'py, i64>>,
+    range_predicates: &Bound<'py, PyList>,
+    residual_predicates: &Bound<'py, PyList>,
+    keep: &str,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let keep = Keep::parse(keep)?;
+    if range_predicates.len() > 2 {
+        return Err(PyValueError::new_err(
+            "equi range path accepts at most two range predicates",
+        ));
+    }
+
+    let (parsed, metadata) = if original_right_positions.is_none() {
+        let combined = append_range_residuals(py, range_predicates, residual_predicates)?;
+        parse_predicates_with_nulls_strings(py, &combined)?
+    } else {
+        parse_predicates_with_nulls_strings(py, residual_predicates)?
+    };
+    check_predicate_lengths(
+        &parsed,
+        left_index.as_array().len(),
+        right_index.as_array().len(),
+    )?;
+    let views: Vec<_> = parsed.iter().map(Predicate::view).collect();
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
+
+    let pairs = if let Some(right_codes) = original_right_positions {
+        ensure_equal_lengths_core(
+            "right index",
+            right_index.as_array().len(),
+            "duplicate codes",
+            right_codes.as_array().len(),
+        )
+        .map_err(PyValueError::new_err)?;
+        let ranges = range_predicates
+            .iter()
+            .map(|item| {
+                let tuple = item
+                    .cast::<PyTuple>()
+                    .map_err(|_| PyValueError::new_err("each equi range must be a tuple"))?;
+                if tuple.len() != 5 {
+                    return Err(PyValueError::new_err(
+                        "equi range predicates must contain 5 elements",
+                    ));
+                }
+                parse_any_range_predicate(tuple, true)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let (starts, ends) = build_equi_range_windows(
+            &ranges,
+            left_index.as_array().len(),
+            right_index.as_array().len(),
+        )
+        .map_err(PyValueError::new_err)?;
+        let metadata =
+            build_dense_right_metadata(right_index.as_array(), right_codes.as_array(), Keep::All)
+                .map_err(PyValueError::new_err)?;
+        build_filtered_duplicate_equi_pairs_core(
+            left_index.as_array(),
+            left_indexer.as_array(),
+            right_index.as_array(),
+            &metadata,
+            &starts,
+            &ends,
+            &views,
+            metadata_views.as_deref(),
+            keep,
+        )
+        .map_err(PyValueError::new_err)?
+    } else {
+        build_filtered_unique_equi_pairs_core(
+            left_index.as_array(),
+            left_indexer.as_array(),
+            right_index.as_array(),
+            &views,
+            metadata_views.as_deref(),
+        )
+        .map_err(PyValueError::new_err)?
+    };
+
+    pairs
+        .map(|(left_output, right_output)| {
+            crate::join_common::result_dict(py, left_output, right_output, None, None)
+        })
+        .transpose()
+}
+
 /// Build indices for a pure equi join with duplicate right keys.
 ///
 /// PyJanitor handles the unique-right case directly. This function is for the
@@ -361,6 +779,7 @@ pub fn equi_join_indices<'py>(
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(equi_join_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(equi_join_range_indices, m)?)?;
     Ok(())
 }
 
@@ -428,6 +847,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(all.unwrap().1, vec![12, 9, 5]);
+    }
+
+    #[test]
+    fn duplicate_equi_range_uses_binary_searched_code_slice() {
+        let right_index = array![12_i64, 5, 9, 7, 3];
+        let right_codes = array![3_i64, 1, 3, 3, 1];
+        let metadata =
+            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
+        let result = build_filtered_duplicate_equi_pairs_core(
+            array![10_i64].view(),
+            array![3_i64].view(),
+            right_index.view(),
+            &metadata,
+            &[2],
+            &[4],
+            &[],
+            None,
+            Keep::All,
+        )
+        .unwrap();
+        assert_eq!(result.unwrap().1, vec![9, 7]);
+    }
+
+    #[test]
+    fn duplicate_equi_range_applies_keep_after_window() {
+        let right_index = array![100_i64, 50, 90, 70];
+        let right_codes = array![2_i64, 2, 2, 2];
+        let metadata =
+            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
+        let first = build_filtered_duplicate_equi_pairs_core(
+            array![10_i64].view(),
+            array![2_i64].view(),
+            right_index.view(),
+            &metadata,
+            &[1],
+            &[4],
+            &[],
+            None,
+            Keep::First,
+        )
+        .unwrap();
+        assert_eq!(first.unwrap().1, vec![50]);
+
+        let last = build_filtered_duplicate_equi_pairs_core(
+            array![10_i64].view(),
+            array![2_i64].view(),
+            right_index.view(),
+            &metadata,
+            &[1],
+            &[3],
+            &[],
+            None,
+            Keep::Last,
+        )
+        .unwrap();
+        assert_eq!(last.unwrap().1, vec![90]);
     }
 
     #[test]

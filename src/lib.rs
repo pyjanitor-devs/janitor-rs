@@ -303,6 +303,7 @@ mod registration_tests {
                 "aggregate_batch_no_range_reverse",  // reverse no-range compare
                 "repeat_index",                      // index_builder
                 "equi_join_indices",                 // equi_join
+                "equi_join_range_indices",           // equi_join
                 "compute_sum_start_int64",           // aggs::sum
                 "compute_sum_rev_start_int64",       // aggs::sum_rev
                 "compute_min_start_int64",           // aggs::min
@@ -340,11 +341,11 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (824 exports across the retained leaf
+    /// `register`, as of this PR (825 exports across the retained leaf
     /// modules).
     /// Bump this alongside any PR that intentionally adds or removes an
     /// export.
-    const EXPECTED_EXPORT_COUNT: usize = 824;
+    const EXPECTED_EXPORT_COUNT: usize = 825;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would
