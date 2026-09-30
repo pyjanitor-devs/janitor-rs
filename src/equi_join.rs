@@ -764,14 +764,34 @@ fn build_filtered_duplicate_equi_pairs_core(
         return Ok(Some((left_output, right_output)));
     }
 
-    // Keep::All can produce an arbitrary number of pairs per left row. Use the
-    // left-row count as an initial capacity estimate and materialize each
-    // surviving pair during one traversal. Re-running range searches and
-    // residual predicates merely to discover the exact final length is more
-    // expensive than occasional vector growth when predicates are selective
-    // or costly.
-    let mut left_output = Vec::with_capacity(left_indexer.len());
-    let mut right_output = Vec::with_capacity(left_indexer.len());
+    // Keep::All can produce an arbitrary number of pairs per left row. When
+    // there are no range windows or residual predicates, the dense equi
+    // metadata already contains the exact number of candidates for each left
+    // code. Compute that capacity without revisiting any predicates, avoiding
+    // repeated vector growth while retaining the single-pass materialization.
+    // Filtered paths continue to use the left-row count as an inexpensive
+    // capacity estimate because discovering their exact size would require
+    // evaluating the range and residual predicates a second time.
+    let output_capacity = if windows.is_none() && predicates.is_empty() {
+        let mut output_capacity = 0usize;
+        for &code in left_indexer.iter() {
+            if let Some(code) = decode_equi_code(code, "left equi")? {
+                output_capacity = output_capacity
+                    .checked_add(
+                        *metadata
+                            .counts
+                            .get(code)
+                            .ok_or("left equi code exceeds right metadata")?,
+                    )
+                    .ok_or("equi join output is too large")?;
+            }
+        }
+        output_capacity
+    } else {
+        left_indexer.len()
+    };
+    let mut left_output = Vec::with_capacity(output_capacity);
+    let mut right_output = Vec::with_capacity(output_capacity);
     for row in 0..left_indexer.len() {
         visit_filtered_equi_candidates(
             row,
