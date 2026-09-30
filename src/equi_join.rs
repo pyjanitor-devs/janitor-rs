@@ -51,6 +51,12 @@ struct DenseRightMetadata {
     positions: Vec<usize>,
 }
 
+/// Optional pair arrays returned by an equi join.
+type EquiPairs = Option<(Vec<i64>, Vec<i64>)>;
+
+/// Optional half-open range windows aligned to left rows.
+type RangeWindows = Option<(Vec<usize>, Vec<usize>)>;
+
 /// Build the right-side lookup metadata needed by one `Keep` mode.
 ///
 /// The factorization codes are expected to be dense: if the largest
@@ -234,7 +240,7 @@ fn build_duplicate_equi_pairs_core(
     right_index: ArrayView1<'_, i64>,
     right_codes: ArrayView1<'_, i64>,
     keep: Keep,
-) -> Result<Option<(Vec<i64>, Vec<i64>)>, String> {
+) -> Result<EquiPairs, String> {
     // Validate all parallel arrays before building metadata or entering either
     // output pass. This makes the physical-row alignment explicit: every
     // right code must describe exactly one right index entry, and every left
@@ -405,7 +411,7 @@ fn build_equi_range_bounds<'py>(
 /// full-right windows.
 fn build_equi_range_windows<'py>(
     ranges: &[AnyParsedRangePredicate<'py>],
-) -> Result<Option<(Vec<usize>, Vec<usize>)>, String> {
+) -> Result<RangeWindows, String> {
     if ranges.len() > 2 {
         return Err("equi range path accepts at most two range predicates".to_owned());
     }
@@ -439,6 +445,7 @@ fn build_equi_range_windows<'py>(
 /// bounds therefore reduce the code slice to the intersection with the
 /// row's half-open range window before residual predicates are evaluated. When
 /// `windows` is `None`, the entire equi-code slice is used.
+#[allow(clippy::too_many_arguments)]
 fn visit_filtered_equi_candidates<F>(
     row: usize,
     left_code: i64,
@@ -498,6 +505,7 @@ where
 
 /// Materialize duplicate-right equi candidates after range and residual
 /// filtering.
+#[allow(clippy::too_many_arguments)]
 fn build_filtered_duplicate_equi_pairs_core(
     left_index: ArrayView1<'_, i64>,
     left_indexer: ArrayView1<'_, i64>,
@@ -507,7 +515,7 @@ fn build_filtered_duplicate_equi_pairs_core(
     predicates: &[crate::predicate::PredicateView<'_>],
     null_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
     keep: Keep,
-) -> Result<Option<(Vec<i64>, Vec<i64>)>, String> {
+) -> Result<EquiPairs, String> {
     if let Some((starts, ends)) = windows {
         ensure_equal_lengths_core(
             "equi starts",
@@ -630,7 +638,7 @@ fn build_filtered_unique_equi_pairs_core(
     right_index: ArrayView1<'_, i64>,
     predicates: &[crate::predicate::PredicateView<'_>],
     null_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
-) -> Result<Option<(Vec<i64>, Vec<i64>)>, String> {
+) -> Result<EquiPairs, String> {
     ensure_equal_lengths_core(
         "left index",
         left_index.len(),
@@ -720,6 +728,7 @@ fn append_range_residuals<'py>(
 /// * `residual_predicates` - Remaining three- or six-field predicate tuples.
 /// * `keep` - One of `"any"`, `"first"`, `"last"`, or `"all"`.
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 pub fn equi_join_filtered_indices<'py>(
     py: Python<'py>,
     left_index: &Bound<'py, PyAny>,
