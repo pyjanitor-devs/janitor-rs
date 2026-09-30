@@ -320,16 +320,18 @@ fn lower_bound(values: &[usize], target: usize) -> usize {
 /// `left_indexer` remains aligned to the original left rows. This helper keeps
 /// one `[start, end)` pair per left row and intersects the second range in
 /// place when both ranges share the same physical right layout.
+/// When `ranges` is empty, it returns `None` rather than allocating synthetic
+/// full-right windows.
 fn build_equi_range_windows<'py>(
     ranges: &[AnyParsedRangePredicate<'py>],
     left_len: usize,
     right_len: usize,
-) -> Result<(Vec<usize>, Vec<usize>), String> {
+) -> Result<Option<(Vec<usize>, Vec<usize>)>, String> {
     if ranges.len() > 2 {
         return Err("equi range path accepts at most two range predicates".to_owned());
     }
     if ranges.is_empty() {
-        return Ok((vec![0; left_len], vec![right_len; left_len]));
+        return Ok(None);
     }
 
     let build = |range: &AnyParsedRangePredicate<'py>| -> Result<(Vec<usize>, Vec<usize>), String> {
@@ -379,7 +381,7 @@ fn build_equi_range_windows<'py>(
             ends[row] = ends[row].min(second.1[row]);
         }
     }
-    Ok((starts, ends))
+    Ok(Some((starts, ends)))
 }
 
 /// Visit duplicate-right equi candidates that survive the range window and
@@ -387,13 +389,13 @@ fn build_equi_range_windows<'py>(
 ///
 /// The right positions for one code are sorted physical positions. Two lower
 /// bounds therefore reduce the code slice to the intersection with the
-/// row's half-open range window before residual predicates are evaluated.
+/// row's half-open range window before residual predicates are evaluated. When
+/// `windows` is `None`, the entire equi-code slice is used.
 fn visit_filtered_equi_candidates<F>(
     row: usize,
     left_code: i64,
     metadata: &DenseRightMetadata,
-    starts: &[usize],
-    ends: &[usize],
+    windows: Option<(&[usize], &[usize])>,
     right_len: usize,
     predicates: &[crate::predicate::PredicateView<'_>],
     null_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
@@ -405,11 +407,8 @@ where
     if left_code < -1 {
         return Err("left codes must be greater than or equal to -1".to_owned());
     }
-    if left_code == -1 || starts[row] >= ends[row] {
+    if left_code == -1 {
         return Ok(0);
-    }
-    if ends[row] > right_len {
-        return Err("equi range window is out of bounds".to_owned());
     }
     let code = usize::try_from(left_code).map_err(|_| "invalid left code")?;
     if metadata.counts.get(code).copied().unwrap_or(0) == 0 {
@@ -420,8 +419,22 @@ where
     };
     let group_end = metadata.offsets[code + 1];
     let group = &metadata.positions[group_start..group_end];
-    let first = lower_bound(group, starts[row]);
-    let last = lower_bound(group, ends[row]);
+    let (first, last) = if let Some((starts, ends)) = windows {
+        if ends[row] > right_len {
+            return Err("equi range window is out of bounds".to_owned());
+        }
+        if starts[row] >= ends[row] {
+            return Ok(0);
+        }
+        (
+            lower_bound(group, starts[row]),
+            lower_bound(group, ends[row]),
+        )
+    } else {
+        // No range predicates means the entire equi-code slice is eligible.
+        // Do not allocate synthetic full-right windows in this case.
+        (0, group.len())
+    };
     let mut count = 0_usize;
     for &right_position in &group[first..last] {
         if !predicates_match_dispatch(predicates, null_metadata, row, right_position) {
@@ -442,19 +455,20 @@ fn build_filtered_duplicate_equi_pairs_core(
     left_indexer: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     metadata: &DenseRightMetadata,
-    starts: &[usize],
-    ends: &[usize],
+    windows: Option<(&[usize], &[usize])>,
     predicates: &[crate::predicate::PredicateView<'_>],
     null_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
     keep: Keep,
 ) -> Result<Option<(Vec<i64>, Vec<i64>)>, String> {
-    ensure_equal_lengths_core(
-        "equi starts",
-        starts.len(),
-        "left indexer",
-        left_indexer.len(),
-    )?;
-    ensure_equal_lengths_core("equi ends", ends.len(), "left indexer", left_indexer.len())?;
+    if let Some((starts, ends)) = windows {
+        ensure_equal_lengths_core(
+            "equi starts",
+            starts.len(),
+            "left indexer",
+            left_indexer.len(),
+        )?;
+        ensure_equal_lengths_core("equi ends", ends.len(), "left indexer", left_indexer.len())?;
+    }
 
     let mut output_len = 0_usize;
     for row in 0..left_indexer.len() {
@@ -463,8 +477,7 @@ fn build_filtered_duplicate_equi_pairs_core(
             row,
             left_indexer[row],
             metadata,
-            starts,
-            ends,
+            windows,
             right_index.len(),
             predicates,
             null_metadata,
@@ -491,8 +504,7 @@ fn build_filtered_duplicate_equi_pairs_core(
             row,
             left_indexer[row],
             metadata,
-            starts,
-            ends,
+            windows,
             right_index.len(),
             predicates,
             null_metadata,
@@ -712,12 +724,15 @@ pub fn equi_join_filtered_indices<'py>(
                 )
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let (starts, ends) = build_equi_range_windows(
+        let range_windows = build_equi_range_windows(
             &ranges,
             left_index_array.as_array().len(),
             right_index_array.as_array().len(),
         )
         .map_err(PyValueError::new_err)?;
+        let windows = range_windows
+            .as_ref()
+            .map(|(starts, ends)| (starts.as_slice(), ends.as_slice()));
         let metadata = build_dense_right_metadata(
             right_index_array.as_array(),
             right_codes.as_array(),
@@ -729,8 +744,7 @@ pub fn equi_join_filtered_indices<'py>(
             left_indexer.as_array(),
             right_index_array.as_array(),
             &metadata,
-            &starts,
-            &ends,
+            windows,
             &views,
             metadata_views.as_deref(),
             keep,
@@ -895,8 +909,7 @@ mod tests {
             array![3_i64].view(),
             right_index.view(),
             &metadata,
-            &[2],
-            &[4],
+            Some((&[2][..], &[4][..])),
             &[],
             None,
             Keep::All,
@@ -916,8 +929,7 @@ mod tests {
             array![2_i64].view(),
             right_index.view(),
             &metadata,
-            &[1],
-            &[4],
+            Some((&[1][..], &[4][..])),
             &[],
             None,
             Keep::First,
@@ -930,8 +942,7 @@ mod tests {
             array![2_i64].view(),
             right_index.view(),
             &metadata,
-            &[1],
-            &[3],
+            Some((&[1][..], &[3][..])),
             &[],
             None,
             Keep::Last,
