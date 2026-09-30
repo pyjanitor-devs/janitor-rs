@@ -321,10 +321,10 @@ fn lower_bound(values: &[usize], target: usize) -> usize {
 /// result.
 fn build_equi_range_bounds<'py>(
     range: &AnyParsedRangePredicate<'py>,
-    left_len: usize,
 ) -> Result<(Vec<usize>, Vec<usize>), String> {
     range.validate_range_operator()?;
     range.validate_lengths()?;
+    let left_len = range.left_len();
 
     macro_rules! build_bounds {
         ($predicate:expr) => {{
@@ -369,7 +369,6 @@ fn build_equi_range_bounds<'py>(
 /// full-right windows.
 fn build_equi_range_windows<'py>(
     ranges: &[AnyParsedRangePredicate<'py>],
-    left_len: usize,
 ) -> Result<Option<(Vec<usize>, Vec<usize>)>, String> {
     if ranges.len() > 2 {
         return Err("equi range path accepts at most two range predicates".to_owned());
@@ -378,12 +377,18 @@ fn build_equi_range_windows<'py>(
         return Ok(None);
     }
 
-    let first = build_equi_range_bounds(&ranges[0], left_len)?;
+    let first = build_equi_range_bounds(&ranges[0])?;
     let mut starts = first.0;
     let mut ends = first.1;
     if let Some(second) = ranges.get(1) {
-        let second = build_equi_range_bounds(second, left_len)?;
-        for row in 0..left_len {
+        let second = build_equi_range_bounds(second)?;
+        ensure_equal_lengths_core(
+            "first range windows",
+            starts.len(),
+            "second range windows",
+            second.0.len(),
+        )?;
+        for row in 0..starts.len() {
             starts[row] = starts[row].max(second.0[row]);
             ends[row] = ends[row].min(second.1[row]);
         }
@@ -731,8 +736,7 @@ pub fn equi_join_filtered_indices<'py>(
                 )
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let range_windows = build_equi_range_windows(&ranges, left_index_array.as_array().len())
-            .map_err(PyValueError::new_err)?;
+        let range_windows = build_equi_range_windows(&ranges).map_err(PyValueError::new_err)?;
         let windows = range_windows
             .as_ref()
             .map(|(starts, ends)| (starts.as_slice(), ends.as_slice()));
