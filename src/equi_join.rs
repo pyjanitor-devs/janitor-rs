@@ -886,6 +886,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::op::CompareOp;
+    use crate::predicate::PredicateView;
     use numpy::ndarray::array;
 
     #[test]
@@ -1023,5 +1025,84 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "right codes must be greater than or equal to -1");
+    }
+
+    #[test]
+    fn duplicate_equi_sparse_codes_and_unmatched_left_codes_produce_no_match() {
+        let result = build_duplicate_equi_pairs_core(
+            array![10_i64, 11].view(),
+            array![1_i64, 2].view(),
+            array![100_i64, 200].view(),
+            array![0_i64, 2].view(),
+            Keep::All,
+        )
+        .unwrap();
+
+        assert_eq!(result.unwrap().1, vec![200]);
+    }
+
+    #[test]
+    fn duplicate_equi_empty_right_side_produces_no_match() {
+        let result = build_duplicate_equi_pairs_core(
+            array![10_i64, 11].view(),
+            array![-1_i64, 0].view(),
+            array![].view(),
+            array![].view(),
+            Keep::All,
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn duplicate_equi_empty_range_window_produces_no_match() {
+        let right_index = array![10_i64, 20, 30];
+        let right_codes = array![0_i64, 0, 0];
+        let metadata =
+            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
+
+        let result = build_filtered_duplicate_equi_pairs_core(
+            array![1_i64].view(),
+            array![0_i64].view(),
+            right_index.view(),
+            &metadata,
+            Some((&[2][..], &[2][..])),
+            &[],
+            None,
+            Keep::All,
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn duplicate_equi_residual_can_remove_every_candidate() {
+        let right_index = array![10_i64, 20];
+        let right_codes = array![0_i64, 0];
+        let metadata =
+            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
+        let left_values = array![1_i64];
+        let right_values = array![2_i64, 3];
+        let predicates = vec![PredicateView::I64(
+            left_values.view(),
+            right_values.view(),
+            CompareOp::Eq,
+        )];
+
+        let result = build_filtered_duplicate_equi_pairs_core(
+            array![1_i64].view(),
+            array![0_i64].view(),
+            right_index.view(),
+            &metadata,
+            None,
+            &predicates,
+            None,
+            Keep::All,
+        )
+        .unwrap();
+
+        assert!(result.is_none());
     }
 }
