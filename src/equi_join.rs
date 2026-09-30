@@ -313,6 +313,54 @@ fn lower_bound(values: &[usize], target: usize) -> usize {
     values.partition_point(|&value| value < target)
 }
 
+/// Build one range predicate's half-open physical windows.
+///
+/// The value arrays are already aligned and the right values are already
+/// sorted by PyJanitor. This helper performs only validation and typed binary
+/// searches; it does not copy index labels or construct a building-block
+/// result.
+fn build_equi_range_bounds<'py>(
+    range: &AnyParsedRangePredicate<'py>,
+    left_len: usize,
+    right_len: usize,
+) -> Result<(Vec<usize>, Vec<usize>), String> {
+    range.validate_range_operator()?;
+    range.validate_lengths()?;
+    ensure_equal_lengths_core("range left", range.left_len(), "left indexer", left_len)?;
+    ensure_equal_lengths_core("range right", range.right_len(), "right index", right_len)?;
+
+    macro_rules! build_bounds {
+        ($predicate:expr) => {{
+            let predicate = $predicate;
+            let left = predicate.left.as_array();
+            let right = predicate.right.as_array();
+            if right.is_empty() {
+                return Ok((vec![0; left_len], vec![0; left_len]));
+            }
+            let mut starts = Vec::with_capacity(left_len);
+            let mut ends = Vec::with_capacity(left_len);
+            for &value in left {
+                let (start, end) = range_window(value, right, predicate.op);
+                starts.push(start);
+                ends.push(end);
+            }
+            Ok((starts, ends))
+        }};
+    }
+    match range {
+        AnyParsedRangePredicate::I64(predicate) => build_bounds!(predicate),
+        AnyParsedRangePredicate::I32(predicate) => build_bounds!(predicate),
+        AnyParsedRangePredicate::I16(predicate) => build_bounds!(predicate),
+        AnyParsedRangePredicate::I8(predicate) => build_bounds!(predicate),
+        AnyParsedRangePredicate::U64(predicate) => build_bounds!(predicate),
+        AnyParsedRangePredicate::U32(predicate) => build_bounds!(predicate),
+        AnyParsedRangePredicate::U16(predicate) => build_bounds!(predicate),
+        AnyParsedRangePredicate::U8(predicate) => build_bounds!(predicate),
+        AnyParsedRangePredicate::F64(predicate) => build_bounds!(predicate),
+        AnyParsedRangePredicate::F32(predicate) => build_bounds!(predicate),
+    }
+}
+
 /// Build one or two range windows without dropping empty left rows.
 ///
 /// The existing dual-range materializer removes empty windows because that is
@@ -334,48 +382,11 @@ fn build_equi_range_windows<'py>(
         return Ok(None);
     }
 
-    let build = |range: &AnyParsedRangePredicate<'py>| -> Result<(Vec<usize>, Vec<usize>), String> {
-        range.validate_range_operator()?;
-        range.validate_lengths()?;
-        ensure_equal_lengths_core("range left", range.left_len(), "left indexer", left_len)?;
-        ensure_equal_lengths_core("range right", range.right_len(), "right index", right_len)?;
-        macro_rules! build_bounds {
-            ($predicate:expr) => {{
-                let predicate = $predicate;
-                let left = predicate.left.as_array();
-                let right = predicate.right.as_array();
-                if right.is_empty() {
-                    return Ok((vec![0; left_len], vec![0; left_len]));
-                }
-                let mut starts = Vec::with_capacity(left_len);
-                let mut ends = Vec::with_capacity(left_len);
-                for &value in left {
-                    let (start, end) = range_window(value, right, predicate.op);
-                    starts.push(start);
-                    ends.push(end);
-                }
-                Ok((starts, ends))
-            }};
-        }
-        match range {
-            AnyParsedRangePredicate::I64(predicate) => build_bounds!(predicate),
-            AnyParsedRangePredicate::I32(predicate) => build_bounds!(predicate),
-            AnyParsedRangePredicate::I16(predicate) => build_bounds!(predicate),
-            AnyParsedRangePredicate::I8(predicate) => build_bounds!(predicate),
-            AnyParsedRangePredicate::U64(predicate) => build_bounds!(predicate),
-            AnyParsedRangePredicate::U32(predicate) => build_bounds!(predicate),
-            AnyParsedRangePredicate::U16(predicate) => build_bounds!(predicate),
-            AnyParsedRangePredicate::U8(predicate) => build_bounds!(predicate),
-            AnyParsedRangePredicate::F64(predicate) => build_bounds!(predicate),
-            AnyParsedRangePredicate::F32(predicate) => build_bounds!(predicate),
-        }
-    };
-
-    let first = build(&ranges[0])?;
+    let first = build_equi_range_bounds(&ranges[0], left_len, right_len)?;
     let mut starts = first.0;
     let mut ends = first.1;
     if let Some(second) = ranges.get(1) {
-        let second = build(second)?;
+        let second = build_equi_range_bounds(second, left_len, right_len)?;
         for row in 0..left_len {
             starts[row] = starts[row].max(second.0[row]);
             ends[row] = ends[row].min(second.1[row]);
