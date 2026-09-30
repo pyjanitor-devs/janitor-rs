@@ -102,13 +102,37 @@ struct EquiBlocks {
 ///
 /// # Errors
 ///
-/// Returns an error if a code is below `-1`, cannot be represented as a
-/// physical position, or if metadata sizes would overflow `usize`.
+/// Returns an error if the code and index arrays have different lengths, a
+/// code is below `-1`, a nonnegative code is outside the right physical
+/// layout, or if metadata sizes would overflow `usize`.
 pub(crate) fn build_dense_right_metadata(
     right_index: ArrayView1<'_, i64>,
     right_codes: ArrayView1<'_, i64>,
     keep: Keep,
 ) -> Result<DenseRightMetadata, String> {
+    ensure_equal_lengths_core(
+        "right index",
+        right_index.len(),
+        "right codes",
+        right_codes.len(),
+    )?;
+
+    // Validate every code before deriving `code_count`. In particular, an
+    // attacker-controlled i64::MAX must be rejected before it can become a
+    // vector length and trigger an enormous allocation.
+    for &code in right_codes {
+        if code < -1 {
+            return Err("right codes must be greater than or equal to -1".to_owned());
+        }
+        if code >= 0 {
+            let code = usize::try_from(code)
+                .map_err(|_| "right code cannot be represented as a physical position")?;
+            if code >= right_index.len() {
+                return Err("right code exceeds the right index length".to_owned());
+            }
+        }
+    }
+
     // Codes are zero-based, so the number of slots is the largest code plus
     // one. `-1` is the no-match sentinel and does not create a slot.
     let code_count = right_codes
@@ -118,12 +142,12 @@ pub(crate) fn build_dense_right_metadata(
         .max()
         .map(|code| {
             usize::try_from(code)
-                .map_err(|_| "right code exceeds the positional contract")?
+                .map_err(|_| "right code cannot be represented as a metadata slot")?
                 .checked_add(1)
-                .ok_or("right code exceeds the positional contract")
+                .ok_or("right code cannot be represented as a metadata slot")
         })
         .transpose()
-        .map_err(|_| "right code exceeds the positional contract")?
+        .map_err(|_| "right code cannot be represented as a metadata slot")?
         .unwrap_or(0);
     // Allocate only the selected mode's single-position metadata. Keeping the
     // other vectors empty avoids storing three copies of equivalent lookups.
@@ -1240,17 +1264,30 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_equi_sparse_codes_and_unmatched_left_codes_produce_no_match() {
-        let result = build_duplicate_equi_pairs_core(
+    fn duplicate_equi_rejects_codes_outside_right_layout_before_allocation() {
+        let error = build_duplicate_equi_pairs_core(
+            array![10_i64].view(),
+            array![0_i64].view(),
+            array![100_i64].view(),
+            array![i64::MAX].view(),
+            Keep::All,
+        )
+        .unwrap_err();
+        assert_eq!(error, "right code exceeds the right index length");
+    }
+
+    #[test]
+    fn duplicate_equi_rejects_codes_outside_right_layout() {
+        let error = build_duplicate_equi_pairs_core(
             array![10_i64, 11].view(),
             array![1_i64, 2].view(),
             array![100_i64, 200].view(),
             array![0_i64, 2].view(),
             Keep::All,
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(result.unwrap().1, vec![200]);
+        assert_eq!(error, "right code exceeds the right index length");
     }
 
     #[test]
