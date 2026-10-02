@@ -10,7 +10,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
 use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
-use crate::common::range_window_bounds;
 use crate::join_common::SingleJoinResult;
 use crate::op::CompareOp;
 use crate::predicate::{
@@ -19,13 +18,29 @@ use crate::predicate::{
 };
 use crate::range_predicate::AnyParsedRangePredicate;
 
-/// Build dense windows for an aggregation anchor.
+/// Package precomputed range bounds as dense aggregation windows.
 ///
 /// Empty windows are retained because aggregation output slots must remain
 /// aligned with the complete left layout. The caller may later compact the
-/// windows when it is materializing index pairs instead of aggregations.
+/// windows when it is materializing index pairs instead of aggregations. This
+/// helper intentionally does not calculate the bounds; the caller owns that
+/// typed binary-search step and can reuse the result elsewhere.
+///
+/// # Arguments
+///
+/// * `range` - Parsed anchor supplying the left/right physical position maps.
+/// * `starts` / `ends` - Half-open offsets into the sorted right-value layout,
+///   one pair for every compact left value.
+/// * `include_right_index` - Retain the right physical position map when true.
+///
+/// # Errors
+///
+/// Returns an error when the supplied bound arrays do not have one entry per
+/// compact left value.
 pub(crate) fn aggregation_windows(
     range: &AnyParsedRangePredicate<'_>,
+    starts: Vec<usize>,
+    ends: Vec<usize>,
     include_right_index: bool,
 ) -> Result<SingleJoinResult, String> {
     // Keep empty windows in the dense representation. The range-first index
@@ -34,13 +49,11 @@ pub(crate) fn aggregation_windows(
     macro_rules! build {
         ($predicate:expr) => {{
             let predicate = $predicate;
-            let (starts, ends) = range_window_bounds(
-                predicate.left.as_array(),
-                predicate.left_index.as_array(),
-                predicate.right.as_array(),
-                predicate.right_index.as_array(),
-                predicate.op,
-            )?;
+            if starts.len() != predicate.left.as_array().len()
+                || ends.len() != predicate.left.as_array().len()
+            {
+                return Err("range aggregation bounds must match left values".to_owned());
+            }
             Ok(SingleJoinResult {
                 left_positions: (0..predicate.left.as_array().len()).collect(),
                 left_index: predicate.left_index.as_array().to_vec(),
