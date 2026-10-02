@@ -28,6 +28,7 @@ use pyo3::types::PyTuple;
 
 use crate::aggs::ensure_equal_lengths_core;
 use crate::anchor_non_equi_join::build_range_core_with_labels;
+use crate::common::range_window_bounds;
 use crate::join_common::SingleJoinResult;
 use crate::op::CompareOp;
 
@@ -346,6 +347,43 @@ impl AnyParsedRangePredicate<'_> {
             Self::U8(value) => validate!(value),
             Self::F64(value) => validate!(value),
             Self::F32(value) => validate!(value),
+        }
+    }
+
+    /// Compute typed half-open windows for this parsed range anchor.
+    ///
+    /// The returned offsets address the sorted right-value layout. The
+    /// companion physical position arrays are used only to validate the
+    /// range-window inputs; callers must still use `right_index[offset]` when
+    /// converting a sorted offset back to an original right position.
+    ///
+    /// Keeping this dispatch beside [`AnyParsedRangePredicate`] avoids making
+    /// every caller repeat the ten-variant dtype match. The actual binary
+    /// search remains in `common::range_window_bounds`, which is independent
+    /// of the parsed-predicate representation.
+    pub(crate) fn bounds(&self) -> Result<(Vec<usize>, Vec<usize>), String> {
+        macro_rules! bounds {
+            ($predicate:expr) => {
+                range_window_bounds(
+                    $predicate.left.as_array(),
+                    $predicate.left_index.as_array(),
+                    $predicate.right.as_array(),
+                    $predicate.right_index.as_array(),
+                    $predicate.op,
+                )
+            };
+        }
+        match self {
+            Self::I64(predicate) => bounds!(predicate),
+            Self::I32(predicate) => bounds!(predicate),
+            Self::I16(predicate) => bounds!(predicate),
+            Self::I8(predicate) => bounds!(predicate),
+            Self::U64(predicate) => bounds!(predicate),
+            Self::U32(predicate) => bounds!(predicate),
+            Self::U16(predicate) => bounds!(predicate),
+            Self::U8(predicate) => bounds!(predicate),
+            Self::F64(predicate) => bounds!(predicate),
+            Self::F32(predicate) => bounds!(predicate),
         }
     }
 

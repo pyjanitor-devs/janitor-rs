@@ -718,39 +718,6 @@ struct FullLayoutRangeAnchor<'py> {
     right_len: usize,
 }
 
-/// Compute the typed binary-search bounds for a parsed range anchor.
-///
-/// The returned offsets address the sorted right-value layout. They are kept
-/// separate from `aggregation_windows`, which only packages those offsets
-/// with the anchor's physical position maps for residual traversal.
-fn range_anchor_bounds(
-    range: &AnyParsedRangePredicate<'_>,
-) -> Result<(Vec<usize>, Vec<usize>), String> {
-    macro_rules! bounds {
-        ($predicate:expr) => {
-            range_window_bounds(
-                $predicate.left.as_array(),
-                $predicate.left_index.as_array(),
-                $predicate.right.as_array(),
-                $predicate.right_index.as_array(),
-                $predicate.op,
-            )
-        };
-    }
-    match range {
-        AnyParsedRangePredicate::I64(predicate) => bounds!(predicate),
-        AnyParsedRangePredicate::I32(predicate) => bounds!(predicate),
-        AnyParsedRangePredicate::I16(predicate) => bounds!(predicate),
-        AnyParsedRangePredicate::I8(predicate) => bounds!(predicate),
-        AnyParsedRangePredicate::U64(predicate) => bounds!(predicate),
-        AnyParsedRangePredicate::U32(predicate) => bounds!(predicate),
-        AnyParsedRangePredicate::U16(predicate) => bounds!(predicate),
-        AnyParsedRangePredicate::U8(predicate) => bounds!(predicate),
-        AnyParsedRangePredicate::F64(predicate) => bounds!(predicate),
-        AnyParsedRangePredicate::F32(predicate) => bounds!(predicate),
-    }
-}
-
 /// Parse the seven-field range-first aggregation ABI.
 ///
 /// The tuple is:
@@ -846,7 +813,7 @@ fn aggregate_range_anchor<'py>(
     let anchor = parse_full_layout_range_anchor(first)?;
     let (parsed, metadata) =
         crate::join_aggregation_helpers::residuals(py, predicates, false, false)?;
-    let (starts, ends) = range_anchor_bounds(&anchor.range).map_err(PyValueError::new_err)?;
+    let (starts, ends) = anchor.range.bounds().map_err(PyValueError::new_err)?;
     let windows =
         aggregation_windows(&anchor.range, starts, ends, true).map_err(PyValueError::new_err)?;
     if windows.left_index.is_empty() {
