@@ -18,6 +18,21 @@ Wheels are built and published by `.github/workflows/release.yml` via
 cargo test --no-default-features
 ```
 
+For a reproducible local environment, use the project wrapper instead. It
+creates a `uv`-managed Python 3.12 environment and points PyO3 at that
+interpreter so macOS does not accidentally select the Xcode
+Command Line Tools Python framework:
+
+```sh
+./scripts/test-rust.sh
+```
+
+Additional Cargo test arguments are forwarded by the wrapper, for example:
+
+```sh
+./scripts/test-rust.sh anchor_non_equi_join
+```
+
 `--no-default-features` disables the `extension-module` pyo3 feature. That
 feature tells pyo3 not to link against libpython, because the real wheel
 is `dlopen()`'d *by* a Python interpreter that already provides those

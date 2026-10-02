@@ -3,6 +3,7 @@ mod aggs;
 mod anchor_non_equi_join;
 mod anchor_non_equi_join_agg;
 mod bin_search;
+mod common;
 mod equi_join;
 mod equi_join_agg;
 mod index_builder;
@@ -10,6 +11,7 @@ mod join_aggregation_helpers;
 mod join_candidate_materialization;
 mod join_common;
 mod multi_join_indices;
+mod not_equals_only;
 mod op;
 mod predicate;
 mod range_join;
@@ -17,6 +19,7 @@ mod range_join_agg;
 mod range_predicate;
 mod regions;
 mod regions_agg;
+mod single_range_predicate;
 
 /// Narrow Rust-only surface used by `benches/kernels.rs`.
 ///
@@ -270,9 +273,10 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     index_builder::register(m)?;
     equi_join::register(m)?;
     equi_join_agg::register(m)?;
-    anchor_non_equi_join::register(m)?;
+    not_equals_only::register(m)?;
     range_join::register(m)?;
     range_join_agg::register(m)?;
+    single_range_predicate::register(m)?;
     regions::register(m)?;
     regions_agg::register(m)?;
     anchor_non_equi_join_agg::register(m)?;
@@ -299,40 +303,41 @@ mod registration_tests {
             janitor_rs(&module).expect("registration must not fail");
 
             let representative_exports = [
-                "binary_search_lt_int64",            // bin_search
-                "compare_batch_indices_first",       // fused batch comparison
-                "aggregate_batch_reverse",           // reverse fused compare
-                "aggregate_batch_no_range_reverse",  // reverse no-range compare
-                "repeat_index",                      // index_builder
-                "equi_join_indices",                 // equi_join
-                "equi_join_building_blocks",         // equi_join
-                "equi_join_filtered_indices",        // equi_join
-                "equi_join_aggregate",               // equi_join_agg
-                "compute_sum_start_int64",           // aggs::sum
-                "compute_sum_rev_start_int64",       // aggs::sum_rev
-                "compute_min_start_int64",           // aggs::min
-                "compute_min_rev_start_int64",       // aggs::min_rev
-                "compute_max_start_int64",           // aggs::max
-                "compute_max_rev_start_int64",       // aggs::max_rev
-                "compute_prod_start_int64",          // aggs::prod
-                "compute_prod_rev_start_int64",      // aggs::prod_rev
-                "compute_size_rev_start",            // aggs::size_rev
-                "aggregate_dual_regions_reverse",    // reverse dual regions
-                "aggregate_multi_regions_reverse",   // reverse multi regions
-                "aggregate_starts_reverse",          // reverse starts ranges
-                "aggregate_ends_reverse",            // reverse ends ranges
-                "aggregate_starts_ends_reverse",     // reverse starts/ends ranges
-                "single_join_indices_int64",         // single-predicate join
-                "range_join_indices",                // two-range join
-                "range_join_extended_indices",       // range-led extended join
-                "range_join_extended_aggregate",     // range-led aggregation
-                "range_join_aggregate",              // two-range aggregation
-                "region_indices",                    // dual regions join
-                "region_indices_extended",           // dual/multi regions join
-                "region_aggregate",                  // dual regions aggregation
-                "region_aggregate_reverse",          // reverse dual regions aggregation
-                "region_extended_aggregate",         // dual/multi regions aggregation
-                "region_extended_aggregate_reverse", // reverse dual/multi aggregation
+                "binary_search_lt_int64",              // bin_search
+                "compare_batch_indices_first",         // fused batch comparison
+                "aggregate_batch_reverse",             // reverse fused compare
+                "aggregate_batch_no_range_reverse",    // reverse no-range compare
+                "repeat_index",                        // index_builder
+                "equi_join_indices",                   // equi_join
+                "equi_join_building_blocks",           // equi_join
+                "equi_join_filtered_indices",          // equi_join
+                "equi_join_aggregate",                 // equi_join_agg
+                "compute_sum_start_int64",             // aggs::sum
+                "compute_sum_rev_start_int64",         // aggs::sum_rev
+                "compute_min_start_int64",             // aggs::min
+                "compute_min_rev_start_int64",         // aggs::min_rev
+                "compute_max_start_int64",             // aggs::max
+                "compute_max_rev_start_int64",         // aggs::max_rev
+                "compute_prod_start_int64",            // aggs::prod
+                "compute_prod_rev_start_int64",        // aggs::prod_rev
+                "compute_size_rev_start",              // aggs::size_rev
+                "aggregate_dual_regions_reverse",      // reverse dual regions
+                "aggregate_multi_regions_reverse",     // reverse multi regions
+                "aggregate_starts_reverse",            // reverse starts ranges
+                "aggregate_ends_reverse",              // reverse ends ranges
+                "aggregate_starts_ends_reverse",       // reverse starts/ends ranges
+                "single_join_indices_int64",           // single-predicate join
+                "range_anchor_extended_indices_int64", // range-first residual join
+                "range_join_indices",                  // two-range join
+                "range_join_extended_indices",         // range-led extended join
+                "range_join_extended_aggregate",       // range-led aggregation
+                "range_join_aggregate",                // two-range aggregation
+                "region_indices",                      // dual regions join
+                "region_indices_extended",             // dual/multi regions join
+                "region_aggregate",                    // dual regions aggregation
+                "region_aggregate_reverse",            // reverse dual regions aggregation
+                "region_extended_aggregate",           // dual/multi regions aggregation
+                "region_extended_aggregate_reverse",   // reverse dual/multi aggregation
             ];
 
             for name in representative_exports {
@@ -345,11 +350,11 @@ mod registration_tests {
     }
 
     /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (827 exports across the retained leaf
+    /// `register`, as of this PR (897 exports across the retained leaf
     /// modules).
     /// Bump this alongside any PR that intentionally adds or removes an
     /// export.
-    const EXPECTED_EXPORT_COUNT: usize = 827;
+    const EXPECTED_EXPORT_COUNT: usize = 897;
 
     /// ELI5: the representative-export test above only proves each
     /// department's guest list reports up the chain at all -- it would

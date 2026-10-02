@@ -104,6 +104,7 @@ pub(crate) fn aggregate_range_extended<'py>(
         source_len,
         return_matched,
         reverse,
+        false,
     )
 }
 

@@ -31,6 +31,10 @@
 //! materialized dictionary containing `left_index` and `right_index`; they
 //! must inspect every residual predicate before applying `keep`.
 
+#![allow(dead_code)]
+
+use std::iter::repeat_n;
+
 use numpy::ndarray::ArrayView1;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
@@ -38,41 +42,318 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::aggs::ensure_equal_lengths_core;
-use crate::join_candidate_materialization::{
-    materialize_not_equal_candidates, materialize_range_candidates,
-};
+use crate::common::{partition_point, range_window};
+use crate::join_candidate_materialization::materialize_range_candidates;
 use crate::join_common::{result_dict, Keep, SingleJoinResult};
 use crate::op::CompareOp;
 use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
 
-/// Find the first position at which a monotone predicate becomes false.
-///
-/// The predicate must be true for an initial prefix of `right` and false for
-/// the remaining suffix. This is the same boundary operation as Rust's slice
-/// `partition_point`.
-///
-/// Contiguous views use the standard slice implementation. Strided ndarray
-/// views cannot expose a contiguous slice, so they use the equivalent manual
-/// binary-search loop. Both paths return a physical position in the supplied
-/// right view; neither path changes or sorts the input.
-pub(crate) fn partition_point<T: PartialOrd + Copy>(
-    right: ArrayView1<'_, T>,
-    predicate: impl Fn(T) -> bool,
-) -> usize {
-    if let Some(slice) = right.as_slice() {
-        return slice.partition_point(|value| predicate(*value));
+fn legacy_positions(name: &str, values: ArrayView1<'_, i64>) -> Result<Vec<usize>, String> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(offset, value)| {
+            usize::try_from(*value).map_err(|_| {
+                format!("{name} position at offset {offset} must be a non-negative int64")
+            })
+        })
+        .collect()
+}
+
+fn legacy_validate_partition(
+    name: &str,
+    full_len: usize,
+    non_null: &[usize],
+    null: &[usize],
+) -> Result<(), String> {
+    let count = non_null
+        .len()
+        .checked_add(null.len())
+        .ok_or("position count exceeds platform capacity")?;
+    if count != full_len {
+        return Err(format!(
+            "{name} length must equal the number of non-null values plus null positions"
+        ));
     }
-    let mut low = 0;
-    let mut high = right.len();
-    while low < high {
-        let middle = low + ((high - low) >> 1);
-        if predicate(right[middle]) {
-            low = middle + 1;
+    let mut seen = vec![false; full_len];
+    for (&position, kind) in non_null
+        .iter()
+        .zip(std::iter::repeat("non-null"))
+        .chain(null.iter().zip(std::iter::repeat("null")))
+    {
+        if position >= full_len {
+            return Err(format!(
+                "{name} {kind} position {position} is out of bounds"
+            ));
+        }
+        if seen[position] {
+            return Err(format!("{name} position {position} appears more than once"));
+        }
+        seen[position] = true;
+    }
+    Ok(())
+}
+
+fn legacy_choose(current: &mut Option<usize>, candidate: usize, keep: Keep) {
+    match current {
+        None => *current = Some(candidate),
+        Some(previous) if keep == Keep::First && candidate < *previous => *previous = candidate,
+        Some(previous) if keep == Keep::Last && candidate > *previous => *previous = candidate,
+        _ => {}
+    }
+}
+
+fn legacy_prefix_extrema(values: &[usize], minimum: bool) -> Vec<usize> {
+    let mut result = Vec::with_capacity(values.len());
+    let mut selected = None;
+    for (offset, &value) in values.iter().enumerate() {
+        if selected.is_none_or(|current| {
+            (minimum && value < values[current]) || (!minimum && value > values[current])
+        }) {
+            selected = Some(offset);
+        }
+        result.push(selected.expect("prefix position exists after iteration"));
+    }
+    result
+}
+
+fn legacy_suffix_extrema(values: &[usize], minimum: bool) -> Vec<usize> {
+    let mut result = vec![0; values.len()];
+    let mut selected = None;
+    for offset in (0..values.len()).rev() {
+        let value = values[offset];
+        if selected.is_none_or(|current| {
+            (minimum && value < values[current]) || (!minimum && value > values[current])
+        }) {
+            selected = Some(offset);
+        }
+        result[offset] = selected.expect("suffix position exists after iteration");
+    }
+    result
+}
+
+fn legacy_all_capacity<T: PartialOrd + Copy>(
+    left: ArrayView1<'_, T>,
+    right: ArrayView1<'_, T>,
+    left_null_count: usize,
+    right_null_count: usize,
+    is_extension_array: bool,
+) -> Result<usize, String> {
+    let mut capacity = 0_usize;
+    for value in left {
+        let less_end = partition_point(right, |candidate| candidate < *value);
+        let greater_start = partition_point(right, |candidate| candidate <= *value);
+        let strict_count = less_end
+            .checked_add(right.len().saturating_sub(greater_start))
+            .ok_or("single join result size exceeds platform capacity")?;
+        let row_count = if is_extension_array {
+            strict_count
         } else {
-            high = middle;
+            strict_count
+                .checked_add(right_null_count)
+                .ok_or("single join result size exceeds platform capacity")?
+        };
+        capacity = capacity
+            .checked_add(row_count)
+            .ok_or("single join result size exceeds platform capacity")?;
+    }
+    if !is_extension_array {
+        capacity = capacity
+            .checked_add(
+                left_null_count
+                    .checked_mul(
+                        right
+                            .len()
+                            .checked_add(right_null_count)
+                            .ok_or("single join result size exceeds platform capacity")?,
+                    )
+                    .ok_or("single join result size exceeds platform capacity")?,
+            )
+            .ok_or("single join result size exceeds platform capacity")?;
+    }
+    Ok(capacity)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Build selected physical position pairs for the legacy mixed single-join
+/// compatibility wrapper's `!=` branch.
+///
+/// This is intentionally separate from the dedicated `not_equals_only`
+/// traversal. The compatibility wrapper still exposes the historical
+/// materialized-pair ABI, while the dedicated path visits pairs directly.
+///
+/// # Arguments
+///
+/// * `left` / `right` - Compact non-null value arrays; `right` is sorted.
+/// * `left_full_positions` / `right_full_positions` - Full physical layouts.
+/// * `left_non_null_positions` / `right_non_null_positions` - Maps from
+///   compact offsets to full physical positions.
+/// * `left_null_positions` / `right_null_positions` - Optional null-row maps.
+/// * `is_extension_array` - Whether nulls participate in `!=` matching.
+/// * `keep` - Pair selection mode applied after candidate generation.
+///
+/// # Returns
+///
+/// Returns physical left/right position vectors suitable for the legacy
+/// materializer. It does not return index labels.
+///
+/// # Errors
+///
+/// Returns an error if values and maps are misaligned or the position maps do
+/// not form complete, disjoint partitions of their full layouts.
+fn build_positions<T: PartialOrd + Copy>(
+    left: ArrayView1<'_, T>,
+    left_full_positions: ArrayView1<'_, i64>,
+    left_non_null_positions: ArrayView1<'_, i64>,
+    right: ArrayView1<'_, T>,
+    right_full_positions: ArrayView1<'_, i64>,
+    right_non_null_positions: ArrayView1<'_, i64>,
+    left_null_positions: Option<ArrayView1<'_, i64>>,
+    right_null_positions: Option<ArrayView1<'_, i64>>,
+    is_extension_array: bool,
+    keep: Keep,
+) -> Result<(Vec<usize>, Vec<usize>), String> {
+    ensure_equal_lengths_core(
+        "left values",
+        left.len(),
+        "left non-null positions",
+        left_non_null_positions.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "right values",
+        right.len(),
+        "right non-null positions",
+        right_non_null_positions.len(),
+    )?;
+    let left_positions = legacy_positions("left non-null", left_non_null_positions)?;
+    let right_positions = legacy_positions("right non-null", right_non_null_positions)?;
+    let left_null_positions = left_null_positions
+        .map(|values| legacy_positions("left null", values))
+        .transpose()?;
+    let right_null_positions = right_null_positions
+        .map(|values| legacy_positions("right null", values))
+        .transpose()?;
+    let empty = Vec::new();
+    let left_null_positions = left_null_positions.as_deref().unwrap_or(&empty);
+    let right_null_positions = right_null_positions.as_deref().unwrap_or(&empty);
+    legacy_validate_partition(
+        "left full positions",
+        left_full_positions.len(),
+        &left_positions,
+        left_null_positions,
+    )?;
+    legacy_validate_partition(
+        "right full positions",
+        right_full_positions.len(),
+        &right_positions,
+        right_null_positions,
+    )?;
+
+    let capacity = if keep == Keep::All {
+        legacy_all_capacity(
+            left,
+            right,
+            left_null_positions.len(),
+            right_null_positions.len(),
+            is_extension_array,
+        )?
+    } else {
+        left_full_positions.len()
+    };
+    let mut output_left = Vec::new();
+    output_left
+        .try_reserve_exact(capacity)
+        .map_err(|_| "single join result allocation failed")?;
+    let mut output_right = Vec::new();
+    output_right
+        .try_reserve_exact(capacity)
+        .map_err(|_| "single join result allocation failed")?;
+
+    let prefix_extrema = match keep {
+        Keep::First => Some(legacy_prefix_extrema(&right_positions, true)),
+        Keep::Last => Some(legacy_prefix_extrema(&right_positions, false)),
+        Keep::Any | Keep::All => None,
+    };
+    let suffix_extrema = match keep {
+        Keep::First => Some(legacy_suffix_extrema(&right_positions, true)),
+        Keep::Last => Some(legacy_suffix_extrema(&right_positions, false)),
+        Keep::Any | Keep::All => None,
+    };
+    let null_extreme = match keep {
+        Keep::First => right_null_positions.iter().copied().min(),
+        Keep::Last => right_null_positions.iter().copied().max(),
+        Keep::Any | Keep::All => None,
+    };
+
+    for (left_value, &left_position) in left.iter().zip(&left_positions) {
+        let less_end = partition_point(right, |value| value < *left_value);
+        let greater_start = partition_point(right, |value| value <= *left_value);
+        if keep == Keep::All {
+            output_left.extend(repeat_n(left_position, less_end));
+            output_right.extend_from_slice(&right_positions[..less_end]);
+            output_left.extend(repeat_n(left_position, right.len() - greater_start));
+            output_right.extend_from_slice(&right_positions[greater_start..]);
+            if !is_extension_array {
+                output_left.extend(repeat_n(left_position, right_null_positions.len()));
+                output_right.extend_from_slice(right_null_positions);
+            }
+            continue;
+        }
+        let mut selected = None;
+        if less_end > 0 {
+            selected = match keep {
+                Keep::Any => Some(right_positions[0]),
+                Keep::First | Keep::Last => {
+                    Some(right_positions[prefix_extrema.as_ref().unwrap()[less_end - 1]])
+                }
+                Keep::All => unreachable!(),
+            };
+        }
+        if greater_start < right.len() {
+            match keep {
+                Keep::Any if selected.is_none() => {
+                    selected = Some(right_positions[greater_start]);
+                }
+                Keep::Any => {}
+                Keep::First | Keep::Last => legacy_choose(
+                    &mut selected,
+                    right_positions[suffix_extrema.as_ref().unwrap()[greater_start]],
+                    keep,
+                ),
+                Keep::All => unreachable!(),
+            }
+        }
+        if !is_extension_array {
+            if keep == Keep::Any && selected.is_none() {
+                selected = right_null_positions.first().copied();
+            } else if let Some(position) = null_extreme {
+                legacy_choose(&mut selected, position, keep);
+            }
+        }
+        if let Some(right_position) = selected {
+            output_left.push(left_position);
+            output_right.push(right_position);
         }
     }
-    low
+    if !is_extension_array {
+        for &left_position in left_null_positions {
+            if keep == Keep::All {
+                output_left.extend(repeat_n(left_position, right_full_positions.len()));
+                output_right.extend(0..right_full_positions.len());
+                continue;
+            }
+            let selected = match keep {
+                Keep::Any | Keep::First => (!right_full_positions.is_empty()).then_some(0),
+                Keep::Last => right_full_positions.len().checked_sub(1),
+                Keep::All => unreachable!(),
+            };
+            if let Some(right_position) = selected {
+                output_left.push(left_position);
+                output_right.push(right_position);
+            }
+        }
+    }
+    Ok((output_left, output_right))
 }
 
 /// Return the half-open physical right-array window satisfying one range op.
@@ -91,49 +372,6 @@ pub(crate) fn partition_point<T: PartialOrd + Copy>(
 /// upstream by pyjanitor, while inequality is the union of the strict prefix
 /// and strict suffix and needs its own null-aware implementation.
 ///
-/// The returned `(start, end)` pair identifies the contiguous portion of the
-/// ascending `right` array that satisfies `left_value op right_value`.
-///
-/// # Arguments
-///
-/// * `left_value` - One left-side value.
-/// * `right` - An ascending right-side value view.
-/// * `op` - One of `<`, `<=`, `>`, or `>=`.
-///
-/// # Returns
-///
-/// A half-open positional range into `right`. Equality and inequality are not
-/// valid inputs and are unreachable after caller validation.
-pub(crate) fn range_window<T: PartialOrd + Copy>(
-    left_value: T,
-    right: ArrayView1<'_, T>,
-    op: CompareOp,
-) -> (usize, usize) {
-    match op {
-        // left < right: keep the suffix after the last right <= left.
-        CompareOp::Lt => {
-            let start = partition_point(right, |value| value <= left_value);
-            (start, right.len())
-        }
-        // left <= right: keep the suffix from the first right >= left.
-        CompareOp::Le => {
-            let start = partition_point(right, |value| value < left_value);
-            (start, right.len())
-        }
-        // left > right: keep the prefix before the first right >= left.
-        CompareOp::Gt => {
-            let end = partition_point(right, |value| value < left_value);
-            (0, end)
-        }
-        // left >= right: keep the prefix through the last right <= left.
-        CompareOp::Ge => {
-            let end = partition_point(right, |value| value <= left_value);
-            (0, end)
-        }
-        CompareOp::Eq | CompareOp::Ne => unreachable!("range_window only handles range operators"),
-    }
-}
-
 /// Build a running label minimum or maximum for every prefix.
 ///
 /// `minimum=true` produces prefix minima; `minimum=false` produces prefix
@@ -249,6 +487,7 @@ where
 /// For each prefix ending at `i`, the filtered-layout offset of its smallest
 /// label. The caller maps that offset through the right position map before
 /// indexing the full right-index array.
+#[allow(dead_code)]
 fn prefix_min_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = Vec::with_capacity(labels.len());
     let mut current = None;
@@ -285,6 +524,7 @@ fn prefix_min_positions(labels: &[i64]) -> Vec<usize> {
 /// For each prefix ending at `i`, the filtered-layout offset of its largest
 /// label. The caller maps that offset through the right position map before
 /// indexing the full right-index array.
+#[allow(dead_code)]
 fn prefix_max_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = Vec::with_capacity(labels.len());
     let mut current = None;
@@ -322,6 +562,7 @@ fn prefix_max_positions(labels: &[i64]) -> Vec<usize> {
 /// For each suffix beginning at `i`, the filtered-layout offset of its
 /// smallest label. The caller maps that offset through the right position map
 /// before indexing the full right-index array.
+#[allow(dead_code)]
 fn suffix_min_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = vec![0_usize; labels.len()];
     let mut current = None;
@@ -360,6 +601,7 @@ fn suffix_min_positions(labels: &[i64]) -> Vec<usize> {
 /// For each suffix beginning at `i`, the filtered-layout offset of its largest
 /// label. The caller maps that offset through the right position map before
 /// indexing the full right-index array.
+#[allow(dead_code)]
 fn suffix_max_positions(labels: &[i64]) -> Vec<usize> {
     let mut result = vec![0_usize; labels.len()];
     let mut current = None;
@@ -796,6 +1038,7 @@ where
 ///
 /// `all` can emit several pairs for one left row, so its capacity is computed
 /// from the two strict binary-search regions plus the right-null labels.
+#[allow(dead_code)]
 fn not_equal_output_capacity<T: PartialOrd + Copy>(
     left: ArrayView1<'_, T>,
     right: ArrayView1<'_, T>,
@@ -902,6 +1145,7 @@ fn not_equal_output_capacity<T: PartialOrd + Copy>(
 /// number of null positions. Non-null and null positions must be disjoint and
 /// cover the full physical index range.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
     left: ArrayView1<'_, T>,
     left_index: ArrayView1<'_, i64>,
@@ -1234,7 +1478,7 @@ pub fn build_not_equal_positions_core<T: PartialOrd + Copy>(
 }
 
 /// Convert physical position pairs into public index-label pairs.
-fn materialize_index_pairs(
+pub(crate) fn materialize_index_pairs(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     left_positions: Vec<usize>,
@@ -1275,7 +1519,7 @@ fn materialize_index_pairs(
 /// disjoint regions and therefore returns fully materialized pairs. In both
 /// cases a caller-provided `keep` mode has no effect; `!=` uses `All` to make
 /// that materialization explicit.
-fn effective_keep(keep: Keep, return_building_blocks: bool) -> Keep {
+pub(crate) fn effective_keep(keep: Keep, return_building_blocks: bool) -> Keep {
     if return_building_blocks {
         Keep::All
     } else {
@@ -1286,7 +1530,6 @@ fn effective_keep(keep: Keep, return_building_blocks: bool) -> Keep {
 macro_rules! single_join_function {
     ($name:ident, $type:ty) => {
         #[allow(clippy::too_many_arguments)]
-        #[pyfunction]
         /// Construct indices for one conditional join predicate.
         ///
         /// `left` and `right` are aligned with their original `int64` index
@@ -1297,12 +1540,11 @@ macro_rules! single_join_function {
         ///
         /// `keep` accepts `first`, `last`, `any`, or `all`. `first` and `last`
         /// select by original right index label, while `all` emits every
-        /// physical matching right row. `return_building_blocks` ignores
-        /// `keep` for every operator. For range operators it returns the
-        /// retained left labels, the complete right-label array, and one
-        /// half-open `starts`/`ends` window per retained left row. For `!=`,
-        /// it returns fully materialized flat pairs, equivalent to
-        /// `keep="all"`, because `!=` has no single window.
+        /// physical matching right row. `return_building_blocks` affects only
+        /// range operators: it returns the retained left labels, the complete
+        /// right-label array, and one half-open `starts`/`ends` window per
+        /// retained left row. For `!=`, the flag is ignored because `!=`
+        /// always returns materialized pairs selected by `keep`.
         ///
         /// For `!=`, the value arrays are filtered non-null arrays. Their
         /// position arrays map filtered offsets to physical positions in the
@@ -1323,8 +1565,8 @@ macro_rules! single_join_function {
         ///   increasing in the sorted-right layout.
         /// * `comparator` - One of `>`, `>=`, `<`, `<=`, `==`, or `!=`.
         /// * `keep` - One of `first`, `last`, `any`, or `all`.
-        /// * `return_building_blocks` - Ignore `keep` and return range windows
-        ///   or, for `!=`, all fully materialized pairs.
+        /// * `return_building_blocks` - Applies only to range operators;
+        ///   ignored for `!=`.
         /// * `left_positions`, `right_positions` - Filtered-to-original
         ///   physical position maps used only for `!=`.
         /// * `left_null_positions`, `right_null_positions` - Optional null
@@ -1337,7 +1579,7 @@ macro_rules! single_join_function {
         /// Returns `None` when no pair matches. Otherwise returns a dictionary
         /// containing `left_index` and `right_index`; range building-block
         /// requests additionally contain `starts` and `ends`.
-        pub fn $name<'py>(
+        pub(crate) fn $name<'py>(
             py: Python<'py>,
             left: PyReadonlyArray1<'py, $type>,
             left_index: PyReadonlyArray1<'py, i64>,
@@ -1372,7 +1614,7 @@ macro_rules! single_join_function {
                 let right_positions = right_positions
                     .as_ref()
                     .ok_or_else(|| PyValueError::new_err("right positions are required for !="))?;
-                let (left_positions, right_positions) = build_not_equal_positions_core(
+                let (left_positions, right_positions) = build_positions(
                     left,
                     left_index,
                     left_positions.as_array(),
@@ -1381,7 +1623,6 @@ macro_rules! single_join_function {
                     right_positions.as_array(),
                     left_null_positions.as_ref().map(|value| value.as_array()),
                     right_null_positions.as_ref().map(|value| value.as_array()),
-                    right_index_is_ordered,
                     is_extension_array,
                     keep,
                 )
@@ -1505,108 +1746,23 @@ fn extended_not_equal_join<'py, T: numpy::Element + PartialOrd + Copy>(
     first_right_index: PyReadonlyArray1<'py, i64>,
     first_right_positions: PyReadonlyArray1<'py, i64>,
     first_right_null_positions: Option<PyReadonlyArray1<'py, i64>>,
-    right_index_is_ordered: bool,
+    _right_index_is_ordered: bool,
     is_extension_array: bool,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
-    // The extended kernel needs an anchor plus at least one residual
-    // predicate. The single-predicate case belongs to the ordinary
-    // single-join wrapper, which can apply `keep` without a residual pass.
-    if predicates.len() < 2 {
-        return Err(PyValueError::new_err(
-            "single extended join requires at least two predicates",
-        ));
-    }
-    let keep = Keep::parse(keep)?;
-
-    // Keep every predicate after the anchor in a temporary Python list. The
-    // shared parser expects a list, and this also preserves the caller's
-    // predicate order. The list stores references; it does not copy arrays.
-    let residuals = PyList::empty(py);
-    for item in predicates.iter().skip(1) {
-        let tuple = item
-            .cast::<PyTuple>()
-            .map_err(|_| PyValueError::new_err("each residual comparison must be a tuple"))?;
-        let op_position = if tuple.len() == 3 {
-            2
-        } else if tuple.len() == 6 {
-            5
-        } else {
-            return Err(PyValueError::new_err(
-                "each residual comparison must contain 3 or 6 elements",
-            ));
-        };
-        // All-`!=` extended joins use the same null-aware comparison contract
-        // for the anchor and every residual. Rejecting another operator here
-        // prevents the residual parser from silently applying incompatible
-        // null semantics.
-        let op = CompareOp::try_from_str(tuple.get_item(op_position)?.extract::<&str>()?)?;
-        if op != CompareOp::Ne {
-            return Err(PyValueError::new_err(
-                "all-!= joins require every predicate to use !=",
-            ));
-        }
-        residuals.append(item)?;
-    }
-    // Residual arrays represent the complete physical layouts, not the
-    // filtered non-null arrays used by the anchor. Parse their masks before
-    // validating lengths so the hot candidate loop can use borrowed views.
-    let (parsed, metadata) = parse_predicates_with_nulls_strings(py, &residuals)?;
-    let left_index = first_left_index.as_array();
-    let right_index = first_right_index.as_array();
-
-    // Residual predicates use the full physical layouts, so their lengths
-    // must match the full indexes rather than the filtered first-predicate
-    // value arrays.
-    check_predicate_lengths(&parsed, left_index.len(), right_index.len())?;
-
-    // The first `!=` predicate is always expanded fully. Applying `keep`
-    // here would discard pairs needed by later predicates. The core returns
-    // physical position pairs, not public labels, so residual predicates can
-    // index their complete arrays directly.
-    let (left_positions, right_positions) = build_not_equal_positions_core(
-        first_left.as_array(),
-        left_index,
-        first_left_positions.as_array(),
-        first_right.as_array(),
-        right_index,
-        first_right_positions.as_array(),
-        first_left_null_positions
-            .as_ref()
-            .map(|values| values.as_array()),
-        first_right_null_positions
-            .as_ref()
-            .map(|values| values.as_array()),
-        right_index_is_ordered,
-        is_extension_array,
-        Keep::All,
-    )
-    .map_err(PyValueError::new_err)?;
-    if left_positions.is_empty() {
-        // No first-stage candidates means no residual can produce a match.
-        return Ok(None);
-    }
-
-    // Only now apply `keep`. This is important: `first`, `last`, and `any`
-    // must be chosen from candidates that survive every residual predicate,
-    // not from the broader first `!=` candidate stream.
-    let (out_left, out_right) = materialize_not_equal_candidates(
-        left_index,
-        right_index,
-        &left_positions,
-        &right_positions,
-        &parsed,
-        metadata.as_deref(),
+    crate::not_equals_only::materialize_with_residuals(
+        py,
+        predicates,
         keep,
+        first_left,
+        first_left_index,
+        first_left_positions,
+        first_left_null_positions,
+        first_right,
+        first_right_index,
+        first_right_positions,
+        first_right_null_positions,
+        is_extension_array,
     )
-    .map_err(PyValueError::new_err)?;
-    if out_left.is_empty() {
-        // The first candidate stream was non-empty, but all candidates may
-        // have been rejected by the residual predicates.
-        return Ok(None);
-    }
-    // Position pairs are converted to the caller-visible index labels only
-    // after filtering and keep selection are complete.
-    Ok(Some(result_dict(py, out_left, out_right, None, None)?))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1818,7 +1974,8 @@ fn parse_extended_anchor<'py, T: numpy::Element + PartialOrd + Copy>(
 }
 
 macro_rules! extended_join_function {
-    ($name:ident, $type:ty) => {
+    ($name:ident, $type:ty, $export:literal) => {
+        #[pyfunction(name = $export)]
         /// Build flat indices for a multi-predicate conditional join.
         ///
         /// Mixed joins use a six-element range first-predicate form:
@@ -1858,7 +2015,6 @@ macro_rules! extended_join_function {
         /// Returns `ValueError` for malformed tuple layouts, unsupported
         /// comparator combinations, mismatched aligned lengths, invalid null
         /// metadata, or an invalid `keep` value.
-        #[pyfunction]
         pub fn $name<'py>(
             py: Python<'py>,
             predicates: &Bound<'py, PyList>,
@@ -1902,28 +2058,60 @@ macro_rules! extended_join_function {
     };
 }
 
-extended_join_function!(single_join_extended_indices_int64, i64);
-extended_join_function!(single_join_extended_indices_int32, i32);
-extended_join_function!(single_join_extended_indices_int16, i16);
-extended_join_function!(single_join_extended_indices_int8, i8);
-extended_join_function!(single_join_extended_indices_uint64, u64);
-extended_join_function!(single_join_extended_indices_uint32, u32);
-extended_join_function!(single_join_extended_indices_uint16, u16);
-extended_join_function!(single_join_extended_indices_uint8, u8);
-extended_join_function!(single_join_extended_indices_f64, f64);
-extended_join_function!(single_join_extended_indices_f32, f32);
+extended_join_function!(
+    single_join_extended_indices_int64,
+    i64,
+    "range_anchor_extended_indices_int64"
+);
+extended_join_function!(
+    single_join_extended_indices_int32,
+    i32,
+    "range_anchor_extended_indices_int32"
+);
+extended_join_function!(
+    single_join_extended_indices_int16,
+    i16,
+    "range_anchor_extended_indices_int16"
+);
+extended_join_function!(
+    single_join_extended_indices_int8,
+    i8,
+    "range_anchor_extended_indices_int8"
+);
+extended_join_function!(
+    single_join_extended_indices_uint64,
+    u64,
+    "range_anchor_extended_indices_uint64"
+);
+extended_join_function!(
+    single_join_extended_indices_uint32,
+    u32,
+    "range_anchor_extended_indices_uint32"
+);
+extended_join_function!(
+    single_join_extended_indices_uint16,
+    u16,
+    "range_anchor_extended_indices_uint16"
+);
+extended_join_function!(
+    single_join_extended_indices_uint8,
+    u8,
+    "range_anchor_extended_indices_uint8"
+);
+extended_join_function!(
+    single_join_extended_indices_f64,
+    f64,
+    "range_anchor_extended_indices_f64"
+);
+extended_join_function!(
+    single_join_extended_indices_f32,
+    f32,
+    "range_anchor_extended_indices_f32"
+);
 
+/// Register the range-anchor extended index ABI used by PyJanitor's
+/// multi-predicate range-first path.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(single_join_indices_int64, m)?)?;
-    m.add_function(wrap_pyfunction!(single_join_indices_int32, m)?)?;
-    m.add_function(wrap_pyfunction!(single_join_indices_int16, m)?)?;
-    m.add_function(wrap_pyfunction!(single_join_indices_int8, m)?)?;
-    m.add_function(wrap_pyfunction!(single_join_indices_uint64, m)?)?;
-    m.add_function(wrap_pyfunction!(single_join_indices_uint32, m)?)?;
-    m.add_function(wrap_pyfunction!(single_join_indices_uint16, m)?)?;
-    m.add_function(wrap_pyfunction!(single_join_indices_uint8, m)?)?;
-    m.add_function(wrap_pyfunction!(single_join_indices_f64, m)?)?;
-    m.add_function(wrap_pyfunction!(single_join_indices_f32, m)?)?;
     m.add_function(wrap_pyfunction!(single_join_extended_indices_int64, m)?)?;
     m.add_function(wrap_pyfunction!(single_join_extended_indices_int32, m)?)?;
     m.add_function(wrap_pyfunction!(single_join_extended_indices_int16, m)?)?;
@@ -1941,6 +2129,75 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use numpy::ndarray::{array, s};
+
+    #[test]
+    fn maps_sorted_right_values_to_original_positions() {
+        let result = build_positions(
+            array![4_i64].view(),
+            array![0_i64].view(),
+            array![0_i64].view(),
+            array![1_i64, 3, 5].view(),
+            array![0_i64, 1, 2].view(),
+            array![2_i64, 0, 1].view(),
+            None,
+            None,
+            false,
+            Keep::All,
+        )
+        .unwrap();
+        assert_eq!(result, (vec![0, 0, 0], vec![2, 0, 1]));
+    }
+
+    #[test]
+    fn first_and_last_use_original_physical_positions() {
+        let first = build_positions(
+            array![4_i64].view(),
+            array![0_i64].view(),
+            array![0_i64].view(),
+            array![1_i64, 3, 5].view(),
+            array![0_i64, 1, 2].view(),
+            array![2_i64, 0, 1].view(),
+            None,
+            None,
+            false,
+            Keep::First,
+        )
+        .unwrap();
+        let last = build_positions(
+            array![4_i64].view(),
+            array![0_i64].view(),
+            array![0_i64].view(),
+            array![1_i64, 3, 5].view(),
+            array![0_i64, 1, 2].view(),
+            array![2_i64, 0, 1].view(),
+            None,
+            None,
+            false,
+            Keep::Last,
+        )
+        .unwrap();
+        assert_eq!(first, (vec![0], vec![0]));
+        assert_eq!(last, (vec![0], vec![2]));
+    }
+
+    #[test]
+    fn null_partitions_are_disjoint_and_extension_nulls_do_not_match() {
+        let result = build_positions(
+            array![1_i64].view(),
+            array![0_i64, 1].view(),
+            array![0_i64].view(),
+            array![1_i64].view(),
+            array![0_i64, 1].view(),
+            array![0_i64].view(),
+            Some(array![1_i64].view()),
+            Some(array![1_i64].view()),
+            true,
+            Keep::All,
+        )
+        .unwrap();
+        assert!(result.0.is_empty());
+        assert!(result.1.is_empty());
+    }
 
     #[test]
     fn contiguous_and_strided_boundaries_match() {
@@ -2746,7 +3003,7 @@ mod extended_tests {
             assert_value_error(
                 single_join_extended_indices_int64(py, &predicates, "all"),
                 py,
-                "left index length must equal the number of non-null values plus null positions",
+                "left full positions length must equal the number of non-null values plus null positions",
             );
             Ok(())
         })

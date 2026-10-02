@@ -21,7 +21,7 @@
 //! per distinct equi key.
 
 use crate::aggs::ensure_equal_lengths_core;
-use crate::anchor_non_equi_join::range_window;
+use crate::common::range_window;
 use crate::join_common::Keep;
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,

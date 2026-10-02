@@ -1183,3 +1183,26 @@ array length.
 addition to end-to-end legacy-path tests. Exercise every operator and both
 full/empty boundary cases so a dtype-dispatch change cannot silently alter
 window coordinates.
+
+### [2026-10-02] Keep all-not-equal implementation in `not_equals_only.rs`
+
+**Context**: Defining the all-`!=` Rust implementation contract.
+**Learning**: The all-`!=` anchor path belongs in `src/not_equals_only.rs`;
+the pyjanitor-side preparation is already covered and should not be expanded
+as part of this work.
+
+**Recommendation**: Keep Rust responsibilities focused on validating the
+unique physical-position maps, generating the three disjoint null/non-null
+candidate partitions, applying residuals by physical position, and reducing
+`keep` modes.
+
+### [2026-10-02] Ignore right ordering metadata after residual filtering
+
+**Context**: Defining the all-`!=` keep-selection contract.
+**Learning**: When residual predicates are present, `right_index_is_ordered`
+does not describe a valid shortcut for selection because candidates must first
+survive every residual predicate.
+
+**Recommendation**: Ignore `right_index_is_ordered` on residual paths. Apply
+all residuals first, then choose `any`, `first`, or `last` using original
+physical right positions.

@@ -38,7 +38,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::anchor_non_equi_join::range_window;
+use crate::common::range_window;
 use crate::join_common::{result_dict, Keep};
 use crate::multi_join_indices::common::{add_right_region, checked_region_start, GroupState};
 use crate::op::CompareOp;

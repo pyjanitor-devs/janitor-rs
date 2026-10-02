@@ -66,10 +66,12 @@ pub(crate) fn make_results<'py>(
 
 /// Build the result used by single and extended fused joins.
 ///
-/// `output_positions` describes the trimmed physical output layout. The
-/// aggregation state is already in that same calculation order; this helper
-/// only preserves the map in the returned tuple. It deliberately does not
-/// scatter or reorder any accumulator buffer.
+/// `output_positions` describes the physical output layout. The aggregation
+/// state is already in exactly that order; this helper only preserves the map
+/// in the returned tuple. It deliberately does not scatter or reorder any
+/// accumulator buffer. When no explicit map is supplied, the output slots
+/// are the complete physical domain `0..output_len`, which is also the public
+/// dataframe order used by conditional joins.
 pub(crate) fn make_results_with_positions<'py>(
     py: Python<'py>,
     set: AggregationSet<'_>,

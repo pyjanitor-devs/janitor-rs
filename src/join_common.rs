@@ -34,6 +34,15 @@ impl Keep {
             ))),
         }
     }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Any => "any",
+            Self::First => "first",
+            Self::Last => "last",
+        }
+    }
 }
 
 /// Own the positional windows and labels produced by a non-equi join.

@@ -13,71 +13,13 @@ use pyo3::types::{PyList, PyTuple};
 
 use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
 use crate::aggs::ensure_equal_lengths_core;
-use crate::anchor_non_equi_join::{build_range_core, range_window, visit_not_equal_pairs_core};
+use crate::anchor_non_equi_join::build_range_core;
+use crate::common::range_window;
 use crate::join_aggregation_helpers::{aggregate_range_windows, residuals};
+use crate::not_equals_only::aggregate_not_equal;
 use crate::op::CompareOp;
-use crate::predicate::{
-    check_predicate_lengths, null_metadata_views, predicates_match_dispatch, PredicateView,
-};
+use crate::predicate::check_predicate_lengths;
 use crate::range_predicate::{parse_aggregation_range_anchor, AnyParsedRangePredicate};
-
-/// Build a lookup from original physical rows to compact aggregation slots.
-///
-/// A physical position is the row's original position in the full input.
-/// A compact position is the row's position in the trimmed aggregation array;
-/// each compact position is therefore an aggregation slot.
-///
-/// Before filtering or sorting, the physical input is:
-///
-/// ```text
-/// physical row:      [0,    1,  2]
-/// original values:   [null, 20, 10]
-/// ```
-///
-/// PyJanitor supplies the aggregation values in compact sorted order:
-///
-/// ```text
-/// compact slot:      [0,  1,  2]
-/// physical row:      [2,  1,  0]
-/// compact values:    [10, 20, null]
-/// ```
-///
-/// Rust inverts that pairing to:
-///
-/// ```text
-/// physical row:      [0,  1,  2]
-/// compact slot:      [2,  1,  0]
-/// ```
-///
-/// Thus, a candidate reported at physical row `2` is written to compact
-/// aggregation slot `physical_to_slot[2]`, which is slot `0`.
-///
-/// This lets aggregation update the compact result directly without a later
-/// scattering pass.
-fn physical_to_local_positions(
-    name: &str,
-    full_len: usize,
-    output_positions: ArrayView1<'_, i64>,
-) -> Result<Vec<usize>, String> {
-    if output_positions.len() != full_len {
-        return Err(format!(
-            "{name} output positions must cover the complete physical layout"
-        ));
-    }
-    let mut local_positions = vec![usize::MAX; full_len];
-    for (local, &physical) in output_positions.iter().enumerate() {
-        let physical = usize::try_from(physical)
-            .map_err(|_| format!("{name} output position must be non-negative"))?;
-        if physical >= full_len {
-            return Err(format!("{name} output position is out of bounds"));
-        }
-        if local_positions[physical] != usize::MAX {
-            return Err(format!("{name} output positions contain duplicates"));
-        }
-        local_positions[physical] = local;
-    }
-    Ok(local_positions)
-}
 
 /// Execute one fused aggregation pass over a single predicate.
 ///
@@ -354,37 +296,22 @@ fn aggregate_single<'py, T: numpy::Element + PartialOrd + Copy>(
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
 
     if is_not_equal {
-        let left_map = physical_to_local_positions(
-            "left",
-            left_full_len,
-            left_output_positions.as_ref().unwrap().as_array(),
-        )
-        .map_err(PyValueError::new_err)?;
-        let right_map = physical_to_local_positions(
-            "right",
-            right_full_len,
-            right_output_positions.as_ref().unwrap().as_array(),
-        )
-        .map_err(PyValueError::new_err)?;
-        visit_not_equal_pairs_core(
+        aggregate_not_equal(
             left,
             left_full_len,
             left_positions.as_ref().unwrap().as_array(),
+            left_null_positions.as_ref().map(|values| values.as_array()),
             right,
             right_full_len,
             right_positions.as_ref().unwrap().as_array(),
-            left_null_positions.as_ref().map(|values| values.as_array()),
             right_null_positions
                 .as_ref()
                 .map(|values| values.as_array()),
             is_extension_array,
-            |left_position, right_position| {
-                if reverse {
-                    set.update(left_map[left_position], right_map[right_position]);
-                } else {
-                    set.update(right_map[right_position], left_map[left_position]);
-                }
-            },
+            &[],
+            None,
+            &mut set,
+            reverse,
         )
         .map_err(PyValueError::new_err)?;
     } else {
@@ -680,89 +607,6 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Visit null-aware `!=` candidates for an extended join.
-///
-/// [`visit_not_equal_pairs_core`] generates the strict less-than and
-/// greater-than candidates from the first `!=` predicate and adds null
-/// candidates according to the NumPy or pandas extension-array contract.
-/// Each candidate is passed through the residual predicates before it updates
-/// the aggregation state.
-///
-/// The filtered value arrays contain only non-null values. `left_positions`
-/// and `right_positions` map those values to the complete physical domains;
-/// the optional null-position arrays complete those domains when nulls exist.
-/// Separate output-position arrays describe the compact aggregation layouts.
-/// Consequently, `left_full_len` and `right_full_len` describe the original
-/// physical layouts, while `AggregationSet` uses compact layout lengths.
-///
-/// # Arguments
-///
-/// * `left` / `right` - Filtered, non-null first-predicate values.
-/// * `left_full_len` / `right_full_len` - Full physical lengths used for
-///   aggregation output and residual indexing.
-/// * `left_positions` / `right_positions` - Physical positions of the
-///   filtered values in the original layouts.
-/// * `left_null_positions` / `right_null_positions` - Optional physical
-///   positions of null rows.
-/// * `left_output_positions` / `right_output_positions` - Complete physical
-///   positions in the compact source/output layouts.
-/// * `is_extension_array` - Selects pandas nullable versus NumPy null
-///   comparison behavior.
-/// * `residuals` - Parsed predicates after the first `!=` predicate.
-/// * `residual_metadata` - Optional null metadata for residual predicates.
-/// * `set` - Aggregation state updated for each surviving pair.
-/// * `reverse` - Selects forward or reverse source/output slot mapping.
-///
-/// # Errors
-///
-/// Returns a string error when the physical position partitions are malformed.
-#[allow(clippy::too_many_arguments)]
-fn aggregate_not_equal<T: PartialOrd + Copy>(
-    left: ArrayView1<'_, T>,
-    left_full_len: usize,
-    left_positions: ArrayView1<'_, i64>,
-    left_null_positions: Option<ArrayView1<'_, i64>>,
-    right: ArrayView1<'_, T>,
-    right_full_len: usize,
-    right_positions: ArrayView1<'_, i64>,
-    right_null_positions: Option<ArrayView1<'_, i64>>,
-    left_output_positions: ArrayView1<'_, i64>,
-    right_output_positions: ArrayView1<'_, i64>,
-    is_extension_array: bool,
-    residuals: &[PredicateView<'_>],
-    residual_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
-    set: &mut AggregationSet<'_>,
-    reverse: bool,
-) -> Result<(), String> {
-    let left_map = physical_to_local_positions("left", left_full_len, left_output_positions)?;
-    let right_map = physical_to_local_positions("right", right_full_len, right_output_positions)?;
-    visit_not_equal_pairs_core(
-        left,
-        left_full_len,
-        left_positions,
-        right,
-        right_full_len,
-        right_positions,
-        left_null_positions,
-        right_null_positions,
-        is_extension_array,
-        |left_position, right_position| {
-            if predicates_match_dispatch(
-                residuals,
-                residual_metadata,
-                left_position,
-                right_position,
-            ) {
-                if reverse {
-                    set.update(left_map[left_position], right_map[right_position]);
-                } else {
-                    set.update(right_map[right_position], left_map[left_position]);
-                }
-            }
-        },
-    )
-}
-
 /// Run aggregation for one range anchor followed by residual predicates.
 ///
 /// Predicate one creates the binary-search window. Predicate two may be
@@ -838,129 +682,15 @@ fn run_range<'py, T: numpy::Element + PartialOrd + Copy>(
         },
         return_matched,
         reverse,
+        false,
     )
-}
-
-/// Run fused aggregation for an all-`!=` extended join.
-///
-/// The first tuple uses the thirteen-element null-aware aggregation contract.
-/// The eleven-element form belongs to index generation and is rejected here:
-/// it does not contain the output-layout positions required by aggregation.
-/// The thirteen-element form contains filtered value arrays and physical
-/// position partitions for candidate generation, followed by complete
-/// physical-to-compact output layouts. Every later tuple is a residual
-/// predicate over the full physical layouts. No pair tape is materialized;
-/// successful candidates update the aggregation state immediately.
-///
-/// # Arguments
-///
-/// * `py` - Active Python interpreter token.
-/// * `predicates` - First null-aware `!=` tuple followed by residual tuples.
-/// * `left` / `right` - Filtered, non-null values from the first `!=`
-///   predicate. Their order and their position maps must agree.
-/// * `left_index` / `right_index` - Complete physical index-label arrays;
-///   their lengths define the physical domains used by residual predicates.
-/// * `left_positions` / `right_positions` - Physical maps for filtered
-///   non-null first-predicate values.
-/// * `left_null_positions` / `right_null_positions` - Optional physical null
-///   partitions.
-/// * `is_extension_array` - Selects pandas extension-array null semantics.
-/// * `aggregations` - Full-layout aggregation requests.
-/// * `return_matched` - Include the per-output matched array when true.
-/// * `reverse` - Selects right-oriented output and left-side source values.
-///
-/// # Returns
-///
-/// Returns `None` when no pair survives every predicate; otherwise returns
-/// `(output_positions, matched, aggregation_arrays)` when `return_matched` is
-/// true, or `(output_positions, aggregation_arrays)` when it is false.
-#[allow(clippy::too_many_arguments)]
-fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
-    py: Python<'py>,
-    predicates: &Bound<'py, PyList>,
-    left: PyReadonlyArray1<'py, T>,
-    left_index: PyReadonlyArray1<'py, i64>,
-    left_positions: PyReadonlyArray1<'py, i64>,
-    left_null_positions: Option<PyReadonlyArray1<'py, i64>>,
-    right: PyReadonlyArray1<'py, T>,
-    right_index: PyReadonlyArray1<'py, i64>,
-    right_positions: PyReadonlyArray1<'py, i64>,
-    right_null_positions: Option<PyReadonlyArray1<'py, i64>>,
-    left_output_positions: PyReadonlyArray1<'py, i64>,
-    right_output_positions: PyReadonlyArray1<'py, i64>,
-    is_extension_array: bool,
-    aggregations: &Bound<'py, PyList>,
-    return_matched: bool,
-    reverse: bool,
-) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    let (parsed, metadata) = residuals(py, predicates, true, false)?;
-    check_predicate_lengths(&parsed, left_index.len()?, right_index.len()?)?;
-    let inputs = parse_inputs(aggregations)?;
-    if inputs.is_empty() {
-        return Err(PyValueError::new_err(
-            "at least one aggregation is required",
-        ));
-    }
-    let left_full_len = left_index.len()?;
-    let right_full_len = right_index.len()?;
-    let output_len = if reverse {
-        right_output_positions.len()?
-    } else {
-        left_output_positions.len()?
-    };
-    let source_len = if reverse {
-        left_output_positions.len()?
-    } else {
-        right_output_positions.len()?
-    };
-    let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
-    let views: Vec<_> = parsed.iter().map(|predicate| predicate.view()).collect();
-    let metadata_views = metadata.as_deref().map(null_metadata_views);
-    aggregate_not_equal(
-        left.as_array(),
-        left_full_len,
-        left_positions.as_array(),
-        left_null_positions.as_ref().map(|values| values.as_array()),
-        right.as_array(),
-        right_full_len,
-        right_positions.as_array(),
-        right_null_positions
-            .as_ref()
-            .map(|values| values.as_array()),
-        left_output_positions.as_array(),
-        right_output_positions.as_array(),
-        is_extension_array,
-        &views,
-        metadata_views.as_deref(),
-        &mut set,
-        reverse,
-    )
-    .map_err(PyValueError::new_err)?;
-    if set.is_empty() {
-        return Ok(None);
-    }
-    // The accumulator is stored in the trimmed layout described by the
-    // selected output map. Returning `None` here would make the Python side
-    // fabricate an identity map and silently mislabel reordered `!=` results.
-    let output_positions = if reverse {
-        right_output_positions.as_array()
-    } else {
-        left_output_positions.as_array()
-    };
-    Ok(Some(make_results_with_positions(
-        py,
-        set,
-        Some(output_positions),
-        output_len,
-        return_matched,
-    )?))
 }
 
 /// Validate the first extended predicate and dispatch to its fused traversal.
 ///
 /// The first tuple is the algorithm anchor. A six- or eight-element tuple is a
-/// range anchor; a thirteen-element tuple is the null-aware all-`!=`
-/// aggregation anchor with output-layout positions. The eleven-element
+/// range anchor; a ten-element tuple is the null-aware all-`!=`
+/// aggregation anchor. The eleven-element
 /// all-`!=` tuple belongs to index generation and is rejected here. The tuple
 /// shape is deliberately checked before any aggregation state or candidate
 /// loop is created.
@@ -982,15 +712,14 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
 ///  right_index_is_ordered, left_output_positions,
 ///  right_output_positions, comparator)
 ///
-/// 13 fields for `!=` aggregation:
+/// 10 fields for `!=` aggregation:
 /// (left_values, left_index, left_positions, left_null_positions,
 ///  right_values, right_index, right_positions, right_null_positions,
-///  right_index_is_ordered, is_extension_array,
-///  left_output_positions, right_output_positions, comparator)
+///  is_extension_array, comparator)
 /// ```
 ///
 /// In the six/eight-field forms, the first range predicate creates a window
-/// and later predicates are residual filters. In the thirteen-field form,
+/// and later predicates are residual filters. In the ten-field form,
 /// the first predicate creates the null-aware `!=` candidate stream and every
 /// later predicate must also be `!=`.
 ///
@@ -1009,105 +738,6 @@ fn run_not_equal<'py, T: numpy::Element + PartialOrd + Copy>(
 /// Returns `(output_positions, matched, aggregation_arrays)` when
 /// `return_matched` is true, or `(output_positions, aggregation_arrays)` when
 /// it is false. Returns `None` when no candidate survives.
-/// Named representation of the thirteen-field null-aware `!=` aggregation
-/// anchor.
-///
-/// This intentionally does not reuse [`ParsedAggregationRangeAnchor`]. A
-/// range anchor has two value arrays and one comparator. The `!=` anchor has a
-/// different physical contract: its value arrays have already had nulls
-/// removed, its position arrays map those filtered values back to the full
-/// source layout, its optional null-position arrays describe the excluded
-/// rows, and its output maps describe a compact/reordered result layout.
-/// Combining both contracts into one struct would turn these required fields
-/// into a collection of unrelated `Option`s and make it easier to use a
-/// filtered position as though it were a source position.
-///
-/// The tuple layout is parsed once at the Python/Rust boundary; traversal
-/// functions below consume these named fields directly. Keeping the parser
-/// separate still gives both families the same important property: tuple
-/// positions are confined to one boundary function rather than scattered
-/// through the hot loop.
-struct ParsedNotEqualAggregationAnchor<'py, T: numpy::Element> {
-    left: PyReadonlyArray1<'py, T>,
-    left_index: PyReadonlyArray1<'py, i64>,
-    left_positions: PyReadonlyArray1<'py, i64>,
-    left_null_positions: Option<PyReadonlyArray1<'py, i64>>,
-    right: PyReadonlyArray1<'py, T>,
-    right_index: PyReadonlyArray1<'py, i64>,
-    right_positions: PyReadonlyArray1<'py, i64>,
-    right_null_positions: Option<PyReadonlyArray1<'py, i64>>,
-    left_output_positions: PyReadonlyArray1<'py, i64>,
-    right_output_positions: PyReadonlyArray1<'py, i64>,
-    is_extension_array: bool,
-}
-
-/// Parse the thirteen-field null-aware `!=` aggregation anchor once.
-///
-/// The parser validates the operator and boolean metadata before borrowing
-/// the arrays. The value arrays are filtered non-null arrays, so their
-/// physical position arrays and optional null-position arrays are part of the
-/// contract; treating a filtered offset as a full-frame position would write
-/// aggregation results into the wrong source row.
-///
-/// # Arguments
-///
-/// * `first` - The thirteen-field first predicate tuple.
-///
-/// # Errors
-///
-/// Returns `ValueError` when the tuple length, operator, boolean metadata, or
-/// any typed array field does not match the `!=` aggregation contract.
-fn parse_not_equal_aggregation_anchor<'py, T: numpy::Element>(
-    first: &Bound<'py, PyTuple>,
-) -> PyResult<ParsedNotEqualAggregationAnchor<'py, T>> {
-    if first.len() != 13 {
-        return Err(PyValueError::new_err(
-            "the first extended aggregation predicate must contain 13 elements",
-        ));
-    }
-    let op = CompareOp::try_from_str(first.get_item(12)?.extract::<&str>()?)?;
-    if op != CompareOp::Ne {
-        return Err(PyValueError::new_err(
-            "the thirteen-element aggregation predicate must use !=",
-        ));
-    }
-    // `None` means the caller has no null partition. An empty NumPy array is
-    // different but has the same zero-row contribution; preserve both forms
-    // because the caller's metadata shape is meaningful.
-    let left_null_positions = if first.get_item(3)?.is_none() {
-        None
-    } else {
-        Some(first.get_item(3)?.extract::<PyReadonlyArray1<'py, i64>>()?)
-    };
-    let right_null_positions = if first.get_item(7)?.is_none() {
-        None
-    } else {
-        Some(first.get_item(7)?.extract::<PyReadonlyArray1<'py, i64>>()?)
-    };
-    // Field 8 is retained for tuple compatibility and validated even though
-    // aggregation consumes every passing candidate and does not use ordering
-    // to select first/last rows.
-    first.get_item(8)?.extract::<bool>()?;
-    let is_extension_array = first.get_item(9)?.extract::<bool>()?;
-    Ok(ParsedNotEqualAggregationAnchor {
-        left: first.get_item(0)?.extract::<PyReadonlyArray1<'py, T>>()?,
-        left_index: first.get_item(1)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        left_positions: first.get_item(2)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        left_null_positions,
-        right: first.get_item(4)?.extract::<PyReadonlyArray1<'py, T>>()?,
-        right_index: first.get_item(5)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        right_positions: first.get_item(6)?.extract::<PyReadonlyArray1<'py, i64>>()?,
-        right_null_positions,
-        left_output_positions: first
-            .get_item(10)?
-            .extract::<PyReadonlyArray1<'py, i64>>()?,
-        right_output_positions: first
-            .get_item(11)?
-            .extract::<PyReadonlyArray1<'py, i64>>()?,
-        is_extension_array,
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
     py: Python<'py>,
@@ -1129,25 +759,14 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
             "single extended aggregation requires at least one predicate",
         ));
     }
-    if first.len() == 13 {
-        // The thirteen-field shape is a distinct null-aware `!=` protocol.
+    if first.len() == 10 {
+        // The ten-field shape is a distinct null-aware `!=` protocol.
         // Dispatch it before range-shape validation so its specialized maps
         // and null partitions cannot be mistaken for range output metadata.
-        let anchor = parse_not_equal_aggregation_anchor::<T>(first)?;
-        return run_not_equal(
+        return crate::not_equals_only::dispatch_not_equal_aggregation::<T>(
             py,
             predicates,
-            anchor.left,
-            anchor.left_index,
-            anchor.left_positions,
-            anchor.left_null_positions,
-            anchor.right,
-            anchor.right_index,
-            anchor.right_positions,
-            anchor.right_null_positions,
-            anchor.left_output_positions,
-            anchor.right_output_positions,
-            anchor.is_extension_array,
+            first,
             aggregations,
             return_matched,
             reverse,
@@ -1161,7 +780,7 @@ fn dispatch<'py, T: numpy::Element + PartialOrd + Copy>(
     // malformed extended aggregation request.
     if !matches!(first.len(), 6 | 8) {
         return Err(PyValueError::new_err(
-            "the first extended aggregation predicate must contain 6, 8, or 13 elements",
+            "the first extended aggregation predicate must contain 6, 8, or 10 elements",
         ));
     }
 
@@ -1248,7 +867,7 @@ macro_rules! extended_aggregation_functions {
         /// predicates.
         ///
         /// The first predicate must be either a range comparator (`<`, `<=`,
-        /// `>`, `>=`) or the null-aware thirteen-element `!=` aggregation
+        /// `>`, `>=`) or the null-aware twelve-element `!=` aggregation
         /// form. The eleven-element form belongs to index generation.
         /// Remaining predicates are aligned residual filters. Aggregation is
         /// performed as candidates pass the first predicate and all residual
@@ -1310,7 +929,7 @@ macro_rules! extended_aggregation_functions {
         ///
         /// * `py` - Active Python interpreter token.
         /// * `predicates` - Python list of aligned anchor and residual tuples;
-        ///   it has the same six/eight/thirteen-element anchor contract as the
+        ///   it has the same six/eight/twelve-element anchor contract as the
         ///   forward function.
         /// * `aggregations` - Non-empty aggregation requests over the complete
         ///   left-side physical layout.
@@ -1588,10 +1207,7 @@ mod extended_tests {
                     PyArray1::from_vec(py, vec![20_i64, 21]).into_any(),
                     PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
                     py.None().into_pyobject(py)?.into_any(),
-                    true.into_pyobject(py)?.to_owned().into_any(),
                     false.into_pyobject(py)?.to_owned().into_any(),
-                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
-                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
                     "!=".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
@@ -1630,7 +1246,7 @@ mod extended_tests {
     }
 
     #[test]
-    fn not_equal_aggregation_maps_reordered_physical_positions_to_compact_slots() {
+    fn not_equal_aggregation_uses_full_physical_positions() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
             let predicates = PyList::empty(py);
@@ -1646,9 +1262,6 @@ mod extended_tests {
                     PyArray1::from_vec(py, vec![1_i64, 0]).into_any(),
                     py.None().into_pyobject(py)?.into_any(),
                     false.into_pyobject(py)?.to_owned().into_any(),
-                    false.into_pyobject(py)?.to_owned().into_any(),
-                    PyArray1::from_vec(py, vec![1_i64, 0]).into_any(),
-                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
                     "!=".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
@@ -1674,14 +1287,14 @@ mod extended_tests {
             let result =
                 single_join_extended_aggregate_int64(py, &predicates, &aggregations, true)?
                     .expect("the reordered not-equal layout has matches");
-            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![1, 0]);
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0, 1]);
             assert_eq!(
                 result.get_item(1)?.extract::<Vec<bool>>()?,
                 vec![true, true]
             );
             let outputs_item = result.get_item(2)?;
             let outputs = outputs_item.cast::<PyList>()?;
-            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![100, 200]);
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![200, 100]);
             Ok(())
         })
         .unwrap();
@@ -1703,10 +1316,7 @@ mod extended_tests {
                     PyArray1::from_vec(py, vec![20_i64]).into_any(),
                     PyArray1::from_vec(py, vec![0_i64]).into_any(),
                     py.None().into_pyobject(py)?.into_any(),
-                    true.into_pyobject(py)?.to_owned().into_any(),
                     false.into_pyobject(py)?.to_owned().into_any(),
-                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
-                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
                     "!=".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
@@ -1729,7 +1339,7 @@ mod extended_tests {
                 .expect_err("mixed operators after a != anchor must be rejected");
             assert_eq!(
                 error.to_string(),
-                "ValueError: all-!= joins require every predicate to use !="
+                "ValueError: not_equals aggregation requires every predicate to use !="
             );
 
             let error =
@@ -1742,7 +1352,7 @@ mod extended_tests {
                     .expect_err("reverse mixed operators after a != anchor must be rejected");
             assert_eq!(
                 error.to_string(),
-                "ValueError: all-!= joins require every predicate to use !="
+                "ValueError: not_equals aggregation requires every predicate to use !="
             );
 
             let legacy_predicate = PyTuple::new(
@@ -1756,7 +1366,7 @@ mod extended_tests {
                     PyArray1::from_vec(py, vec![20_i64]).into_any(),
                     PyArray1::from_vec(py, vec![0_i64]).into_any(),
                     py.None().into_pyobject(py)?.into_any(),
-                    true.into_pyobject(py)?.to_owned().into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
                     false.into_pyobject(py)?.to_owned().into_any(),
                     "!=".into_pyobject(py)?.into_any(),
                 ],
@@ -1784,7 +1394,7 @@ mod extended_tests {
             .expect_err("the index-only eleven-element tuple must be rejected");
             assert_eq!(
                 error.to_string(),
-                "ValueError: the first extended aggregation predicate must contain 6, 8, or 13 elements"
+                "ValueError: the first extended aggregation predicate must contain 6, 8, or 10 elements"
             );
             Ok(())
         })

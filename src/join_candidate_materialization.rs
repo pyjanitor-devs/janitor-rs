@@ -166,6 +166,7 @@ pub(crate) fn materialize_range_candidates(
 /// # Returns
 ///
 /// Flat materialized label pairs, or empty vectors when no candidate survives.
+#[allow(dead_code)]
 pub(crate) fn materialize_not_equal_candidates(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
