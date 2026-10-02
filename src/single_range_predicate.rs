@@ -49,7 +49,7 @@ use crate::join_candidate_materialization::materialize_range_candidates;
 use crate::join_common::{result_dict, Keep, SingleJoinResult};
 use crate::op::CompareOp;
 use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
-use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
+use crate::range_predicate::parse_full_layout_aggregation_anchor;
 
 fn prefix_extreme(values: &[i64], minimum: bool) -> Vec<i64> {
     // Prefix extrema are used only when the right physical positions are not
@@ -707,92 +707,6 @@ pub fn range_anchor_extended_aggregate_reverse<'py>(
     aggregate_range_anchor(py, predicates, aggregations, return_matched, true)
 }
 
-/// The full-layout metadata carried by the range-first aggregation anchor.
-///
-/// The value and position arrays remain compact because they are the layouts
-/// used by the binary search. The two lengths, however, describe the original
-/// left and right arrays used by Python to build aggregation inputs.
-struct FullLayoutRangeAnchor<'py> {
-    range: AnyParsedRangePredicate<'py>,
-    left_len: usize,
-    right_len: usize,
-}
-
-/// Parse the seven-field range-first aggregation ABI.
-///
-/// The tuple is:
-///
-/// ```text
-/// (left_values, left_positions, right_values, right_positions,
-///  left_full_len, right_full_len, operator)
-/// ```
-///
-/// `left_positions` and `right_positions` contain physical positions in the
-/// original Python arrays. They are deliberately not sorted or compacted.
-fn parse_full_layout_range_anchor<'py>(
-    tuple: &Bound<'py, PyTuple>,
-) -> PyResult<FullLayoutRangeAnchor<'py>> {
-    // Lengths describe the original source arrays, while the value/index
-    // arrays themselves describe the compact search layout. Keeping both in
-    // the ABI lets Rust use physical position maps without asking Python to
-    // reorder aggregation columns to match a sorted anchor.
-    if tuple.len() != 7 {
-        return Err(PyValueError::new_err(
-            "range-first aggregation anchor must contain 7 elements",
-        ));
-    }
-    let left_len = tuple.get_item(4)?.extract::<usize>()?;
-    let right_len = tuple.get_item(5)?.extract::<usize>()?;
-    let range = parse_any_range_parts(
-        &tuple.get_item(0)?,
-        &tuple.get_item(1)?,
-        &tuple.get_item(2)?,
-        &tuple.get_item(3)?,
-        &tuple.get_item(6)?,
-    )?;
-    range
-        .validate_range_operator()
-        .map_err(PyValueError::new_err)?;
-    range.validate_lengths().map_err(PyValueError::new_err)?;
-
-    macro_rules! validate_positions {
-        ($predicate:expr) => {{
-            let predicate = $predicate;
-            let invalid_left = predicate.left_index.as_array().iter().any(|&position| {
-                position < 0
-                    || usize::try_from(position).map_or(true, |position| position >= left_len)
-            });
-            let invalid_right = predicate.right_index.as_array().iter().any(|&position| {
-                position < 0
-                    || usize::try_from(position).map_or(true, |position| position >= right_len)
-            });
-            if invalid_left || invalid_right {
-                return Err(PyValueError::new_err(
-                    "range-first aggregation positions must address the full input arrays",
-                ));
-            }
-        }};
-    }
-    match &range {
-        AnyParsedRangePredicate::I64(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::I32(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::I16(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::I8(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::U64(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::U32(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::U16(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::U8(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::F64(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::F32(predicate) => validate_positions!(predicate),
-    }
-
-    Ok(FullLayoutRangeAnchor {
-        range,
-        left_len,
-        right_len,
-    })
-}
-
 fn aggregate_range_anchor<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
@@ -810,7 +724,7 @@ fn aggregate_range_anchor<'py>(
     }
     let first_item = predicates.get_item(0)?;
     let first = first_item.cast::<PyTuple>()?;
-    let anchor = parse_full_layout_range_anchor(first)?;
+    let anchor = parse_full_layout_aggregation_anchor(first)?;
     let (parsed, metadata) =
         crate::join_aggregation_helpers::residuals(py, predicates, false, false)?;
     let (starts, ends) = anchor.range.bounds().map_err(PyValueError::new_err)?;

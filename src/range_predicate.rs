@@ -115,6 +115,21 @@ pub(crate) struct ParsedAggregationRangeAnchor<'py> {
     pub(crate) right_output_positions: Option<PyReadonlyArray1<'py, i64>>,
 }
 
+/// A range-first aggregation anchor paired with the original source lengths.
+///
+/// The range value and position arrays describe the compact search layout.
+/// `left_len` and `right_len` describe the full Python source arrays used for
+/// aggregation inputs. The distinction lets the aggregation kernel translate
+/// sorted compact offsets back to physical source positions.
+pub(crate) struct ParsedFullLayoutAggregationAnchor<'py> {
+    /// Typed range data used to build the candidate windows.
+    pub(crate) range: AnyParsedRangePredicate<'py>,
+    /// Length of the original left source array.
+    pub(crate) left_len: usize,
+    /// Length of the original right source array.
+    pub(crate) right_len: usize,
+}
+
 /// Parse one aggregation range anchor without exposing tuple positions to a
 /// kernel.
 ///
@@ -220,6 +235,83 @@ pub(crate) fn parse_aggregation_range_anchor<'py>(
         ordered,
         left_output_positions,
         right_output_positions,
+    })
+}
+
+/// Parse the seven-field range-first aggregation ABI.
+///
+/// The tuple is:
+///
+/// ```text
+/// (left_values, left_positions, right_values, right_positions,
+///  left_full_len, right_full_len, operator)
+/// ```
+///
+/// The position arrays contain physical positions in the original Python
+/// arrays. They are deliberately not sorted or compacted.
+///
+/// # Errors
+///
+/// Returns `ValueError` for malformed tuple lengths, invalid full lengths,
+/// unsupported operators, value/index length mismatches, or physical
+/// positions outside the full source arrays.
+pub(crate) fn parse_full_layout_aggregation_anchor<'py>(
+    tuple: &Bound<'py, PyTuple>,
+) -> PyResult<ParsedFullLayoutAggregationAnchor<'py>> {
+    if tuple.len() != 7 {
+        return Err(PyValueError::new_err(
+            "range-first aggregation anchor must contain 7 elements",
+        ));
+    }
+    let left_len = tuple.get_item(4)?.extract::<usize>()?;
+    let right_len = tuple.get_item(5)?.extract::<usize>()?;
+    let range = parse_any_range_parts(
+        &tuple.get_item(0)?,
+        &tuple.get_item(1)?,
+        &tuple.get_item(2)?,
+        &tuple.get_item(3)?,
+        &tuple.get_item(6)?,
+    )?;
+    range
+        .validate_range_operator()
+        .map_err(PyValueError::new_err)?;
+    range.validate_lengths().map_err(PyValueError::new_err)?;
+
+    macro_rules! validate_positions {
+        ($predicate:expr) => {{
+            let predicate = $predicate;
+            let invalid_left = predicate.left_index.as_array().iter().any(|&position| {
+                position < 0
+                    || usize::try_from(position).map_or(true, |position| position >= left_len)
+            });
+            let invalid_right = predicate.right_index.as_array().iter().any(|&position| {
+                position < 0
+                    || usize::try_from(position).map_or(true, |position| position >= right_len)
+            });
+            if invalid_left || invalid_right {
+                return Err(PyValueError::new_err(
+                    "range-first aggregation positions must address the full input arrays",
+                ));
+            }
+        }};
+    }
+    match &range {
+        AnyParsedRangePredicate::I64(predicate) => validate_positions!(predicate),
+        AnyParsedRangePredicate::I32(predicate) => validate_positions!(predicate),
+        AnyParsedRangePredicate::I16(predicate) => validate_positions!(predicate),
+        AnyParsedRangePredicate::I8(predicate) => validate_positions!(predicate),
+        AnyParsedRangePredicate::U64(predicate) => validate_positions!(predicate),
+        AnyParsedRangePredicate::U32(predicate) => validate_positions!(predicate),
+        AnyParsedRangePredicate::U16(predicate) => validate_positions!(predicate),
+        AnyParsedRangePredicate::U8(predicate) => validate_positions!(predicate),
+        AnyParsedRangePredicate::F64(predicate) => validate_positions!(predicate),
+        AnyParsedRangePredicate::F32(predicate) => validate_positions!(predicate),
+    }
+
+    Ok(ParsedFullLayoutAggregationAnchor {
+        range,
+        left_len,
+        right_len,
     })
 }
 
