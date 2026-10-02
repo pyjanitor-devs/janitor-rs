@@ -1,10 +1,40 @@
-//! Rust boundary for one non-equality range predicate.
+//! Rust boundary for single range predicates and range-first residual joins.
 //!
-//! PyJanitor supplies non-null arrays. The right values are already sorted,
-//! and `right_index` is the companion physical-position array for that sorted
-//! layout. Index positions are unique by contract, but are not necessarily
-//! ordered; `right_index_is_ordered` therefore controls only `first`/`last`
-//! selection.
+//! PyJanitor owns pandas preparation: null removal, right-anchor sorting, and
+//! construction of physical position maps. This module owns the public PyO3
+//! boundary, binary-search windows, `keep` materialization, residual dispatch,
+//! and range-first aggregation.
+//!
+//! A position array always contains a physical row position in the original
+//! Python array. It is not a sorted offset and is never compacted. The value
+//! arrays may be compact and the right values may be sorted, so every sorted
+//! right slot must be translated through `right_index` before it is returned
+//! or used to index a full-layout aggregation array.
+//!
+//! The ordinary single-range ABI is:
+//!
+//! ```text
+//! (left_index, left_values, right_index, right_values,
+//!  right_index_is_ordered, operator, keep, return_building_blocks)
+//! ```
+//!
+//! The range-first index ABI is a list whose first tuple is:
+//!
+//! ```text
+//! (left_values, left_positions, right_values, right_positions, operator)
+//! ```
+//!
+//! Range-first aggregation extends that first tuple with the full source
+//! lengths and uses the complete source aggregation arrays:
+//!
+//! ```text
+//! (left_values, left_positions, right_values, right_positions,
+//!  left_full_len, right_full_len, operator)
+//! ```
+//!
+//! Later tuples are residual predicates. They are evaluated using compact
+//! offsets, then successful candidates are translated through the anchor
+//! position maps before updating full-layout aggregation state.
 
 use numpy::ndarray::ArrayView1;
 use numpy::{Element, PyReadonlyArray1};
@@ -22,6 +52,9 @@ use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_stri
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
 fn prefix_extreme(values: &[i64], minimum: bool) -> Vec<i64> {
+    // Prefix extrema are used only when the right physical positions are not
+    // ordered. `first` and `last` refer to physical output order, not to the
+    // order in which sorted right values happen to be searched.
     let initial = if minimum { i64::MAX } else { i64::MIN };
     values
         .iter()
@@ -38,6 +71,9 @@ fn prefix_extreme(values: &[i64], minimum: bool) -> Vec<i64> {
 }
 
 fn suffix_extreme(values: &[i64], minimum: bool) -> Vec<i64> {
+    // The suffix table is the reverse-direction counterpart of
+    // `prefix_extreme`; it lets each binary-search window select its physical
+    // minimum or maximum without rescanning the window.
     let mut result = vec![0_i64; values.len()];
     let initial = if minimum { i64::MAX } else { i64::MIN };
     let mut current = initial;
@@ -53,6 +89,26 @@ fn suffix_extreme(values: &[i64], minimum: bool) -> Vec<i64> {
 }
 
 /// Materialize one range predicate from already-built candidate windows.
+///
+/// `starts` and `ends` are offsets into the sorted right-value layout. The
+/// returned right positions are always values from `right_index`, never those
+/// offsets. When `right_index_is_ordered` is false, `first` and `last` use
+/// prefix/suffix extrema over physical positions; `any` may select the first
+/// binary-search hit because it has no ordering guarantee.
+///
+/// # Arguments
+///
+/// * `left_index` - Physical left positions, one per left search value.
+/// * `right_index` - Physical right positions in sorted right-value order.
+/// * `starts` / `ends` - Half-open right-window boundaries per left value.
+/// * `op` - Range operator that produced the windows.
+/// * `right_index_is_ordered` - Whether physical right positions are ordered.
+/// * `keep` - Output selection policy.
+///
+/// # Returns
+///
+/// Physical left/right position pairs, or an empty pair when no window has a
+/// candidate.
 fn materialize(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
@@ -130,6 +186,10 @@ fn run_single_range<'py, T: PartialOrd + Copy + Element>(
     keep: &str,
     return_building_blocks: bool,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    // This function is the typed implementation behind every public
+    // dtype-specialised single-range index function. It validates the
+    // operator, constructs binary-search windows, and only then either
+    // exposes those windows or applies `keep`.
     let op = CompareOp::try_from_str(operator)?;
     if !matches!(
         op,
@@ -183,6 +243,12 @@ fn run_single_range<'py, T: PartialOrd + Copy + Element>(
 
 macro_rules! registered_single_range {
     ($name:ident, $type:ty) => {
+        /// Dtype-specialised Python entry point for one range predicate.
+        ///
+        /// The Python caller supplies value arrays and physical position
+        /// arrays. The right values must already be sorted in ascending order;
+        /// `right_index_is_ordered` describes only the physical position order
+        /// used by `first` and `last`.
         #[pyfunction]
         #[allow(clippy::too_many_arguments)]
         pub fn $name<'py>(
@@ -224,12 +290,21 @@ registered_single_range!(single_range_predicate_indices_f32, f32);
 
 /// Aggregate a single range predicate using layout-aligned source arrays.
 ///
-/// `left` and `right` are the same layouts used for the predicate search:
-/// `right` is sorted, and both index arrays contain the physical positions for
-/// their corresponding layouts. Aggregation requests are already realigned by
-/// PyJanitor to those layouts, so their lengths are derived from the index
-/// arrays. This lets the existing prefix/suffix aggregation implementations
-/// operate without per-match physical-position updates.
+/// Unlike the range-first extended aggregation path below, this function
+/// receives aggregation arrays already aligned to the compact predicate
+/// layouts. That alignment permits the specialised starts/ends aggregation
+/// implementations to index directly without a physical-position map.
+///
+/// # Arguments
+///
+/// * `left_index` / `right_index` - Physical positions paired with the
+///   prepared left/right value layouts.
+/// * `left` / `right` - Non-null values; `right` is sorted for binary search.
+/// * `operator` - One of `<`, `<=`, `>`, or `>=`.
+/// * `aggregations` - Rust aggregation requests prepared by Python.
+/// * `return_matched` - Include one match flag per output slot.
+/// * `reverse` - Aggregate left source values into right output slots.
+///
 #[allow(clippy::too_many_arguments)]
 fn aggregate_single_range<'py, T: PartialOrd + Copy + Element>(
     py: Python<'py>,
@@ -324,6 +399,7 @@ fn aggregate_single_range<'py, T: PartialOrd + Copy + Element>(
 
 macro_rules! registered_single_range_aggregation {
     ($forward:ident, $reverse:ident, $type:ty) => {
+        /// Forward single-range aggregation entry point for one numeric dtype.
         #[pyfunction]
         #[allow(clippy::too_many_arguments)]
         pub fn $forward<'py>(
@@ -349,6 +425,7 @@ macro_rules! registered_single_range_aggregation {
             )
         }
 
+        /// Reverse single-range aggregation entry point for one numeric dtype.
         #[pyfunction]
         #[allow(clippy::too_many_arguments)]
         pub fn $reverse<'py>(
@@ -427,13 +504,23 @@ registered_single_range_aggregation!(
     f32
 );
 
-/// Build dense half-open candidate windows for each left value.
+/// Materialize a range-first candidate stream after residual predicates.
 ///
-/// Both the normal single-range path and the extended residual path use this
-/// traversal. The extended path additionally compacts non-empty windows into
-/// a `SingleJoinResult` while preserving the corresponding left positions.
-/// Materialize a range-first candidate stream after all residual predicates
-/// have been evaluated.
+/// The first range predicate builds one half-open window per compact left
+/// value. Later predicates are parsed as residuals and evaluated for every
+/// candidate in that window before `keep` is applied. This ordering is
+/// essential: `first` and `last` describe the first/last surviving candidate,
+/// not merely the first/last candidate from the anchor window.
+///
+/// # Arguments
+///
+/// * `predicates` - At least two tuples: a five-field range anchor followed by
+///   residual comparison tuples.
+/// * `keep` - Final selection policy after residual filtering.
+/// * `left_index` / `right_index` - Physical position arrays for the compact
+///   anchor layouts.
+/// * `left` / `right` - Typed anchor values; right values are sorted.
+/// * `operator` - Parsed range operator for the first predicate.
 #[allow(clippy::too_many_arguments)]
 fn materialize_range_first_indices<'py, T: Element + PartialOrd + Copy>(
     py: Python<'py>,
@@ -502,6 +589,12 @@ fn materialize_range_first_indices<'py, T: Element + PartialOrd + Copy>(
 
 macro_rules! registered_range_first_extended_indices {
     ($name:ident, $type:ty, $export:literal) => {
+        /// Dtype-specialised Python entry point for a range anchor followed
+        /// by one or more residual predicates.
+        ///
+        /// The first tuple must be the five-field range anchor; all later
+        /// tuples are evaluated against the anchor's compact layouts. The
+        /// `keep` policy is applied only after residual filtering.
         #[pyfunction(name = $export)]
         #[allow(clippy::too_many_arguments)]
         pub fn $name<'py>(
@@ -590,6 +683,8 @@ registered_range_first_extended_indices!(
     "range_anchor_extended_indices_f32"
 );
 
+/// Forward range-first aggregation: right source values are aggregated into
+/// one output slot per full-layout left row.
 #[pyfunction]
 pub fn range_anchor_extended_aggregate<'py>(
     py: Python<'py>,
@@ -600,6 +695,8 @@ pub fn range_anchor_extended_aggregate<'py>(
     aggregate_range_anchor(py, predicates, aggregations, return_matched, false)
 }
 
+/// Reverse range-first aggregation: left source values are aggregated into
+/// one output slot per full-layout right row.
 #[pyfunction]
 pub fn range_anchor_extended_aggregate_reverse<'py>(
     py: Python<'py>,
@@ -635,6 +732,10 @@ struct FullLayoutRangeAnchor<'py> {
 fn parse_full_layout_range_anchor<'py>(
     tuple: &Bound<'py, PyTuple>,
 ) -> PyResult<FullLayoutRangeAnchor<'py>> {
+    // Lengths describe the original source arrays, while the value/index
+    // arrays themselves describe the compact search layout. Keeping both in
+    // the ABI lets Rust use physical position maps without asking Python to
+    // reorder aggregation columns to match a sorted anchor.
     if tuple.len() != 7 {
         return Err(PyValueError::new_err(
             "range-first aggregation anchor must contain 7 elements",
@@ -699,6 +800,9 @@ fn aggregate_range_anchor<'py>(
     return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    // The first tuple is parsed separately from residuals because it both
+    // defines the binary-search windows and carries the full source lengths.
+    // Residuals continue to use their ordinary compact predicate ABI.
     if predicates.len() < 2 {
         return Err(PyValueError::new_err(
             "range-first extended aggregation requires at least two predicates",
@@ -739,6 +843,9 @@ fn aggregate_range_anchor<'py>(
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Keep all single-range exports together. Python dispatch tables import
+    // these names directly, so changing a registration name is an ABI change
+    // even when the underlying Rust implementation is unchanged.
     m.add_function(wrap_pyfunction!(single_range_predicate_indices_int64, m)?)?;
     m.add_function(wrap_pyfunction!(single_range_predicate_indices_int32, m)?)?;
     m.add_function(wrap_pyfunction!(single_range_predicate_indices_int16, m)?)?;

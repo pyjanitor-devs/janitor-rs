@@ -28,6 +28,9 @@ pub(crate) fn aggregation_windows(
     range: &AnyParsedRangePredicate<'_>,
     include_right_index: bool,
 ) -> Result<SingleJoinResult, String> {
+    // Keep empty windows in the dense representation. The range-first index
+    // path later compacts them, while aggregation needs the left-side slot
+    // relationship to remain explicit for matched-mask construction.
     macro_rules! build {
         ($predicate:expr) => {{
             let predicate = $predicate;
@@ -143,10 +146,8 @@ pub(crate) fn residuals<'py>(
 ///
 /// # Arguments
 ///
-/// * `left` - Non-null left values for the first range predicate, in physical
-///   left-row order.
-/// * `right` - Sorted, non-null right values for the first range predicate.
-/// * `op` - The first predicate's range operator: `<`, `<=`, `>`, or `>=`.
+/// * `windows` - Candidate windows produced by the range anchor. Their
+///   `starts`/`ends` offsets address the sorted right layout.
 /// * `residuals` - Parsed predicates after the first predicate. Their arrays
 ///   must be aligned to the same physical left and right positions.
 /// * `residual_metadata` - Optional authoritative null metadata for residual
@@ -156,12 +157,13 @@ pub(crate) fn residuals<'py>(
 ///   are indexed by the right side.
 /// * `physical_position_maps` - Translate compact candidate offsets through
 ///   the anchor's physical position arrays before updating aggregation state.
+///   This is true only when Python passed full-layout aggregation arrays.
 ///
 /// # Example
 ///
-/// With `right = [2, 5, 8]`, `left = [4]`, and `left < right`, the first
-/// predicate produces the candidate window `right[1..] = [5, 8]`. A residual
-/// predicate can remove either candidate before `set.update` is called.
+/// With sorted `right = [2, 5, 8]`, `left = [4]`, and `left < right`, the
+/// anchor produces `right[1..] = [5, 8]`. A residual predicate can remove
+/// either candidate before `set.update` is called.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_range(
     windows: &SingleJoinResult,
