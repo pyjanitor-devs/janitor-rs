@@ -1946,7 +1946,7 @@ mod aggregation_tests {
             // field four is the ordering bool, while fields five and six are
             // the output-position maps. Reading the old offsets would try to
             // extract this bool as an integer array.
-            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0]);
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![100]);
             assert_eq!(result.get_item(1)?.extract::<Vec<bool>>()?, vec![true]);
             let outputs_item = result.get_item(2)?;
             let outputs = outputs_item.cast::<PyList>()?;
@@ -2061,7 +2061,10 @@ mod aggregation_tests {
             // Reverse aggregation creates one output slot per right row. The
             // left value contributes to the two right positions in the
             // intersected window, not to the source-left slot itself.
-            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0, 1, 2, 3]);
+            assert_eq!(
+                result.get_item(0)?.extract::<Vec<i64>>()?,
+                vec![40, 10, 30, 20]
+            );
             assert_eq!(
                 result.get_item(1)?.extract::<Vec<bool>>()?,
                 vec![false, false, true, true]
@@ -2167,7 +2170,7 @@ mod aggregation_tests {
 
             let result = call_range_join_aggregate(py, &predicates, &aggregations, true)?
                 .expect("the exact range aggregation has matches");
-            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0, 1]);
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![100, 101]);
             assert_eq!(
                 result.get_item(1)?.extract::<Vec<bool>>()?,
                 vec![true, true]
@@ -2244,7 +2247,10 @@ mod aggregation_tests {
                 call_range_join_aggregate_reverse(py, &predicates, &reverse_aggregations, false)?
                     .expect("the reverse range aggregation has matches");
             assert_eq!(result.len(), 2);
-            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0, 1, 2, 3]);
+            assert_eq!(
+                result.get_item(0)?.extract::<Vec<i64>>()?,
+                vec![40, 10, 30, 20]
+            );
             let outputs_item = result.get_item(1)?;
             let outputs = outputs_item.cast::<PyList>()?;
             assert_eq!(
@@ -2347,7 +2353,7 @@ mod aggregation_tests {
             let result = call_range_join_extended_aggregate(py, &predicates, &aggregations, false)?
                 .expect("the residual leaves one left row with matches");
             assert_eq!(result.len(), 2);
-            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0, 1]);
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![100, 101]);
             let outputs_item = result.get_item(1)?;
             let outputs = outputs_item.cast::<PyList>()?;
             assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![70, 0]);
@@ -2391,7 +2397,10 @@ mod aggregation_tests {
                 true,
             )?
             .expect("the residual leaves reverse matches");
-            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0, 1, 2, 3]);
+            assert_eq!(
+                result.get_item(0)?.extract::<Vec<i64>>()?,
+                vec![40, 10, 30, 20]
+            );
             assert_eq!(
                 result.get_item(1)?.extract::<Vec<bool>>()?,
                 vec![false, false, true, true]
@@ -2706,9 +2715,9 @@ mod aggregation_tests {
             )?;
             let result = call_range_join_aggregate(py, &predicates, &aggregations, true)?
                 .expect("the null lies inside the matching window");
-            // Forward aggregation writes one slot per left row; the source
-            // left label is 100, whose compact output position is zero.
-            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![0]);
+            // Forward aggregation writes one slot per left row and returns
+            // the source physical label rather than a compact offset.
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![100]);
             assert_eq!(result.get_item(1)?.extract::<Vec<bool>>()?, vec![true]);
             let outputs_item = result.get_item(2)?;
             let outputs = outputs_item.cast::<PyList>()?;

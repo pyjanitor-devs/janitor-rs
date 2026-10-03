@@ -1336,7 +1336,7 @@ mod tests {
                 true,
             )?
             .expect("the range has matching right rows");
-            assert_eq!(forward.get_item(0)?.extract::<Vec<i64>>()?, vec![0]);
+            assert_eq!(forward.get_item(0)?.extract::<Vec<i64>>()?, vec![2]);
             assert_eq!(forward.get_item(1)?.extract::<Vec<bool>>()?, vec![true]);
             let forward_values_item = forward.get_item(2)?;
             let forward_values = forward_values_item.cast::<PyList>()?;
