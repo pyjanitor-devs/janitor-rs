@@ -35,24 +35,6 @@ impl CompareOp {
         }
     }
 
-    /// ELI5: turns the small numeric code pyjanitor's Python side passes in
-    /// into one of six known comparisons, or a clear error -- an
-    /// unrecognized code used to silently fall back to `!=` instead of
-    /// being rejected.
-    pub fn try_from_code<T: Into<i64>>(code: T) -> PyResult<Self> {
-        match code.into() {
-            0 => Ok(Self::Gt),
-            1 => Ok(Self::Ge),
-            2 => Ok(Self::Lt),
-            3 => Ok(Self::Le),
-            4 => Ok(Self::Eq),
-            5 => Ok(Self::Ne),
-            other => Err(PyValueError::new_err(format!(
-                "invalid comparison operator code: {other} (expected 0..=5)"
-            ))),
-        }
-    }
-
     /// Applies this comparison to one candidate pair.
     ///
     /// ELI5: an indirect function-pointer call can't be inlined, so
@@ -62,10 +44,8 @@ impl CompareOp {
     /// the inlining/branch-prediction the compiler gets for free from a
     /// `match` on a small `Copy` enum, which is exactly as cheap per
     /// iteration as the `i8` match every file used to carry its own copy
-    /// of). Validating the raw code once via `try_from_code` and matching
-    /// on the resulting `CompareOp` every iteration keeps that same
-    /// per-iteration cost while still sharing one definition and never
-    /// falling back to `!=` on an unrecognized code.
+    /// of). Matching on the resulting `CompareOp` every iteration keeps that
+    /// same per-iteration cost while sharing one definition.
     #[inline]
     pub fn apply<T: PartialOrd>(self, left: &T, right: &T) -> bool {
         match self {
@@ -83,27 +63,6 @@ impl CompareOp {
 mod tests {
     use super::*;
     use pyo3::Python;
-
-    #[test]
-    fn each_code_decodes_to_its_operator() {
-        let cases = [
-            (0_i64, CompareOp::Gt),
-            (1, CompareOp::Ge),
-            (2, CompareOp::Lt),
-            (3, CompareOp::Le),
-            (4, CompareOp::Eq),
-            (5, CompareOp::Ne),
-        ];
-        for (code, expected) in cases {
-            assert_eq!(
-                CompareOp::try_from_code(code).unwrap(),
-                expected,
-                "code={code}"
-            );
-        }
-        // i8 codes decode the same way, without a manual cast at the call site.
-        assert_eq!(CompareOp::try_from_code(2_i8).unwrap(), CompareOp::Lt);
-    }
 
     #[test]
     fn each_string_decodes_to_its_operator() {
@@ -148,18 +107,6 @@ mod tests {
                 op.apply(&left, &right),
                 expected,
                 "op={op:?} left={left} right={right}"
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_codes_are_rejected_not_silently_treated_as_ne() {
-        Python::initialize();
-        for code in [-1_i64, 6, 100, i64::MIN, i64::MAX] {
-            let error = CompareOp::try_from_code(code).unwrap_err().to_string();
-            assert!(
-                error.contains("invalid comparison operator code"),
-                "code={code} produced unexpected message: {error}"
             );
         }
     }
