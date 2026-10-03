@@ -1658,16 +1658,6 @@ pub fn region_extended_aggregate_reverse<'py>(
     aggregate_regions_extended(py, predicates, aggregations, return_matched, true)
 }
 
-/// Register all region aggregation Python entry points on the module.
-///
-/// # Arguments
-///
-/// * `m` - The parent `janitor_rs` Python module.
-///
-/// # Errors
-///
-/// Returns any PyO3 error raised while adding a function to `m`.
-
 #[cfg(test)]
 mod aggregation_tests {
     use super::*;
