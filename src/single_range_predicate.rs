@@ -9,7 +9,7 @@
 //! Python array. It is not a sorted offset and is never compacted. The value
 //! arrays may be compact and the right values may be sorted, so every sorted
 //! right slot must be translated through `right_index` before it is returned
-//! or used to index a full-layout aggregation array.
+//! or used to index an aggregation array aligned with that compact layout.
 //!
 //! The ordinary single-range ABI is:
 //!
@@ -18,23 +18,25 @@
 //!  right_index_is_ordered, operator, keep, return_building_blocks)
 //! ```
 //!
-//! The range-first index ABI is a list whose first tuple is:
+//! The range-first index ABI is a predicate list plus explicit position maps.
+//! Its first tuple is:
 //!
 //! ```text
-//! (left_values, left_positions, right_values, right_positions, operator)
+//! (left_values, right_values, operator)
 //! ```
 //!
-//! Range-first aggregation extends that first tuple with the full source
-//! lengths and uses the complete source aggregation arrays:
+//! The left and right position maps are separate kernel arguments.
+//!
+//! Range-first aggregation uses the same three-field anchor tuple and aligned
+//! source aggregation arrays:
 //!
 //! ```text
-//! (left_values, left_positions, right_values, right_positions,
-//!  left_full_len, right_full_len, operator)
+//! (left_values, right_values, operator)
 //! ```
 //!
-//! Later tuples are residual predicates. They are evaluated using compact
-//! offsets, then successful candidates are translated through the anchor
-//! position maps before updating full-layout aggregation state.
+//! The position maps are separate kernel arguments. Later tuples are residual
+//! predicates, and both residuals and aggregations use the compact aligned
+//! layouts so window offsets can index them directly.
 
 use numpy::ndarray::ArrayView1;
 use numpy::{Element, PyReadonlyArray1};
@@ -42,14 +44,16 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
-use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
-use crate::common::{range_window, range_window_bounds};
+use crate::aggregation_common::aggregation::{
+    make_results_with_positions, parse_inputs, AggregationSet,
+};
+use crate::compare_op::CompareOp;
 use crate::join_aggregation_helpers::{aggregate_range_windows, aggregation_windows};
 use crate::join_candidate_materialization::materialize_range_candidates;
-use crate::join_common::{result_dict, Keep, SingleJoinResult};
-use crate::op::CompareOp;
+use crate::join_search::{range_window, range_window_bounds};
+use crate::join_types::{result_dict, Keep, SingleJoinResult};
 use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
-use crate::range_predicate::parse_full_layout_aggregation_anchor;
+use crate::range_predicate::parse_any_range_parts;
 
 fn prefix_extreme(values: &[i64], minimum: bool) -> Vec<i64> {
     // Prefix extrema are used only when the right physical positions are not
@@ -249,6 +253,26 @@ macro_rules! registered_single_range {
         /// arrays. The right values must already be sorted in ascending order;
         /// `right_index_is_ordered` describes only the physical position order
         /// used by `first` and `last`.
+        ///
+        /// # Arguments
+        ///
+        /// * `py` - Active Python interpreter token.
+        /// * `left_index` - Original physical positions paired with `left`.
+        /// * `left` - Non-null left anchor values in left-row order.
+        /// * `right_index` - Original physical positions paired with sorted
+        ///   `right` values.
+        /// * `right` - Non-null right anchor values in ascending order.
+        /// * `right_index_is_ordered` - Whether physical right positions are
+        ///   ordered for direct `first`/`last` selection.
+        /// * `operator` - One of `<`, `<=`, `>`, or `>=`.
+        /// * `keep` - `all`, `any`, `first`, or `last`.
+        /// * `return_building_blocks` - Return physical maps and half-open
+        ///   `starts`/`ends` windows instead of final pairs.
+        ///
+        /// # Returns
+        ///
+        /// A dictionary of physical pairs, optionally with binary-search
+        /// windows, or `None` when no pair matches.
         #[pyfunction]
         #[allow(clippy::too_many_arguments)]
         pub fn $name<'py>(
@@ -400,6 +424,21 @@ fn aggregate_single_range<'py, T: PartialOrd + Copy + Element>(
 macro_rules! registered_single_range_aggregation {
     ($forward:ident, $reverse:ident, $type:ty) => {
         /// Forward single-range aggregation entry point for one numeric dtype.
+        ///
+        /// `left` and `right` are compact non-null anchor layouts. The
+        /// aggregation arrays supplied in `aggregations` use the same layout;
+        /// `left_index` and `right_index` carry original physical positions.
+        /// Results contain one slot per left output position.
+        ///
+        /// # Arguments
+        ///
+        /// * `py` - Active Python interpreter token.
+        /// * `left_index` / `right_index` - Physical position maps aligned to
+        ///   the corresponding value arrays.
+        /// * `left` / `right` - Typed anchor values; `right` is sorted.
+        /// * `operator` - One of `<`, `<=`, `>`, or `>=`.
+        /// * `aggregations` - Parsed aggregation requests over right values.
+        /// * `return_matched` - Include one match flag per output slot.
         #[pyfunction]
         #[allow(clippy::too_many_arguments)]
         pub fn $forward<'py>(
@@ -426,6 +465,20 @@ macro_rules! registered_single_range_aggregation {
         }
 
         /// Reverse single-range aggregation entry point for one numeric dtype.
+        ///
+        /// The inputs have the same layout as the forward entry point, but
+        /// aggregation consumes left-side source values and produces one slot
+        /// per right output position.
+        ///
+        /// # Arguments
+        ///
+        /// * `py` - Active Python interpreter token.
+        /// * `left_index` / `right_index` - Physical position maps aligned to
+        ///   the corresponding value arrays.
+        /// * `left` / `right` - Typed anchor values; `right` is sorted.
+        /// * `operator` - One of `<`, `<=`, `>`, or `>=`.
+        /// * `aggregations` - Parsed aggregation requests over left values.
+        /// * `return_matched` - Include one match flag per output slot.
         #[pyfunction]
         #[allow(clippy::too_many_arguments)]
         pub fn $reverse<'py>(
@@ -514,7 +567,7 @@ registered_single_range_aggregation!(
 ///
 /// # Arguments
 ///
-/// * `predicates` - At least two tuples: a five-field range anchor followed by
+/// * `predicates` - At least two tuples: a three-field range anchor followed by
 ///   residual comparison tuples.
 /// * `keep` - Final selection policy after residual filtering.
 /// * `left_index` / `right_index` - Physical position arrays for the compact
@@ -525,10 +578,10 @@ registered_single_range_aggregation!(
 fn materialize_range_first_indices<'py, T: Element + PartialOrd + Copy>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
-    keep: &str,
     left_index: PyReadonlyArray1<'py, i64>,
-    left: PyReadonlyArray1<'py, T>,
     right_index: PyReadonlyArray1<'py, i64>,
+    keep: &str,
+    left: PyReadonlyArray1<'py, T>,
     right: PyReadonlyArray1<'py, T>,
     operator: CompareOp,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
@@ -592,24 +645,27 @@ macro_rules! registered_range_first_extended_indices {
         /// Dtype-specialised Python entry point for a range anchor followed
         /// by one or more residual predicates.
         ///
-        /// The first tuple must be the five-field range anchor; all later
+        /// The first tuple must be the three-field range anchor; all later
         /// tuples are evaluated against the anchor's compact layouts. The
-        /// `keep` policy is applied only after residual filtering.
+        /// position maps are explicit arguments and `keep` is applied only
+        /// after residual filtering.
         #[pyfunction(name = $export)]
         #[allow(clippy::too_many_arguments)]
         pub fn $name<'py>(
             py: Python<'py>,
             predicates: &Bound<'py, PyList>,
+            left_index: PyReadonlyArray1<'py, i64>,
+            right_index: PyReadonlyArray1<'py, i64>,
             keep: &str,
         ) -> PyResult<Option<Bound<'py, PyDict>>> {
             let first_item = predicates.get_item(0)?;
             let first = first_item.cast::<PyTuple>()?;
-            if first.len() != 5 {
+            if first.len() != 3 {
                 return Err(PyValueError::new_err(
-                    "range-first anchor must contain 5 elements",
+                    "range-first anchor must contain 3 elements",
                 ));
             }
-            let operator = CompareOp::try_from_str(first.get_item(4)?.extract()?)?;
+            let operator = CompareOp::try_from_str(first.get_item(2)?.extract()?)?;
             if !matches!(
                 operator,
                 CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
@@ -621,11 +677,11 @@ macro_rules! registered_range_first_extended_indices {
             materialize_range_first_indices::<$type>(
                 py,
                 predicates,
+                left_index,
+                right_index,
                 keep,
-                first.get_item(1)?.extract()?,
                 first.get_item(0)?.extract()?,
-                first.get_item(3)?.extract()?,
-                first.get_item(2)?.extract()?,
+                first.get_item(1)?.extract()?,
                 operator,
             )
         }
@@ -683,40 +739,87 @@ registered_range_first_extended_indices!(
     "range_anchor_extended_indices_f32"
 );
 
-/// Forward range-first aggregation: right source values are aggregated into
-/// one output slot per full-layout left row.
+/// Forward range-first aggregation over aligned layouts.
+///
+/// The first predicate is the range anchor and every later predicate is a
+/// residual. Anchor values, residual arrays, and aggregation arrays all use
+/// the same compact filtered/sorted layout. `left_index` and `right_index`
+/// remain physical position maps and are not binary-search offsets.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token.
+/// * `predicates` - At least one range anchor plus one residual tuple.
+/// * `left_index` / `right_index` - Physical maps aligned with the anchor
+///   arrays.
+/// * `aggregations` - Requests over right-side aligned source arrays.
+/// * `return_matched` - Include the output match mask.
 #[pyfunction]
 pub fn range_anchor_extended_aggregate<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
+    left_index: Bound<'py, PyAny>,
+    right_index: Bound<'py, PyAny>,
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    aggregate_range_anchor(py, predicates, aggregations, return_matched, false)
+    aggregate_range_anchor(
+        py,
+        predicates,
+        &left_index,
+        &right_index,
+        aggregations,
+        return_matched,
+        false,
+    )
 }
 
-/// Reverse range-first aggregation: left source values are aggregated into
-/// one output slot per full-layout right row.
+/// Reverse range-first aggregation over aligned layouts.
+///
+/// This is the reverse counterpart of [`range_anchor_extended_aggregate`]:
+/// it produces right-side output slots and consumes left-side aggregation
+/// arrays while preserving the same anchor/residual ordering.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter token.
+/// * `predicates` - At least one range anchor plus one residual tuple.
+/// * `left_index` / `right_index` - Physical maps aligned with the anchor
+///   arrays.
+/// * `aggregations` - Requests over left-side aligned source arrays.
+/// * `return_matched` - Include the output match mask.
 #[pyfunction]
 pub fn range_anchor_extended_aggregate_reverse<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
+    left_index: Bound<'py, PyAny>,
+    right_index: Bound<'py, PyAny>,
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    aggregate_range_anchor(py, predicates, aggregations, return_matched, true)
+    aggregate_range_anchor(
+        py,
+        predicates,
+        &left_index,
+        &right_index,
+        aggregations,
+        return_matched,
+        true,
+    )
 }
 
 fn aggregate_range_anchor<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
+    left_index: &Bound<'py, PyAny>,
+    right_index: &Bound<'py, PyAny>,
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    // The first tuple is parsed separately from residuals because it both
-    // defines the binary-search windows and carries the full source lengths.
-    // Residuals continue to use their ordinary compact predicate ABI.
+    // The first tuple is parsed separately from residuals because it defines
+    // the binary-search windows. Position maps are explicit arguments, and
+    // all aggregation inputs use the same compact aligned layouts.
     if predicates.len() < 2 {
         return Err(PyValueError::new_err(
             "range-first extended aggregation requires at least two predicates",
@@ -724,24 +827,42 @@ fn aggregate_range_anchor<'py>(
     }
     let first_item = predicates.get_item(0)?;
     let first = first_item.cast::<PyTuple>()?;
-    let anchor = parse_full_layout_aggregation_anchor(first)?;
+    if first.len() != 3 {
+        return Err(PyValueError::new_err(
+            "range-first aggregation anchor must contain 3 elements",
+        ));
+    }
+    let anchor = parse_any_range_parts(
+        &first.get_item(0)?,
+        left_index,
+        &first.get_item(1)?,
+        right_index,
+        &first.get_item(2)?,
+    )?;
     let (parsed, metadata) =
         crate::join_aggregation_helpers::residuals(py, predicates, false, false)?;
-    let (starts, ends) = anchor.range.bounds().map_err(PyValueError::new_err)?;
+    let (starts, ends) = anchor.bounds().map_err(PyValueError::new_err)?;
     let windows =
-        aggregation_windows(&anchor.range, starts, ends, true).map_err(PyValueError::new_err)?;
+        aggregation_windows(&anchor, starts, ends, true).map_err(PyValueError::new_err)?;
     if windows.left_index.is_empty() {
         return Ok(None);
     }
     let output_len = if reverse {
-        anchor.right_len
+        anchor.right_len()
     } else {
-        anchor.left_len
+        anchor.left_len()
     };
     let source_len = if reverse {
-        anchor.left_len
+        anchor.left_len()
     } else {
-        anchor.right_len
+        anchor.right_len()
+    };
+    let left_index = left_index.extract::<PyReadonlyArray1<'py, i64>>()?;
+    let right_index = right_index.extract::<PyReadonlyArray1<'py, i64>>()?;
+    let output_positions = if reverse {
+        Some(right_index.as_array())
+    } else {
+        Some(left_index.as_array())
     };
     aggregate_range_windows(
         py,
@@ -749,12 +870,12 @@ fn aggregate_range_anchor<'py>(
         &parsed,
         metadata.as_deref(),
         aggregations,
-        None,
+        output_positions,
         output_len,
         source_len,
         return_matched,
         reverse,
-        true,
+        false,
     )
 }
 
@@ -1050,9 +1171,7 @@ mod tests {
             py,
             [
                 PyArray1::from_vec(py, vec![4_i64]).into_any(),
-                PyArray1::from_vec(py, vec![100_i64]).into_any(),
                 PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
-                PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).into_any(),
                 operator.into_pyobject(py)?.into_any(),
             ],
         )?)?;
@@ -1100,8 +1219,14 @@ mod tests {
                 ("<=", vec![30_i64, 20]),
             ] {
                 let predicates = extended_range_predicates(py, operator)?;
-                let result = range_anchor_extended_indices_int64(py, &predicates, "all")?
-                    .expect("range anchor should produce matches");
+                let result = range_anchor_extended_indices_int64(
+                    py,
+                    &predicates,
+                    PyArray1::from_vec(py, vec![100_i64]).readonly(),
+                    PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).readonly(),
+                    "all",
+                )?
+                .expect("range anchor should produce matches");
                 assert_eq!(read_extended_pair(&result), (vec![100, 100], expected));
             }
             Ok(())
@@ -1120,8 +1245,14 @@ mod tests {
                 ("all", vec![30_i64, 20]),
             ] {
                 let predicates = extended_range_predicates(py, "<")?;
-                let result = range_anchor_extended_indices_int64(py, &predicates, keep)?
-                    .expect("range anchor should produce matches");
+                let result = range_anchor_extended_indices_int64(
+                    py,
+                    &predicates,
+                    PyArray1::from_vec(py, vec![100_i64]).readonly(),
+                    PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]).readonly(),
+                    keep,
+                )?
+                .expect("range anchor should produce matches");
                 assert_eq!(
                     read_extended_pair(&result),
                     (vec![100; expected.len()], expected)
@@ -1172,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn extended_aggregation_maps_compact_anchor_positions_to_full_layouts() {
+    fn extended_aggregation_uses_aligned_anchor_layouts() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
             let predicates = PyList::empty(py);
@@ -1180,11 +1311,7 @@ mod tests {
                 py,
                 [
                     PyArray1::from_vec(py, vec![4_i64]).into_any(),
-                    PyArray1::from_vec(py, vec![2_i64]).into_any(),
                     PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
-                    PyArray1::from_vec(py, vec![1_i64, 3, 0, 2]).into_any(),
-                    3_usize.into_pyobject(py)?.into_any(),
-                    4_usize.into_pyobject(py)?.into_any(),
                     "<".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
@@ -1197,38 +1324,46 @@ mod tests {
                 ],
             )?)?;
 
-            // The source right values use their original physical order, not
-            // the sorted anchor order [1, 3, 0, 2]. The matching sorted
-            // offsets are 2 and 3, which map to physical positions 0 and 2.
-            let right_aggregations = PyList::new(py, [sum_request(py, vec![50_i64, 10, 70, 30])?])?;
-            let forward =
-                range_anchor_extended_aggregate(py, &predicates, &right_aggregations, true)?
-                    .expect("the range has matching right rows");
-            assert_eq!(forward.get_item(0)?.extract::<Vec<i64>>()?, vec![0, 1, 2]);
-            assert_eq!(
-                forward.get_item(1)?.extract::<Vec<bool>>()?,
-                vec![false, false, true]
-            );
+            // Aggregation values follow the sorted right layout [1, 3, 0, 2].
+            // The matching sorted offsets are 2 and 3.
+            let right_aggregations = PyList::new(py, [sum_request(py, vec![10_i64, 30, 50, 70])?])?;
+            let forward = range_anchor_extended_aggregate(
+                py,
+                &predicates,
+                PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                PyArray1::from_vec(py, vec![1_i64, 3, 0, 2]).into_any(),
+                &right_aggregations,
+                true,
+            )?
+            .expect("the range has matching right rows");
+            assert_eq!(forward.get_item(0)?.extract::<Vec<i64>>()?, vec![0]);
+            assert_eq!(forward.get_item(1)?.extract::<Vec<bool>>()?, vec![true]);
             let forward_values_item = forward.get_item(2)?;
             let forward_values = forward_values_item.cast::<PyList>()?;
             assert_eq!(
                 forward_values.get_item(0)?.extract::<Vec<i64>>()?,
-                vec![0, 0, 120]
+                vec![120]
             );
 
-            let left_aggregations = PyList::new(py, [sum_request(py, vec![100_i64, 200, 300])?])?;
-            let reverse =
-                range_anchor_extended_aggregate_reverse(py, &predicates, &left_aggregations, true)?
-                    .expect("the range has matching right rows");
+            let left_aggregations = PyList::new(py, [sum_request(py, vec![300_i64])?])?;
+            let reverse = range_anchor_extended_aggregate_reverse(
+                py,
+                &predicates,
+                PyArray1::from_vec(py, vec![2_i64]).into_any(),
+                PyArray1::from_vec(py, vec![1_i64, 3, 0, 2]).into_any(),
+                &left_aggregations,
+                true,
+            )?
+            .expect("the range has matching right rows");
             assert_eq!(
                 reverse.get_item(1)?.extract::<Vec<bool>>()?,
-                vec![true, false, true, false]
+                vec![false, false, true, true]
             );
             let reverse_values_item = reverse.get_item(2)?;
             let reverse_values = reverse_values_item.cast::<PyList>()?;
             assert_eq!(
                 reverse_values.get_item(0)?.extract::<Vec<i64>>()?,
-                vec![300, 0, 300, 0]
+                vec![0, 0, 300, 300]
             );
             Ok(())
         })

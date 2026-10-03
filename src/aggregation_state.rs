@@ -28,16 +28,16 @@
 //! input `f32` or `f64` width through materialization. Position, length, and
 //! allocation arithmetic remains checked and must not wrap.
 
-use super::input::{AggregationInput, AggregationOp};
+use super::aggregation_input::{AggregationInput, AggregationOp};
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::IntoPyArray;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use crate::aggs::adaptive::{
+use crate::aggregation_common::adaptive::{
     should_use_running_aggregation, should_use_segment_tree, MAX_DIRECT_QUERY_COUNT,
 };
-use crate::aggs::ensure_equal_lengths;
+use crate::aggregation_common::ensure_equal_lengths;
 
 /// A borrowed view of one supported NumPy dtype.
 ///

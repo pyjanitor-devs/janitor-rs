@@ -130,7 +130,7 @@ pub(crate) enum AggregationInput<'py> {
 /// `("*", null_mask, "count")`, or the two-element count-all shorthand
 /// `("*", "count")`; `("*", "size")` is also accepted. The values and mask
 /// are borrowed rather than copied, so their Python owners must remain alive
-/// while the returned inputs are used by [`super::state::AggregationSet`].
+/// while the returned inputs are used by [`super::aggregation_state::AggregationSet`].
 ///
 /// # Arguments
 ///

@@ -6,8 +6,8 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyList, PyTuple};
 
-use crate::aggs::{ensure_equal_lengths, ensure_equal_lengths_core};
-use crate::op::CompareOp;
+use crate::aggregation_common::{ensure_equal_lengths, ensure_equal_lengths_core};
+use crate::compare_op::CompareOp;
 
 /// A typed comparison between one left-hand array and one right-hand array.
 ///
@@ -502,9 +502,19 @@ pub(crate) fn parse_predicates_with_nulls_strings<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
 ) -> PyResult<(Vec<Predicate<'py>>, Option<Vec<NullMetadata<'py>>>)> {
+    parse_predicates_with_nulls_strings_from(py, predicates, 0)
+}
+
+/// Parse string-based predicates beginning at `start` without copying the
+/// preceding Python tuples into a temporary list.
+pub(crate) fn parse_predicates_with_nulls_strings_from<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    start: usize,
+) -> PyResult<(Vec<Predicate<'py>>, Option<Vec<NullMetadata<'py>>>)> {
     let base_tuples = PyList::empty(py);
-    let mut metadata = Vec::with_capacity(predicates.len());
-    for item in predicates.iter() {
+    let mut metadata = Vec::with_capacity(predicates.len().saturating_sub(start));
+    for item in predicates.iter().skip(start) {
         let tuple = item
             .cast::<PyTuple>()
             .map_err(|_| PyTypeError::new_err("each residual comparison must be a tuple"))?;

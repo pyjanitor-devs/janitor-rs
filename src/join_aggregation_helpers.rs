@@ -9,9 +9,11 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
-use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
-use crate::join_common::SingleJoinResult;
-use crate::op::CompareOp;
+use crate::aggregation_common::aggregation::{
+    make_results_with_positions, parse_inputs, AggregationSet,
+};
+use crate::compare_op::CompareOp;
+use crate::join_types::SingleJoinResult;
 use crate::predicate::{
     null_metadata_views, parse_predicates_with_nulls_strings, predicates_match_dispatch,
     PredicateView,

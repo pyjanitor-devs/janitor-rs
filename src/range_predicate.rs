@@ -20,17 +20,72 @@
 //! in the order required by binary search. This module owns only tuple
 //! parsing, dtype dispatch, shape validation, and delegation to the existing
 //! typed window implementation.
+//!
+//! The basic dual-range index entry point uses a shared-index representation:
+//! each anchor is `(left_values, right_values, operator)`, while the single
+//! `left_index`, `right_index`, and `right_index_is_ordered` values are passed
+//! separately. This guarantees that both anchors address the same physical
+//! left and right layouts.
 
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
-use crate::aggs::ensure_equal_lengths_core;
-use crate::anchor_non_equi_join::build_range_core_with_labels;
-use crate::common::range_window_bounds;
-use crate::join_common::SingleJoinResult;
-use crate::op::CompareOp;
+use crate::aggregation_common::ensure_equal_lengths_core;
+use crate::compare_op::CompareOp;
+use crate::join_search::{range_window, range_window_bounds};
+use crate::join_types::SingleJoinResult;
+
+/// Build one typed range window without depending on the deleted legacy
+/// anchor module. The returned bounds address the supplied sorted right-value
+/// layout; the right index labels are copied only when building blocks need
+/// to expose them to Python.
+#[allow(clippy::too_many_arguments)]
+fn build_range_core_with_labels<T: PartialOrd + Copy>(
+    left: numpy::ndarray::ArrayView1<'_, T>,
+    left_index: numpy::ndarray::ArrayView1<'_, i64>,
+    right: numpy::ndarray::ArrayView1<'_, T>,
+    right_index: numpy::ndarray::ArrayView1<'_, i64>,
+    _right_index_is_ordered: bool,
+    op: CompareOp,
+    include_right_index: bool,
+    retain_empty_windows: bool,
+) -> Result<SingleJoinResult, String> {
+    ensure_equal_lengths_core("left", left.len(), "left_index", left_index.len())?;
+    ensure_equal_lengths_core("right", right.len(), "right_index", right_index.len())?;
+    if !matches!(
+        op,
+        CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+    ) {
+        return Err("single join range core requires a range comparator".to_owned());
+    }
+    let mut result = SingleJoinResult {
+        left_positions: Vec::new(),
+        left_index: Vec::new(),
+        right_index: if include_right_index {
+            right_index.to_vec()
+        } else {
+            Vec::new()
+        },
+        starts: Vec::new(),
+        ends: Vec::new(),
+    };
+    if left.is_empty() || right.is_empty() {
+        return Ok(result);
+    }
+    for (left_position, &left_value) in left.iter().enumerate() {
+        let (start, end) = range_window(left_value, right, op);
+        if start >= end && !retain_empty_windows {
+            continue;
+        }
+        result.left_positions.push(left_position);
+        result.left_index.push(left_index[left_position]);
+        result.starts.push(start);
+        result.ends.push(end);
+    }
+    Ok(result)
+}
 
 /// One typed range anchor after parsing.
 ///
@@ -115,29 +170,16 @@ pub(crate) struct ParsedAggregationRangeAnchor<'py> {
     pub(crate) right_output_positions: Option<PyReadonlyArray1<'py, i64>>,
 }
 
-/// A range-first aggregation anchor paired with the original source lengths.
-///
-/// The range value and position arrays describe the compact search layout.
-/// `left_len` and `right_len` describe the full Python source arrays used for
-/// aggregation inputs. The distinction lets the aggregation kernel translate
-/// sorted compact offsets back to physical source positions.
-pub(crate) struct ParsedFullLayoutAggregationAnchor<'py> {
-    /// Typed range data used to build the candidate windows.
-    pub(crate) range: AnyParsedRangePredicate<'py>,
-    /// Length of the original left source array.
-    pub(crate) left_len: usize,
-    /// Length of the original right source array.
-    pub(crate) right_len: usize,
-}
-
 /// Parse one aggregation range anchor without exposing tuple positions to a
 /// kernel.
 ///
-/// The first anchor uses the established six- or eight-field aggregation
-/// form. The second anchor uses the five-field range form because it does not
-/// carry output maps:
+/// The first anchor accepts the five-field dual-range form, plus the
+/// established six- or eight-field forms used by other aggregation paths.
+/// The second anchor always uses the five-field range form because it does
+/// not carry output maps:
 ///
 /// ```text
+/// first, five: (left, left_index, right, right_index, op)
 /// first, six:  (left, left_index, right, right_index, ordered, op)
 /// first, eight:(left, left_index, right, right_index, ordered,
 ///              left_output_positions, right_output_positions, op)
@@ -163,12 +205,13 @@ pub(crate) fn parse_aggregation_range_anchor<'py>(
     tuple: &Bound<'py, PyTuple>,
     first: bool,
 ) -> PyResult<ParsedAggregationRangeAnchor<'py>> {
-    // The first tuple has metadata that the second tuple does not. Parse the
-    // shape and metadata before touching values so malformed output maps are
-    // reported at the public boundary rather than during result assembly.
+    // Parse tuple shape and metadata before touching values so malformed
+    // output maps are reported at the public boundary rather than during
+    // result assembly.
     let (range, ordered, left_output_positions, right_output_positions) = if first {
         let (operator_position, ordered, left_output_positions, right_output_positions) =
             match tuple.len() {
+                5 => (4, None, None, None),
                 6 => {
                     let ordered = tuple.get_item(4)?.extract::<bool>()?;
                     (5, Some(ordered), None, None)
@@ -181,7 +224,7 @@ pub(crate) fn parse_aggregation_range_anchor<'py>(
                 }
                 _ => {
                     return Err(PyValueError::new_err(
-                        "aggregation first anchor must contain 6 or 8 elements",
+                        "aggregation first anchor must contain 5, 6, or 8 elements",
                     ));
                 }
             };
@@ -235,83 +278,6 @@ pub(crate) fn parse_aggregation_range_anchor<'py>(
         ordered,
         left_output_positions,
         right_output_positions,
-    })
-}
-
-/// Parse the seven-field range-first aggregation ABI.
-///
-/// The tuple is:
-///
-/// ```text
-/// (left_values, left_positions, right_values, right_positions,
-///  left_full_len, right_full_len, operator)
-/// ```
-///
-/// The position arrays contain physical positions in the original Python
-/// arrays. They are deliberately not sorted or compacted.
-///
-/// # Errors
-///
-/// Returns `ValueError` for malformed tuple lengths, invalid full lengths,
-/// unsupported operators, value/index length mismatches, or physical
-/// positions outside the full source arrays.
-pub(crate) fn parse_full_layout_aggregation_anchor<'py>(
-    tuple: &Bound<'py, PyTuple>,
-) -> PyResult<ParsedFullLayoutAggregationAnchor<'py>> {
-    if tuple.len() != 7 {
-        return Err(PyValueError::new_err(
-            "range-first aggregation anchor must contain 7 elements",
-        ));
-    }
-    let left_len = tuple.get_item(4)?.extract::<usize>()?;
-    let right_len = tuple.get_item(5)?.extract::<usize>()?;
-    let range = parse_any_range_parts(
-        &tuple.get_item(0)?,
-        &tuple.get_item(1)?,
-        &tuple.get_item(2)?,
-        &tuple.get_item(3)?,
-        &tuple.get_item(6)?,
-    )?;
-    range
-        .validate_range_operator()
-        .map_err(PyValueError::new_err)?;
-    range.validate_lengths().map_err(PyValueError::new_err)?;
-
-    macro_rules! validate_positions {
-        ($predicate:expr) => {{
-            let predicate = $predicate;
-            let invalid_left = predicate.left_index.as_array().iter().any(|&position| {
-                position < 0
-                    || usize::try_from(position).map_or(true, |position| position >= left_len)
-            });
-            let invalid_right = predicate.right_index.as_array().iter().any(|&position| {
-                position < 0
-                    || usize::try_from(position).map_or(true, |position| position >= right_len)
-            });
-            if invalid_left || invalid_right {
-                return Err(PyValueError::new_err(
-                    "range-first aggregation positions must address the full input arrays",
-                ));
-            }
-        }};
-    }
-    match &range {
-        AnyParsedRangePredicate::I64(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::I32(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::I16(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::I8(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::U64(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::U32(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::U16(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::U8(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::F64(predicate) => validate_positions!(predicate),
-        AnyParsedRangePredicate::F32(predicate) => validate_positions!(predicate),
-    }
-
-    Ok(ParsedFullLayoutAggregationAnchor {
-        range,
-        left_len,
-        right_len,
     })
 }
 

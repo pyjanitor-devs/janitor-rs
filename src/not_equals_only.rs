@@ -63,11 +63,13 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
-use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
-use crate::aggs::ensure_equal_lengths_core;
-use crate::common::partition_point;
-use crate::join_common::{result_dict, Keep};
-use crate::op::CompareOp;
+use crate::aggregation_common::aggregation::{
+    make_results_with_positions, parse_inputs, AggregationSet,
+};
+use crate::aggregation_common::ensure_equal_lengths_core;
+use crate::compare_op::CompareOp;
+use crate::join_search::partition_point;
+use crate::join_types::{result_dict, Keep};
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
     predicates_match_dispatch, NullMetadataView, PredicateView,
@@ -223,26 +225,42 @@ where
     let empty = Vec::new();
     let left_null_positions = left_null_positions.as_deref().unwrap_or(&empty);
     let right_null_positions = right_null_positions.as_deref().unwrap_or(&empty);
-    for (left_value, &left_position) in left.iter().zip(&left_positions) {
-        let lt_end = partition_point(right, |value| value < *left_value);
-        let gt_start = partition_point(right, |value| value <= *left_value);
-        for &right_position in &right_positions[..lt_end] {
-            visit(left_position, right_position);
-        }
-        for &right_position in &right_positions[gt_start..] {
-            visit(left_position, right_position);
-        }
-        if !is_extension_array {
-            for &right_position in right_null_positions {
-                visit(left_position, right_position);
+    // Both partitions are physical positions in original row order. Walking
+    // their merge keeps the public all-!= result in left-row order while the
+    // compact non-null offset remains available for the binary search.
+    let mut left_non_null_offset = 0;
+    let mut left_null_offset = 0;
+    for left_position in 0..left_full_len {
+        let left_position = i64::try_from(left_position)
+            .map_err(|_| "left physical position exceeds int64".to_owned())?;
+        let left_position_usize = left_position as usize;
+        if left_non_null_offset < left_positions.len()
+            && left_positions[left_non_null_offset] == left_position_usize
+        {
+            let left_value = left[left_non_null_offset];
+            let lt_end = partition_point(right, |value| value < left_value);
+            let gt_start = partition_point(right, |value| value <= left_value);
+            for &right_position in &right_positions[..lt_end] {
+                visit(left_position_usize, right_position);
             }
-        }
-    }
-    if !is_extension_array {
-        for &left_position in left_null_positions {
-            for right_position in right_positions.iter().chain(right_null_positions) {
-                visit(left_position, *right_position);
+            for &right_position in &right_positions[gt_start..] {
+                visit(left_position_usize, right_position);
             }
+            if !is_extension_array {
+                for &right_position in right_null_positions {
+                    visit(left_position_usize, right_position);
+                }
+            }
+            left_non_null_offset += 1;
+        } else if left_null_offset < left_null_positions.len()
+            && left_null_positions[left_null_offset] == left_position_usize
+        {
+            if !is_extension_array {
+                for right_position in right_positions.iter().chain(right_null_positions) {
+                    visit(left_position_usize, *right_position);
+                }
+            }
+            left_null_offset += 1;
         }
     }
     Ok(())

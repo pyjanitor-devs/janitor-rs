@@ -10,8 +10,8 @@
 
 use numpy::ndarray::ArrayView1;
 
-use crate::aggs::ensure_equal_lengths_core;
-use crate::join_common::{Keep, SingleJoinResult};
+use crate::aggregation_common::ensure_equal_lengths_core;
+use crate::join_types::{Keep, SingleJoinResult};
 use crate::predicate::{null_metadata_views, predicates_match_dispatch, NullMetadata, Predicate};
 
 /// Filter candidates represented by one half-open right-side window per left row.
