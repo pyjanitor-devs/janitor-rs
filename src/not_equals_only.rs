@@ -1807,6 +1807,63 @@ mod tests {
     }
 
     #[test]
+    fn keep_any_returns_the_first_candidate_from_the_traversal() {
+        let left = Array1::from_vec(vec![2_i64]);
+        let left_positions = Array1::from_vec(vec![0_i64]);
+        let right = Array1::from_vec(vec![1_i64, 2, 3]);
+        let right_positions = Array1::from_vec(vec![2_i64, 0, 1]);
+        let mut pairs = Vec::new();
+
+        visit_single_selected(
+            left.view(),
+            1,
+            left_positions.view(),
+            None,
+            right.view(),
+            3,
+            right_positions.view(),
+            None,
+            false,
+            Keep::Any,
+            |left_position, right_position| pairs.push((left_position, right_position)),
+        )
+        .unwrap();
+
+        assert_eq!(pairs, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn keep_first_and_last_consider_numpy_null_positions() {
+        let left = Array1::from_vec(vec![2_i64]);
+        let left_positions = Array1::from_vec(vec![0_i64]);
+        let right = Array1::from_vec(vec![1_i64]);
+        let right_positions = Array1::from_vec(vec![0_i64]);
+        let right_null_positions = Array1::from_vec(vec![2_i64, 1]);
+        let mut first = Vec::new();
+        let mut last = Vec::new();
+
+        for (keep, output) in [(Keep::First, &mut first), (Keep::Last, &mut last)] {
+            visit_single_selected(
+                left.view(),
+                1,
+                left_positions.view(),
+                None,
+                right.view(),
+                3,
+                right_positions.view(),
+                Some(right_null_positions.view()),
+                false,
+                keep,
+                |left_position, right_position| output.push((left_position, right_position)),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(first, vec![(0, 0)]);
+        assert_eq!(last, vec![(0, 2)]);
+    }
+
+    #[test]
     fn keep_all_materializes_every_physical_pair() {
         let left = Array1::from_vec(vec![2_i64]);
         let left_full_positions = Array1::from_vec(vec![7_i64]);
