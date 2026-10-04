@@ -30,7 +30,7 @@ Command Line Tools Python framework:
 Additional Cargo test arguments are forwarded by the wrapper, for example:
 
 ```sh
-./scripts/test-rust.sh anchor_non_equi_join
+./scripts/test-rust.sh single_range_predicate
 ```
 
 `--no-default-features` disables the `extension-module` pyo3 feature. That
@@ -53,43 +53,26 @@ DYLD_FRAMEWORK_PATH="/Applications/Xcode.app/Contents/Developer/"\
   cargo test --no-default-features
 ```
 
-Tests live as `#[cfg(test)] mod tests` at the bottom of the files that
-define the kernel they're testing (e.g. `src/bin_search/bin_search_lt.rs`),
-next to a `pub fn <name>_core(...)` -- a plain-Rust extraction of that
-kernel's algorithm, taking `ndarray::ArrayView1` instead of PyO3's
-`PyReadonlyArray1`, so it needs no Python interpreter to call. The
-`#[pyfunction]`-wrapped, per-dtype entry points that Python actually calls
-are then thin wrappers around that one core function. Not every kernel has
-been extracted this way yet -- see "What's covered" below.
+Tests live as `#[cfg(test)] mod tests` at the bottom of the module that owns
+the endpoint. The fused join tests use `Python::attach` because they exercise
+the actual PyO3 boundary, typed dispatch, result tuples, and Python-facing
+validation contracts. Plain Rust helpers are tested directly where a helper
+has been extracted from that boundary.
 
 ### What's covered
 
-As a foundation (issue [#21](https://github.com/pyjanitor-devs/janitor-rs/issues/21)),
-one or two representative kernels are covered per family, not the whole
-crate:
+The current fused join families are tested in the modules that define their
+PyO3 endpoints. The suite covers range windows, equality groups, null-aware
+`!=` traversal, region sweeps, residual filtering, physical position maps,
+matched masks, no-match results, aggregation identities, null masks, integer
+wrapping, and representative unsigned and floating-point inputs. The
+operation and endpoint matrix is maintained in
+[`AGGREGATION_MIGRATION_MATRIX.md`](AGGREGATION_MIGRATION_MATRIX.md).
 
-| Family | Kernel | Where |
-| --- | --- | --- |
-| Binary search | `binary_search_lt_core` | `src/bin_search/bin_search_lt.rs` |
-| Index building | `repeat_index_core`, `trim_index_core` | `src/index_builder.rs` |
-| Aggregation | `sum_start_core`, `sum_end_core`, `sum_start_end_core` | `src/aggs/sum/sum_starts.rs`, `sum_ends.rs`, `sum_starts_ends.rs` |
-
-The standalone per-op comparison-kernel family (formerly `src/compare/`) was
-removed in [#207](https://github.com/pyjanitor-devs/janitor-rs/pull/207)
-(issue [#193](https://github.com/pyjanitor-devs/janitor-rs/issues/193)) in
-favor of the fused predicate paths retained in `src/multi_join_indices/` and
-`src/aggs/`. Those paths take PyO3 types directly and are tested with
-`Python::attach`-based scaffolding rather than the no-interpreter `_core`
-pattern above -- there is currently no `_core`-extracted representative for
-that family.
-
-Each covers: empty arrays, zero matches, duplicate values, boundary
-positions, integer overflow/wraparound, and (for the aggregation kernels)
-null masks. Integer and float range-sum paths also lock in the same `-1`
-"no match" sentinel behavior: the range contributes zero before the signed
-bound can be cast into an invalid array position. This is meant to be
-extended kernel-by-kernel as other issues touch them (see "Relationship to
-other issues" below) -- it is not a one-time exhaustive pass.
+The matrix is deliberately explicit about where coverage is direct and where
+macro-generated dtype variants share the same typed implementation. It is an
+audit record, not a promise that deleted optimization modules remain part of
+the crate.
 
 ### How this relates to pyjanitor's own tests
 
@@ -137,31 +120,27 @@ therefore part of the ABI, not an optimization hint. They must remain unique
 physical positions and must never be replaced with sorted offsets or compact
 array positions.
 
-The public range-first aggregation tuple is:
+The range-first extended endpoints use separate physical position maps. The
+first predicate is a three-field anchor, followed by any residual predicate
+tuples:
 
 ```text
-(left_values, left_positions, right_values, right_positions,
- left_full_len, right_full_len, operator)
+(left_values, right_values, operator)
+(residual_left_values, residual_right_values, residual_operator)
 ```
 
-Residual predicate tuples follow the ordinary predicate ABI and are evaluated
-before `keep` selection. Consequently, `first` and `last` select from the
-surviving residual-filtered candidates rather than from the unfiltered range
-window.
+`left_index` and `right_index` are separate endpoint arguments. They contain
+physical positions in the original Python layouts, while the value arrays
+may be compact or sorted. Aggregation source arrays use the aligned compact
+layout expected by the endpoint. Residual predicate tuples are evaluated
+before aggregation and before `keep` selection, so `first` and `last` always
+refer to surviving candidates rather than the unfiltered range window.
 
 ## Benchmarking
 
-```sh
-cargo bench --no-default-features
-```
-
-Runs `benches/kernels.rs` (a [`criterion`](https://bheisler.github.io/criterion.rs/book/)
-harness) against the same `*_core` functions the unit tests cover, at
-n=100,000, with no Python interpreter or pyjanitor checkout required. The
-sum group also includes one tiny `u32` suffix query over the same column.
-That sparse case protects cast-on-access: an accidental whole-column
-widening is visible there instead of being hidden inside an `n`-query
-throughput workload.
+Benchmark rebaselining is intentionally outside issue #206. This audit records
+observable correctness and endpoint coverage; it makes no release-profile or
+performance claim.
 
 ### Benchmarking a change that moves the Python/Rust boundary
 

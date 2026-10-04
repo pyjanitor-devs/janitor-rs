@@ -1982,6 +1982,29 @@ mod tests {
                 aggregation_result(&reverse)?,
                 (vec![0, 1], vec![true, true], vec![2, 3])
             );
+
+            let without_matched = run_single_not_equal_aggregation(
+                py,
+                Some(left.readonly()),
+                left_full_positions.readonly(),
+                Some(right.readonly()),
+                right_full_positions.readonly(),
+                "!=",
+                Some(left_positions.readonly()),
+                None,
+                Some(right_positions.readonly()),
+                None,
+                false,
+                &aggregation_request(py, vec![1, 3])?,
+                false,
+                false,
+            )?
+            .expect("forward aggregation should match without a mask");
+            assert_eq!(without_matched.len(), 2);
+            assert_eq!(
+                without_matched.get_item(0)?.extract::<Vec<i64>>()?,
+                vec![0, 1]
+            );
             Ok(())
         })
         .unwrap();
