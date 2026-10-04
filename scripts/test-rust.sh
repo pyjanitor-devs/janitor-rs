@@ -18,6 +18,16 @@ uv pip install --python "$python_bin" numpy
 
 cd "$repo_root"
 site_packages="$($python_bin -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+python_libdir="$($python_bin -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"
+
+# PyO3 links standalone test binaries against libpython. On macOS, Python
+# installations created by uv may put that dylib outside dyld's default
+# search paths; without this export the binary compiles but fails at runtime
+# with "Library not loaded: @rpath/libpython..." (or the framework equivalent).
+if [[ "$(uname -s)" == "Darwin" && -d "$python_libdir" ]]; then
+    export DYLD_LIBRARY_PATH="$python_libdir${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+fi
+
 PYTHONPATH="$site_packages${PYTHONPATH:+:$PYTHONPATH}" \
     PYO3_PYTHON="$python_bin" \
     cargo test --no-default-features "$@"
