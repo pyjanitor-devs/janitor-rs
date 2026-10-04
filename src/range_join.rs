@@ -453,6 +453,10 @@ pub fn range_join_indices<'py>(
     keep: &str,
     return_building_blocks: bool,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    // Python has already removed nulls, sorted the primary right anchor, and
+    // aligned every second anchor to that physical layout. Rust's job here is
+    // only to build/intersect positional windows; it must not sort again or
+    // confuse a search offset with an original dataframe position.
     if predicates.len() != 2 {
         return Err(PyValueError::new_err(
             "range join requires exactly two predicates",
@@ -513,6 +517,9 @@ fn extended_join<'py>(
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
     let keep = Keep::parse(keep)?;
     let residuals = PyList::empty(py);
+    // The first two predicates define the bounded candidate region. All later
+    // predicates—including the original non-monotonic range predicate paired
+    // with a cumulative envelope—are exact filters over that region.
     for item in predicates.iter().skip(2) {
         residuals.append(item)?;
     }

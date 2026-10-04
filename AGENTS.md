@@ -40,8 +40,10 @@ the bottom of this file.
   instantiated per dtype, not hand-written per dtype.
 - **Minimal changes**: this crate has ~100 near-identical macro-generated
   functions; don't "fix" all of them when the task only needs one.
-- **Test after every change**: `cargo test --no-default-features` (see below
-  for why the flag is required).
+- **Test after every change**: `./scripts/test-rust.sh` (see below for why
+  the wrapper is required). It selects a consistent Python, exposes NumPy,
+  disables the wheel-only PyO3 feature, and on macOS adds the selected
+  Python's library directory to dyld's search path.
 - **Preserve numerical contracts**: overflow/wraparound behavior, null-skip
   semantics, and dtype-widening rules here are load-bearing for pyjanitor's
   correctness, not incidental implementation details. See "Non-Obvious
@@ -147,7 +149,7 @@ summation, ints don't.
 
 | Task | Command |
 | --- | --- |
-| Run kernel unit tests | `cargo test --no-default-features` |
+| Run kernel unit tests | `./scripts/test-rust.sh` |
 | Run benchmarks | `cargo bench --no-default-features` |
 | Compile-check benches (fast) | `cargo bench --no-default-features --no-run` |
 | Lint | `cargo clippy --all-targets --all-features -- -D warnings` |
@@ -342,19 +344,31 @@ re-export only benchmark targets through `lib.rs`'s `bench_support` module.
 None of this changes the *Python* surface, which remains only what
 `#[pymodule] fn janitor_rs(...)` registers.
 
-### 5. macOS-only: Xcode's framework Python needs an explicit rpath locally
+### 5. macOS-only: use the repository Rust-test wrapper for Python linking
 
-Purely a local macOS dev-machine issue, not a CI concern (CI runs on
-`ubuntu-latest`, no framework Python): if `python3` resolves to Xcode's
-bundled framework Python (`which python3` → `/usr/bin/python3`, version
-tied to Xcode), `cargo test --no-default-features` can compile and link
-but then fail at **runtime** with `Library not loaded: @rpath/Python3
-.framework/...`. Work around it locally with:
+Standalone PyO3 test binaries link against libpython and need to find that
+library again at runtime. Calling `cargo test --no-default-features`
+directly can accidentally select `/usr/bin/python3` or another framework
+Python, producing a binary that fails with a dyld error such as
+`Library not loaded: @rpath/Python3.framework/...` or
+`@rpath/libpython3.12.dylib`.
+
+Always run `./scripts/test-rust.sh`. It creates or reuses a Python 3.12 uv
+environment, sets `PYO3_PYTHON`, adds NumPy to `PYTHONPATH`, and exports the
+Python installation's `LIBDIR` as `DYLD_LIBRARY_PATH` on macOS. This keeps
+Cargo's compile-time interpreter and dyld's runtime library consistent. If a
+direct Cargo invocation is unavoidable, reproduce those settings explicitly:
 
 ```sh
-DYLD_FRAMEWORK_PATH="/Applications/Xcode.app/Contents/Developer/Library/Frameworks" \
+python_bin=".venv/bin/python"
+python_libdir="$($python_bin -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"
+DYLD_LIBRARY_PATH="$python_libdir" \
+PYO3_PYTHON="$python_bin" \
   cargo test --no-default-features
 ```
+
+CI uses a hosted Python on Linux and does not need the macOS dyld export, but
+the wrapper remains the canonical local command on every platform.
 
 ### 6. Aggregation benchmarks: bound the interval width, don't scale it with `n`
 
