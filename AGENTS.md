@@ -90,6 +90,24 @@ the bottom of this file.
   proof that an optimized branch executed; record empirical branch evidence
   and any unverified matrix cells in the review.
 
+### PyJanitor compatibility gate (janitor-rs #225)
+
+Every janitor-rs change needs an explicit pyjanitor impact assessment before
+merge:
+
+- Rust-only internals, benchmarks, or refactors: document why no pyjanitor
+  change is needed and run `cargo test --no-default-features`.
+- Python-visible behavior, signatures, dtypes, errors, or performance
+  contracts: use coordinated PRs or add explicit compatibility tests in both
+  repositories, linking janitor-rs #225.
+- Release-affecting changes: validate pyjanitor against the published
+  janitor-rs wheel before the pyjanitor change merges.
+
+The PR description must state the classification, the pyjanitor impact, and
+the validation evidence. A paired pyjanitor PR is required when the
+Python-visible contract changes; Rust-only work does not require a no-op
+pyjanitor PR.
+
 ---
 
 ## Project Overview
