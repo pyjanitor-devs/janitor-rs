@@ -81,12 +81,18 @@ fn window_extreme_positions(
 fn cumulative_bound<T: PartialOrd + Copy>(values: &[T], reverse_min: bool) -> Vec<T> {
     let mut output = values.to_vec();
     if reverse_min {
+        // ELI5: scan from the right and carry the smallest value seen so far.
+        // Every suffix therefore has one monotonic boundary, even when the
+        // original endpoint values jump up and down.
         for position in (0..output.len().saturating_sub(1)).rev() {
             if output[position + 1] < output[position] {
                 output[position] = output[position + 1];
             }
         }
     } else {
+        // ELI5: scan from the left and carry the largest value seen so far.
+        // This makes each prefix boundary safe for binary search: a real
+        // match can be added to a window, but never accidentally excluded.
         for position in 1..output.len() {
             if output[position - 1] > output[position] {
                 output[position] = output[position - 1];
@@ -108,6 +114,9 @@ pub fn range_join_cumulative_bound<'py>(
     values: Bound<'py, PyAny>,
     direction: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // The direction is deliberately a small string at the Python boundary,
+    // while the loop below stays generic and typed. Keeping the operation in
+    // Rust avoids a dtype-changing pandas/NumPy round trip for every join.
     let reverse_min = match direction {
         "max" => false,
         "reverse_min" => true,
@@ -123,6 +132,9 @@ pub fn range_join_cumulative_bound<'py>(
         .extract::<String>()?;
     macro_rules! dispatch {
         ($ty:ty) => {{
+            // PyO3 extraction verifies that the array really has this dtype;
+            // silently coercing here could change integer overflow behavior
+            // or the ordering semantics used by the later binary search.
             let values = values.extract::<PyReadonlyArray1<'py, $ty>>()?;
             let output = cumulative_bound(values.as_slice()?, reverse_min);
             Ok(PyArray1::from_vec(py, output).into_any())
@@ -528,6 +540,10 @@ pub fn range_join_indices<'py>(
     keep: &str,
     return_building_blocks: bool,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    // Python has already removed nulls, sorted the primary right anchor, and
+    // aligned every second anchor to that physical layout. Rust's job here is
+    // only to build/intersect positional windows; it must not sort again or
+    // confuse a search offset with an original dataframe position.
     if predicates.len() != 2 {
         return Err(PyValueError::new_err(
             "range join requires exactly two predicates",
@@ -589,6 +605,9 @@ fn extended_join<'py>(
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
     let keep = Keep::parse(keep)?;
     let residuals = PyList::empty(py);
+    // The first two predicates define the bounded candidate region. All later
+    // predicates—including the original non-monotonic range predicate paired
+    // with a cumulative envelope—are exact filters over that region.
     for item in predicates.iter().skip(2) {
         residuals.append(item)?;
     }
