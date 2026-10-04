@@ -1,390 +1,60 @@
 use pyo3::prelude::*;
-mod aggs;
-mod anchor_non_equi_join;
-mod anchor_non_equi_join_agg;
-mod bin_search;
+mod aggregation_common;
+mod aggregation_input;
+mod aggregation_state;
+mod compare_op;
 mod equi_join;
-mod equi_join_agg;
-mod index_builder;
 mod join_aggregation_helpers;
 mod join_candidate_materialization;
-mod join_common;
-mod multi_join_indices;
-mod op;
+mod join_search;
+mod join_types;
+mod not_equals_only;
 mod predicate;
 mod range_join;
-mod range_join_agg;
 mod range_predicate;
 mod regions;
-mod regions_agg;
-
-/// Narrow Rust-only surface used by `benches/kernels.rs`.
-///
-/// ELI5: Criterion benchmarks are separate Rust programs, so they need a
-/// public door into this library. This door exposes only the small set of
-/// algorithms they time instead of opening every implementation module and
-/// hundreds of Python wrappers.
-#[doc(hidden)]
-pub mod bench_support {
-    use numpy::ndarray::ArrayView1;
-    use pyo3::prelude::*;
-
-    pub use crate::aggs::max::max_ends::max_end_core;
-    pub use crate::aggs::max::max_starts::max_start_core;
-    pub use crate::aggs::max::max_starts_ends::max_start_end_core;
-    pub use crate::aggs::max_rev::max_ends::max_rev_ends_core;
-    pub use crate::aggs::max_rev::max_ends_matches::compute_max_rev_end_match_int64;
-    pub use crate::aggs::max_rev::max_ends_matches::max_rev_end_match_core;
-    pub use crate::aggs::max_rev::max_positions::{
-        max_positions_core, max_positions_core_with_storage,
-    };
-    pub use crate::aggs::max_rev::max_starts::max_rev_starts_core;
-    pub use crate::aggs::max_rev::max_starts_ends::max_rev_start_end_core;
-    pub use crate::aggs::min::min_ends::min_end_core;
-    pub use crate::aggs::min::min_starts::min_start_core;
-    pub use crate::aggs::min::min_starts_ends::min_start_end_core;
-    pub use crate::aggs::min_rev::min_ends::min_rev_ends_core;
-    pub use crate::aggs::min_rev::min_ends_matches::compute_min_rev_end_match_int64;
-    pub use crate::aggs::min_rev::min_positions::{
-        min_positions_core, min_positions_core_with_storage,
-    };
-    pub use crate::aggs::min_rev::min_starts::min_rev_starts_core;
-    pub use crate::aggs::min_rev::min_starts_ends::min_rev_start_end_core;
-    pub use crate::aggs::prod::prod_ends::{prod_end_core, prod_end_float_core};
-    pub use crate::aggs::prod::prod_starts::{prod_start_core, prod_start_float_core};
-    pub use crate::aggs::prod::prod_starts_ends::{prod_start_end_core, prod_start_end_float_core};
-    pub use crate::aggs::prod_rev::prod_ends::prod_rev_ends_int_core;
-    pub use crate::aggs::prod_rev::prod_ends_matches::compute_prod_rev_end_match_int64;
-    pub use crate::aggs::prod_rev::prod_positions::prod_positions_float_core_with_storage;
-    pub use crate::aggs::prod_rev::prod_starts::prod_rev_starts_int_core;
-    pub use crate::aggs::size_rev::computes::compute_size_rev_end_matches;
-    pub use crate::aggs::size_rev::computes::{
-        size_positions_core, size_positions_core_with_storage, size_rev_ends_core,
-        size_rev_start_end_core, size_rev_starts_core,
-    };
-    pub use crate::aggs::sum::sum_ends::{sum_end_core, sum_end_float_core_with_cast};
-    pub use crate::aggs::sum::sum_starts::{
-        sum_start_core, sum_start_float_core_with_cast, sum_start_u32_core,
-    };
-    pub use crate::aggs::sum::sum_starts_ends::{
-        sum_start_end_core, sum_start_end_float_core_with_cast,
-    };
-    pub use crate::aggs::sum_rev::sum_ends::sum_rev_ends_int_core;
-    pub use crate::aggs::sum_rev::sum_ends_matches::compute_sum_rev_end_match_int64;
-    pub use crate::aggs::sum_rev::sum_positions::sum_positions_float_core_with_storage;
-    pub use crate::aggs::sum_rev::sum_starts::sum_rev_starts_int_core;
-    pub use crate::bin_search::bin_search_ge_first::binary_search_ge_first_core;
-    pub use crate::bin_search::bin_search_gt_first::binary_search_gt_first_core;
-    pub use crate::bin_search::bin_search_le_first::binary_search_le_first_core;
-    pub use crate::bin_search::bin_search_lt::binary_search_lt_core;
-    pub use crate::bin_search::bin_search_lt_first::binary_search_lt_first_core;
-    pub use crate::index_builder::{repeat_index_core, trim_index_core};
-    pub use crate::multi_join_indices::batch_indices::{
-        compare_batch_indices_all, compare_batch_indices_any, compare_batch_indices_first,
-        compare_batch_indices_last,
-    };
-    pub use crate::multi_join_indices::batch_no_range_indices::compare_batch_no_range;
-    pub use crate::multi_join_indices::dual_regions::{
-        build_dual_region_indices_all, build_dual_region_indices_any,
-        build_dual_region_indices_first, build_dual_region_indices_last,
-    };
-    pub use crate::multi_join_indices::multi_regions::{
-        compare_multi_region_indices_all, compare_multi_region_indices_any,
-        compare_multi_region_indices_first, compare_multi_region_indices_last,
-    };
-    pub use crate::op::CompareOp;
-
-    pub fn sum_rev_start_end_i64(
-        arr: ArrayView1<'_, i64>,
-        starts: ArrayView1<'_, i64>,
-        ends: ArrayView1<'_, i64>,
-        index: ArrayView1<'_, i64>,
-        booleans: ArrayView1<'_, bool>,
-    ) -> Result<(Vec<i64>, Vec<i64>), String> {
-        crate::aggs::sum_rev::sum_starts_ends::sum_rev_start_end_int_core(
-            arr,
-            starts,
-            ends,
-            index,
-            booleans,
-            |value| value,
-        )
-    }
-
-    pub fn sum_rev_start_end_f64(
-        arr: ArrayView1<'_, f64>,
-        starts: ArrayView1<'_, i64>,
-        ends: ArrayView1<'_, i64>,
-        index: ArrayView1<'_, i64>,
-        booleans: ArrayView1<'_, bool>,
-    ) -> Result<(Vec<i64>, Vec<f64>), String> {
-        crate::aggs::sum_rev::sum_starts_ends::sum_rev_start_end_float_core(
-            arr,
-            starts,
-            ends,
-            index,
-            booleans,
-            |value| value,
-        )
-    }
-
-    pub fn prod_rev_start_end_i64(
-        arr: ArrayView1<'_, i64>,
-        starts: ArrayView1<'_, i64>,
-        ends: ArrayView1<'_, i64>,
-        index: ArrayView1<'_, i64>,
-        booleans: ArrayView1<'_, bool>,
-    ) -> Result<(Vec<i64>, Vec<i64>), String> {
-        crate::aggs::prod_rev::prod_starts_ends::prod_rev_start_end_int_core(
-            arr,
-            starts,
-            ends,
-            index,
-            booleans,
-            |value| value,
-        )
-    }
-
-    pub fn prod_rev_start_end_f64(
-        arr: ArrayView1<'_, f64>,
-        starts: ArrayView1<'_, i64>,
-        ends: ArrayView1<'_, i64>,
-        index: ArrayView1<'_, i64>,
-        booleans: ArrayView1<'_, bool>,
-    ) -> Result<(Vec<i64>, Vec<f64>), String> {
-        crate::aggs::prod_rev::prod_starts_ends::prod_rev_start_end_float_core(
-            arr,
-            starts,
-            ends,
-            index,
-            booleans,
-            |value| value,
-        )
-    }
-
-    pub fn prod_positions_i64(
-        arr: ArrayView1<'_, i64>,
-        starts: ArrayView1<'_, i64>,
-        ends: ArrayView1<'_, i64>,
-        index: ArrayView1<'_, i64>,
-        positions: ArrayView1<'_, i64>,
-        booleans: ArrayView1<'_, bool>,
-    ) -> (Vec<i64>, Vec<i64>) {
-        crate::aggs::prod_rev::prod_positions::prod_positions_int_core(
-            arr,
-            starts,
-            ends,
-            index,
-            positions,
-            booleans,
-            |value| value,
-        )
-        .expect("benchmark inputs satisfy positions validation")
-    }
-
-    pub fn prod_positions_i64_with_storage(
-        arr: ArrayView1<'_, i64>,
-        starts: ArrayView1<'_, i64>,
-        ends: ArrayView1<'_, i64>,
-        index: ArrayView1<'_, i64>,
-        positions: ArrayView1<'_, i64>,
-        booleans: ArrayView1<'_, bool>,
-        dense: bool,
-    ) -> (Vec<i64>, Vec<i64>) {
-        crate::aggs::prod_rev::prod_positions::prod_positions_int_core_with_storage(
-            arr,
-            starts,
-            ends,
-            index,
-            positions,
-            booleans,
-            |value| value,
-            dense,
-        )
-        .expect("benchmark inputs satisfy positions validation")
-    }
-
-    pub fn sum_positions_i64(
-        arr: ArrayView1<'_, i64>,
-        starts: ArrayView1<'_, i64>,
-        ends: ArrayView1<'_, i64>,
-        index: ArrayView1<'_, i64>,
-        positions: ArrayView1<'_, i64>,
-        booleans: ArrayView1<'_, bool>,
-    ) -> (Vec<i64>, Vec<i64>) {
-        crate::aggs::sum_rev::sum_positions::sum_positions_int_core(
-            arr,
-            starts,
-            ends,
-            index,
-            positions,
-            booleans,
-            |value| value,
-        )
-        .expect("benchmark inputs satisfy positions validation")
-    }
-
-    pub fn sum_positions_i64_with_storage(
-        arr: ArrayView1<'_, i64>,
-        starts: ArrayView1<'_, i64>,
-        ends: ArrayView1<'_, i64>,
-        index: ArrayView1<'_, i64>,
-        positions: ArrayView1<'_, i64>,
-        booleans: ArrayView1<'_, bool>,
-        dense: bool,
-    ) -> (Vec<i64>, Vec<i64>) {
-        crate::aggs::sum_rev::sum_positions::sum_positions_int_core_with_storage(
-            arr,
-            starts,
-            ends,
-            index,
-            positions,
-            booleans,
-            |value| value,
-            dense,
-        )
-        .expect("benchmark inputs satisfy positions validation")
-    }
-
-    /// Build the fully registered Python module for wrapper benchmarks.
-    pub fn registered_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
-        let module = PyModule::new(py, "janitor_rs_bench")?;
-        super::janitor_rs(&module)?;
-        Ok(module)
-    }
-}
+mod single_range_predicate;
 
 /// Top-level composition point: each family owns and registers its own
-/// exports, so this function only has to know the five family names, not
+/// exports, so this function only has to know the surviving family names, not
 /// the ~900 individual dtype-specialized functions they expose.
 ///
 /// ELI5: instead of one giant guest list at the front door, each
-/// department (binary search, comparison, index building, aggregation)
+/// department (equality, inequality, range, or region joins)
 /// keeps its own short list and reports up through its `register`
 /// function; the front door just asks each department to check its own
 /// guests in.
 #[pymodule]
 fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    bin_search::register(m)?;
-    multi_join_indices::register(m)?;
-    index_builder::register(m)?;
     equi_join::register(m)?;
-    equi_join_agg::register(m)?;
-    anchor_non_equi_join::register(m)?;
+    not_equals_only::register(m)?;
     range_join::register(m)?;
-    range_join_agg::register(m)?;
+    single_range_predicate::register(m)?;
     regions::register(m)?;
-    regions_agg::register(m)?;
-    anchor_non_equi_join_agg::register(m)?;
-    aggs::register(m)?;
     Ok(())
 }
 
-/// ELI5: instead of re-checking all ~900 dtype-specialized exports (that's
-/// what `cargo test` running every family's own tests already does), this
-/// builds the real module once and asks it for one guest per department --
-/// enough to prove each family's `register` actually got wired into
-/// `janitor_rs`, not just that it compiles.
 #[cfg(test)]
 mod registration_tests {
     use super::janitor_rs;
     use pyo3::prelude::*;
 
     #[test]
-    fn every_family_registers_a_representative_export() {
+    fn surviving_join_families_register_exports() {
         Python::initialize();
         Python::attach(|py| {
             let module = PyModule::new(py, "janitor_rs_registration_test")
                 .expect("module creation must not fail");
             janitor_rs(&module).expect("registration must not fail");
-
-            let representative_exports = [
-                "binary_search_lt_int64",            // bin_search
-                "compare_batch_indices_first",       // fused batch comparison
-                "aggregate_batch_reverse",           // reverse fused compare
-                "aggregate_batch_no_range_reverse",  // reverse no-range compare
-                "repeat_index",                      // index_builder
-                "equi_join_indices",                 // equi_join
-                "equi_join_building_blocks",         // equi_join
-                "equi_join_filtered_indices",        // equi_join
-                "equi_join_aggregate",               // equi_join_agg
-                "compute_sum_start_int64",           // aggs::sum
-                "compute_sum_rev_start_int64",       // aggs::sum_rev
-                "compute_min_start_int64",           // aggs::min
-                "compute_min_rev_start_int64",       // aggs::min_rev
-                "compute_max_start_int64",           // aggs::max
-                "compute_max_rev_start_int64",       // aggs::max_rev
-                "compute_prod_start_int64",          // aggs::prod
-                "compute_prod_rev_start_int64",      // aggs::prod_rev
-                "compute_size_rev_start",            // aggs::size_rev
-                "aggregate_dual_regions_reverse",    // reverse dual regions
-                "aggregate_multi_regions_reverse",   // reverse multi regions
-                "aggregate_starts_reverse",          // reverse starts ranges
-                "aggregate_ends_reverse",            // reverse ends ranges
-                "aggregate_starts_ends_reverse",     // reverse starts/ends ranges
-                "single_join_indices_int64",         // single-predicate join
-                "range_join_indices",                // two-range join
-                "range_join_extended_indices",       // range-led extended join
-                "range_join_extended_aggregate",     // range-led aggregation
-                "range_join_aggregate",              // two-range aggregation
-                "region_indices",                    // dual regions join
-                "region_indices_extended",           // dual/multi regions join
-                "region_aggregate",                  // dual regions aggregation
-                "region_aggregate_reverse",          // reverse dual regions aggregation
-                "region_extended_aggregate",         // dual/multi regions aggregation
-                "region_extended_aggregate_reverse", // reverse dual/multi aggregation
-            ];
-
-            for name in representative_exports {
-                assert!(
-                    module.getattr(name).is_ok(),
-                    "expected `{name}` to be registered on the janitor_rs module"
-                );
+            for name in [
+                "equi_join_indices",
+                "not_equals_aggregate_int64",
+                "range_join_indices",
+                "single_range_predicate_indices_int64",
+                "region_indices",
+            ] {
+                assert!(module.getattr(name).is_ok(), "missing export: {name}");
             }
-        });
-    }
-
-    /// Total `m.add_function(...)` call count across every family's
-    /// `register`, as of this PR (827 exports across the retained leaf
-    /// modules).
-    /// Bump this alongside any PR that intentionally adds or removes an
-    /// export.
-    const EXPECTED_EXPORT_COUNT: usize = 827;
-
-    /// ELI5: the representative-export test above only proves each
-    /// department's guest list reports up the chain at all -- it would
-    /// still pass even if one department quietly dropped a single guest
-    /// from an otherwise-still-reporting list. This test instead counts
-    /// heads: every dunder-free (non-`__x__`) name on a freshly registered
-    /// module must be one of our own exports (Python/PyO3 module
-    /// machinery -- `__name__`, `__all__`, etc. -- all use `__`-wrapped
-    /// names), so counting just those catches a missing or duplicate
-    /// export without spelling out all 751 names here.
-    #[test]
-    fn total_registered_export_count_matches_expected() {
-        Python::initialize();
-        Python::attach(|py| {
-            let module = PyModule::new(py, "janitor_rs_export_count_test")
-                .expect("module creation must not fail");
-            janitor_rs(&module).expect("registration must not fail");
-
-            let export_count = module
-                .dir()
-                .expect("dir() must not fail")
-                .iter()
-                .filter(|name| {
-                    let name = name.to_string();
-                    !(name.starts_with("__") && name.ends_with("__"))
-                })
-                .count();
-
-            assert_eq!(
-                export_count, EXPECTED_EXPORT_COUNT,
-                "expected exactly {EXPECTED_EXPORT_COUNT} registered exports; got \
-                 {export_count}. If this PR intentionally added or removed an export, update \
-                 EXPECTED_EXPORT_COUNT to match -- otherwise a register() call went missing \
-                 somewhere in the chain."
-            );
         });
     }
 }

@@ -20,16 +20,72 @@
 //! in the order required by binary search. This module owns only tuple
 //! parsing, dtype dispatch, shape validation, and delegation to the existing
 //! typed window implementation.
+//!
+//! The basic dual-range index entry point uses a shared-index representation:
+//! each anchor is `(left_values, right_values, operator)`, while the single
+//! `left_index`, `right_index`, and `right_index_is_ordered` values are passed
+//! separately. This guarantees that both anchors address the same physical
+//! left and right layouts.
 
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
-use crate::aggs::ensure_equal_lengths_core;
-use crate::anchor_non_equi_join::build_range_core_with_labels;
-use crate::join_common::SingleJoinResult;
-use crate::op::CompareOp;
+use crate::aggregation_common::ensure_equal_lengths_core;
+use crate::compare_op::CompareOp;
+use crate::join_search::{range_window, range_window_bounds};
+use crate::join_types::SingleJoinResult;
+
+/// Build one typed range window without depending on the deleted legacy
+/// anchor module. The returned bounds address the supplied sorted right-value
+/// layout; the right index labels are copied only when building blocks need
+/// to expose them to Python.
+#[allow(clippy::too_many_arguments)]
+fn build_range_core_with_labels<T: PartialOrd + Copy>(
+    left: numpy::ndarray::ArrayView1<'_, T>,
+    left_index: numpy::ndarray::ArrayView1<'_, i64>,
+    right: numpy::ndarray::ArrayView1<'_, T>,
+    right_index: numpy::ndarray::ArrayView1<'_, i64>,
+    _right_index_is_ordered: bool,
+    op: CompareOp,
+    include_right_index: bool,
+    retain_empty_windows: bool,
+) -> Result<SingleJoinResult, String> {
+    ensure_equal_lengths_core("left", left.len(), "left_index", left_index.len())?;
+    ensure_equal_lengths_core("right", right.len(), "right_index", right_index.len())?;
+    if !matches!(
+        op,
+        CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+    ) {
+        return Err("single join range core requires a range comparator".to_owned());
+    }
+    let mut result = SingleJoinResult {
+        left_positions: Vec::new(),
+        left_index: Vec::new(),
+        right_index: if include_right_index {
+            right_index.to_vec()
+        } else {
+            Vec::new()
+        },
+        starts: Vec::new(),
+        ends: Vec::new(),
+    };
+    if left.is_empty() || right.is_empty() {
+        return Ok(result);
+    }
+    for (left_position, &left_value) in left.iter().enumerate() {
+        let (start, end) = range_window(left_value, right, op);
+        if start >= end && !retain_empty_windows {
+            continue;
+        }
+        result.left_positions.push(left_position);
+        result.left_index.push(left_index[left_position]);
+        result.starts.push(start);
+        result.ends.push(end);
+    }
+    Ok(result)
+}
 
 /// One typed range anchor after parsing.
 ///
@@ -117,11 +173,13 @@ pub(crate) struct ParsedAggregationRangeAnchor<'py> {
 /// Parse one aggregation range anchor without exposing tuple positions to a
 /// kernel.
 ///
-/// The first anchor uses the established six- or eight-field aggregation
-/// form. The second anchor uses the five-field range form because it does not
-/// carry output maps:
+/// The first anchor accepts the five-field dual-range form, plus the
+/// established six- or eight-field forms used by other aggregation paths.
+/// The second anchor always uses the five-field range form because it does
+/// not carry output maps:
 ///
 /// ```text
+/// first, five: (left, left_index, right, right_index, op)
 /// first, six:  (left, left_index, right, right_index, ordered, op)
 /// first, eight:(left, left_index, right, right_index, ordered,
 ///              left_output_positions, right_output_positions, op)
@@ -147,12 +205,13 @@ pub(crate) fn parse_aggregation_range_anchor<'py>(
     tuple: &Bound<'py, PyTuple>,
     first: bool,
 ) -> PyResult<ParsedAggregationRangeAnchor<'py>> {
-    // The first tuple has metadata that the second tuple does not. Parse the
-    // shape and metadata before touching values so malformed output maps are
-    // reported at the public boundary rather than during result assembly.
+    // Parse tuple shape and metadata before touching values so malformed
+    // output maps are reported at the public boundary rather than during
+    // result assembly.
     let (range, ordered, left_output_positions, right_output_positions) = if first {
         let (operator_position, ordered, left_output_positions, right_output_positions) =
             match tuple.len() {
+                5 => (4, None, None, None),
                 6 => {
                     let ordered = tuple.get_item(4)?.extract::<bool>()?;
                     (5, Some(ordered), None, None)
@@ -165,7 +224,7 @@ pub(crate) fn parse_aggregation_range_anchor<'py>(
                 }
                 _ => {
                     return Err(PyValueError::new_err(
-                        "aggregation first anchor must contain 6 or 8 elements",
+                        "aggregation first anchor must contain 5, 6, or 8 elements",
                     ));
                 }
             };
@@ -346,6 +405,43 @@ impl AnyParsedRangePredicate<'_> {
             Self::U8(value) => validate!(value),
             Self::F64(value) => validate!(value),
             Self::F32(value) => validate!(value),
+        }
+    }
+
+    /// Compute typed half-open windows for this parsed range anchor.
+    ///
+    /// The returned offsets address the sorted right-value layout. The
+    /// companion physical position arrays are used only to validate the
+    /// range-window inputs; callers must still use `right_index[offset]` when
+    /// converting a sorted offset back to an original right position.
+    ///
+    /// Keeping this dispatch beside [`AnyParsedRangePredicate`] avoids making
+    /// every caller repeat the ten-variant dtype match. The actual binary
+    /// search remains in `common::range_window_bounds`, which is independent
+    /// of the parsed-predicate representation.
+    pub(crate) fn bounds(&self) -> Result<(Vec<usize>, Vec<usize>), String> {
+        macro_rules! bounds {
+            ($predicate:expr) => {
+                range_window_bounds(
+                    $predicate.left.as_array(),
+                    $predicate.left_index.as_array(),
+                    $predicate.right.as_array(),
+                    $predicate.right_index.as_array(),
+                    $predicate.op,
+                )
+            };
+        }
+        match self {
+            Self::I64(predicate) => bounds!(predicate),
+            Self::I32(predicate) => bounds!(predicate),
+            Self::I16(predicate) => bounds!(predicate),
+            Self::I8(predicate) => bounds!(predicate),
+            Self::U64(predicate) => bounds!(predicate),
+            Self::U32(predicate) => bounds!(predicate),
+            Self::U16(predicate) => bounds!(predicate),
+            Self::U8(predicate) => bounds!(predicate),
+            Self::F64(predicate) => bounds!(predicate),
+            Self::F32(predicate) => bounds!(predicate),
         }
     }
 

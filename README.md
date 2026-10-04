@@ -18,6 +18,21 @@ Wheels are built and published by `.github/workflows/release.yml` via
 cargo test --no-default-features
 ```
 
+For a reproducible local environment, use the project wrapper instead. It
+creates a `uv`-managed Python 3.12 environment and points PyO3 at that
+interpreter so macOS does not accidentally select the Xcode
+Command Line Tools Python framework:
+
+```sh
+./scripts/test-rust.sh
+```
+
+Additional Cargo test arguments are forwarded by the wrapper, for example:
+
+```sh
+./scripts/test-rust.sh anchor_non_equi_join
+```
+
 `--no-default-features` disables the `extension-module` pyo3 feature. That
 feature tells pyo3 not to link against libpython, because the real wheel
 is `dlopen()`'d *by* a Python interpreter that already provides those
@@ -94,6 +109,45 @@ aggregation dispatch, wrong null handling in the full pipeline); this
 repo's tests catch kernel-level regressions (an off-by-one at a range
 boundary, an overflow behavior change, a duplicate-value edge case) in
 isolation, and much faster.
+
+## Range-first Python/Rust contract
+
+The range-first conditional-join family is split deliberately across the two
+repositories. `pyjanitor` owns pandas preparation and `janitor-rs` owns typed
+candidate traversal and aggregation:
+
+1. Python removes null anchor values and sorts the right range values.
+2. Python keeps the original physical row positions beside every prepared
+   value. Sorting changes the search order, not the position identity.
+3. The Rust index kernel uses the sorted values to produce half-open windows
+   and evaluates residual predicates against compact offsets.
+4. Rust returns physical left/right positions, so Python can recover the
+   original dataframe rows without reconstructing the sorted layout.
+
+For range-first aggregation, Python passes the compact anchor arrays plus the
+full left/right source lengths. Aggregation columns remain in their original
+full layouts. Rust translates each surviving compact candidate through the
+anchor position arrays before updating the accumulator. Forward aggregation
+uses physical right positions as source slots and physical left positions as
+output slots; reverse aggregation swaps those roles.
+
+This distinction is important because a sorted right value offset is not a
+valid index into an original right aggregation column. The position arrays are
+therefore part of the ABI, not an optimization hint. They must remain unique
+physical positions and must never be replaced with sorted offsets or compact
+array positions.
+
+The public range-first aggregation tuple is:
+
+```text
+(left_values, left_positions, right_values, right_positions,
+ left_full_len, right_full_len, operator)
+```
+
+Residual predicate tuples follow the ordinary predicate ABI and are evaluated
+before `keep` selection. Consequently, `first` and `last` select from the
+surviving residual-filtered candidates rather than from the unfiltered range
+window.
 
 ## Benchmarking
 

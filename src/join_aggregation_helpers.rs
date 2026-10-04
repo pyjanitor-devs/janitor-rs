@@ -9,13 +9,79 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
-use crate::aggs::aggregation::{make_results_with_positions, parse_inputs, AggregationSet};
-use crate::join_common::SingleJoinResult;
-use crate::op::CompareOp;
+use crate::aggregation_common::aggregation::{
+    make_results_with_positions, parse_inputs, AggregationSet,
+};
+use crate::compare_op::CompareOp;
+use crate::join_types::SingleJoinResult;
 use crate::predicate::{
     null_metadata_views, parse_predicates_with_nulls_strings, predicates_match_dispatch,
     PredicateView,
 };
+use crate::range_predicate::AnyParsedRangePredicate;
+
+/// Package precomputed range bounds as dense aggregation windows.
+///
+/// Empty windows are retained because aggregation output slots must remain
+/// aligned with the complete left layout. The caller may later compact the
+/// windows when it is materializing index pairs instead of aggregations. This
+/// helper intentionally does not calculate the bounds; the caller owns that
+/// typed binary-search step and can reuse the result elsewhere.
+///
+/// # Arguments
+///
+/// * `range` - Parsed anchor supplying the left/right physical position maps.
+/// * `starts` / `ends` - Half-open offsets into the sorted right-value layout,
+///   one pair for every compact left value.
+/// * `include_right_index` - Retain the right physical position map when true.
+///
+/// # Errors
+///
+/// Returns an error when the supplied bound arrays do not have one entry per
+/// compact left value.
+pub(crate) fn aggregation_windows(
+    range: &AnyParsedRangePredicate<'_>,
+    starts: Vec<usize>,
+    ends: Vec<usize>,
+    include_right_index: bool,
+) -> Result<SingleJoinResult, String> {
+    // Keep empty windows in the dense representation. The range-first index
+    // path later compacts them, while aggregation needs the left-side slot
+    // relationship to remain explicit for matched-mask construction.
+    macro_rules! build {
+        ($predicate:expr) => {{
+            let predicate = $predicate;
+            if starts.len() != predicate.left.as_array().len()
+                || ends.len() != predicate.left.as_array().len()
+            {
+                return Err("range aggregation bounds must match left values".to_owned());
+            }
+            Ok(SingleJoinResult {
+                left_positions: (0..predicate.left.as_array().len()).collect(),
+                left_index: predicate.left_index.as_array().to_vec(),
+                right_index: if include_right_index {
+                    predicate.right_index.as_array().to_vec()
+                } else {
+                    Vec::new()
+                },
+                starts,
+                ends,
+            })
+        }};
+    }
+    match range {
+        AnyParsedRangePredicate::I64(predicate) => build!(predicate),
+        AnyParsedRangePredicate::I32(predicate) => build!(predicate),
+        AnyParsedRangePredicate::I16(predicate) => build!(predicate),
+        AnyParsedRangePredicate::I8(predicate) => build!(predicate),
+        AnyParsedRangePredicate::U64(predicate) => build!(predicate),
+        AnyParsedRangePredicate::U32(predicate) => build!(predicate),
+        AnyParsedRangePredicate::U16(predicate) => build!(predicate),
+        AnyParsedRangePredicate::U8(predicate) => build!(predicate),
+        AnyParsedRangePredicate::F64(predicate) => build!(predicate),
+        AnyParsedRangePredicate::F32(predicate) => build!(predicate),
+    }
+}
 
 /// Parse every predicate after the first extended-join predicate.
 ///
@@ -95,10 +161,8 @@ pub(crate) fn residuals<'py>(
 ///
 /// # Arguments
 ///
-/// * `left` - Non-null left values for the first range predicate, in physical
-///   left-row order.
-/// * `right` - Sorted, non-null right values for the first range predicate.
-/// * `op` - The first predicate's range operator: `<`, `<=`, `>`, or `>=`.
+/// * `windows` - Candidate windows produced by the range anchor. Their
+///   `starts`/`ends` offsets address the sorted right layout.
 /// * `residuals` - Parsed predicates after the first predicate. Their arrays
 ///   must be aligned to the same physical left and right positions.
 /// * `residual_metadata` - Optional authoritative null metadata for residual
@@ -106,12 +170,15 @@ pub(crate) fn residuals<'py>(
 /// * `set` - Aggregation state updated for every fully matching pair.
 /// * `reverse` - Whether source values come from the left and output slots
 ///   are indexed by the right side.
+/// * `physical_position_maps` - Translate compact candidate offsets through
+///   the anchor's physical position arrays before updating aggregation state.
+///   This is true only when Python passed full-layout aggregation arrays.
 ///
 /// # Example
 ///
-/// With `right = [2, 5, 8]`, `left = [4]`, and `left < right`, the first
-/// predicate produces the candidate window `right[1..] = [5, 8]`. A residual
-/// predicate can remove either candidate before `set.update` is called.
+/// With sorted `right = [2, 5, 8]`, `left = [4]`, and `left < right`, the
+/// anchor produces `right[1..] = [5, 8]`. A residual predicate can remove
+/// either candidate before `set.update` is called.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_range(
     windows: &SingleJoinResult,
@@ -119,6 +186,7 @@ fn aggregate_range(
     residual_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
     set: &mut AggregationSet<'_>,
     reverse: bool,
+    physical_position_maps: bool,
 ) {
     for (row, (&start, &end)) in windows.starts.iter().zip(windows.ends.iter()).enumerate() {
         let left_position = windows.left_positions[row];
@@ -129,7 +197,17 @@ fn aggregate_range(
                 left_position,
                 right_position,
             ) {
-                if reverse {
+                if physical_position_maps {
+                    let physical_left = usize::try_from(windows.left_index[row])
+                        .expect("validated physical left position");
+                    let physical_right = usize::try_from(windows.right_index[right_position])
+                        .expect("validated physical right position");
+                    if reverse {
+                        set.update(physical_left, physical_right);
+                    } else {
+                        set.update(physical_right, physical_left);
+                    }
+                } else if reverse {
                     set.update(left_position, right_position);
                 } else {
                     set.update(right_position, left_position);
@@ -168,6 +246,11 @@ fn aggregate_range(
 /// * `source_len` - Number of source rows visible to the aggregation inputs.
 /// * `return_matched` - Include the per-output match mask when true.
 /// * `reverse` - Select forward or reverse source/output orientation.
+/// * `physical_position_maps` - When true, translate compact candidate
+///   offsets through `windows.left_index` and `windows.right_index` before
+///   updating aggregation state. This is used when aggregation inputs retain
+///   the original full Python layouts. Existing aligned-layout callers pass
+///   false because their arrays already use compact offsets.
 ///
 /// # Returns
 ///
@@ -191,6 +274,7 @@ pub(crate) fn aggregate_range_windows<'py>(
     source_len: usize,
     return_matched: bool,
     reverse: bool,
+    physical_position_maps: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let inputs = parse_inputs(aggregations)?;
     if inputs.is_empty() {
@@ -256,6 +340,7 @@ pub(crate) fn aggregate_range_windows<'py>(
         metadata_views.as_deref(),
         &mut set,
         reverse,
+        physical_position_maps,
     );
     if set.is_empty() {
         return Ok(None);
