@@ -33,7 +33,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 The per-endpoint test and operation coverage is tracked in
-[`AGGREGATION_MIGRATION_MATRIX.md`](AGGREGATION_MIGRATION_MATRIX.md).
+[`AGGREGATION_MIGRATION_MATRIX.md`](https://github.com/pyjanitor-devs/janitor-rs/blob/main/AGGREGATION_MIGRATION_MATRIX.md).
 
 ## Building
 
@@ -44,7 +44,8 @@ maturin build --release
 ```
 
 The package version is read from `Cargo.toml`. Release preparation and PyPI
-publishing are documented in [`RELEASING.md`](RELEASING.md).
+publishing are documented in
+[`RELEASING.md`](https://github.com/pyjanitor-devs/janitor-rs/blob/main/RELEASING.md).
 
 ## Repository layout
 
@@ -57,7 +58,8 @@ to the Rust/Python boundary should be tested in both repositories.
 
 ## Further reading
 
-[`AGENTS.md`](AGENTS.md) is the canonical reference for implementation-level
+[`AGENTS.md`](https://github.com/pyjanitor-devs/janitor-rs/blob/main/AGENTS.md)
+is the canonical reference for implementation-level
 detail that doesn't belong in a contributor quickstart: the range-first
 Python/Rust ABI contract, the cross-boundary benchmarking methodology, and
 other non-obvious conventions and gotchas.
