@@ -37,6 +37,6 @@ git push origin v0.6.2
 ```
 
 The tag is required to be exactly `v< Cargo.toml version >`; the release
-workflow rejects mismatches before publishing.  A workflow dispatch remains
-available for rebuilding the current Cargo version, but the tagged release
-path is preferred because it produces an auditable GitHub release.
+workflow rejects mismatches before publishing. The release workflow has no
+manual publishing trigger, so PyPI publication remains behind the reviewed
+release PR and generated version tag path.
