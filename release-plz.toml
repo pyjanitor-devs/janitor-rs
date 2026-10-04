@@ -1,0 +1,19 @@
+# janitor-rs publishes Python wheels and source distributions through Maturin,
+# not a crate through crates.io.  release-plz still provides the version,
+# changelog, tag, and GitHub-release workflow; git-only mode prevents it from
+# attempting a Cargo registry publication.
+[workspace]
+git_only = true
+publish = false
+git_release_enable = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+semver_check = false
+release_always = false
+
+# Keep release-plz focused on user-visible changes.  Maintenance-only commits
+# can still be released manually when required.
+release_commits = "^(feat|fix|perf|refactor|docs|build|ci|test|chore)(\\(|:)"
+
+[changelog]
+tag_pattern = "v[0-9].*"

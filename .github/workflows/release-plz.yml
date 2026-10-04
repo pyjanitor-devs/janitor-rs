@@ -1,0 +1,51 @@
+name: release-plz
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: Release-plz operation to run
+        required: true
+        type: choice
+        options:
+          - release-pr
+          - release
+
+concurrency:
+  group: release-plz
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-pr:
+    if: github.repository == 'pyjanitor-devs/janitor-rs' && inputs.command == 'release-pr'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    if: github.repository == 'pyjanitor-devs/janitor-rs' && inputs.command == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

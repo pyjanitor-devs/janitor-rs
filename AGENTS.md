@@ -1206,3 +1206,20 @@ survive every residual predicate.
 **Recommendation**: Ignore `right_index_is_ordered` on residual paths. Apply
 all residuals first, then choose `any`, `first`, or `last` using original
 physical right positions.
+
+### [2026-10-04] Releases are explicitly agent-authorized and on demand
+
+**Context**: The release workflow must not create release pull requests or
+publish packages after ordinary pushes to `main`.
+
+**Learning**: A release is authorized only when the user explicitly tells the
+agent to proceed with a release. The agent may then run the `release-plz`
+workflow manually with `command: release-pr`, report the generated pull
+request, and wait for that pull request to be merged. After the merge, the
+agent may run the workflow again with `command: release`; this creates the
+version tag and starts the PyPI publishing workflow.
+
+**Recommendation**: Never trigger release preparation or publication from a
+normal push. Treat an explicit user release instruction as the release gate,
+and keep the two workflow dispatches separate so the version bump remains
+reviewable before the tag is created.
