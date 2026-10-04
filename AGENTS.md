@@ -1206,3 +1206,118 @@ survive every residual predicate.
 **Recommendation**: Ignore `right_index_is_ordered` on residual paths. Apply
 all residuals first, then choose `any`, `first`, or `last` using original
 physical right positions.
+
+### [2026-10-04] Releases are explicitly agent-authorized and on demand
+
+**Context**: The release workflow must not create release pull requests or
+publish packages after ordinary pushes to `main`.
+
+**Learning**: A release is authorized only when the user explicitly tells the
+agent to proceed with a release. The agent may then run the `release-plz`
+workflow manually with `command: release-pr`, report the generated pull
+request, and wait for that pull request to be merged. After the merge, the
+agent may run the workflow again with `command: release`; this creates the
+version tag and starts the PyPI publishing workflow.
+
+**Recommendation**: Never trigger release preparation or publication from a
+normal push. Treat an explicit user release instruction as the release gate,
+and keep the two workflow dispatches separate so the version bump remains
+reviewable before the tag is created.
+
+### [2026-10-05] Range-first Python/Rust ABI contract (relocated from README.md)
+
+**Context**: PR #224 trimmed `README.md` to a short contributor quickstart
+and dropped several sections that documented real, load-bearing contracts
+rather than stale references. This entry preserves the range-first ABI
+contract that lived under README's old "Range-first Python/Rust contract"
+heading.
+
+The range-first conditional-join family is split deliberately across the two
+repositories. `pyjanitor` owns pandas preparation and `janitor-rs` owns typed
+candidate traversal and aggregation:
+
+1. Python removes null anchor values and sorts the right range values.
+2. Python keeps the original physical row positions beside every prepared
+   value. Sorting changes the search order, not the position identity.
+3. The Rust index kernel uses the sorted values to produce half-open windows
+   and evaluates residual predicates against compact offsets.
+4. Rust returns physical left/right positions, so Python can recover the
+   original dataframe rows without reconstructing the sorted layout.
+
+For range-first aggregation, Python passes the compact anchor arrays plus the
+full left/right source lengths. Aggregation columns remain in their original
+full layouts. Rust translates each surviving compact candidate through the
+anchor position arrays before updating the accumulator. Forward aggregation
+uses physical right positions as source slots and physical left positions as
+output slots; reverse aggregation swaps those roles.
+
+**This distinction is important because a sorted right value offset is not a
+valid index into an original right aggregation column.** The position arrays
+are therefore part of the ABI, not an optimization hint. They must remain
+unique physical positions and must never be replaced with sorted offsets or
+compact array positions.
+
+The range-first extended endpoints use separate physical position maps. The
+first predicate is a three-field anchor, followed by any residual predicate
+tuples:
+
+```text
+(left_values, right_values, operator)
+(residual_left_values, residual_right_values, residual_operator)
+```
+
+`left_index` and `right_index` are separate endpoint arguments. They contain
+physical positions in the original Python layouts, while the value arrays
+may be compact or sorted. Aggregation source arrays use the aligned compact
+layout expected by the endpoint. Residual predicate tuples are evaluated
+before aggregation and before `keep` selection, so `first` and `last` always
+refer to surviving candidates rather than the unfiltered range window.
+
+**Recommendation**: Treat this entry, not README.md, as the canonical home
+for this contract going forward. If it drifts from `src/single_range_predicate.rs`
+or `src/range_join.rs`, fix the code-comment/doc-comment source first, then
+update this entry to match.
+
+### [2026-10-05] Benchmarking a change that moves the Python/Rust boundary (relocated from README.md)
+
+**Context**: Also dropped from README.md by PR #224. Several issues in this
+repo (e.g. #26) are about moving logic across the Python/Rust boundary --
+replacing a Rust kernel with NumPy, or vice versa. For that kind of change, a
+Rust-only `cargo bench` number in isolation isn't the whole story: what
+matters is the end-to-end call from Python.
+
+**Recommendation**: Follow the process used for pyjanitor-devs/pyjanitor#1673
+(moving three integer sum kernels from Rust to NumPy) as the worked example:
+
+1. Benchmark the kernel(s) in isolation first -- here, via `cargo bench`
+   (Rust) or the equivalent in pyjanitor (NumPy/Python), at both a small
+   and a large size.
+2. Benchmark the real end-to-end call downstream in pyjanitor (e.g.
+   `join_agg(..., aggfunc=[...])`), not just the kernel -- boundary
+   crossings and index-building overhead can dominate at small sizes even
+   when the kernel itself is faster in isolation.
+3. Record both sets of numbers in the PR description (see pyjanitor PR
+   #1673 for the format), so a reviewer can see the kernel-level and
+   end-to-end pictures without having to reproduce either locally.
+
+Benchmark rebaselining itself was intentionally out of scope for issue #206's
+aggregation-migration audit (see `AGGREGATION_MIGRATION_MATRIX.md`); that
+audit records observable correctness and endpoint coverage, not a
+release-profile or performance claim.
+
+### [2026-10-05] `too_many_arguments` is an intentional, scoped clippy allow (relocated from README.md)
+
+**Context**: Also dropped from README.md by PR #224.
+
+**Learning**: The default `too_many_arguments` clippy threshold remains active
+for handwritten functions. Macro-generated `#[pyfunction]` wrappers have a
+local `#[allow(clippy::too_many_arguments)]` because their separate arrays,
+masks, and flags are the Python-facing API and should not be bundled into an
+internal struct solely to satisfy the linter. A small number of existing
+low-level comparison and aggregation cores have the same targeted allow
+because their public Rust signatures mirror those kernel inputs.
+
+**Recommendation**: New handwritten functions remain subject to clippy's
+default threshold -- don't reach for this allow as a shortcut on a genuinely
+new function. Every other lint, and `-D warnings` itself, still applies in
+full.
