@@ -1275,6 +1275,67 @@ mod tests {
         )
     }
 
+    fn all_aggregation_requests<'py>(
+        py: Python<'py>,
+        values: Vec<i64>,
+        mask: Vec<bool>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let values = PyArray1::from_vec(py, values);
+        let mask = PyArray1::from_vec(py, mask);
+        PyList::new(
+            py,
+            [
+                PyTuple::new(
+                    py,
+                    [
+                        values.clone().into_any(),
+                        mask.clone().into_any(),
+                        "sum".into_pyobject(py)?.into_any(),
+                    ],
+                )?,
+                PyTuple::new(
+                    py,
+                    [
+                        values.clone().into_any(),
+                        mask.clone().into_any(),
+                        "prod".into_pyobject(py)?.into_any(),
+                    ],
+                )?,
+                PyTuple::new(
+                    py,
+                    [
+                        values.clone().into_any(),
+                        mask.clone().into_any(),
+                        "min".into_pyobject(py)?.into_any(),
+                    ],
+                )?,
+                PyTuple::new(
+                    py,
+                    [
+                        values.clone().into_any(),
+                        mask.clone().into_any(),
+                        "max".into_pyobject(py)?.into_any(),
+                    ],
+                )?,
+                PyTuple::new(
+                    py,
+                    [
+                        "*".into_pyobject(py)?.into_any(),
+                        mask.into_any(),
+                        "count".into_pyobject(py)?.into_any(),
+                    ],
+                )?,
+                PyTuple::new(
+                    py,
+                    [
+                        "*".into_pyobject(py)?.into_any(),
+                        "size".into_pyobject(py)?.into_any(),
+                    ],
+                )?,
+            ],
+        )
+    }
+
     #[test]
     fn forward_aggregation_uses_sorted_aligned_source_values() {
         Python::initialize();
@@ -1297,6 +1358,42 @@ mod tests {
             let values_item = result.get_item(2)?;
             let values = values_item.cast::<PyList>()?;
             assert_eq!(values.get_item(0)?.extract::<Vec<i64>>()?, vec![40]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn single_aggregation_covers_all_operations_and_null_masks() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let aggregations =
+                all_aggregation_requests(py, vec![10_i64, 20, 30], vec![false, true, false])?;
+            let result = single_range_aggregate_int64(
+                py,
+                PyArray1::from_vec(py, vec![100_i64, 101]).readonly(),
+                PyArray1::from_vec(py, vec![2_i64, 4]).readonly(),
+                PyArray1::from_vec(py, vec![10_i64, 20, 30]).readonly(),
+                PyArray1::from_vec(py, vec![1_i64, 3, 5]).readonly(),
+                "<",
+                &aggregations,
+                true,
+            )?
+            .expect("both left rows have a range match");
+
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![100, 101]);
+            assert_eq!(
+                result.get_item(1)?.extract::<Vec<bool>>()?,
+                vec![true, true]
+            );
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![30, 30]);
+            assert_eq!(outputs.get_item(1)?.extract::<Vec<i64>>()?, vec![30, 30]);
+            assert_eq!(outputs.get_item(2)?.extract::<Vec<i64>>()?, vec![2, 2]);
+            assert_eq!(outputs.get_item(3)?.extract::<Vec<i64>>()?, vec![2, 2]);
+            assert_eq!(outputs.get_item(4)?.extract::<Vec<i64>>()?, vec![1, 1]);
+            assert_eq!(outputs.get_item(5)?.extract::<Vec<i64>>()?, vec![2, 1]);
             Ok(())
         })
         .unwrap();
