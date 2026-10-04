@@ -423,6 +423,16 @@ work, while one width-eight query makes that regression obvious.
   specialized until a later abstraction pass demonstrates a shared helper
   without obscuring their two-pass allocation and selection behavior.
 
+### [2026-10-05] `keep="any"` short-circuit scope for all-`!=`
+
+The direct single-`!=` kernel and region kernels can select an existence
+witness without enumerating every candidate. The extended multi-condition
+all-`!=` path is different: it must keep traversing anchor candidates until a
+candidate passes every residual predicate, then it may stop for that driving
+row. A first anchor match is not sufficient, because residual predicates can
+reject it. This distinction must be preserved in performance discussions and
+tests.
+
 <!--
 This section is for agents to record new learnings.
 Add entries in the format:
