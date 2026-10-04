@@ -22,6 +22,7 @@
 use numpy::ndarray::Array1;
 #[cfg(test)]
 use numpy::ndarray::ArrayView1;
+use numpy::PyArray1;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -68,6 +69,80 @@ fn window_extreme_positions(
         selected.push(i64::try_from(best).map_err(|_| "range position exceeds int64".to_owned())?);
     }
     Ok(selected)
+}
+
+/// Build the monotonic envelope used to bound an opposing range predicate.
+///
+/// PyJanitor sorts the right side by the primary lower-bound predicate. The
+/// corresponding upper bounds are not necessarily ordered in that layout.
+/// A forward cumulative maximum (or reverse cumulative minimum) is a safe
+/// superset boundary; the original predicate is still evaluated by the
+/// extended candidate materializer.
+fn cumulative_bound<T: PartialOrd + Copy>(values: &[T], reverse_min: bool) -> Vec<T> {
+    let mut output = values.to_vec();
+    if reverse_min {
+        for position in (0..output.len().saturating_sub(1)).rev() {
+            if output[position + 1] < output[position] {
+                output[position] = output[position + 1];
+            }
+        }
+    } else {
+        for position in 1..output.len() {
+            if output[position - 1] > output[position] {
+                output[position] = output[position - 1];
+            }
+        }
+    }
+    output
+}
+
+/// Return a cumulative range bound for a right-hand array.
+///
+/// `direction` is `"max"` for a forward cumulative maximum and
+/// `"reverse_min"` for a reverse cumulative minimum. This keeps the dtype
+/// operation in Rust while Python retains ownership of the original array
+/// for the exact residual recheck.
+#[pyfunction]
+pub fn range_join_cumulative_bound<'py>(
+    py: Python<'py>,
+    values: Bound<'py, PyAny>,
+    direction: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let reverse_min = match direction {
+        "max" => false,
+        "reverse_min" => true,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown cumulative range direction: {other}"
+            )))
+        }
+    };
+    let dtype = values
+        .getattr("dtype")?
+        .getattr("name")?
+        .extract::<String>()?;
+    macro_rules! dispatch {
+        ($ty:ty) => {{
+            let values = values.extract::<PyReadonlyArray1<'py, $ty>>()?;
+            let output = cumulative_bound(values.as_slice()?, reverse_min);
+            Ok(PyArray1::from_vec(py, output).into_any())
+        }};
+    }
+    match dtype.as_str() {
+        "int64" => dispatch!(i64),
+        "int32" => dispatch!(i32),
+        "int16" => dispatch!(i16),
+        "int8" => dispatch!(i8),
+        "uint64" => dispatch!(u64),
+        "uint32" => dispatch!(u32),
+        "uint16" => dispatch!(u16),
+        "uint8" => dispatch!(u8),
+        "float64" => dispatch!(f64),
+        "float32" => dispatch!(f32),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported cumulative range dtype: {other}"
+        ))),
+    }
 }
 
 /// Parse one basic dual-range anchor using shared physical index arrays.
@@ -493,6 +568,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         };
     }
     add!(
+        range_join_cumulative_bound,
         range_join_indices,
         range_join_extended_indices,
         range_join_aggregate,
@@ -592,6 +668,14 @@ pub fn range_join_extended_indices<'py>(
 mod tests {
     use super::*;
     use numpy::{ndarray::Array1, PyArray1, PyArrayMethods};
+
+    #[test]
+    fn cumulative_bounds_are_safe_monotonic_envelopes() {
+        let values = [8_i64, 2, 5, 3];
+
+        assert_eq!(cumulative_bound(&values, false), vec![8, 8, 8, 8]);
+        assert_eq!(cumulative_bound(&values, true), vec![2, 2, 3, 3]);
+    }
 
     /// Select reference positions using the same public `keep` semantics as
     /// the production wrapper.
