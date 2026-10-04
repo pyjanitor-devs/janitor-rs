@@ -1695,3 +1695,400 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::IntoPyObject;
+
+    fn collect_pairs(
+        left: &[i64],
+        left_non_null: &[i64],
+        left_null: Option<&[i64]>,
+        right: &[i64],
+        right_non_null: &[i64],
+        right_null: Option<&[i64]>,
+        is_extension_array: bool,
+    ) -> Vec<(usize, usize)> {
+        let left_values = Array1::from_vec(left.to_vec());
+        let left_positions = Array1::from_vec(left_non_null.to_vec());
+        let right_values = Array1::from_vec(right.to_vec());
+        let right_positions = Array1::from_vec(right_non_null.to_vec());
+        let left_null_values = left_null.map(|values| Array1::from_vec(values.to_vec()));
+        let right_null_values = right_null.map(|values| Array1::from_vec(values.to_vec()));
+        let mut pairs = Vec::new();
+
+        visit_not_equal_pairs_core(
+            left_values.view(),
+            left_non_null.len() + left_null.map_or(0, |values| values.len()),
+            left_positions.view(),
+            right_values.view(),
+            right_non_null.len() + right_null.map_or(0, |values| values.len()),
+            right_positions.view(),
+            left_null_values.as_ref().map(|values| values.view()),
+            right_null_values.as_ref().map(|values| values.view()),
+            is_extension_array,
+            |left_position, right_position| pairs.push((left_position, right_position)),
+        )
+        .unwrap();
+
+        pairs
+    }
+
+    #[test]
+    fn physical_positions_follow_sorted_value_layouts() {
+        let pairs = collect_pairs(&[2], &[0], None, &[1, 3], &[1, 0], None, false);
+
+        assert_eq!(pairs, vec![(0, 1), (0, 0)]);
+    }
+
+    #[test]
+    fn numpy_nulls_match_everything_on_the_other_side() {
+        let pairs = collect_pairs(&[1], &[0], Some(&[1]), &[1], &[0], Some(&[1]), false);
+
+        assert_eq!(pairs, vec![(0, 1), (1, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn extension_array_nulls_do_not_match() {
+        let pairs = collect_pairs(&[1], &[0], Some(&[1]), &[1], &[0], Some(&[1]), true);
+
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn all_null_side_is_supported_for_numpy_nulls() {
+        let pairs = collect_pairs(&[], &[], Some(&[0, 1]), &[1, 2], &[1, 0], None, false);
+
+        assert_eq!(pairs, vec![(0, 1), (0, 0), (1, 1), (1, 0)]);
+    }
+
+    #[test]
+    fn keep_first_and_last_use_physical_positions() {
+        let left = Array1::from_vec(vec![2_i64]);
+        let left_positions = Array1::from_vec(vec![0_i64]);
+        let right = Array1::from_vec(vec![1_i64, 2, 3]);
+        let right_positions = Array1::from_vec(vec![2_i64, 0, 1]);
+        let mut first = Vec::new();
+        let mut last = Vec::new();
+
+        visit_single_selected(
+            left.view(),
+            1,
+            left_positions.view(),
+            None,
+            right.view(),
+            3,
+            right_positions.view(),
+            None,
+            false,
+            Keep::First,
+            |left_position, right_position| first.push((left_position, right_position)),
+        )
+        .unwrap();
+        visit_single_selected(
+            left.view(),
+            1,
+            left_positions.view(),
+            None,
+            right.view(),
+            3,
+            right_positions.view(),
+            None,
+            false,
+            Keep::Last,
+            |left_position, right_position| last.push((left_position, right_position)),
+        )
+        .unwrap();
+
+        assert_eq!(first, vec![(0, 1)]);
+        assert_eq!(last, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn keep_all_materializes_every_physical_pair() {
+        let left = Array1::from_vec(vec![2_i64]);
+        let left_full_positions = Array1::from_vec(vec![7_i64]);
+        let left_positions = Array1::from_vec(vec![0_i64]);
+        let right = Array1::from_vec(vec![1_i64, 3]);
+        let right_full_positions = Array1::from_vec(vec![11_i64, 13]);
+        let right_positions = Array1::from_vec(vec![1_i64, 0]);
+
+        let (output_left, output_right) = materialize_single_all(
+            left.view(),
+            left_full_positions.view(),
+            left_positions.view(),
+            None,
+            right.view(),
+            right_full_positions.view(),
+            right_positions.view(),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(output_left, vec![7, 7]);
+        assert_eq!(output_right, vec![13, 11]);
+    }
+
+    fn aggregation_request<'py>(py: Python<'py>, values: Vec<i64>) -> PyResult<Bound<'py, PyList>> {
+        let values = PyArray1::from_vec(py, values);
+        let mask = PyArray1::from_vec(py, vec![false; values.len()?]);
+        let request = PyTuple::new(
+            py,
+            [
+                values.into_any(),
+                mask.into_any(),
+                "sum".into_pyobject(py)?.into_any(),
+            ],
+        )?;
+        PyList::new(py, [request])
+    }
+
+    fn aggregation_result<'py>(
+        result: &Bound<'py, PyTuple>,
+    ) -> PyResult<(Vec<i64>, Vec<bool>, Vec<i64>)> {
+        let positions = result.get_item(0)?.extract::<Vec<i64>>()?;
+        let matched = result.get_item(1)?.extract::<Vec<bool>>()?;
+        let values = result
+            .get_item(2)?
+            .cast::<PyList>()?
+            .get_item(0)?
+            .extract::<Vec<i64>>()?;
+        Ok((positions, matched, values))
+    }
+
+    fn pair_result<'py>(result: &Bound<'py, PyDict>) -> PyResult<(Vec<i64>, Vec<i64>)> {
+        let left = result
+            .get_item("left_index")?
+            .expect("left_index is present")
+            .extract::<Vec<i64>>()?;
+        let right = result
+            .get_item("right_index")?
+            .expect("right_index is present")
+            .extract::<Vec<i64>>()?;
+        Ok((left, right))
+    }
+
+    #[test]
+    fn forward_and_reverse_aggregation_use_physical_output_slots() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let left_full_positions = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let left_positions = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let right = PyArray1::from_vec(py, vec![1_i64, 3]);
+            let right_full_positions = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let right_positions = PyArray1::from_vec(py, vec![0_i64, 1]);
+
+            let forward = run_single_not_equal_aggregation(
+                py,
+                Some(left.readonly()),
+                left_full_positions.readonly(),
+                Some(right.readonly()),
+                right_full_positions.readonly(),
+                "!=",
+                Some(left_positions.readonly()),
+                None,
+                Some(right_positions.readonly()),
+                None,
+                false,
+                &aggregation_request(py, vec![1, 3])?,
+                true,
+                false,
+            )?
+            .expect("forward aggregation should match");
+            assert_eq!(
+                aggregation_result(&forward)?,
+                (vec![0, 1], vec![true, true], vec![3, 4])
+            );
+
+            let reverse = run_single_not_equal_aggregation(
+                py,
+                Some(left.readonly()),
+                left_full_positions.readonly(),
+                Some(right.readonly()),
+                right_full_positions.readonly(),
+                "!=",
+                Some(left_positions.readonly()),
+                None,
+                Some(right_positions.readonly()),
+                None,
+                false,
+                &aggregation_request(py, vec![1, 2])?,
+                true,
+                true,
+            )?
+            .expect("reverse aggregation should match");
+            assert_eq!(
+                aggregation_result(&reverse)?,
+                (vec![0, 1], vec![true, true], vec![2, 3])
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn extended_residuals_are_applied_before_keep() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_values = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let left_full_positions = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let left_non_null_positions = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let right_values = PyArray1::from_vec(py, vec![1_i64, 3]);
+            let right_full_positions = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let right_non_null_positions = PyArray1::from_vec(py, vec![0_i64, 1]);
+            let residual_left = PyArray1::from_vec(py, vec![10_i64, 20]);
+            let residual_right = PyArray1::from_vec(py, vec![10_i64, 15]);
+            let predicates = PyList::empty(py);
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    left_values.clone().into_any(),
+                    left_full_positions.clone().into_any(),
+                    left_non_null_positions.clone().into_any(),
+                    py.None().into_pyobject(py)?.into_any(),
+                    right_values.clone().into_any(),
+                    right_full_positions.clone().into_any(),
+                    right_non_null_positions.clone().into_any(),
+                    py.None().into_pyobject(py)?.into_any(),
+                    false.into_pyobject(py)?.to_owned().into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            predicates.append(PyTuple::new(
+                py,
+                [
+                    residual_left.into_any(),
+                    residual_right.into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+
+            let all = materialize_with_residuals(
+                py,
+                &predicates,
+                "all",
+                left_values.readonly(),
+                left_full_positions.readonly(),
+                left_non_null_positions.readonly(),
+                None,
+                right_values.readonly(),
+                right_full_positions.readonly(),
+                right_non_null_positions.readonly(),
+                None,
+                false,
+            )?
+            .expect("residuals should leave matching pairs");
+            assert_eq!(pair_result(&all)?, (vec![0, 1, 1], vec![1, 0, 1]));
+
+            let first = materialize_with_residuals(
+                py,
+                &predicates,
+                "first",
+                left_values.readonly(),
+                left_full_positions.readonly(),
+                left_non_null_positions.readonly(),
+                None,
+                right_values.readonly(),
+                right_full_positions.readonly(),
+                right_non_null_positions.readonly(),
+                None,
+                false,
+            )?
+            .expect("residuals should leave first matches");
+            assert_eq!(pair_result(&first)?, (vec![0, 1], vec![1, 0]));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn invalid_partitions_are_rejected() {
+        let left = Array1::from_vec(vec![1_i64]);
+        let right = Array1::from_vec(vec![2_i64]);
+        let duplicate = Array1::from_vec(vec![0_i64]);
+        let null = Array1::from_vec(vec![0_i64]);
+
+        let error = visit_not_equal_pairs_core(
+            left.view(),
+            2,
+            duplicate.view(),
+            right.view(),
+            1,
+            duplicate.view(),
+            Some(null.view()),
+            None,
+            false,
+            |_, _| {},
+        )
+        .unwrap_err();
+
+        assert!(error.contains("appears more than once"), "{error}");
+    }
+
+    #[test]
+    fn exhaustive_small_layouts_match_brute_force_oracle() {
+        for left_null_mask in 0..8_u8 {
+            for right_null_mask in 0..8_u8 {
+                for is_extension_array in [false, true] {
+                    let left_non_null: Vec<i64> = (0..3)
+                        .filter(|position| left_null_mask & (1 << position) == 0)
+                        .map(|position| position as i64)
+                        .collect();
+                    let right_non_null: Vec<i64> = (0..3)
+                        .filter(|position| right_null_mask & (1 << position) == 0)
+                        .map(|position| position as i64)
+                        .collect();
+                    let left_positions: Vec<i64> = (0..3)
+                        .filter(|position| left_null_mask & (1 << position) == 0)
+                        .map(|position| position as i64)
+                        .collect();
+                    let right_positions: Vec<i64> = (0..3)
+                        .filter(|position| right_null_mask & (1 << position) == 0)
+                        .map(|position| position as i64)
+                        .collect();
+                    let left_null: Vec<i64> = (0..3)
+                        .filter(|position| left_null_mask & (1 << position) != 0)
+                        .map(|position| position as i64)
+                        .collect();
+                    let right_null: Vec<i64> = (0..3)
+                        .filter(|position| right_null_mask & (1 << position) != 0)
+                        .map(|position| position as i64)
+                        .collect();
+
+                    let actual = collect_pairs(
+                        &left_non_null,
+                        &left_positions,
+                        Some(&left_null),
+                        &right_non_null,
+                        &right_positions,
+                        Some(&right_null),
+                        is_extension_array,
+                    );
+                    let mut expected = Vec::new();
+                    for left_position in 0..3 {
+                        for right_position in 0..3 {
+                            let left_is_null = left_null_mask & (1 << left_position) != 0;
+                            let right_is_null = right_null_mask & (1 << right_position) != 0;
+                            let matches = if left_is_null || right_is_null {
+                                !is_extension_array
+                            } else {
+                                left_position != right_position
+                            };
+                            if matches {
+                                expected.push((left_position, right_position));
+                            }
+                        }
+                    }
+                    let mut actual = actual;
+                    actual.sort_unstable();
+                    expected.sort_unstable();
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+}
