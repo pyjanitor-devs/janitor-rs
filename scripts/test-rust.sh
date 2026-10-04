@@ -10,7 +10,8 @@ if ! command -v uv >/dev/null 2>&1; then
     exit 1
 fi
 
-if [[ ! -x "$python_bin" ]]; then
+if [[ ! -x "$python_bin" ]] || ! "$python_bin" -c \
+    'import sys; raise SystemExit(sys.version_info[:2] != (3, 12))'; then
     uv venv --python 3.12 "$venv_dir"
 fi
 
