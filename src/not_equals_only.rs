@@ -200,6 +200,48 @@ where
     T: PartialOrd + Copy,
     F: FnMut(usize, usize),
 {
+    visit_not_equal_pairs_core_until(
+        left,
+        left_full_len,
+        left_non_null_positions,
+        right,
+        right_full_len,
+        right_non_null_positions,
+        left_null_positions,
+        right_null_positions,
+        is_extension_array,
+        |left_position, right_position| {
+            visit(left_position, right_position);
+            true
+        },
+    )
+}
+
+/// Visit null-aware `!=` candidates, allowing the visitor to stop one row.
+///
+/// `true` continues visiting candidates for the current left row. `false`
+/// stops that row and resumes the outer traversal at the next left row.
+///
+/// ELI5: a row may need to check several possible partners until one passes
+/// every predicate; once that witness is found, there is no reason to inspect
+/// the rest of that row's partners, but the next row still needs its own scan.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn visit_not_equal_pairs_core_until<T, F>(
+    left: ArrayView1<'_, T>,
+    left_full_len: usize,
+    left_non_null_positions: ArrayView1<'_, i64>,
+    right: ArrayView1<'_, T>,
+    right_full_len: usize,
+    right_non_null_positions: ArrayView1<'_, i64>,
+    left_null_positions: Option<ArrayView1<'_, i64>>,
+    right_null_positions: Option<ArrayView1<'_, i64>>,
+    is_extension_array: bool,
+    mut visit: F,
+) -> Result<(), String>
+where
+    T: PartialOrd + Copy,
+    F: FnMut(usize, usize) -> bool,
+{
     validate_not_equal_side(
         "left",
         left_full_len,
@@ -240,15 +282,26 @@ where
             let left_value = left[left_non_null_offset];
             let lt_end = partition_point(right, |value| value < left_value);
             let gt_start = partition_point(right, |value| value <= left_value);
+            let mut continue_row = true;
             for &right_position in &right_positions[..lt_end] {
-                visit(left_position_usize, right_position);
+                if !visit(left_position_usize, right_position) {
+                    continue_row = false;
+                    break;
+                }
             }
-            for &right_position in &right_positions[gt_start..] {
-                visit(left_position_usize, right_position);
+            if continue_row {
+                for &right_position in &right_positions[gt_start..] {
+                    if !visit(left_position_usize, right_position) {
+                        continue_row = false;
+                        break;
+                    }
+                }
             }
-            if !is_extension_array {
+            if continue_row && !is_extension_array {
                 for &right_position in right_null_positions {
-                    visit(left_position_usize, right_position);
+                    if !visit(left_position_usize, right_position) {
+                        break;
+                    }
                 }
             }
             left_non_null_offset += 1;
@@ -257,7 +310,9 @@ where
         {
             if !is_extension_array {
                 for right_position in right_positions.iter().chain(right_null_positions) {
-                    visit(left_position_usize, *right_position);
+                    if !visit(left_position_usize, *right_position) {
+                        break;
+                    }
                 }
             }
             left_null_offset += 1;
@@ -1137,7 +1192,8 @@ pub(crate) fn materialize_with_residuals<'py, T: numpy::Element + PartialOrd + C
     }
 
     let mut selected = vec![None; left_full_positions.len()];
-    visit_not_equal_pairs_core(
+    let stop_after_match = keep == Keep::Any;
+    visit_not_equal_pairs_core_until(
         first_left.as_array(),
         left_full_positions.len(),
         first_left_non_null_positions.as_array(),
@@ -1149,7 +1205,7 @@ pub(crate) fn materialize_with_residuals<'py, T: numpy::Element + PartialOrd + C
         is_extension_array,
         |left_position, right_position| {
             if !matches(left_position, right_position) {
-                return;
+                return true;
             }
             let slot = &mut selected[left_position];
             match keep {
@@ -1170,6 +1226,7 @@ pub(crate) fn materialize_with_residuals<'py, T: numpy::Element + PartialOrd + C
                 }
                 Keep::All => unreachable!(),
             }
+            !stop_after_match
         },
     )
     .map_err(PyValueError::new_err)?;
@@ -2021,7 +2078,9 @@ mod tests {
             let right_full_positions = PyArray1::from_vec(py, vec![0_i64, 1]);
             let right_non_null_positions = PyArray1::from_vec(py, vec![0_i64, 1]);
             let residual_left = PyArray1::from_vec(py, vec![10_i64, 20]);
-            let residual_right = PyArray1::from_vec(py, vec![10_i64, 15]);
+            // The first anchor candidate for left row 1 fails the residual;
+            // the second one succeeds. `any` must continue past the former.
+            let residual_right = PyArray1::from_vec(py, vec![20_i64, 15]);
             let predicates = PyList::empty(py);
             predicates.append(PyTuple::new(
                 py,
@@ -2062,7 +2121,7 @@ mod tests {
                 false,
             )?
             .expect("residuals should leave matching pairs");
-            assert_eq!(pair_result(&all)?, (vec![0, 1, 1], vec![1, 0, 1]));
+            assert_eq!(pair_result(&all)?, (vec![0, 1], vec![1, 1]));
 
             let first = materialize_with_residuals(
                 py,
@@ -2079,7 +2138,24 @@ mod tests {
                 false,
             )?
             .expect("residuals should leave first matches");
-            assert_eq!(pair_result(&first)?, (vec![0, 1], vec![1, 0]));
+            assert_eq!(pair_result(&first)?, (vec![0, 1], vec![1, 1]));
+
+            let any = materialize_with_residuals(
+                py,
+                &predicates,
+                "any",
+                left_values.readonly(),
+                left_full_positions.readonly(),
+                left_non_null_positions.readonly(),
+                None,
+                right_values.readonly(),
+                right_full_positions.readonly(),
+                right_non_null_positions.readonly(),
+                None,
+                false,
+            )?
+            .expect("any should retain the first complete match");
+            assert_eq!(pair_result(&any)?, (vec![0, 1], vec![1, 1]));
             Ok(())
         })
         .unwrap();
@@ -2107,6 +2183,33 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("appears more than once"), "{error}");
+    }
+
+    #[test]
+    fn controlled_traversal_stops_only_the_current_left_row() {
+        let left = Array1::from_vec(vec![1_i64, 2]);
+        let right = Array1::from_vec(vec![0_i64, 3]);
+        let positions = Array1::from_vec(vec![0_i64, 1]);
+        let mut visited = Vec::new();
+
+        visit_not_equal_pairs_core_until(
+            left.view(),
+            2,
+            positions.view(),
+            right.view(),
+            2,
+            positions.view(),
+            None,
+            None,
+            true,
+            |left_position, right_position| {
+                visited.push((left_position, right_position));
+                left_position != 0
+            },
+        )
+        .unwrap();
+
+        assert_eq!(visited, vec![(0, 0), (1, 0), (1, 1)]);
     }
 
     #[test]
