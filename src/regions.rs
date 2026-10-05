@@ -85,6 +85,7 @@
 //! candidate.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound as RangeBound;
 
 use crate::aggregation_common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
@@ -102,7 +103,7 @@ use crate::range_predicate::{
     parse_aggregation_range_anchor, parse_any_range_predicate, AnyParsedRangePredicate,
     ParsedAggregationRangeAnchor,
 };
-use numpy::ndarray::ArrayView1;
+use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -133,6 +134,26 @@ fn add_right_region(
             state.head = right_position as i64;
         } else {
             debug_assert!(state.tail >= 0 && (state.tail as usize) < next.len());
+            next[state.tail as usize] = right_position as i64;
+        }
+        state.tail = right_position as i64;
+    }
+}
+
+fn add_right_region_equi(
+    right_region: &[i64],
+    right_codes: &[i64],
+    start: usize,
+    previous_end: usize,
+    next: &mut [i64],
+    groups: &mut BTreeMap<(i64, i64), GroupState>,
+) {
+    for right_position in (start..previous_end).rev() {
+        let key = (right_codes[right_position], right_region[right_position]);
+        let state = groups.entry(key).or_default();
+        if state.head == -1 {
+            state.head = right_position as i64;
+        } else {
             next[state.tail as usize] = right_position as i64;
         }
         state.tail = right_position as i64;
@@ -220,6 +241,9 @@ pub(crate) struct AlignedRegions {
     /// Original right-array position for each aligned right region position.
     /// Greater-than anchors reverse this mapping for traversal.
     pub(crate) right_positions: Vec<usize>,
+    /// Optional equality codes aligned to compact region positions.
+    pub(crate) left_codes: Option<Vec<i64>>,
+    pub(crate) right_codes: Option<Vec<i64>>,
     /// Number of left rows before impossible region rows are removed.
     pub(crate) left_len: usize,
     /// Number of right rows before region traversal reorders the layout.
@@ -312,6 +336,7 @@ where
 {
     let queries = sweep_queries(regions);
     let mut active = BTreeMap::<i64, GroupState>::new();
+    let mut active_equi = BTreeMap::<(i64, i64), GroupState>::new();
     // `next` is a linked-list tape. Each right position points to the next
     // position with the same second-region label; -1 means chain end.
     let mut next = vec![-1_i64; regions.right_index.len()];
@@ -330,30 +355,60 @@ where
             // left row. There is no candidate to visit.
             continue;
         };
-        add_right_region(
-            &regions.right_second,
-            start,
-            previous_end,
-            &mut next,
-            &mut active,
-        );
-        previous_end = start;
-
-        // Only groups at or above the left second-region label satisfy the
-        // second inequality. Walk every duplicate in each qualifying chain.
-        // ELI5: the B-tree tells us which labelled buckets qualify; the
-        // linked list inside each bucket tells us which individual right rows
-        // belong to that bucket. We need both because labels can repeat.
-        'candidate_groups: for (_, state) in active.range(regions.left_second[left_position]..) {
-            let mut position = state.head;
-            while position >= 0 {
-                let right_position = position as usize;
-                if !visit(left_position, right_position)? {
-                    break 'candidate_groups;
+        if let (Some(left_codes), Some(right_codes)) = (&regions.left_codes, &regions.right_codes) {
+            add_right_region_equi(
+                &regions.right_second,
+                right_codes,
+                start,
+                previous_end,
+                &mut next,
+                &mut active_equi,
+            );
+            let code = left_codes[left_position];
+            if code < 0 {
+                previous_end = start;
+                continue;
+            }
+            let lower = RangeBound::Included((code, regions.left_second[left_position]));
+            'candidate_groups_equi: for ((candidate_code, _), state) in
+                active_equi.range((lower, RangeBound::Unbounded))
+            {
+                if *candidate_code != code {
+                    break 'candidate_groups_equi;
                 }
-                position = next[right_position];
+                let mut position = state.head;
+                while position >= 0 {
+                    let right_position = position as usize;
+                    if !visit(left_position, right_position)? {
+                        break 'candidate_groups_equi;
+                    }
+                    position = next[right_position];
+                }
+            }
+        } else {
+            add_right_region(
+                &regions.right_second,
+                start,
+                previous_end,
+                &mut next,
+                &mut active,
+            );
+
+            // Only groups at or above the left second-region label satisfy the
+            // second inequality. Walk every duplicate in each qualifying chain.
+            'candidate_groups: for (_, state) in active.range(regions.left_second[left_position]..)
+            {
+                let mut position = state.head;
+                while position >= 0 {
+                    let right_position = position as usize;
+                    if !visit(left_position, right_position)? {
+                        break 'candidate_groups;
+                    }
+                    position = next[right_position];
+                }
             }
         }
+        previous_end = start;
     }
     Ok(())
 }
@@ -936,6 +991,8 @@ pub(crate) fn align(
         right_second: Vec::with_capacity(first.right_index.len()),
         left_positions: Vec::with_capacity(first.left_index.len()),
         right_positions: Vec::with_capacity(first.right_index.len()),
+        left_codes: None,
+        right_codes: None,
         left_len: first.left_len,
         right_len: first.right_len,
     };
@@ -966,6 +1023,31 @@ pub(crate) fn align(
         }
     }
     Ok(output)
+}
+
+fn attach_equi_codes(
+    mut regions: AlignedRegions,
+    left_codes: &[i64],
+    right_codes: &[i64],
+) -> Result<AlignedRegions, String> {
+    if left_codes.len() < regions.left_len || right_codes.len() < regions.right_len {
+        return Err("equality code arrays are shorter than the physical layouts".to_owned());
+    }
+    regions.left_codes = Some(
+        regions
+            .left_index
+            .iter()
+            .map(|&position| left_codes[position as usize])
+            .collect(),
+    );
+    regions.right_codes = Some(
+        regions
+            .right_index
+            .iter()
+            .map(|&position| right_codes[position as usize])
+            .collect(),
+    );
+    Ok(regions)
 }
 
 /// Build aligned regions from two anchors that were already parsed by a
@@ -1021,6 +1103,17 @@ pub(crate) fn parse_and_align<'py>(predicates: &Bound<'py, PyList>) -> PyResult<
         region_boundaries(&second).map_err(PyValueError::new_err)?,
     )
     .map_err(PyValueError::new_err)
+}
+
+fn parse_and_align_equi<'py>(
+    predicates: &Bound<'py, PyList>,
+    left_codes: ArrayView1<'_, i64>,
+    right_codes: ArrayView1<'_, i64>,
+) -> PyResult<AlignedRegions> {
+    let regions = parse_and_align(predicates)?;
+    let left_codes = left_codes.iter().copied().collect::<Vec<_>>();
+    let right_codes = right_codes.iter().copied().collect::<Vec<_>>();
+    attach_equi_codes(regions, &left_codes, &right_codes).map_err(PyValueError::new_err)
 }
 
 /// Build index pairs from aligned regions and optional residual predicates.
@@ -1112,6 +1205,44 @@ pub fn region_indices<'py>(
     Ok(Some(result_dict(py, left_index, right_index, None, None)?))
 }
 
+/// Equality-aware region traversal. Equality codes are aligned to the
+/// reset-index physical layouts and are used by the shared region sweep to
+/// key the active structure by `(equality_code, second_region)`.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn region_indices_equi<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    left_codes: PyReadonlyArray1<'py, i64>,
+    right_codes: PyReadonlyArray1<'py, i64>,
+    keep: &str,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    if predicates.len() < 2 {
+        return Err(PyValueError::new_err(
+            "region_indices_equi requires at least two predicates",
+        ));
+    }
+    let regions = parse_and_align_equi(predicates, left_codes.as_array(), right_codes.as_array())?;
+    let (parsed, metadata) = parse_predicates_with_nulls_strings_from(py, predicates, 2)?;
+    check_predicate_lengths(&parsed, regions.left_len, regions.right_len)?;
+    let views: Vec<_> = parsed.iter().map(Predicate::view).collect();
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
+    let (left_index, right_index) =
+        build_indices_extended(&regions, Keep::parse(keep)?, |left, right| {
+            predicates_match_dispatch(
+                &views,
+                metadata_views.as_deref(),
+                regions.left_positions[left],
+                regions.right_positions[right],
+            )
+        })
+        .map_err(PyValueError::new_err)?;
+    if left_index.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(result_dict(py, left_index, right_index, None, None)?))
+}
+
 /// Build index pairs for two primary regions followed by residual predicates.
 ///
 /// Residual predicates may use any supported comparison operator and do not
@@ -1160,11 +1291,16 @@ pub fn region_indices_extended<'py>(
 /// Returns any PyO3 error raised while adding the function.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(region_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(region_indices_equi, m)?)?;
     m.add_function(wrap_pyfunction!(region_indices_extended, m)?)?;
     m.add_function(wrap_pyfunction!(region_aggregate, m)?)?;
     m.add_function(wrap_pyfunction!(region_aggregate_reverse, m)?)?;
     m.add_function(wrap_pyfunction!(region_extended_aggregate, m)?)?;
     m.add_function(wrap_pyfunction!(region_extended_aggregate_reverse, m)?)?;
+    m.add_function(wrap_pyfunction!(region_aggregate_equi, m)?)?;
+    m.add_function(wrap_pyfunction!(region_aggregate_equi_reverse, m)?)?;
+    m.add_function(wrap_pyfunction!(region_extended_aggregate_equi, m)?)?;
+    m.add_function(wrap_pyfunction!(region_extended_aggregate_equi_reverse, m)?)?;
     Ok(())
 }
 
@@ -1293,6 +1429,17 @@ fn prepare_region_aggregation<'py>(
     Ok((prepared, regions))
 }
 
+fn prepare_region_aggregation_equi<'py>(
+    predicates: &Bound<'py, PyList>,
+    left_codes: &[i64],
+    right_codes: &[i64],
+) -> PyResult<(PreparedPredicates<'py>, AlignedRegions)> {
+    let (prepared, regions) = prepare_region_aggregation(predicates)?;
+    let regions =
+        attach_equi_codes(regions, left_codes, right_codes).map_err(PyValueError::new_err)?;
+    Ok((prepared, regions))
+}
+
 /// Execute exact dual-region aggregation and build the standard Python result.
 ///
 /// Only the first two predicates are accepted. Both are converted into region
@@ -1325,6 +1472,7 @@ fn aggregate_regions_exact<'py>(
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
     reverse: bool,
+    codes: Option<(&[i64], &[i64])>,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
     // This exact path is intentionally separate from the extended path. With
     // no residual predicates, the sweep can update aggregation state directly
@@ -1335,7 +1483,12 @@ fn aggregate_regions_exact<'py>(
         ));
     }
 
-    let (prepared, regions) = prepare_region_aggregation(predicates)?;
+    let (prepared, regions) = match codes {
+        Some((left_codes, right_codes)) => {
+            prepare_region_aggregation_equi(predicates, left_codes, right_codes)?
+        }
+        None => prepare_region_aggregation(predicates)?,
+    };
     let (output_positions, output_len, source_len) = aggregation_layout(&prepared.first, reverse);
     if regions.left_index.is_empty() || regions.right_index.is_empty() {
         return Ok(None);
@@ -1430,6 +1583,7 @@ fn aggregate_regions_extended<'py>(
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
     reverse: bool,
+    codes: Option<(&[i64], &[i64])>,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
     // The extended path keeps the same region sweep as the exact path, but
     // inserts a residual-filter step between candidate discovery and the
@@ -1447,7 +1601,12 @@ fn aggregate_regions_extended<'py>(
     // Region construction reads only the first two anchors. It aligns their
     // left and right rows by original index labels, so the two independently
     // built region paths can be traversed together safely.
-    let (prepared, regions) = prepare_region_aggregation(predicates)?;
+    let (prepared, regions) = match codes {
+        Some((left_codes, right_codes)) => {
+            prepare_region_aggregation_equi(predicates, left_codes, right_codes)?
+        }
+        None => prepare_region_aggregation(predicates)?,
+    };
     let (output_positions, output_len, source_len) = aggregation_layout(&prepared.first, reverse);
     if regions.left_index.is_empty() || regions.right_index.is_empty() {
         // At least one anchor has no surviving aligned rows. There can be no
@@ -1557,7 +1716,7 @@ pub fn region_aggregate<'py>(
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    aggregate_regions_exact(py, predicates, aggregations, return_matched, false)
+    aggregate_regions_exact(py, predicates, aggregations, return_matched, false, None)
 }
 
 /// Aggregate exactly two region predicates in the reverse direction.
@@ -1589,7 +1748,7 @@ pub fn region_aggregate_reverse<'py>(
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    aggregate_regions_exact(py, predicates, aggregations, return_matched, true)
+    aggregate_regions_exact(py, predicates, aggregations, return_matched, true, None)
 }
 
 /// Aggregate two region predicates followed by residual filter predicates.
@@ -1622,7 +1781,7 @@ pub fn region_extended_aggregate<'py>(
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    aggregate_regions_extended(py, predicates, aggregations, return_matched, false)
+    aggregate_regions_extended(py, predicates, aggregations, return_matched, false, None)
 }
 
 /// Aggregate two region predicates plus residual filters in reverse direction.
@@ -1655,7 +1814,91 @@ pub fn region_extended_aggregate_reverse<'py>(
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    aggregate_regions_extended(py, predicates, aggregations, return_matched, true)
+    aggregate_regions_extended(py, predicates, aggregations, return_matched, true, None)
+}
+
+#[pyfunction]
+pub fn region_aggregate_equi<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    left_codes: PyReadonlyArray1<'py, i64>,
+    right_codes: PyReadonlyArray1<'py, i64>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    let left_codes = left_codes.as_array().iter().copied().collect::<Vec<_>>();
+    let right_codes = right_codes.as_array().iter().copied().collect::<Vec<_>>();
+    aggregate_regions_exact(
+        py,
+        predicates,
+        aggregations,
+        return_matched,
+        false,
+        Some((&left_codes, &right_codes)),
+    )
+}
+
+#[pyfunction]
+pub fn region_aggregate_equi_reverse<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    left_codes: PyReadonlyArray1<'py, i64>,
+    right_codes: PyReadonlyArray1<'py, i64>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    let left_codes = left_codes.as_array().iter().copied().collect::<Vec<_>>();
+    let right_codes = right_codes.as_array().iter().copied().collect::<Vec<_>>();
+    aggregate_regions_exact(
+        py,
+        predicates,
+        aggregations,
+        return_matched,
+        true,
+        Some((&left_codes, &right_codes)),
+    )
+}
+
+#[pyfunction]
+pub fn region_extended_aggregate_equi<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    left_codes: PyReadonlyArray1<'py, i64>,
+    right_codes: PyReadonlyArray1<'py, i64>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    let left_codes = left_codes.as_array().iter().copied().collect::<Vec<_>>();
+    let right_codes = right_codes.as_array().iter().copied().collect::<Vec<_>>();
+    aggregate_regions_extended(
+        py,
+        predicates,
+        aggregations,
+        return_matched,
+        false,
+        Some((&left_codes, &right_codes)),
+    )
+}
+
+#[pyfunction]
+pub fn region_extended_aggregate_equi_reverse<'py>(
+    py: Python<'py>,
+    predicates: &Bound<'py, PyList>,
+    left_codes: PyReadonlyArray1<'py, i64>,
+    right_codes: PyReadonlyArray1<'py, i64>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    let left_codes = left_codes.as_array().iter().copied().collect::<Vec<_>>();
+    let right_codes = right_codes.as_array().iter().copied().collect::<Vec<_>>();
+    aggregate_regions_extended(
+        py,
+        predicates,
+        aggregations,
+        return_matched,
+        true,
+        Some((&left_codes, &right_codes)),
+    )
 }
 
 #[cfg(test)]
@@ -2045,6 +2288,8 @@ mod tests {
             right_second,
             left_positions: vec![0, 1],
             right_positions: vec![0, 1, 2, 3],
+            left_codes: None,
+            right_codes: None,
             left_len: 2,
             right_len: 4,
         }

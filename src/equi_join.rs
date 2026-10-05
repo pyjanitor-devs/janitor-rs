@@ -24,7 +24,6 @@ use crate::aggregation_common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
 use crate::aggregation_common::ensure_equal_lengths_core;
-use crate::join_search::range_window;
 use crate::join_types::Keep;
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
@@ -96,8 +95,10 @@ pub(crate) fn validate_equi_range_predicate_count(count: usize) -> PyResult<()> 
     Ok(())
 }
 
-/// Optional half-open range windows aligned one-for-one to left rows.
-pub(crate) type RangeWindows = Option<(Vec<usize>, Vec<usize>)>;
+/// Range windows expressed as offsets into each left row's equality group.
+/// Unlike `RangeWindows`, these offsets cannot be applied to the global right
+/// layout; they index the flat position slice for the row's equality code.
+pub(crate) type GroupRangeWindows = Option<(Vec<usize>, Vec<usize>)>;
 
 /// Building blocks for a pure duplicate-right equi join.
 struct EquiBlocks {
@@ -487,12 +488,6 @@ fn build_duplicate_equi_blocks_core(
     }))
 }
 
-/// Find the first element in a sorted physical-position slice that is at
-/// least `target`.
-fn lower_bound(values: &[usize], target: usize) -> usize {
-    values.partition_point(|&value| value < target)
-}
-
 /// Parse the three-field range tuples used by the equi entry points.
 pub(crate) fn parse_equi_range_predicates<'py>(
     range_predicates: &Bound<'py, PyList>,
@@ -521,119 +516,180 @@ pub(crate) fn parse_equi_range_predicates<'py>(
         .collect()
 }
 
-/// Build one range predicate's half-open physical windows.
-///
-/// The value arrays are already aligned and the right values are already
-/// sorted by PyJanitor. This helper performs only validation and typed binary
-/// searches; it does not copy index labels or construct a building-block
-/// result.
-pub(crate) fn build_equi_range_bounds<'py>(
-    range: &AnyParsedRangePredicate<'py>,
-) -> Result<(Vec<usize>, Vec<usize>), String> {
-    range.validate_range_operator()?;
-    range.validate_lengths()?;
-    let left_len = range.left_len();
-
-    macro_rules! build_bounds {
-        ($predicate:expr) => {{
-            let predicate = $predicate;
-            let left = predicate.left.as_array();
-            let right = predicate.right.as_array();
-            let mut starts = Vec::with_capacity(left_len);
-            let mut ends = Vec::with_capacity(left_len);
-            for &value in left {
-                let (start, end) = range_window(value, right, predicate.op);
-                starts.push(start);
-                ends.push(end);
-            }
-            Ok((starts, ends))
-        }};
-    }
-    match range {
-        AnyParsedRangePredicate::I64(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::I32(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::I16(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::I8(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::U64(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::U32(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::U16(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::U8(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::F64(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::F32(predicate) => build_bounds!(predicate),
+/// Return the half-open window for an indirect, group-local right sequence.
+/// The physical right values remain in PyJanitor's shared layout; `positions`
+/// supplies the equality group's ordered view of those values.
+fn indirect_range_window<T: PartialOrd + Copy>(
+    left: T,
+    positions: &[usize],
+    right: ArrayView1<'_, T>,
+    op: crate::compare_op::CompareOp,
+) -> (usize, usize) {
+    match op {
+        crate::compare_op::CompareOp::Lt => (
+            positions.partition_point(|&position| right[position] <= left),
+            positions.len(),
+        ),
+        crate::compare_op::CompareOp::Le => (
+            positions.partition_point(|&position| right[position] < left),
+            positions.len(),
+        ),
+        crate::compare_op::CompareOp::Gt => (
+            0,
+            positions.partition_point(|&position| right[position] < left),
+        ),
+        crate::compare_op::CompareOp::Ge => (
+            0,
+            positions.partition_point(|&position| right[position] <= left),
+        ),
+        crate::compare_op::CompareOp::Eq | crate::compare_op::CompareOp::Ne => {
+            unreachable!("indirect_range_window only handles range operators")
+        }
     }
 }
 
-/// Build one or two range windows without dropping empty left rows.
-///
-/// The existing dual-range materializer removes empty windows because that is
-/// convenient for ordinary range joins. Equi matching cannot do that: the
-/// `left_indexer` remains aligned to the original left rows. This helper keeps
-/// one `[start, end)` pair per left row and intersects the second range in
-/// place when both ranges share the same physical right layout.
-/// When `ranges` is empty, it returns `None` rather than allocating synthetic
-/// full-right windows.
-pub(crate) fn build_equi_range_windows<'py>(
+/// Build group-local windows for one or two range predicates. The first
+/// predicate is searched directly because PyJanitor orders the right layout
+/// by that range. The second predicate is searched directly when its values
+/// are monotonic within a group; otherwise a cumulative envelope provides a
+/// safe superset and the original predicate remains an exact residual.
+pub(crate) fn build_group_range_windows<'py>(
     ranges: &[AnyParsedRangePredicate<'py>],
-) -> Result<RangeWindows, String> {
+    metadata: &DenseRightMetadata,
+    left_codes: ArrayView1<'_, i64>,
+) -> Result<GroupRangeWindows, String> {
     if ranges.len() > 2 {
         return Err("equi range path accepts at most two range predicates".to_owned());
     }
     if ranges.is_empty() {
         return Ok(None);
     }
+    let left_len = ranges[0].left_len();
+    ensure_equal_lengths_core("left range", left_len, "left codes", left_codes.len())?;
+    let mut starts = vec![0; left_len];
+    let mut ends = vec![0; left_len];
 
-    let first = build_equi_range_bounds(&ranges[0])?;
-    let mut starts = first.0;
-    let mut ends = first.1;
+    macro_rules! first_windows {
+        ($predicate:expr) => {{
+            let predicate = $predicate;
+            let left = predicate.left.as_array();
+            let right = predicate.right.as_array();
+            for row in 0..left_len {
+                let Some(code) = decode_equi_code(left_codes[row], "left")? else {
+                    continue;
+                };
+                let Some(&group_start) = metadata.offsets.get(code) else {
+                    continue;
+                };
+                let group = &metadata.positions[group_start..metadata.offsets[code + 1]];
+                let (start, end) = indirect_range_window(left[row], group, right, predicate.op);
+                starts[row] = start;
+                ends[row] = end;
+            }
+        }};
+    }
+    match &ranges[0] {
+        AnyParsedRangePredicate::I64(p) => first_windows!(p),
+        AnyParsedRangePredicate::I32(p) => first_windows!(p),
+        AnyParsedRangePredicate::I16(p) => first_windows!(p),
+        AnyParsedRangePredicate::I8(p) => first_windows!(p),
+        AnyParsedRangePredicate::U64(p) => first_windows!(p),
+        AnyParsedRangePredicate::U32(p) => first_windows!(p),
+        AnyParsedRangePredicate::U16(p) => first_windows!(p),
+        AnyParsedRangePredicate::U8(p) => first_windows!(p),
+        AnyParsedRangePredicate::F64(p) => first_windows!(p),
+        AnyParsedRangePredicate::F32(p) => first_windows!(p),
+    }
+
     if let Some(second) = ranges.get(1) {
-        let second = build_equi_range_bounds(second)?;
-        ensure_equal_lengths_core(
-            "first range windows",
-            starts.len(),
-            "second range windows",
-            second.0.len(),
-        )?;
-        for row in 0..starts.len() {
-            starts[row] = starts[row].max(second.0[row]);
-            ends[row] = ends[row].min(second.1[row]);
+        macro_rules! second_windows {
+            ($predicate:expr) => {{
+                let predicate = $predicate;
+                let left = predicate.left.as_array();
+                let right = predicate.right.as_array();
+                let mut envelopes: Vec<Vec<_>> =
+                    Vec::with_capacity(metadata.offsets.len().saturating_sub(1));
+                let mut monotonic = Vec::with_capacity(metadata.offsets.len().saturating_sub(1));
+                for code in 0..metadata.offsets.len().saturating_sub(1) {
+                    let group =
+                        &metadata.positions[metadata.offsets[code]..metadata.offsets[code + 1]];
+                    let values = group
+                        .iter()
+                        .map(|&position| right[position])
+                        .collect::<Vec<_>>();
+                    let is_monotonic = values.windows(2).all(|pair| pair[0] <= pair[1]);
+                    monotonic.push(is_monotonic);
+                    let mut envelope = values.clone();
+                    if !is_monotonic {
+                        match predicate.op {
+                            crate::compare_op::CompareOp::Lt | crate::compare_op::CompareOp::Le => {
+                                for index in 1..envelope.len() {
+                                    envelope[index] = envelope[index - 1].max(envelope[index]);
+                                }
+                            }
+                            crate::compare_op::CompareOp::Gt | crate::compare_op::CompareOp::Ge => {
+                                for index in (0..envelope.len().saturating_sub(1)).rev() {
+                                    envelope[index] = envelope[index].min(envelope[index + 1]);
+                                }
+                            }
+                            _ => {
+                                unreachable!("range predicate validated before window construction")
+                            }
+                        }
+                    }
+                    envelopes.push(envelope);
+                }
+                for row in 0..left_len {
+                    let Some(code) = decode_equi_code(left_codes[row], "left")? else {
+                        continue;
+                    };
+                    let Some(&group_start) = metadata.offsets.get(code) else {
+                        continue;
+                    };
+                    let group = &metadata.positions[group_start..metadata.offsets[code + 1]];
+                    let (start, end) = if monotonic.get(code).copied().unwrap_or(false) {
+                        indirect_range_window(left[row], group, right, predicate.op)
+                    } else {
+                        let envelope = &envelopes[code];
+                        match predicate.op {
+                            crate::compare_op::CompareOp::Lt => (
+                                envelope.partition_point(|&value| value <= left[row]),
+                                envelope.len(),
+                            ),
+                            crate::compare_op::CompareOp::Le => (
+                                envelope.partition_point(|&value| value < left[row]),
+                                envelope.len(),
+                            ),
+                            crate::compare_op::CompareOp::Gt => {
+                                (0, envelope.partition_point(|&value| value < left[row]))
+                            }
+                            crate::compare_op::CompareOp::Ge => {
+                                (0, envelope.partition_point(|&value| value <= left[row]))
+                            }
+                            _ => {
+                                unreachable!("range predicate validated before window construction")
+                            }
+                        }
+                    };
+                    starts[row] = starts[row].max(start);
+                    ends[row] = ends[row].min(end);
+                }
+            }};
+        }
+        match second {
+            AnyParsedRangePredicate::I64(p) => second_windows!(p),
+            AnyParsedRangePredicate::I32(p) => second_windows!(p),
+            AnyParsedRangePredicate::I16(p) => second_windows!(p),
+            AnyParsedRangePredicate::I8(p) => second_windows!(p),
+            AnyParsedRangePredicate::U64(p) => second_windows!(p),
+            AnyParsedRangePredicate::U32(p) => second_windows!(p),
+            AnyParsedRangePredicate::U16(p) => second_windows!(p),
+            AnyParsedRangePredicate::U8(p) => second_windows!(p),
+            AnyParsedRangePredicate::F64(p) => second_windows!(p),
+            AnyParsedRangePredicate::F32(p) => second_windows!(p),
         }
     }
     Ok(Some((starts, ends)))
-}
-
-/// Return the physical right positions for one equi code after its range
-/// window has been applied.
-///
-/// The returned slice borrows the dense metadata and remains ordered by
-/// physical right position. Empty or unknown code groups return an empty
-/// slice; invalid range windows return an error.
-pub(crate) fn equi_candidate_slice<'a>(
-    code: usize,
-    metadata: &'a DenseRightMetadata,
-    windows: Option<(&[usize], &[usize])>,
-    row: usize,
-    right_len: usize,
-) -> Result<&'a [usize], String> {
-    if metadata.counts.get(code).copied().unwrap_or(0) == 0 {
-        return Ok(&[]);
-    }
-    let Some(&group_start) = metadata.offsets.get(code) else {
-        return Ok(&[]);
-    };
-    let group_end = metadata.offsets[code + 1];
-    let group = &metadata.positions[group_start..group_end];
-    let Some((starts, ends)) = windows else {
-        return Ok(group);
-    };
-    if ends[row] > right_len {
-        return Err("equi range window is out of bounds".to_owned());
-    }
-    if starts[row] >= ends[row] {
-        return Ok(&[]);
-    }
-    let first = lower_bound(group, starts[row]);
-    let last = lower_bound(group, ends[row]);
-    Ok(&group[first..last])
 }
 
 /// Visit duplicate-right equi candidates that survive the range window and
@@ -649,7 +705,7 @@ fn visit_filtered_equi_candidates<F>(
     left_code: i64,
     metadata: &DenseRightMetadata,
     windows: Option<(&[usize], &[usize])>,
-    right_len: usize,
+    _right_len: usize,
     predicates: &[crate::predicate::PredicateView<'_>],
     null_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
     mut visit: F,
@@ -663,7 +719,7 @@ where
     if metadata.counts.get(code).copied().unwrap_or(0) == 0 {
         return Ok(0);
     }
-    let group = equi_candidate_slice(code, metadata, windows, row, right_len)?;
+    let group = equi_group_candidate_slice(code, metadata, windows, row)?;
     let mut count = 0_usize;
     for &right_position in group {
         if !predicates_match_dispatch(predicates, null_metadata, row, right_position) {
@@ -675,6 +731,29 @@ where
         visit(right_position);
     }
     Ok(count)
+}
+
+fn equi_group_candidate_slice<'a>(
+    code: usize,
+    metadata: &'a DenseRightMetadata,
+    windows: Option<(&[usize], &[usize])>,
+    row: usize,
+) -> Result<&'a [usize], String> {
+    let Some(&group_start) = metadata.offsets.get(code) else {
+        return Ok(&[]);
+    };
+    let group_end = metadata.offsets[code + 1];
+    let group = &metadata.positions[group_start..group_end];
+    let Some((starts, ends)) = windows else {
+        return Ok(group);
+    };
+    if ends[row] > group.len() {
+        return Err("equi group range window is out of bounds".to_owned());
+    }
+    if starts[row] >= ends[row] {
+        return Ok(&[]);
+    }
+    Ok(&group[starts[row]..ends[row]])
 }
 
 /// Materialize duplicate-right equi candidates after range and residual
@@ -951,17 +1030,18 @@ pub fn equi_join_filtered_indices<'py>(
             right_codes.as_array().len(),
         )
         .map_err(PyValueError::new_err)?;
-        let ranges = parse_equi_range_predicates(range_predicates, left_index, right_index)?;
-        let range_windows = build_equi_range_windows(&ranges).map_err(PyValueError::new_err)?;
-        let windows = range_windows
-            .as_ref()
-            .map(|(starts, ends)| (starts.as_slice(), ends.as_slice()));
         let metadata = build_dense_right_metadata(
             right_index_array.as_array(),
             right_codes.as_array(),
             Keep::All,
         )
         .map_err(PyValueError::new_err)?;
+        let ranges = parse_equi_range_predicates(range_predicates, left_index, right_index)?;
+        let range_windows = build_group_range_windows(&ranges, &metadata, left_indexer.as_array())
+            .map_err(PyValueError::new_err)?;
+        let windows = range_windows
+            .as_ref()
+            .map(|(starts, ends)| (starts.as_slice(), ends.as_slice()));
         build_filtered_duplicate_equi_pairs_core(
             left_index_array.as_array(),
             left_indexer.as_array(),
@@ -1203,11 +1283,12 @@ pub fn equi_join_aggregate<'py>(
         )
         .map_err(PyValueError::new_err)?;
         let (parsed, metadata) = parse_predicates_with_nulls_strings(py, residual_predicates)?;
-        let ranges = parse_equi_range_predicates(range_predicates, left_index, right_index)?;
-        let windows = build_equi_range_windows(&ranges).map_err(PyValueError::new_err)?;
         let groups =
             build_dense_right_metadata(right_index_values, right_codes.as_array(), Keep::All)
                 .map_err(PyValueError::new_err)?;
+        let ranges = parse_equi_range_predicates(range_predicates, left_index, right_index)?;
+        let windows = build_group_range_windows(&ranges, &groups, left_indexer)
+            .map_err(PyValueError::new_err)?;
         (parsed, metadata, windows, Some(groups))
     } else {
         let combined = append_range_residuals(py, range_predicates, residual_predicates)?;
@@ -1229,9 +1310,8 @@ pub fn equi_join_aggregate<'py>(
             else {
                 continue;
             };
-            let candidates =
-                equi_candidate_slice(code, &groups, windows, row, right_index_values.len())
-                    .map_err(PyValueError::new_err)?;
+            let candidates = equi_group_candidate_slice(code, &groups, windows, row)
+                .map_err(PyValueError::new_err)?;
             for &right_position in candidates {
                 if !predicates_match_dispatch(
                     &views,
