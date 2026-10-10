@@ -18,6 +18,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use std::cmp::Ordering;
+use std::collections::{hash_map::Entry, HashMap};
 
 use crate::aggregation_common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
@@ -32,6 +33,27 @@ use crate::predicate::{
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
 type IndexPairs = Option<(Vec<i64>, Vec<i64>)>;
+
+/// Return the unique reverse-output labels and their dense aggregation slots.
+///
+/// The unique-equality Python preparation aligns one right label beside every
+/// surviving left row. Repeated left keys therefore repeat the same right
+/// label. Reverse aggregation must collapse those repeated labels back to one
+/// output slot before updating the aggregation state.
+fn unique_reverse_output_slots(
+    right_index: ArrayView1<'_, i64>,
+) -> (Vec<i64>, HashMap<i64, usize>) {
+    let mut labels = Vec::with_capacity(right_index.len());
+    let mut slots = HashMap::with_capacity(right_index.len());
+    for &label in right_index {
+        if let Entry::Vacant(entry) = slots.entry(label) {
+            let slot = labels.len();
+            labels.push(label);
+            entry.insert(slot);
+        }
+    }
+    (labels, slots)
+}
 
 pub fn validate_start_end(
     start: i64,
@@ -1112,7 +1134,15 @@ pub fn equi_aggregate<'py>(
         right_index_array.as_any(),
     )?;
 
-    let output_len = if reverse {
+    let (reverse_output_positions, reverse_output_slots) = if reverse && starts.is_none() {
+        let (positions, slots) = unique_reverse_output_slots(right_index);
+        (Some(positions), Some(slots))
+    } else {
+        (None, None)
+    };
+    let output_len = if let Some(positions) = &reverse_output_positions {
+        positions.len()
+    } else if reverse {
         right_index.len()
     } else {
         left_index.len()
@@ -1209,7 +1239,17 @@ pub fn equi_aggregate<'py>(
                 }
             }
             if reverse {
-                set.update(row, right_position);
+                let output_position = if let Some(slots) = &reverse_output_slots {
+                    // ELI5: several aligned rows can point to the same right
+                    // record; put all of them in that record's one bucket.
+                    slots
+                        .get(&right_index[right_position])
+                        .copied()
+                        .expect("every reverse candidate must have an output slot")
+                } else {
+                    right_position
+                };
+                set.update(row, output_position);
             } else {
                 set.update(right_position, row);
             }
@@ -1220,7 +1260,11 @@ pub fn equi_aggregate<'py>(
         return Ok(None);
     }
     let output_positions = if reverse {
-        Some(right_index)
+        reverse_output_positions
+            .as_ref()
+            .map_or(Some(right_index), |positions| {
+                Some(ArrayView1::from(positions.as_slice()))
+            })
     } else {
         Some(left_index)
     };
@@ -1659,10 +1703,20 @@ mod tests {
         apply_equi_range_bound, build_equi_ne_indices_core, build_equi_only_indices_core,
         build_equi_uniq_residual_indices_core, build_second_range_envelope,
         materialize_equi_windows, materialize_unordered_second_range,
-        narrow_unordered_second_range, range_value_matches,
+        narrow_unordered_second_range, range_value_matches, unique_reverse_output_slots,
     };
     use crate::compare_op::CompareOp;
     use crate::join_types::Keep;
+
+    #[test]
+    fn reverse_unique_output_slots_collapse_aligned_duplicates() {
+        let right_index = Array1::from_vec(vec![7_i64, 7, 3, 7]);
+        let (labels, slots) = unique_reverse_output_slots(right_index.view());
+
+        assert_eq!(labels, vec![7, 3]);
+        assert_eq!(slots.get(&7), Some(&0));
+        assert_eq!(slots.get(&3), Some(&1));
+    }
     use crate::predicate::PredicateView;
     use crate::range_predicate::{AnyParsedRangePredicate, ParsedRangePredicate};
 
