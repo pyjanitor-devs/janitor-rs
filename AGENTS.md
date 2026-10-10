@@ -1363,3 +1363,10 @@ because their public Rust signatures mirror those kernel inputs.
 default threshold -- don't reach for this allow as a shortcut on a genuinely
 new function. Every other lint, and `-D warnings` itself, still applies in
 full.
+
+### [2026-10-10] Equi second-range extrema only support range comparisons
+
+The cumulative-envelope fast path in `src/equi_join.rs` is used only for the
+unordered second range predicate, and it is built from the post-first-range
+windows. Equality and inequality belong to the equi/residual paths and must
+not be added to that classifier.

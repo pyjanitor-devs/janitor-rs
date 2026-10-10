@@ -87,6 +87,28 @@ pub(crate) fn validate_equi_range_predicate_count(count: usize) -> PyResult<()> 
     Ok(())
 }
 
+/// Apply one or two range predicates to equality windows and materialize pairs.
+///
+/// The first predicate is applied with a binary search over the right values,
+/// which are sorted for that predicate. If a second predicate is unordered,
+/// its post-first windows are narrowed with a cumulative min/max envelope and
+/// a second binary search before the exact predicate scan.
+///
+/// # Arguments
+///
+/// * `left_index` - Physical left-row labels for the compact left layout.
+/// * `right_index` - Physical right-row labels for the compact right layout.
+/// * `starts` - Mutable half-open right-window starts, aligned with
+///   `left_index`.
+/// * `ends` - Mutable half-open right-window ends, aligned with `left_index`.
+/// * `first_range` - The range predicate whose right values are sorted.
+/// * `second_range` - An optional second range predicate in the same layout.
+/// * `keep` - Match retention policy for final materialization.
+///
+/// # Errors
+///
+/// Returns an error for mismatched lengths, invalid windows, or a non-range
+/// comparator passed through the range path.
 fn build_equi_range_indices_core(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
@@ -104,7 +126,6 @@ fn build_equi_range_indices_core(
         }
         validate_start_end(start, end, right_index.len())?;
     }
-
     let has_active_window = apply_equi_range_windows(
         first_range,
         starts.view_mut(),
@@ -130,8 +151,8 @@ fn build_equi_range_indices_core(
             return materialize_unordered_second_range(
                 left_index,
                 right_index,
-                starts.view(),
-                ends.view(),
+                starts.view_mut(),
+                ends.view_mut(),
                 second_range,
                 keep,
             );
@@ -311,11 +332,38 @@ fn materialize_equi_windows(
     }
 }
 
+/// Materialize matches for an unordered second range predicate.
+///
+/// `starts` and `ends` already contain the windows surviving the first range.
+/// The function builds one cumulative envelope for each distinct active
+/// window, binary-searches that envelope to remove a provably impossible
+/// prefix or suffix, and then evaluates the original predicate exactly over
+/// the remaining window. The envelope is never treated as the final truth
+/// test.
+///
+/// PyJanitor filters nulls before entering this Rust path, so the supported
+/// inputs are expected to contain ordinary ordered values rather than `NaN`.
+///
+/// # Arguments
+///
+/// * `left_index` - Physical left-row labels aligned with the predicate's
+///   left values.
+/// * `right_index` - Physical right-row labels aligned with the predicate's
+///   right values.
+/// * `starts` - Mutable post-first-range half-open windows.
+/// * `ends` - Mutable post-first-range half-open windows.
+/// * `range` - The unordered second range predicate.
+/// * `keep` - Match retention policy after exact filtering.
+///
+/// # Returns
+///
+/// `None` when no exact matches survive; otherwise the physical left/right
+/// index pairs selected by `keep`.
 fn materialize_unordered_second_range(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
+    mut starts: ArrayViewMut1<'_, i64>,
+    mut ends: ArrayViewMut1<'_, i64>,
     range: &AnyParsedRangePredicate<'_>,
     keep: Keep,
 ) -> Result<IndexPairs, String> {
@@ -324,13 +372,37 @@ fn materialize_unordered_second_range(
             let predicate = $predicate;
             let left = predicate.left.as_array();
             let right = predicate.right.as_array();
+            let use_cummax = matches!(predicate.op, CompareOp::Lt | CompareOp::Le);
+            let mut equality_windows = Vec::new();
+            let mut seen_windows = std::collections::HashSet::new();
+            for (&start, &end) in starts.iter().zip(ends.iter()) {
+                if start < 0 || end < 0 {
+                    continue;
+                }
+                let window = (start as usize, end as usize);
+                if seen_windows.insert(window) {
+                    equality_windows.push(window);
+                }
+            }
+            let envelope = build_second_range_envelope(right, &equality_windows, use_cummax);
+            if !narrow_unordered_second_range(
+                left,
+                &envelope,
+                starts.view_mut(),
+                ends.view_mut(),
+                predicate.op,
+            )? {
+                return Ok(None);
+            }
             if keep == Keep::All {
                 let mut output_capacity = 0_usize;
                 for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
                     if start < 0 || end < 0 {
                         continue;
                     }
-                    for right_position in start as usize..end as usize {
+                    let start = start as usize;
+                    let end = end as usize;
+                    for right_position in start..end {
                         if range_value_matches(left[row], right[right_position], predicate.op) {
                             output_capacity = output_capacity
                                 .checked_add(1)
@@ -347,7 +419,9 @@ fn materialize_unordered_second_range(
                     if start < 0 || end < 0 {
                         continue;
                     }
-                    for right_position in start as usize..end as usize {
+                    let start = start as usize;
+                    let end = end as usize;
+                    for right_position in start..end {
                         if range_value_matches(left[row], right[right_position], predicate.op) {
                             left_output.push(left_index[row]);
                             right_output.push(right_index[right_position]);
@@ -363,8 +437,10 @@ fn materialize_unordered_second_range(
                 if start < 0 || end < 0 {
                     continue;
                 }
+                let start = start as usize;
+                let end = end as usize;
                 let mut selected = None;
-                for right_position in start as usize..end as usize {
+                for right_position in start..end {
                     if !range_value_matches(left[row], right[right_position], predicate.op) {
                         continue;
                     }
@@ -426,6 +502,134 @@ fn range_value_matches<T: PartialOrd>(left: T, right: T, op: CompareOp) -> bool 
         CompareOp::Eq => left == right,
         CompareOp::Ne => left != right,
     }
+}
+
+/// Build one cumulative envelope for each equality window.
+///
+/// The envelope is reset at every equality window, so values from a
+/// neighboring equality group cannot affect the binary search.
+///
+/// When `use_cummax` is true, the envelope is a prefix maximum and is
+/// non-decreasing. Otherwise it is a suffix minimum and is also
+/// non-decreasing when read from left to right.
+///
+/// # Arguments
+///
+/// * `values` - Unordered second-range values in the prepared right layout.
+/// * `equality_windows` - Distinct active post-first-range windows.
+/// * `use_cummax` - Select the prefix-maximum or suffix-minimum envelope.
+///
+/// # Returns
+///
+/// An envelope indexed in the same coordinate system as `values`.
+fn build_second_range_envelope<T: PartialOrd + Copy>(
+    values: ArrayView1<'_, T>,
+    equality_windows: &[(usize, usize)],
+    use_cummax: bool,
+) -> Vec<T> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let mut envelope = vec![values[0]; values.len()];
+    for &(start, end) in equality_windows {
+        if start >= end {
+            continue;
+        }
+        if use_cummax {
+            let mut current = values[start];
+            for position in start..end {
+                let value = values[position];
+                if matches!(value.partial_cmp(&current), Some(Ordering::Greater)) {
+                    current = value;
+                }
+                envelope[position] = current;
+            }
+        } else {
+            let mut current = values[end - 1];
+            for position in (start..end).rev() {
+                let value = values[position];
+                if matches!(value.partial_cmp(&current), Some(Ordering::Less)) {
+                    current = value;
+                }
+                envelope[position] = current;
+            }
+        }
+    }
+    envelope
+}
+
+/// Narrow the second-range windows using a monotonic cumulative envelope.
+///
+/// The raw second-range values may be unordered. The envelope only proves
+/// that a prefix or suffix cannot contain a match; the caller still performs
+/// the exact predicate check over the narrowed window.
+///
+/// # Arguments
+///
+/// * `left` - Second-range left values, one per active window.
+/// * `envelope` - Monotonic cumulative envelope in right-position space.
+/// * `starts` - Mutable post-first-range window starts.
+/// * `ends` - Mutable post-first-range window ends.
+/// * `op` - One of `<`, `<=`, `>`, or `>=`; equality operators are invalid.
+///
+/// # Returns
+///
+/// `true` when at least one narrowed window remains active.
+fn narrow_unordered_second_range<T: PartialOrd + Copy>(
+    left: ArrayView1<'_, T>,
+    envelope: &[T],
+    mut starts: ArrayViewMut1<'_, i64>,
+    mut ends: ArrayViewMut1<'_, i64>,
+    op: CompareOp,
+) -> Result<bool, String> {
+    let envelope = ArrayView1::from(envelope);
+    let mut has_active_window = false;
+    for row in 0..left.len() {
+        if starts[row] < 0 || ends[row] < 0 {
+            continue;
+        }
+        let old_start = starts[row] as usize;
+        let old_end = ends[row] as usize;
+        let boundary = match op {
+            // For left <(=) right, the prefix cummax is non-decreasing.
+            CompareOp::Lt => {
+                partition_point_between(envelope, old_start, old_end, |value| value <= left[row])
+            }
+            CompareOp::Le => {
+                partition_point_between(envelope, old_start, old_end, |value| value < left[row])
+            }
+            // For left >(=) right, the suffix cummin is non-decreasing.
+            CompareOp::Gt => {
+                partition_point_between(envelope, old_start, old_end, |value| value < left[row])
+            }
+            CompareOp::Ge => {
+                partition_point_between(envelope, old_start, old_end, |value| value <= left[row])
+            }
+            CompareOp::Eq | CompareOp::Ne => {
+                return Err("unordered second range requires a range comparator".to_owned())
+            }
+        };
+        match op {
+            CompareOp::Lt | CompareOp::Le => {
+                starts[row] = if boundary == old_end {
+                    -1
+                } else {
+                    has_active_window = true;
+                    boundary as i64
+                };
+            }
+            CompareOp::Gt | CompareOp::Ge => {
+                ends[row] = if boundary == old_start {
+                    -1
+                } else {
+                    has_active_window = true;
+                    boundary as i64
+                };
+            }
+            CompareOp::Eq | CompareOp::Ne => unreachable!(),
+        }
+    }
+    Ok(has_active_window)
 }
 
 fn range_matches_at(
@@ -1407,13 +1611,70 @@ mod tests {
 
     use super::{
         apply_equi_range_bound, build_equi_ne_indices_core, build_equi_only_indices_core,
-        build_equi_uniq_residual_indices_core, materialize_equi_windows,
-        materialize_unordered_second_range,
+        build_equi_uniq_residual_indices_core, build_second_range_envelope,
+        materialize_equi_windows, materialize_unordered_second_range,
+        narrow_unordered_second_range, range_value_matches,
     };
     use crate::compare_op::CompareOp;
     use crate::join_types::Keep;
     use crate::predicate::PredicateView;
     use crate::range_predicate::{AnyParsedRangePredicate, ParsedRangePredicate};
+
+    #[test]
+    fn unordered_second_range_envelope_is_directional() {
+        let right = Array1::from_vec(vec![8_i64, 2, 6, 1, 7, 3]);
+        let windows = [(0, 3), (3, 6)];
+        assert_eq!(
+            build_second_range_envelope(right.view(), &windows, true),
+            vec![8, 8, 8, 1, 7, 7]
+        );
+        assert_eq!(
+            build_second_range_envelope(right.view(), &windows, false),
+            vec![2, 2, 6, 1, 3, 3]
+        );
+    }
+
+    #[test]
+    fn unordered_second_range_narrowing_matches_bruteforce() {
+        let right = Array1::from_vec(vec![8_i64, 2, 6, 1, 7, 3, 9, 0]);
+        let windows = [(0, 4), (4, 8)];
+        let left = Array1::from_vec(vec![0_i64, 5, 10, 4, 8]);
+        let original_starts = [0_i64, 0, 0, 4, 4];
+        let original_ends = [4_i64, 4, 4, 8, 8];
+
+        for op in [CompareOp::Lt, CompareOp::Le, CompareOp::Gt, CompareOp::Ge] {
+            let use_cummax = matches!(op, CompareOp::Lt | CompareOp::Le);
+            let envelope = build_second_range_envelope(right.view(), &windows, use_cummax);
+            let mut starts = Array1::from_vec(original_starts.to_vec());
+            let mut ends = Array1::from_vec(original_ends.to_vec());
+            narrow_unordered_second_range(
+                left.view(),
+                &envelope,
+                starts.view_mut(),
+                ends.view_mut(),
+                op,
+            )
+            .unwrap();
+
+            let mut expected = Vec::new();
+            let mut actual = Vec::new();
+            for row in 0..left.len() {
+                for position in original_starts[row] as usize..original_ends[row] as usize {
+                    if range_value_matches(left[row], right[position], op) {
+                        expected.push((row, position));
+                    }
+                }
+                if starts[row] >= 0 && ends[row] >= 0 {
+                    for position in starts[row] as usize..ends[row] as usize {
+                        if range_value_matches(left[row], right[position], op) {
+                            actual.push((row, position));
+                        }
+                    }
+                }
+            }
+            assert_eq!(actual, expected, "operator: {op:?}");
+        }
+    }
 
     #[test]
     fn unordered_right_labels_select_extrema() {
@@ -1823,20 +2084,19 @@ mod tests {
             });
             let left_index = Array1::from_vec(vec![10]);
             let right_index = Array1::from_vec(vec![10, 11, 12, 13]);
-            let starts = Array1::from_vec(vec![0]);
-            let ends = Array1::from_vec(vec![4]);
-
             for (keep, expected) in [
                 (Keep::All, vec![11, 13]),
                 (Keep::Any, vec![11]),
                 (Keep::First, vec![11]),
                 (Keep::Last, vec![13]),
             ] {
+                let mut starts = Array1::from_vec(vec![0]);
+                let mut ends = Array1::from_vec(vec![4]);
                 let result = materialize_unordered_second_range(
                     left_index.view(),
                     right_index.view(),
-                    starts.view(),
-                    ends.view(),
+                    starts.view_mut(),
+                    ends.view_mut(),
                     &range,
                     keep,
                 )
