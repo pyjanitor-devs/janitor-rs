@@ -1370,3 +1370,10 @@ The cumulative-envelope fast path in `src/equi_join.rs` is used only for the
 unordered second range predicate, and it is built from the post-first-range
 windows. Equality and inequality belong to the equi/residual paths and must
 not be added to that classifier.
+
+### [2026-10-10] Use the Rust test wrapper for local execution
+
+The raw `cargo test` command can compile successfully and then fail at runtime
+on macOS because it does not configure the selected Python library path. Always
+use `./scripts/test-rust.sh`; it selects Python 3.12, installs NumPy, sets
+`PYO3_PYTHON`, and exports the required dyld library path.

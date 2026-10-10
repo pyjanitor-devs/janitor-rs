@@ -2120,6 +2120,7 @@ mod tests {
 
     #[test]
     fn unordered_second_range_applies_all_keep_modes() {
+        Python::initialize();
         Python::attach(|py| {
             let range = AnyParsedRangePredicate::I64(ParsedRangePredicate {
                 left: PyArray1::from_vec(py, vec![3_i64]).readonly(),
