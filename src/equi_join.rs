@@ -367,33 +367,15 @@ fn materialize_unordered_second_range(
     range: &AnyParsedRangePredicate<'_>,
     keep: Keep,
 ) -> Result<IndexPairs, String> {
+    if !narrow_unordered_second_range_for_predicate(range, starts.view_mut(), ends.view_mut())? {
+        return Ok(None);
+    }
+
     macro_rules! materialize {
         ($predicate:expr) => {{
             let predicate = $predicate;
             let left = predicate.left.as_array();
             let right = predicate.right.as_array();
-            let use_cummax = matches!(predicate.op, CompareOp::Lt | CompareOp::Le);
-            let mut equality_windows = Vec::new();
-            let mut seen_windows = std::collections::HashSet::new();
-            for (&start, &end) in starts.iter().zip(ends.iter()) {
-                if start < 0 || end < 0 {
-                    continue;
-                }
-                let window = (start as usize, end as usize);
-                if seen_windows.insert(window) {
-                    equality_windows.push(window);
-                }
-            }
-            let envelope = build_second_range_envelope(right, &equality_windows, use_cummax);
-            if !narrow_unordered_second_range(
-                left,
-                &envelope,
-                starts.view_mut(),
-                ends.view_mut(),
-                predicate.op,
-            )? {
-                return Ok(None);
-            }
             if keep == Keep::All {
                 let mut output_capacity = 0_usize;
                 for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
@@ -490,6 +472,63 @@ fn materialize_unordered_second_range(
         AnyParsedRangePredicate::U8(predicate) => materialize!(predicate),
         AnyParsedRangePredicate::F64(predicate) => materialize!(predicate),
         AnyParsedRangePredicate::F32(predicate) => materialize!(predicate),
+    }
+}
+
+/// Build and apply the second-range envelope for already narrowed windows.
+///
+/// This helper is shared by direct index materialization and the aggregation
+/// path. Both paths must narrow the candidate windows before their exact
+/// predicate/residual scan; otherwise aggregation would silently retain the
+/// slower full-window behavior.
+///
+/// # Arguments
+///
+/// * `range` - The unordered second range predicate and its aligned values.
+/// * `starts` - Mutable post-first-range window starts.
+/// * `ends` - Mutable post-first-range window ends.
+///
+/// # Returns
+///
+/// `true` when at least one candidate window remains after envelope narrowing.
+fn narrow_unordered_second_range_for_predicate(
+    range: &AnyParsedRangePredicate<'_>,
+    starts: ArrayViewMut1<'_, i64>,
+    ends: ArrayViewMut1<'_, i64>,
+) -> Result<bool, String> {
+    macro_rules! narrow {
+        ($predicate:expr) => {{
+            let predicate = $predicate;
+            let left = predicate.left.as_array();
+            let right = predicate.right.as_array();
+            let use_cummax = matches!(predicate.op, CompareOp::Lt | CompareOp::Le);
+            let mut equality_windows = Vec::new();
+            let mut seen_windows = std::collections::HashSet::new();
+            for (&start, &end) in starts.iter().zip(ends.iter()) {
+                if start < 0 || end < 0 {
+                    continue;
+                }
+                let window = (start as usize, end as usize);
+                if seen_windows.insert(window) {
+                    equality_windows.push(window);
+                }
+            }
+            let envelope = build_second_range_envelope(right, &equality_windows, use_cummax);
+            narrow_unordered_second_range(left, &envelope, starts, ends, predicate.op)
+        }};
+    }
+
+    match range {
+        AnyParsedRangePredicate::I64(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::I32(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::I16(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::I8(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::U64(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::U32(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::U16(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::U8(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::F64(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::F32(predicate) => narrow!(predicate),
     }
 }
 
@@ -934,6 +973,13 @@ fn build_equi_range_and_residual_indices_core(
                 return Ok(None);
             }
         } else {
+            if !narrow_unordered_second_range_for_predicate(
+                second_range,
+                starts.view_mut(),
+                ends.view_mut(),
+            )? {
+                return Ok(None);
+            }
             return materialize_equi_windows_and_residuals(
                 left_index,
                 right_index,
