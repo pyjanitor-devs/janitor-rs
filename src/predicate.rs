@@ -367,6 +367,45 @@ pub(crate) fn predicates_match_dispatch(
 ///
 /// The parser follows the public single-join contract and accepts readable
 /// comparator strings.
+pub(crate) fn parse_predicate_tuple<'py>(tuple: &Bound<'py, PyTuple>) -> PyResult<Predicate<'py>> {
+    if tuple.len() != 3 {
+        return Err(PyValueError::new_err(
+            "each comparison must contain left, right, and op",
+        ));
+    }
+    let op = CompareOp::try_from_str(tuple.get_item(2)?.extract::<&str>()?)?;
+    let left = tuple.get_item(0)?;
+    let right = tuple.get_item(1)?;
+    let dtype = left
+        .getattr("dtype")?
+        .getattr("name")?
+        .extract::<String>()?;
+    macro_rules! typed {
+        ($variant:ident, $ty:ty) => {{
+            Ok(Predicate::$variant(
+                left.extract::<PyReadonlyArray1<'py, $ty>>()?,
+                right.extract::<PyReadonlyArray1<'py, $ty>>()?,
+                op,
+            ))
+        }};
+    }
+    match dtype.as_str() {
+        "int64" => typed!(I64, i64),
+        "int32" => typed!(I32, i32),
+        "int16" => typed!(I16, i16),
+        "int8" => typed!(I8, i8),
+        "uint64" => typed!(U64, u64),
+        "uint32" => typed!(U32, u32),
+        "uint16" => typed!(U16, u16),
+        "uint8" => typed!(U8, u8),
+        "float64" => typed!(F64, f64),
+        "float32" => typed!(F32, f32),
+        other => Err(PyTypeError::new_err(format!(
+            "unsupported comparison dtype: {other}"
+        ))),
+    }
+}
+
 pub(crate) fn parse_predicates_strings<'py>(
     predicates: &Bound<'py, PyList>,
 ) -> PyResult<Vec<Predicate<'py>>> {
@@ -375,44 +414,7 @@ pub(crate) fn parse_predicates_strings<'py>(
         let tuple = item
             .cast::<PyTuple>()
             .map_err(|_| PyTypeError::new_err("each comparison must be (left, right, op)"))?;
-        if tuple.len() != 3 {
-            return Err(PyValueError::new_err(
-                "each comparison must contain left, right, and op",
-            ));
-        }
-        let op = CompareOp::try_from_str(tuple.get_item(2)?.extract::<&str>()?)?;
-        let left = tuple.get_item(0)?;
-        let right = tuple.get_item(1)?;
-        let dtype = left
-            .getattr("dtype")?
-            .getattr("name")?
-            .extract::<String>()?;
-        macro_rules! typed {
-            ($variant:ident, $ty:ty) => {{
-                result.push(Predicate::$variant(
-                    left.extract::<PyReadonlyArray1<'py, $ty>>()?,
-                    right.extract::<PyReadonlyArray1<'py, $ty>>()?,
-                    op,
-                ));
-            }};
-        }
-        match dtype.as_str() {
-            "int64" => typed!(I64, i64),
-            "int32" => typed!(I32, i32),
-            "int16" => typed!(I16, i16),
-            "int8" => typed!(I8, i8),
-            "uint64" => typed!(U64, u64),
-            "uint32" => typed!(U32, u32),
-            "uint16" => typed!(U16, u16),
-            "uint8" => typed!(U8, u8),
-            "float64" => typed!(F64, f64),
-            "float32" => typed!(F32, f32),
-            other => {
-                return Err(PyTypeError::new_err(format!(
-                    "unsupported comparison dtype: {other}"
-                )))
-            }
-        }
+        result.push(parse_predicate_tuple(tuple)?);
     }
     Ok(result)
 }

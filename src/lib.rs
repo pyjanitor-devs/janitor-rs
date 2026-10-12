@@ -12,6 +12,7 @@ mod not_equals_only;
 mod predicate;
 mod range_join;
 mod range_predicate;
+mod region;
 mod regions;
 mod single_range_predicate;
 
@@ -30,6 +31,7 @@ fn janitor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     not_equals_only::register(m)?;
     range_join::register(m)?;
     single_range_predicate::register(m)?;
+    region::register(m)?;
     regions::register(m)?;
     Ok(())
 }
@@ -54,6 +56,8 @@ mod registration_tests {
                 "not_equals_aggregate_int64",
                 "range_join_indices",
                 "single_range_predicate_indices_int64",
+                "dual_regions_indices",
+                "dual_regions_and_residual_indices",
                 "region_indices",
             ] {
                 assert!(module.getattr(name).is_ok(), "missing export: {name}");

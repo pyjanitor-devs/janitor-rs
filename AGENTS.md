@@ -415,6 +415,14 @@ work, while one width-eight query makes that regression obvious.
 
 ## Learned Patterns
 
+### [2026-10-12] Dual-region keep selection uses right-index values
+
+For the standalone dual-region index builder, `keep="first"` and
+`keep="last"` select the minimum or maximum actual `right_index` value among
+matching candidates. They must not use the physical position in the sorted or
+aligned right value array, because right-index labels are unique but are not
+guaranteed to be ordered.
+
 - Region aggregation consumes every pair passing the primary and residual
   predicates. `Keep` selection semantics (`all`, `first`, `last`, `any`) apply
   only to index-returning paths and must not be part of the aggregation API.
