@@ -9,6 +9,7 @@ use crate::predicate::{
     parse_predicates_with_nulls_strings, predicates_match_dispatch, Predicate, PredicateView,
 };
 use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
@@ -22,6 +23,12 @@ pub(crate) struct DualRegionPaths {
 }
 
 type RegionPaths = (Vec<i64>, Vec<i64>);
+/// Flat storage layout for positions grouped by a right-region label.
+///
+/// The map stores `(count, offset)` for each label. `offset..offset + count`
+/// is the slice in the accompanying flat position buffer for that label; the
+/// second tuple item is the total buffer length required by all labels.
+type RegionPositionLayout = (HashMap<i64, (usize, usize)>, usize);
 
 /// Counts produced by the first pass of `keep="all"` materialization.
 pub(crate) struct KeepAllFirstPass {
@@ -75,6 +82,28 @@ pub(crate) struct MatchCountPass {
 /// separate arguments to the outer entry point.
 fn parse_region_predicate<'py>(predicate: &Bound<'py, PyTuple>) -> PyResult<Predicate<'py>> {
     parse_predicate_tuple(predicate)
+}
+
+/// Validate that a parsed predicate is a strict range predicate.
+fn validate_region_predicate(predicate: &Predicate<'_>) -> PyResult<()> {
+    let op = match predicate.view() {
+        PredicateView::I64(_, _, op)
+        | PredicateView::I32(_, _, op)
+        | PredicateView::I16(_, _, op)
+        | PredicateView::I8(_, _, op)
+        | PredicateView::U64(_, _, op)
+        | PredicateView::U32(_, _, op)
+        | PredicateView::U16(_, _, op)
+        | PredicateView::U8(_, _, op)
+        | PredicateView::F64(_, _, op)
+        | PredicateView::F32(_, _, op) => op,
+    };
+    if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+        return Err(PyValueError::new_err(
+            "region predicates must use <, <=, >, or >=",
+        ));
+    }
+    Ok(())
 }
 
 /// Return the suffix boundary for a range predicate.
@@ -163,6 +192,30 @@ fn mask_right_region(
     Ok(())
 }
 
+/// Propagate zero regions across a collection of aligned region paths.
+///
+/// A zero in any path means that the corresponding position cannot satisfy
+/// the full predicate set. Every path therefore receives the same zero mask.
+fn mask_zero_regions(regions: &mut [Vec<i64>]) -> Result<(), String> {
+    let Some(first_region) = regions.first() else {
+        return Ok(());
+    };
+
+    for region in regions.iter().skip(1) {
+        ensure_equal_lengths_core("region", region.len(), "first region", first_region.len())?;
+    }
+
+    for position in 0..first_region.len() {
+        if regions.iter().any(|region| region[position] == 0) {
+            for region in regions.iter_mut() {
+                region[position] = 0;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Find the first right position whose first-region label reaches each left
 /// first-region label.
 ///
@@ -199,6 +252,42 @@ fn first_region_starts(
                 right_region.partition_point(|&right_value| right_value < first_left_value)
             };
             if start < right_region.len() {
+                has_match = true;
+            }
+            start
+        })
+        .collect::<Vec<_>>();
+
+    if !has_match {
+        return Ok(None);
+    }
+
+    Ok(Some(starts))
+}
+
+/// Find n-region search starts from the first predicate alone.
+fn n_region_starts(
+    first_left_region: &[i64],
+    first_right_region: &[i64],
+) -> Result<Option<Vec<usize>>, String> {
+    // The first right path is the only path used for the initial binary
+    // search. Later paths are checked candidate-by-candidate, so they do not
+    // need to be monotonic.
+    debug_assert!(
+        first_right_region.windows(2).all(|pair| pair[0] <= pair[1]),
+        "first right region must be monotonically nondecreasing"
+    );
+
+    let mut has_match = false;
+    let starts = first_left_region
+        .iter()
+        .map(|&left_region| {
+            let start = if left_region == 0 {
+                first_right_region.len()
+            } else {
+                first_right_region.partition_point(|&right_region| right_region < left_region)
+            };
+            if start < first_right_region.len() {
                 has_match = true;
             }
             start
@@ -542,6 +631,149 @@ pub(crate) fn keep_all_second_pass(
         left_index: left_output,
         right_index: right_output,
     }))
+}
+
+/// Count the positions needed to store each nonzero second-region label.
+///
+/// ELI5: the second right region is the lookup key. We reserve one contiguous
+/// slice for every key, then reuse those slices during both passes instead of
+/// allocating a vector for every key.
+fn build_n_region_position_layout(
+    second_right_region: &[i64],
+) -> Result<RegionPositionLayout, String> {
+    let mut layout = HashMap::<i64, (usize, usize)>::new();
+    for &region in second_right_region {
+        if region != 0 {
+            let count = &mut layout.entry(region).or_default().0;
+            *count = count
+                .checked_add(1)
+                .ok_or("region result size exceeds platform capacity")?;
+        }
+    }
+
+    let mut position_total = 0usize;
+    for (count, offset) in layout.values_mut() {
+        *offset = position_total;
+        position_total = position_total
+            .checked_add(*count)
+            .ok_or("region result size exceeds platform capacity")?;
+    }
+
+    Ok((layout, position_total))
+}
+
+/// Visit n-region candidates in descending first-region order.
+///
+/// The first two region paths define the search window. The remaining paths
+/// are progressively checked for each candidate, and `.all(...)` stops at the
+/// first failed predicate. `visit` returns `false` when the caller has enough
+/// information for the current left row (for example, `keep="any"`).
+///
+/// `right_positions` is indexed by the second right-region layout. It is
+/// rebuilt as the sweep expands, so a candidate uses only right rows that are
+/// active for the current search window.
+fn visit_n_region_matches<F>(
+    left_regions: &[Vec<i64>],
+    right_regions: &[Vec<i64>],
+    starts: &[usize],
+    end: usize,
+    right_region_layout: &HashMap<i64, (usize, usize)>,
+    right_positions: &mut [usize],
+    mut visit: F,
+) -> Result<usize, String>
+where
+    F: FnMut(usize, usize) -> bool,
+{
+    if left_regions.len() < 3 || right_regions.len() != left_regions.len() {
+        return Err("n-region paths must contain at least three aligned regions".to_owned());
+    }
+    if starts.len() != left_regions[0].len() {
+        return Err("n-region starts must match the left-region length".to_owned());
+    }
+    for region in left_regions.iter().skip(1) {
+        ensure_equal_lengths_core(
+            "left region",
+            region.len(),
+            "first left region",
+            left_regions[0].len(),
+        )?;
+    }
+    for region in right_regions {
+        ensure_equal_lengths_core("right region", region.len(), "first right region", end)?;
+    }
+
+    let mut right_regions_by_label = BTreeMap::<i64, usize>::new();
+    let mut right_region_maxima = vec![0_i64; right_regions.len()];
+    let mut previous_end = end;
+    let mut total_matches = 0usize;
+
+    for (left_position, &start) in starts.iter().enumerate() {
+        if start == end {
+            continue;
+        }
+        if start > previous_end {
+            return Err("starts must be monotonically non-increasing".to_owned());
+        }
+
+        for right_position in start..previous_end {
+            for (maximum, region) in right_region_maxima.iter_mut().zip(right_regions) {
+                *maximum = (*maximum).max(region[right_position]);
+            }
+
+            let second_region = right_regions[1][right_position];
+            if second_region != 0 {
+                let (region_total, region_offset) = right_region_layout
+                    .get(&second_region)
+                    .ok_or_else(|| "second right region was missing from the layout".to_owned())?;
+                let region_count = right_regions_by_label.entry(second_region).or_default();
+                let position = region_offset
+                    .checked_add(*region_count)
+                    .ok_or("region result size exceeds platform capacity")?;
+                if position >= right_positions.len() || *region_count >= *region_total {
+                    return Err("second right region exceeded its layout".to_owned());
+                }
+                right_positions[position] = right_position;
+                *region_count += 1;
+            }
+        }
+        previous_end = start;
+
+        let impossible = left_regions
+            .iter()
+            .zip(&right_region_maxima)
+            .any(|(left_region, &right_maximum)| left_region[left_position] > right_maximum);
+        if impossible {
+            continue;
+        }
+
+        let second_left_region = left_regions[1][left_position];
+        'candidate_regions: for (&second_region, &region_count) in
+            right_regions_by_label.range(second_left_region..)
+        {
+            let &(_, region_offset) = right_region_layout
+                .get(&second_region)
+                .ok_or_else(|| "second right region was missing from the layout".to_owned())?;
+            for &right_position in &right_positions[region_offset..region_offset + region_count] {
+                let matches_remaining = left_regions
+                    .iter()
+                    .skip(2)
+                    .zip(right_regions.iter().skip(2))
+                    .all(|(left_region, right_region)| {
+                        left_region[left_position] <= right_region[right_position]
+                    });
+                if matches_remaining {
+                    total_matches = total_matches
+                        .checked_add(1)
+                        .ok_or("region result size exceeds platform capacity")?;
+                    if !visit(left_position, right_position) {
+                        break 'candidate_regions;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(total_matches)
 }
 
 /// Count residual-passing candidates for each left row.
@@ -1198,10 +1430,359 @@ pub fn dual_regions_and_residual_indices<'py>(
     )?))
 }
 
+/// Build index pairs for three or more range predicates after Python-side
+/// parsing and validation.
+///
+/// `range_predicates` and `aligners` are parallel slices. Keeping them
+/// separate from the first predicate makes the pairing explicit and prevents
+/// an aligner from accidentally being applied to the wrong right-value array.
+fn n_region_indices_core(
+    first_predicate: &Predicate<'_>,
+    range_predicates: &[Predicate<'_>],
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    aligners: &[ArrayView1<'_, i64>],
+    keep: Keep,
+) -> Result<Option<MaterializedIndices>, String> {
+    // The first predicate establishes the canonical right order. Every later
+    // predicate supplies an aligner that has already been prepared by Python,
+    // so this core function only gathers values and performs the sweep.
+    ensure_equal_lengths_core(
+        "first left predicate",
+        first_predicate.left_len(),
+        "left_index",
+        left_index.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "first right predicate",
+        first_predicate.right_len(),
+        "right_index",
+        right_index.len(),
+    )?;
+    if range_predicates.len() < 2 {
+        return Err("n-region paths require at least three predicates".to_owned());
+    }
+    if range_predicates.len() != aligners.len() {
+        return Err("range predicates and aligners must have equal lengths".to_owned());
+    }
+    for predicate in range_predicates {
+        ensure_equal_lengths_core(
+            "range left predicate",
+            predicate.left_len(),
+            "left_index",
+            left_index.len(),
+        )?;
+        ensure_equal_lengths_core(
+            "range right predicate",
+            predicate.right_len(),
+            "right_index",
+            right_index.len(),
+        )?;
+    }
+
+    // `left_index` and `right_index` are output labels, not region offsets.
+    // The value arrays inside each predicate may have been sorted or aligned;
+    // these two arrays retain the physical row identity that Python expects.
+    let Some(first_regions) = build_region_paths(first_predicate, None, None, None)? else {
+        return Ok(None);
+    };
+    let (first_left_region, first_right_region) = first_regions;
+
+    let mut left_range_regions = Vec::with_capacity(range_predicates.len() + 1);
+    let mut right_range_regions = Vec::with_capacity(range_predicates.len() + 1);
+    left_range_regions.push(first_left_region);
+    right_range_regions.push(first_right_region);
+
+    for (predicate, aligner) in range_predicates.iter().zip(aligners) {
+        let Some((left_region, right_region)) =
+            build_region_paths(predicate, Some(aligner), None, None)?
+        else {
+            return Ok(None);
+        };
+        left_range_regions.push(left_region);
+        right_range_regions.push(right_region);
+    }
+
+    mask_zero_regions(&mut left_range_regions)?;
+
+    if left_range_regions[0].iter().all(|&region| region == 0) {
+        return Ok(None);
+    }
+
+    let left_order = descending_left_order(&left_range_regions[0]);
+    for region in &mut left_range_regions {
+        *region = reorder_left_region(region, &left_order);
+    }
+
+    let first_right_region = &right_range_regions[0];
+    // Compute starts before applying the shared zero mask. The first right
+    // path is monotonic at this point, which is the invariant required by
+    // `partition_point`; propagating zeros later can create internal holes.
+    let Some(starts) = n_region_starts(&left_range_regions[0], first_right_region)? else {
+        return Ok(None);
+    };
+    let end = first_right_region.len();
+
+    mask_zero_regions(&mut right_range_regions)?;
+    if right_range_regions[0].iter().all(|&region| region == 0) {
+        return Ok(None);
+    }
+
+    let (right_region_layout, right_position_total) =
+        build_n_region_position_layout(&right_range_regions[1])?;
+    let mut right_positions = vec![0usize; right_position_total];
+
+    if keep != Keep::All {
+        let mut selected_right_positions = vec![None; left_range_regions[0].len()];
+        let _ = visit_n_region_matches(
+            &left_range_regions,
+            &right_range_regions,
+            &starts,
+            end,
+            &right_region_layout,
+            &mut right_positions,
+            |left_position, right_position| match keep {
+                Keep::Any => {
+                    selected_right_positions[left_position] = Some(right_position);
+                    false
+                }
+                Keep::First => {
+                    let selected = &mut selected_right_positions[left_position];
+                    if selected
+                        .is_none_or(|position| right_index[right_position] < right_index[position])
+                    {
+                        *selected = Some(right_position);
+                    }
+                    true
+                }
+                Keep::Last => {
+                    let selected = &mut selected_right_positions[left_position];
+                    if selected
+                        .is_none_or(|position| right_index[right_position] > right_index[position])
+                    {
+                        *selected = Some(right_position);
+                    }
+                    true
+                }
+                Keep::All => unreachable!("keep='all' uses the two-pass path"),
+            },
+        )?;
+
+        let selected_count = selected_right_positions
+            .iter()
+            .filter(|position| position.is_some())
+            .count();
+        if selected_count == 0 {
+            return Ok(None);
+        }
+
+        let mut left_output = Vec::with_capacity(selected_count);
+        let mut right_output = Vec::with_capacity(selected_count);
+        for (left_position, right_position) in selected_right_positions.into_iter().enumerate() {
+            let Some(right_position) = right_position else {
+                continue;
+            };
+            left_output.push(left_index[left_order[left_position]]);
+            right_output.push(right_index[right_position]);
+        }
+
+        return Ok(Some(MaterializedIndices {
+            left_index: left_output,
+            right_index: right_output,
+        }));
+    }
+
+    let mut left_match_counts = vec![0usize; left_range_regions[0].len()];
+    let total_matches = visit_n_region_matches(
+        &left_range_regions,
+        &right_range_regions,
+        &starts,
+        end,
+        &right_region_layout,
+        &mut right_positions,
+        |left_position, _right_position| {
+            left_match_counts[left_position] += 1;
+            true
+        },
+    )?;
+    if total_matches == 0 {
+        return Ok(None);
+    }
+
+    let mut left_output = Vec::with_capacity(total_matches);
+    let mut right_output = Vec::with_capacity(total_matches);
+    let mut second_left_match_counts = vec![0usize; left_range_regions[0].len()];
+    let second_pass_matches = visit_n_region_matches(
+        &left_range_regions,
+        &right_range_regions,
+        &starts,
+        end,
+        &right_region_layout,
+        &mut right_positions,
+        |left_position, right_position| {
+            second_left_match_counts[left_position] += 1;
+            left_output.push(left_index[left_order[left_position]]);
+            right_output.push(right_index[right_position]);
+            true
+        },
+    )?;
+
+    if second_left_match_counts != left_match_counts
+        || second_pass_matches != total_matches
+        || left_output.len() != total_matches
+        || right_output.len() != total_matches
+    {
+        return Err("n-region second pass count disagrees with first pass".to_owned());
+    }
+
+    Ok(Some(MaterializedIndices {
+        left_index: left_output,
+        right_index: right_output,
+    }))
+}
+
+/// Build index pairs from three or more range predicates.
+///
+/// Each predicate is a three-item Python tuple:
+/// `(left_values, right_values, operator)`. The first predicate is the anchor
+/// and its right values must already use the global order described by
+/// `right_index`. Every item in `range_predicates` is paired by position with
+/// one item in `aligners`; an aligner maps a global right position to the
+/// corresponding position in that predicate's sorted right values.
+///
+/// The caller owns the preparation contract: values must be filtered for
+/// nulls, each right range must be sorted in the direction required by its
+/// operator, and each aligner must be a permutation of the global right
+/// positions. Rust validates lengths and permutation safety, but does not sort
+/// values or infer an alignment.
+///
+/// `keep="all"` uses a counting pass followed by an exact-size materialization
+/// pass. `keep="any"`, `keep="first"`, and `keep="last"` select at most one
+/// surviving right row per left row. Selection for `first` and `last` uses the
+/// right-index values, not their temporary sorted positions.
+///
+/// Performance note: this sweep is left-driven. It sorts and visits every
+/// left row, and stores one left-region vector per predicate. When the join
+/// direction is otherwise interchangeable, keeping the smaller input on the
+/// left is generally the better heuristic. This is not a correctness
+/// requirement, and broad joins may still be dominated by output size.
+///
+/// # Arguments
+///
+/// * `py` - Active Python interpreter used to create the result dictionary.
+/// * `left_index` - Physical labels for the prepared left rows.
+/// * `right_index` - Physical labels in the first predicate's global right
+///   order.
+/// * `first_predicate` - First, global-order range predicate.
+/// * `range_predicates` - At least two additional range predicates.
+/// * `aligners` - One right-position permutation for each additional
+///   predicate. `aligners[i][global_position]` is the source position in the
+///   corresponding predicate's right values.
+/// * `keep` - One of `"all"`, `"any"`, `"first"`, or `"last"`.
+///
+/// # Returns
+///
+/// `None` when no left/right pair satisfies every predicate; otherwise a
+/// dictionary containing equal-length `left_index` and `right_index` arrays.
+///
+/// # Errors
+///
+/// Raises `ValueError` for invalid operators, mismatched lengths, invalid
+/// aligners, unsupported keep values, or an internal pass-count invariant
+/// failure. Raises `TypeError` when a predicate or aligner has the wrong
+/// Python shape or dtype.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+pub fn n_region_indices<'py>(
+    py: Python<'py>,
+    left_index: &Bound<'py, PyAny>,
+    right_index: &Bound<'py, PyAny>,
+    first_predicate: &Bound<'py, PyTuple>,
+    range_predicates: &Bound<'py, PyList>,
+    aligners: &Bound<'py, PyList>,
+    keep: &str,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let keep = Keep::parse(keep)?;
+    if range_predicates.len() < 2 {
+        return Err(PyValueError::new_err(
+            "range_predicates must contain at least two predicates",
+        ));
+    }
+    if aligners.len() != range_predicates.len() {
+        return Err(PyValueError::new_err(
+            "aligners and range_predicates must have equal lengths",
+        ));
+    }
+
+    let first = parse_region_predicate(first_predicate)?;
+    validate_region_predicate(&first)?;
+
+    let mut predicates = Vec::with_capacity(range_predicates.len() + 1);
+    predicates.push(first);
+    for item in range_predicates.iter() {
+        let predicate = item
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("range predicates must be tuples"))?;
+        let predicate = parse_region_predicate(predicate)?;
+        validate_region_predicate(&predicate)?;
+        predicates.push(predicate);
+    }
+
+    let left_index = left_index.extract::<PyReadonlyArray1<'py, i64>>()?;
+    let right_index = right_index.extract::<PyReadonlyArray1<'py, i64>>()?;
+    let left_index_view = left_index.as_array();
+    let right_index_view = right_index.as_array();
+    check_predicate_lengths(&predicates, left_index_view.len(), right_index_view.len())?;
+    let (first_predicate, range_predicates) = predicates
+        .split_first()
+        .expect("n_region_indices requires a first predicate");
+
+    let mut aligner_arrays = Vec::with_capacity(aligners.len());
+    for item in aligners.iter() {
+        let aligner = item
+            .extract::<PyReadonlyArray1<'py, i64>>()
+            .map_err(|error| PyTypeError::new_err(error.to_string()))?;
+        ensure_equal_lengths_core(
+            "aligner",
+            aligner.as_array().len(),
+            "right_index",
+            right_index_view.len(),
+        )
+        .map_err(PyValueError::new_err)?;
+        aligner_arrays.push(aligner);
+    }
+    let aligner_views = aligner_arrays
+        .iter()
+        .map(|aligner| aligner.as_array())
+        .collect::<Vec<_>>();
+
+    let indices = n_region_indices_core(
+        first_predicate,
+        range_predicates,
+        left_index_view,
+        right_index_view,
+        &aligner_views,
+        keep,
+    )
+    .map_err(PyValueError::new_err)?;
+
+    let Some(indices) = indices else {
+        return Ok(None);
+    };
+    Ok(Some(result_dict(
+        py,
+        indices.left_index,
+        indices.right_index,
+        None,
+        None,
+    )?))
+}
+
 /// Register the standalone dual-region entry point.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dual_regions_indices, m)?)?;
     m.add_function(wrap_pyfunction!(dual_regions_and_residual_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(n_region_indices, m)?)?;
     Ok(())
 }
 
@@ -1238,6 +1819,41 @@ mod tests {
             .ok_or_else(|| PyValueError::new_err("result has no right_index"))?
             .extract::<Vec<i64>>()?;
         Ok(left.into_iter().zip(right).collect())
+    }
+
+    fn matches(left: i64, right: i64, operator: &str) -> bool {
+        match operator {
+            "<" => left < right,
+            "<=" => left <= right,
+            ">" => left > right,
+            ">=" => left >= right,
+            _ => panic!("unsupported test operator: {operator}"),
+        }
+    }
+
+    fn expected_pairs(
+        left_index: &[i64],
+        left_values: &[Vec<i64>],
+        right_index: &[i64],
+        right_values: &[Vec<i64>],
+        operators: &[&str],
+    ) -> Vec<(i64, i64)> {
+        let mut expected = Vec::new();
+        for left_position in 0..left_index.len() {
+            for (right_position, &right_index_value) in right_index.iter().enumerate() {
+                if operators.iter().enumerate().all(|(predicate, &operator)| {
+                    matches(
+                        left_values[predicate][left_position],
+                        right_values[predicate][right_position],
+                        operator,
+                    )
+                }) {
+                    expected.push((left_index[left_position], right_index_value));
+                }
+            }
+        }
+        expected.sort_unstable();
+        expected
     }
 
     #[test]
@@ -1280,6 +1896,488 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn n_region_indices_materializes_three_range_predicates() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 200]);
+            let right_index = PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]);
+            let first = predicate(py, &[1, 3], &[1, 2, 3, 4], "<=")?;
+            let second = predicate(py, &[1, 3], &[1, 2, 3, 4], "<=")?;
+            let third = predicate(py, &[1, 3], &[1, 2, 3, 4], "<=")?;
+            let range_predicates = PyList::new(py, [second.clone(), third.clone()])?;
+            let first_aligner = PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]);
+            let second_aligner = PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]);
+            let aligners = PyList::new(py, [first_aligner, second_aligner])?;
+            let residuals = PyList::new(py, [third])?;
+
+            for keep in ["all", "any", "first", "last"] {
+                let n_result = n_region_indices(
+                    py,
+                    left_index.as_any(),
+                    right_index.as_any(),
+                    &first,
+                    &range_predicates,
+                    &aligners,
+                    keep,
+                )?
+                .ok_or_else(|| PyValueError::new_err("n-region indices returned None"))?;
+                let dual_result = dual_regions_and_residual_indices(
+                    py,
+                    left_index.as_any(),
+                    right_index.as_any(),
+                    &first,
+                    &second,
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]).readonly(),
+                    &residuals,
+                    keep,
+                )?
+                .ok_or_else(|| PyValueError::new_err("dual residual indices returned None"))?;
+
+                assert_eq!(pairs(&n_result)?, pairs(&dual_result)?, "keep={keep}");
+            }
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn n_region_indices_supports_every_range_operator() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 200, 300]);
+            let left_values = vec![2_i64, 4, 6];
+            let right_values = vec![1_i64, 2, 3, 4, 5, 6, 7];
+            let right_index_values = vec![10_i64, 20, 30, 40, 50, 60, 70];
+
+            for operator in ["<", "<="] {
+                let (prepared_right, aligner) = if matches!(operator, "<" | "<=") {
+                    (right_values.clone(), vec![0_i64, 1, 2, 3, 4, 5, 6])
+                } else {
+                    (
+                        right_values.iter().rev().copied().collect(),
+                        vec![6_i64, 5, 4, 3, 2, 1, 0],
+                    )
+                };
+                // Keep the first anchor ascending; the loop exercises the
+                // additional prefix and suffix builders.
+                let first = predicate(py, &left_values, &right_values, "<=")?;
+                let second = predicate(py, &left_values, &prepared_right, operator)?;
+                let third = predicate(py, &left_values, &prepared_right, operator)?;
+                let range_predicates = PyList::new(py, [second, third])?;
+                let aligner_one = PyArray1::from_vec(py, aligner.clone());
+                let aligner_two = PyArray1::from_vec(py, aligner);
+                let aligners = PyList::new(py, [aligner_one, aligner_two])?;
+
+                let result = n_region_indices(
+                    py,
+                    left_index.as_any(),
+                    PyArray1::from_vec(py, right_index_values.clone()).as_any(),
+                    &first,
+                    &range_predicates,
+                    &aligners,
+                    "all",
+                )?
+                .ok_or_else(|| PyValueError::new_err("operator test returned None"))?;
+                let mut actual = pairs(&result)?;
+                actual.sort_unstable();
+                let expected = expected_pairs(
+                    &[100, 200, 300],
+                    &[
+                        left_values.clone(),
+                        left_values.clone(),
+                        left_values.clone(),
+                    ],
+                    &right_index_values,
+                    &[
+                        right_values.clone(),
+                        right_values.clone(),
+                        right_values.clone(),
+                    ],
+                    &["<=", operator, operator],
+                );
+                assert_eq!(actual, expected, "operator={operator}");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn n_region_indices_applies_independent_aligners_to_four_extra_predicates() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 200]);
+            let left_values = vec![15_i64, 35];
+            let predicate_left_values = vec![left_values.clone(); 5];
+            let right_index_values = vec![10_i64, 20, 30, 40, 50];
+            let global_right = vec![10_i64, 20, 30, 40, 50];
+            let operators = ["<=", "<=", "<=", "<=", "<="];
+            let prepared_rights = [
+                global_right.clone(),
+                vec![5_i64, 15, 25, 35, 45],
+                global_right.clone(),
+                vec![0_i64, 10, 20, 30, 40],
+                global_right.clone(),
+            ];
+            let aligner = vec![0_i64, 1, 2, 3, 4];
+            let reverse_aligner = vec![4_i64, 3, 2, 1, 0];
+            let first = predicate(py, &left_values, &prepared_rights[0], operators[0])?;
+            let mut range_predicates = Vec::new();
+            let mut aligners = Vec::new();
+            for (position, operator) in operators.iter().enumerate().skip(1) {
+                range_predicates.push(predicate(
+                    py,
+                    &predicate_left_values[position],
+                    &prepared_rights[position],
+                    operator,
+                )?);
+                aligners.push(PyArray1::from_vec(
+                    py,
+                    if position == 1 || position == 3 {
+                        reverse_aligner.clone()
+                    } else {
+                        aligner.clone()
+                    },
+                ));
+            }
+            let range_predicates = PyList::new(py, range_predicates)?;
+            let aligners = PyList::new(py, aligners)?;
+
+            let result = n_region_indices(
+                py,
+                left_index.as_any(),
+                PyArray1::from_vec(py, right_index_values.clone()).as_any(),
+                &first,
+                &range_predicates,
+                &aligners,
+                "all",
+            )?
+            .ok_or_else(|| PyValueError::new_err("alignment test returned None"))?;
+            let mut actual = pairs(&result)?;
+            actual.sort_unstable();
+            let expected_rights = vec![
+                global_right.clone(),
+                vec![45_i64, 35, 25, 15, 5],
+                global_right.clone(),
+                vec![40_i64, 30, 20, 10, 0],
+                global_right,
+            ];
+            let expected = expected_pairs(
+                &[100, 200],
+                &predicate_left_values,
+                &right_index_values,
+                &expected_rights,
+                &operators,
+            );
+            assert_eq!(actual, expected);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn n_region_indices_handles_duplicates_boundaries_and_no_matches() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
+            let right_index = PyArray1::from_vec(py, vec![1_i64, 2, 3, 4]);
+            let left_values = [1_i64, 2, 9];
+            let right_values = [1_i64, 1, 2, 2];
+            let first = predicate(py, &left_values, &right_values, "<=")?;
+            let second = predicate(py, &left_values, &right_values, "<=")?;
+            let third = predicate(py, &left_values, &right_values, "<=")?;
+            let predicates = PyList::new(py, [second, third])?;
+            let identity = PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]);
+            let aligners = PyList::new(py, [identity.clone(), identity])?;
+
+            let result = n_region_indices(
+                py,
+                left_index.as_any(),
+                right_index.as_any(),
+                &first,
+                &predicates,
+                &aligners,
+                "all",
+            )?
+            .ok_or_else(|| PyValueError::new_err("duplicate test returned None"))?;
+            let mut actual = pairs(&result)?;
+            actual.sort_unstable();
+            assert_eq!(
+                actual,
+                vec![(10, 1), (10, 2), (10, 3), (10, 4), (20, 3), (20, 4)]
+            );
+
+            let no_match_left = predicate(py, &[9_i64, 10, 11], &right_values, "<=")?;
+            let no_match_second = predicate(py, &[9_i64, 10, 11], &right_values, "<=")?;
+            let no_match_third = predicate(py, &[9_i64, 10, 11], &right_values, "<=")?;
+            let no_match_predicates = PyList::new(py, [no_match_second, no_match_third])?;
+            let no_match_aligners = PyList::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]),
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]),
+                ],
+            )?;
+            assert!(n_region_indices(
+                py,
+                left_index.as_any(),
+                right_index.as_any(),
+                &no_match_left,
+                &no_match_predicates,
+                &no_match_aligners,
+                "all",
+            )?
+            .is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn n_region_indices_keep_modes_select_from_complete_matches() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 200]);
+            let right_index = PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]);
+            let first = predicate(py, &[1, 3], &[1, 2, 3, 4], "<=")?;
+            let second = predicate(py, &[1, 3], &[1, 2, 3, 4], "<=")?;
+            let third = predicate(py, &[1, 3], &[1, 2, 3, 4], "<=")?;
+            let predicates = PyList::new(py, [second, third])?;
+            let aligners = PyList::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]),
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]),
+                ],
+            )?;
+
+            let mut outputs = Vec::new();
+            for keep in ["any", "first", "last"] {
+                let result = n_region_indices(
+                    py,
+                    left_index.as_any(),
+                    right_index.as_any(),
+                    &first,
+                    &predicates,
+                    &aligners,
+                    keep,
+                )?
+                .ok_or_else(|| PyValueError::new_err("selection returned None"))?;
+                let result_pairs = pairs(&result)?;
+                assert_eq!(result_pairs.len(), 2, "keep={keep}");
+                outputs.push((keep, result_pairs));
+            }
+            let mut any = outputs[0].1.clone();
+            let mut first_result = outputs[1].1.clone();
+            let mut last_result = outputs[2].1.clone();
+            any.sort_unstable();
+            first_result.sort_unstable();
+            last_result.sort_unstable();
+            assert_eq!(any, vec![(100, 40), (200, 30)]);
+            assert_eq!(first_result, vec![(100, 10), (200, 20)]);
+            assert_eq!(last_result, vec![(100, 40), (200, 30)]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn n_region_indices_supports_descending_first_predicates() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 200, 300]);
+            let right_index = PyArray1::from_vec(py, vec![10_i64, 20, 30, 40, 50, 60, 70]);
+            let right_values = [7_i64, 6, 5, 4, 3, 2, 1];
+            let alignment = PyArray1::from_vec(py, vec![0_i64, 1, 2, 3, 4, 5, 6]);
+
+            for operator in [">", ">="] {
+                let first = predicate(py, &[2, 4, 6], &right_values, operator)?;
+                let second = predicate(py, &[2, 4, 6], &right_values, operator)?;
+                let third = predicate(py, &[2, 4, 6], &right_values, operator)?;
+                let predicates = PyList::new(py, [second, third])?;
+                let aligners = PyList::new(py, [alignment.clone(), alignment.clone()])?;
+                let result = n_region_indices(
+                    py,
+                    left_index.as_any(),
+                    right_index.as_any(),
+                    &first,
+                    &predicates,
+                    &aligners,
+                    "all",
+                )?
+                .ok_or_else(|| PyValueError::new_err("descending test returned None"))?;
+                let mut actual = pairs(&result)?;
+                actual.sort_unstable();
+                let expected = expected_pairs(
+                    &[100, 200, 300],
+                    &[vec![2, 4, 6], vec![2, 4, 6], vec![2, 4, 6]],
+                    &[10, 20, 30, 40, 50, 60, 70],
+                    &[
+                        right_values.to_vec(),
+                        right_values.to_vec(),
+                        right_values.to_vec(),
+                    ],
+                    &[operator, operator, operator],
+                );
+                assert_eq!(actual, expected, "operator={operator}");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn n_region_indices_returns_none_when_a_later_predicate_has_no_matches() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 200]);
+            let right_index = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
+            let first = predicate(py, &[1, 2], &[1, 2, 3], "<=")?;
+            let second = predicate(py, &[100, 200], &[1, 2, 3], "<=")?;
+            let third = predicate(py, &[1, 2], &[1, 2, 3], "<=")?;
+            let predicates = PyList::new(py, [second, third])?;
+            let aligners = PyList::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2]),
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2]),
+                ],
+            )?;
+            assert!(n_region_indices(
+                py,
+                left_index.as_any(),
+                right_index.as_any(),
+                &first,
+                &predicates,
+                &aligners,
+                "all",
+            )?
+            .is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn n_region_indices_rejects_invalid_alignment_permutations() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![100_i64]);
+            let right_index = PyArray1::from_vec(py, vec![10_i64, 20, 30]);
+            let first = predicate(py, &[1], &[1, 2, 3], "<=")?;
+            let second = predicate(py, &[1], &[1, 2, 3], "<=")?;
+            let third = predicate(py, &[1], &[1, 2, 3], "<=")?;
+            let predicates = PyList::new(py, [second, third])?;
+            for invalid in [vec![0_i64, 0, 2], vec![-1_i64, 1, 2], vec![0_i64, 1, 3]] {
+                let aligners = PyList::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, invalid.clone()),
+                        PyArray1::from_vec(py, vec![0_i64, 1, 2]),
+                    ],
+                )?;
+                assert!(n_region_indices(
+                    py,
+                    left_index.as_any(),
+                    right_index.as_any(),
+                    &first,
+                    &predicates,
+                    &aligners,
+                    "all",
+                )
+                .is_err());
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn n_region_indices_rejects_invalid_shapes_and_operators() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![1_i64, 2]);
+            let right_index = PyArray1::from_vec(py, vec![3_i64, 4]);
+            let first = predicate(py, &[1, 2], &[1, 2], "<=")?;
+            let second = predicate(py, &[1, 2], &[1, 2], "<=")?;
+            let predicates = PyList::new(py, [second.clone()])?;
+            let one_aligner = PyList::new(py, [PyArray1::from_vec(py, vec![0_i64, 1])])?;
+            assert!(n_region_indices(
+                py,
+                left_index.as_any(),
+                right_index.as_any(),
+                &first,
+                &predicates,
+                &one_aligner,
+                "all",
+            )
+            .is_err());
+
+            let third = predicate(py, &[1, 2], &[1, 2], "==")?;
+            let predicates = PyList::new(py, [second, third])?;
+            let wrong_length_aligner = PyList::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![0_i64, 1]),
+                    PyArray1::from_vec(py, vec![0_i64]),
+                ],
+            )?;
+            assert!(n_region_indices(
+                py,
+                left_index.as_any(),
+                right_index.as_any(),
+                &first,
+                &predicates,
+                &wrong_length_aligner,
+                "all",
+            )
+            .is_err());
+
+            let invalid_first = predicate(py, &[1, 2], &[1, 2], "==")?;
+            let valid_aligners = PyList::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![0_i64, 1]),
+                    PyArray1::from_vec(py, vec![0_i64, 1]),
+                ],
+            )?;
+            assert!(n_region_indices(
+                py,
+                left_index.as_any(),
+                right_index.as_any(),
+                &invalid_first,
+                &predicates,
+                &valid_aligners,
+                "all",
+            )
+            .is_err());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn n_region_starts_reports_empty_and_boundary_searches() -> Result<(), String> {
+        assert_eq!(
+            n_region_starts(&[0, 1, 5], &[1, 2, 3])?,
+            Some(vec![3, 0, 3])
+        );
+        assert_eq!(n_region_starts(&[0, 5], &[1, 2, 3])?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn range_boundary_covers_all_inequality_edges() {
+        let ascending = ArrayView1::from(&[1_i64, 2, 3, 4]);
+        let descending = ArrayView1::from(&[4_i64, 3, 2, 1]);
+        assert_eq!(range_boundary(3, ascending, CompareOp::Lt), 3);
+        assert_eq!(range_boundary(3, ascending, CompareOp::Le), 2);
+        assert_eq!(range_boundary(3, descending, CompareOp::Gt), 2);
+        assert_eq!(range_boundary(3, descending, CompareOp::Ge), 1);
     }
 
     #[test]

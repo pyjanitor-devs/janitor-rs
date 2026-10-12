@@ -1385,3 +1385,20 @@ The raw `cargo test` command can compile successfully and then fail at runtime
 on macOS because it does not configure the selected Python library path. Always
 use `./scripts/test-rust.sh`; it selects Python 3.12, installs NumPy, sets
 `PYO3_PYTHON`, and exports the required dyld library path.
+
+### [2026-10-12] N-region right alignment is a paired Python/Rust contract
+
+**Context**: The three-or-more-range region endpoint was added alongside the
+dual-region endpoint. PyJanitor sorts each right range independently, while
+the first range defines the global right layout.
+
+**Learning**: `n_region_indices` receives the first predicate separately,
+followed by parallel `range_predicates` and `aligners` lists. Each aligner is
+the gather permutation from global right position to that predicate's sorted
+right position. Rust validates lengths and permutation safety but does not sort
+or infer the alignment. The first predicate must provide the monotonic global
+search path; later predicates are checked against the active candidates.
+
+**Recommendation**: Keep the Python dispatcher and Rust signature synchronized,
+and test the n-region path with independently shuffled right columns,
+duplicates, no matches, all keep modes, and a brute-force reference.

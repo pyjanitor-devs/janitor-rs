@@ -58,6 +58,7 @@ mod registration_tests {
                 "single_range_predicate_indices_int64",
                 "dual_regions_indices",
                 "dual_regions_and_residual_indices",
+                "n_region_indices",
                 "region_indices",
             ] {
                 assert!(module.getattr(name).is_ok(), "missing export: {name}");
