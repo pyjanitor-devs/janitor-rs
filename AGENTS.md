@@ -1402,3 +1402,13 @@ search path; later predicates are checked against the active candidates.
 **Recommendation**: Keep the Python dispatcher and Rust signature synchronized,
 and test the n-region path with independently shuffled right columns,
 duplicates, no matches, all keep modes, and a brute-force reference.
+
+### [2026-10-13] Keep n-region unchanged while adding dual maxima filtering
+
+**Context**: A cumulative right-region maximum was proposed as an early
+rejection before ranked dual-region searches. This optimization is for the
+dual paths only; the n-region implementation already has its own multi-path
+maximum checks and must not be changed as part of this work.
+
+**Recommendation**: Apply the cumulative-max filter to dual-region paths
+without modifying the n-region traversal or setup.

@@ -59,6 +59,7 @@ mod registration_tests {
                 "dual_regions_indices",
                 "dual_regions_and_residual_indices",
                 "n_region_indices",
+                "n_region_and_residual_indices",
                 "region_indices",
             ] {
                 assert!(module.getattr(name).is_ok(), "missing export: {name}");

@@ -28,14 +28,19 @@ type RegionPaths = (Vec<i64>, Vec<i64>);
 /// The map stores `(count, offset)` for each label. `offset..offset + count`
 /// is the slice in the accompanying flat position buffer for that label; the
 /// second tuple item is the total buffer length required by all labels.
-type RegionPositionLayout = (HashMap<i64, (usize, usize)>, usize);
+pub(crate) struct RankedRegionPositionLayout {
+    labels: Vec<i64>,
+    offsets: Vec<usize>,
+    ranks: Vec<usize>,
+    positions: Vec<usize>,
+}
 
 /// Counts produced by the first pass of `keep="all"` materialization.
 pub(crate) struct KeepAllFirstPass {
     pub(crate) left_match_counts: Vec<usize>,
     pub(crate) total_size: usize,
     /// Final count of every nonzero right-region label.
-    pub(crate) right_region_counts: BTreeMap<i64, usize>,
+    pub(crate) right_region_layout: RankedRegionPositionLayout,
 }
 
 /// Counts produced by the first pass of residual-filtered materialization.
@@ -43,25 +48,23 @@ pub(crate) struct DualResidualFirstPass {
     pub(crate) left_match_counts: Vec<usize>,
     pub(crate) total_matches: usize,
     /// Total count and start position for each right-region label.
-    pub(crate) right_region_layout: HashMap<i64, (usize, usize)>,
-    /// Right positions grouped into the flat region layout.
-    pub(crate) right_positions: Vec<usize>,
+    pub(crate) right_region_layout: RankedRegionPositionLayout,
 }
 
 /// First-pass results for `keep="any"`, `keep="first"`, and `keep="last"`.
 struct DualResidualSelectionFirstPass {
     pub(crate) left_has_match: Vec<bool>,
     pub(crate) matched_left_count: usize,
-    pub(crate) right_region_layout: HashMap<i64, (usize, usize)>,
-    pub(crate) right_positions: Vec<usize>,
+    pub(crate) selected_right_positions: Vec<Option<usize>>,
+    pub(crate) right_region_layout: RankedRegionPositionLayout,
 }
 
 /// Shared candidate/layout data produced while counting a residual pass.
 struct DualResidualCandidatePass {
     left_match_counts: Vec<usize>,
     total_matches: usize,
-    right_region_layout: HashMap<i64, (usize, usize)>,
-    right_positions: Vec<usize>,
+    selected_right_positions: Vec<Option<usize>>,
+    right_region_layout: RankedRegionPositionLayout,
 }
 
 /// Materialized index pairs produced by the second `keep="all"` pass.
@@ -73,6 +76,47 @@ pub(crate) struct MaterializedIndices {
 /// Count the matching left rows for `keep="any"`.
 pub(crate) struct MatchCountPass {
     pub(crate) match_count: usize,
+    pub(crate) left_has_match: Vec<bool>,
+}
+
+/// First-pass results for `keep="any"`.
+pub(crate) struct AnyMatchPass {
+    pub(crate) match_count: usize,
+    pub(crate) selected_right_positions: Vec<Option<usize>>,
+}
+
+/// Find left rows whose second region can possibly match the current window.
+///
+/// ELI5: the first predicate gives each left row a right-side window. If the
+/// largest second-region label inside that window is still smaller than the
+/// left label, searching the ranked labels cannot find a match.
+fn dual_region_match_filter(regions: &DualRegionPaths) -> Result<(Vec<bool>, bool), String> {
+    let mut left_has_match = vec![false; regions.left_region.len()];
+    let mut any_left_match = false;
+    let mut max_right_region = i64::MIN;
+    let mut previous_end = regions.end;
+
+    for (left_position, (&start, &left_region)) in
+        regions.starts.iter().zip(&regions.left_region).enumerate()
+    {
+        if start == regions.end {
+            continue;
+        }
+        if start > previous_end {
+            return Err("starts must be monotonically non-increasing".to_owned());
+        }
+
+        for &right_region in &regions.right_region[start..previous_end] {
+            max_right_region = max_right_region.max(right_region);
+        }
+        previous_end = start;
+
+        let has_match = left_region != 0 && left_region <= max_right_region;
+        left_has_match[left_position] = has_match;
+        any_left_match |= has_match;
+    }
+
+    Ok((left_has_match, any_left_match))
 }
 
 /// Parse a three-element region predicate using shared left/right indices.
@@ -326,11 +370,14 @@ fn reorder_left_region(region: &[i64], left_order: &[usize]) -> Vec<i64> {
 pub(crate) fn count_matching_left_rows(
     regions: &DualRegionPaths,
 ) -> Result<MatchCountPass, String> {
-    let mut max_right_region = 0_i64;
+    let mut max_right_region = i64::MIN;
     let mut previous_end = regions.end;
     let mut match_count = 0usize;
+    let mut left_has_match = vec![false; regions.left_region.len()];
 
-    for (&start, &left_region) in regions.starts.iter().zip(&regions.left_region) {
+    for (left_position, (&start, &left_region)) in
+        regions.starts.iter().zip(&regions.left_region).enumerate()
+    {
         if start == regions.end {
             continue;
         }
@@ -344,29 +391,28 @@ pub(crate) fn count_matching_left_rows(
         previous_end = start;
 
         if left_region != 0 && left_region <= max_right_region {
+            left_has_match[left_position] = true;
             match_count += 1;
         }
     }
 
-    Ok(MatchCountPass { match_count })
+    Ok(MatchCountPass {
+        match_count,
+        left_has_match,
+    })
 }
 
-/// Materialize one matching pair for each left row that has an `any` match.
-pub(crate) fn keep_any_second_pass(
-    regions: &DualRegionPaths,
-    first_pass: &MatchCountPass,
-    left_index: ArrayView1<'_, i64>,
-    right_index: ArrayView1<'_, i64>,
-) -> Result<Option<MaterializedIndices>, String> {
-    if first_pass.match_count == 0 {
-        return Ok(None);
-    }
-
-    let mut left_output = Vec::with_capacity(first_pass.match_count);
-    let mut right_output = Vec::with_capacity(first_pass.match_count);
-    let mut max_right_region = 0_i64;
+/// Find and retain one matching right position for each left row.
+///
+/// ELI5: `keep="any"` does not need a second search. While finding whether a
+/// left row matches, remember the right position that currently has the
+/// largest region value.
+pub(crate) fn count_any_matches(regions: &DualRegionPaths) -> Result<AnyMatchPass, String> {
+    let mut max_right_region = i64::MIN;
     let mut max_right_position = None;
     let mut previous_end = regions.end;
+    let mut match_count = 0usize;
+    let mut selected_right_positions = vec![None; regions.left_region.len()];
 
     for (left_position, (&start, &left_region)) in
         regions.starts.iter().zip(&regions.left_region).enumerate()
@@ -387,15 +433,39 @@ pub(crate) fn keep_any_second_pass(
         }
         previous_end = start;
 
-        if left_region == 0 || left_region > max_right_region {
-            continue;
+        if left_region != 0 && left_region <= max_right_region {
+            selected_right_positions[left_position] = max_right_position;
+            match_count += 1;
         }
+    }
 
-        let right_position =
-            max_right_position.ok_or_else(|| "matching right region had no position".to_owned())?;
+    Ok(AnyMatchPass {
+        match_count,
+        selected_right_positions,
+    })
+}
+
+/// Materialize one matching pair for each left row that has an `any` match.
+pub(crate) fn keep_any_second_pass(
+    regions: &DualRegionPaths,
+    first_pass: &AnyMatchPass,
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+) -> Result<Option<MaterializedIndices>, String> {
+    if first_pass.match_count == 0 {
+        return Ok(None);
+    }
+
+    let mut left_output = Vec::with_capacity(first_pass.match_count);
+    let mut right_output = Vec::with_capacity(first_pass.match_count);
+
+    for (left_position, right_position) in first_pass.selected_right_positions.iter().enumerate() {
+        let Some(right_position) = right_position else {
+            continue;
+        };
         let original_left_position = regions.left_order[left_position];
         left_output.push(left_index[original_left_position]);
-        right_output.push(right_index[right_position]);
+        right_output.push(right_index[*right_position]);
     }
 
     if left_output.len() != first_pass.match_count {
@@ -425,7 +495,9 @@ pub(crate) fn keep_first_last_second_pass(
         return Ok(None);
     }
 
-    let mut right_regions = BTreeMap::<i64, i64>::new();
+    let right_region_layout =
+        build_ranked_region_position_layout(&regions.right_region, &regions.starts, regions.end)?;
+    let mut active_best = BTreeMap::<usize, i64>::new();
     let mut left_output = Vec::with_capacity(first_pass.match_count);
     let mut right_output = Vec::with_capacity(first_pass.match_count);
     let mut previous_end = regions.end;
@@ -441,13 +513,13 @@ pub(crate) fn keep_first_last_second_pass(
         }
 
         for right_position in start..previous_end {
-            let right_region = regions.right_region[right_position];
-            if right_region == 0 {
+            let rank = right_region_layout.ranks[right_position];
+            if rank == usize::MAX {
                 continue;
             }
 
             let right_value = right_index[right_position];
-            let selected = right_regions.entry(right_region).or_insert(right_value);
+            let selected = active_best.entry(rank).or_insert(right_value);
             if keep == Keep::Last {
                 *selected = (*selected).max(right_value);
             } else {
@@ -456,19 +528,27 @@ pub(crate) fn keep_first_last_second_pass(
         }
         previous_end = start;
 
-        if left_region == 0 {
+        if !first_pass.left_has_match[left_position] || left_region == 0 {
             continue;
         }
 
         let selected = if keep == Keep::Last {
-            right_regions
-                .range(left_region..)
-                .map(|(_, &right_value)| right_value)
+            active_best
+                .range(
+                    right_region_layout
+                        .labels
+                        .partition_point(|&label| label < left_region)..,
+                )
+                .map(|(_, &value)| value)
                 .max()
         } else {
-            right_regions
-                .range(left_region..)
-                .map(|(_, &right_value)| right_value)
+            active_best
+                .range(
+                    right_region_layout
+                        .labels
+                        .partition_point(|&label| label < left_region)..,
+                )
+                .map(|(_, &value)| value)
                 .min()
         };
         let Some(right_value) = selected else {
@@ -492,17 +572,34 @@ pub(crate) fn keep_first_last_second_pass(
 
 /// Count all matching right positions for each ordered left row.
 ///
-/// ELI5: starts move from right to left, so each right position enters the
-/// `BTreeMap` once. The map groups those positions by second-region label;
-/// summing labels from the left-region threshold gives this left row's match
-/// count without scanning the active right positions again.
+/// ELI5: starts move from right to left, so each right position becomes active
+/// once. Sorted labels let us jump to the first eligible label, while the
+/// active counts tell us how many positions from each label are visible.
 pub(crate) fn keep_all_first_pass(regions: &DualRegionPaths) -> Result<KeepAllFirstPass, String> {
-    let mut right_regions = BTreeMap::<i64, usize>::new();
+    let (left_has_match, any_left_match) = dual_region_match_filter(regions)?;
+    if !any_left_match {
+        return Ok(KeepAllFirstPass {
+            left_match_counts: vec![0; regions.left_region.len()],
+            total_size: 0,
+            right_region_layout: RankedRegionPositionLayout {
+                labels: Vec::new(),
+                offsets: Vec::new(),
+                ranks: Vec::new(),
+                positions: Vec::new(),
+            },
+        });
+    }
+
+    let right_region_layout =
+        build_ranked_region_position_layout(&regions.right_region, &regions.starts, regions.end)?;
+    let mut active_counts = BTreeMap::<usize, usize>::new();
     let mut left_match_counts = Vec::with_capacity(regions.starts.len());
     let mut total_matches = 0usize;
     let mut previous_end = regions.end;
 
-    for (&start, &left_region) in regions.starts.iter().zip(&regions.left_region) {
+    for (left_position, (&start, &left_region)) in
+        regions.starts.iter().zip(&regions.left_region).enumerate()
+    {
         if start == regions.end {
             left_match_counts.push(0);
             continue;
@@ -510,27 +607,35 @@ pub(crate) fn keep_all_first_pass(regions: &DualRegionPaths) -> Result<KeepAllFi
         if start > previous_end {
             return Err("starts must be monotonically non-increasing".to_owned());
         }
-
-        for right_position in start..previous_end {
-            let right_region = regions.right_region[right_position];
-            if right_region != 0 {
-                *right_regions.entry(right_region).or_default() += 1;
-            }
-        }
+        activate_dual_ranked_positions(
+            &right_region_layout,
+            start,
+            previous_end,
+            &mut active_counts,
+        )?;
         previous_end = start;
 
-        let matches = right_regions
-            .range(left_region..)
+        if !left_has_match[left_position] {
+            left_match_counts.push(0);
+            continue;
+        }
+
+        let first_rank = right_region_layout
+            .labels
+            .partition_point(|&label| label < left_region);
+        let matches = active_counts
+            .range(first_rank..)
             .map(|(_, &count)| count)
             .sum::<usize>();
         left_match_counts.push(matches);
-        total_matches += matches;
+        total_matches = total_matches
+            .checked_add(matches)
+            .ok_or("region result size exceeds platform capacity")?;
     }
-
     Ok(KeepAllFirstPass {
         left_match_counts,
         total_size: total_matches,
-        right_region_counts: right_regions,
+        right_region_layout,
     })
 }
 
@@ -544,7 +649,6 @@ pub(crate) fn keep_all_second_pass(
     if first_pass.total_size == 0 {
         return Ok(None);
     }
-
     let mut offsets = vec![0usize; first_pass.left_match_counts.len()];
     let mut offset = 0usize;
     for (position, &size) in first_pass.left_match_counts.iter().enumerate() {
@@ -553,19 +657,7 @@ pub(crate) fn keep_all_second_pass(
     }
     debug_assert_eq!(offset, first_pass.total_size);
 
-    // ELI5: this buffer stores every right position seen by the sweep. A
-    // right position can later be reused for several left rows, so this is a
-    // different buffer from `positions`, which stores emitted matching pairs.
-    let mut right_region_offsets =
-        HashMap::<i64, usize>::with_capacity(first_pass.right_region_counts.len());
-    let mut right_position_offset = 0usize;
-    for (&right_region, &count) in &first_pass.right_region_counts {
-        right_region_offsets.insert(right_region, right_position_offset);
-        right_position_offset += count;
-    }
-
-    let mut right_regions = BTreeMap::<i64, usize>::new();
-    let mut right_positions = vec![0usize; right_position_offset];
+    let mut active_counts = BTreeMap::<usize, usize>::new();
     let mut positions = vec![0usize; first_pass.total_size];
     let mut left_output = vec![0_i64; first_pass.total_size];
     let mut right_output = vec![0_i64; first_pass.total_size];
@@ -580,19 +672,12 @@ pub(crate) fn keep_all_second_pass(
         if start > previous_end {
             return Err("starts must be monotonically non-increasing".to_owned());
         }
-
-        for right_position in start..previous_end {
-            let right_region = regions.right_region[right_position];
-            if right_region != 0 {
-                let region_offset = *right_region_offsets
-                    .get(&right_region)
-                    .ok_or_else(|| "right region was missing from the first pass".to_owned())?;
-                let region_count = right_regions.entry(right_region).or_default();
-                let position = region_offset + *region_count;
-                right_positions[position] = right_position;
-                *region_count += 1;
-            }
-        }
+        activate_dual_ranked_positions(
+            &first_pass.right_region_layout,
+            start,
+            previous_end,
+            &mut active_counts,
+        )?;
         previous_end = start;
 
         let match_count = first_pass.left_match_counts[left_position];
@@ -603,11 +688,15 @@ pub(crate) fn keep_all_second_pass(
         let output_start = offsets[left_position];
         let output_end = output_start + match_count;
         let mut output_position = output_start;
-        for (&right_region, &count) in right_regions.range(left_region..) {
-            let region_offset = *right_region_offsets
-                .get(&right_region)
-                .ok_or_else(|| "right region was missing from the first pass".to_owned())?;
-            for &right_position in right_positions[region_offset..region_offset + count].iter() {
+        let first_rank = first_pass
+            .right_region_layout
+            .labels
+            .partition_point(|&label| label < left_region);
+        for (&rank, &count) in active_counts.range(first_rank..) {
+            let region_offset = first_pass.right_region_layout.offsets[rank];
+            for &right_position in
+                &first_pass.right_region_layout.positions[region_offset..region_offset + count]
+            {
                 positions[output_position] = right_position;
                 output_position += 1;
             }
@@ -616,7 +705,6 @@ pub(crate) fn keep_all_second_pass(
             return Err("keep-all second pass count disagrees with first pass".to_owned());
         }
     }
-
     for (left_position, &match_count) in first_pass.left_match_counts.iter().enumerate() {
         let output_start = offsets[left_position];
         let output_end = output_start + match_count;
@@ -633,33 +721,162 @@ pub(crate) fn keep_all_second_pass(
     }))
 }
 
-/// Count the positions needed to store each nonzero second-region label.
+/// Count the positions needed for each label that enters a search window.
 ///
 /// ELI5: the second right region is the lookup key. We reserve one contiguous
 /// slice for every key, then reuse those slices during both passes instead of
 /// allocating a vector for every key.
-fn build_n_region_position_layout(
+fn build_ranked_region_position_layout(
     second_right_region: &[i64],
-) -> Result<RegionPositionLayout, String> {
-    let mut layout = HashMap::<i64, (usize, usize)>::new();
+    starts: &[usize],
+    end: usize,
+) -> Result<RankedRegionPositionLayout, String> {
+    let mut counts = HashMap::<i64, usize>::new();
     for &region in second_right_region {
         if region != 0 {
-            let count = &mut layout.entry(region).or_default().0;
-            *count = count
+            let count = counts.entry(region).or_default();
+            *count = (*count)
                 .checked_add(1)
                 .ok_or("region result size exceeds platform capacity")?;
         }
     }
 
+    let mut labels = counts.keys().copied().collect::<Vec<_>>();
+    labels.sort_unstable();
+
+    let mut label_to_rank = HashMap::<i64, usize>::with_capacity(labels.len());
+    for (rank, &label) in labels.iter().enumerate() {
+        label_to_rank.insert(label, rank);
+    }
+
+    let mut ranks = vec![usize::MAX; second_right_region.len()];
+    for (right_position, &region) in second_right_region.iter().enumerate() {
+        if region == 0 {
+            continue;
+        }
+        let rank = label_to_rank[&region];
+        ranks[right_position] = rank;
+    }
+
+    // Count only positions that the sweep can actually see. Some right rows
+    // may never enter a first-predicate window, so allocating for every
+    // nonzero label would make the layout invariant too strong.
+    let mut active_totals = vec![0usize; labels.len()];
+    let mut previous_end = end;
+    for &start in starts {
+        if start == end {
+            continue;
+        }
+        if start > previous_end {
+            return Err("starts must be monotonically non-increasing".to_owned());
+        }
+        for &rank in &ranks[start..previous_end] {
+            if rank != usize::MAX {
+                active_totals[rank] = active_totals[rank]
+                    .checked_add(1)
+                    .ok_or("region result size exceeds platform capacity")?;
+            }
+        }
+        previous_end = start;
+    }
+
+    let mut offsets = vec![0usize; labels.len()];
     let mut position_total = 0usize;
-    for (count, offset) in layout.values_mut() {
-        *offset = position_total;
+    for (rank, &count) in active_totals.iter().enumerate() {
+        offsets[rank] = position_total;
         position_total = position_total
-            .checked_add(*count)
+            .checked_add(count)
             .ok_or("region result size exceeds platform capacity")?;
     }
 
-    Ok((layout, position_total))
+    // Reproduce the sweep's insertion order once. This lets each label's
+    // active positions remain a prefix of its precomputed slice without
+    // changing the output order established by the original B-tree path.
+    let mut positions = vec![0usize; position_total];
+    let mut position_counts = vec![0usize; labels.len()];
+    previous_end = end;
+    for &start in starts {
+        if start == end {
+            continue;
+        }
+        if start > previous_end {
+            return Err("starts must be monotonically non-increasing".to_owned());
+        }
+        for (right_position, &rank) in ranks
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(previous_end - start)
+        {
+            if rank == usize::MAX {
+                continue;
+            }
+            let position = offsets[rank] + position_counts[rank];
+            positions[position] = right_position;
+            position_counts[rank] += 1;
+        }
+        previous_end = start;
+    }
+
+    if position_counts != active_totals {
+        return Err("second right region layout count disagrees with the sweep".to_owned());
+    }
+
+    Ok(RankedRegionPositionLayout {
+        labels,
+        offsets,
+        ranks,
+        positions,
+    })
+}
+
+/// Add dual-region positions to the encountered-rank map.
+fn activate_dual_ranked_positions(
+    layout: &RankedRegionPositionLayout,
+    start: usize,
+    previous_end: usize,
+    active_counts: &mut BTreeMap<usize, usize>,
+) -> Result<(), String> {
+    if start > previous_end {
+        return Err("starts must be monotonically non-increasing".to_owned());
+    }
+
+    for &rank in &layout.ranks[start..previous_end] {
+        if rank == usize::MAX {
+            continue;
+        }
+        let count = active_counts.entry(rank).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or("region result size exceeds platform capacity")?;
+    }
+    Ok(())
+}
+
+/// Add the right positions in one newly visible sweep window.
+///
+/// ELI5: each label owns a shelf in `positions`. `active_counts` records how
+/// many items on each shelf are visible for the current left row.
+fn activate_ranked_positions(
+    layout: &RankedRegionPositionLayout,
+    start: usize,
+    previous_end: usize,
+    active_counts: &mut [usize],
+) -> Result<(), String> {
+    if start > previous_end {
+        return Err("starts must be monotonically non-increasing".to_owned());
+    }
+
+    for &rank in &layout.ranks[start..previous_end] {
+        if rank == usize::MAX {
+            continue;
+        }
+        active_counts[rank] = active_counts[rank]
+            .checked_add(1)
+            .ok_or("region result size exceeds platform capacity")?;
+    }
+
+    Ok(())
 }
 
 /// Visit n-region candidates in descending first-region order.
@@ -669,16 +886,16 @@ fn build_n_region_position_layout(
 /// first failed predicate. `visit` returns `false` when the caller has enough
 /// information for the current left row (for example, `keep="any"`).
 ///
-/// `right_positions` is indexed by the second right-region layout. It is
-/// rebuilt as the sweep expands, so a candidate uses only right rows that are
-/// active for the current search window.
+/// The second right-region positions are grouped once by sorted label and in
+/// the same activation order as the search sweep. The sweep only increments
+/// encountered ranks, so candidate traversal does not scan labels that have
+/// not entered the current window.
 fn visit_n_region_matches<F>(
     left_regions: &[Vec<i64>],
     right_regions: &[Vec<i64>],
     starts: &[usize],
     end: usize,
-    right_region_layout: &HashMap<i64, (usize, usize)>,
-    right_positions: &mut [usize],
+    right_region_layout: &RankedRegionPositionLayout,
     mut visit: F,
 ) -> Result<usize, String>
 where
@@ -702,7 +919,7 @@ where
         ensure_equal_lengths_core("right region", region.len(), "first right region", end)?;
     }
 
-    let mut right_regions_by_label = BTreeMap::<i64, usize>::new();
+    let mut active_counts = vec![0usize; right_region_layout.labels.len()];
     let mut right_region_maxima = vec![0_i64; right_regions.len()];
     let mut previous_end = end;
     let mut total_matches = 0usize;
@@ -719,23 +936,8 @@ where
             for (maximum, region) in right_region_maxima.iter_mut().zip(right_regions) {
                 *maximum = (*maximum).max(region[right_position]);
             }
-
-            let second_region = right_regions[1][right_position];
-            if second_region != 0 {
-                let (region_total, region_offset) = right_region_layout
-                    .get(&second_region)
-                    .ok_or_else(|| "second right region was missing from the layout".to_owned())?;
-                let region_count = right_regions_by_label.entry(second_region).or_default();
-                let position = region_offset
-                    .checked_add(*region_count)
-                    .ok_or("region result size exceeds platform capacity")?;
-                if position >= right_positions.len() || *region_count >= *region_total {
-                    return Err("second right region exceeded its layout".to_owned());
-                }
-                right_positions[position] = right_position;
-                *region_count += 1;
-            }
         }
+        activate_ranked_positions(right_region_layout, start, previous_end, &mut active_counts)?;
         previous_end = start;
 
         let impossible = left_regions
@@ -747,13 +949,16 @@ where
         }
 
         let second_left_region = left_regions[1][left_position];
-        'candidate_regions: for (&second_region, &region_count) in
-            right_regions_by_label.range(second_left_region..)
+        let first_rank = right_region_layout
+            .labels
+            .partition_point(|&label| label < second_left_region);
+        'candidate_regions: for (rank, &region_count) in
+            active_counts.iter().enumerate().skip(first_rank)
         {
-            let &(_, region_offset) = right_region_layout
-                .get(&second_region)
-                .ok_or_else(|| "second right region was missing from the layout".to_owned())?;
-            for &right_position in &right_positions[region_offset..region_offset + region_count] {
+            let region_offset = right_region_layout.offsets[rank];
+            for &right_position in
+                &right_region_layout.positions[region_offset..region_offset + region_count]
+            {
                 let matches_remaining = left_regions
                     .iter()
                     .skip(2)
@@ -778,9 +983,9 @@ where
 
 /// Count residual-passing candidates for each left row.
 ///
-/// ELI5: the first pass uses one flat position buffer. The BTreeMap tracks how
-/// many positions from each region are currently visible, and the hashmap
-/// tells each region where its positions begin in the flat buffer.
+/// ELI5: the first pass uses one flat position buffer. Sorted labels identify
+/// the eligible region suffix, and active counts limit each label to the
+/// positions visible in the current sweep window.
 fn collect_dual_residual_candidates<F>(
     regions: &DualRegionPaths,
     predicates_pass: F,
@@ -789,28 +994,31 @@ fn collect_dual_residual_candidates<F>(
 where
     F: Fn(usize, usize) -> bool,
 {
-    let mut right_region_layout = HashMap::<i64, (usize, usize)>::new();
-    for &right_region in &regions.right_region {
-        if right_region != 0 {
-            let count = &mut right_region_layout.entry(right_region).or_default().0;
-            *count = count
-                .checked_add(1)
-                .ok_or("region result size exceeds platform capacity")?;
-        }
+    let (left_has_match, any_left_match) = dual_region_match_filter(regions)?;
+    if !any_left_match {
+        return Ok(DualResidualCandidatePass {
+            left_match_counts: vec![0; regions.left_region.len()],
+            total_matches: 0,
+            selected_right_positions: Vec::new(),
+            right_region_layout: RankedRegionPositionLayout {
+                labels: Vec::new(),
+                offsets: Vec::new(),
+                ranks: Vec::new(),
+                positions: Vec::new(),
+            },
+        });
     }
 
-    let mut right_position_total = 0usize;
-    for (count, start) in right_region_layout.values_mut() {
-        *start = right_position_total;
-        right_position_total = right_position_total
-            .checked_add(*count)
-            .ok_or("region result size exceeds platform capacity")?;
-    }
-
+    let right_region_layout =
+        build_ranked_region_position_layout(&regions.right_region, &regions.starts, regions.end)?;
     let mut match_counts = vec![0usize; regions.left_region.len()];
+    let mut selected_right_positions = if stop_after_first {
+        vec![None; regions.left_region.len()]
+    } else {
+        Vec::new()
+    };
     let mut total_matches = 0usize;
-    let mut right_region_counts = BTreeMap::<i64, usize>::new();
-    let mut right_positions = vec![0usize; right_position_total];
+    let mut active_counts = BTreeMap::<usize, usize>::new();
     let mut previous_end = regions.end;
 
     for (left_position, (&start, &left_region)) in
@@ -822,35 +1030,33 @@ where
         if start > previous_end {
             return Err("starts must be monotonically non-increasing".to_owned());
         }
-
-        for right_position in start..previous_end {
-            let right_region = regions.right_region[right_position];
-            if right_region != 0 {
-                let region_start = right_region_layout[&right_region].1;
-                let region_count = right_region_counts.entry(right_region).or_default();
-                let position = region_start
-                    .checked_add(*region_count)
-                    .ok_or("region result size exceeds platform capacity")?;
-                right_positions[position] = right_position;
-                *region_count = region_count
-                    .checked_add(1)
-                    .ok_or("region result size exceeds platform capacity")?;
-            }
-        }
+        activate_dual_ranked_positions(
+            &right_region_layout,
+            start,
+            previous_end,
+            &mut active_counts,
+        )?;
         previous_end = start;
 
-        if left_region == 0 {
+        if !left_has_match[left_position] || left_region == 0 {
             continue;
         }
 
-        'candidates: for (&right_region, &region_count) in right_region_counts.range(left_region..)
-        {
-            let region_start = right_region_layout[&right_region].1;
-            for &right_position in &right_positions[region_start..region_start + region_count] {
+        let first_rank = right_region_layout
+            .labels
+            .partition_point(|&label| label < left_region);
+        'candidates: for (&rank, &region_count) in active_counts.range(first_rank..) {
+            let region_start = right_region_layout.offsets[rank];
+            for &right_position in
+                &right_region_layout.positions[region_start..region_start + region_count]
+            {
                 if predicates_pass(left_position, right_position) {
                     match_counts[left_position] = match_counts[left_position]
                         .checked_add(1)
                         .ok_or("region result size exceeds platform capacity")?;
+                    if stop_after_first {
+                        selected_right_positions[left_position] = Some(right_position);
+                    }
                     total_matches = total_matches
                         .checked_add(1)
                         .ok_or("region result size exceeds platform capacity")?;
@@ -865,8 +1071,8 @@ where
     Ok(DualResidualCandidatePass {
         left_match_counts: match_counts,
         total_matches,
+        selected_right_positions,
         right_region_layout,
-        right_positions,
     })
 }
 
@@ -883,7 +1089,6 @@ where
         left_match_counts: pass.left_match_counts,
         total_matches: pass.total_matches,
         right_region_layout: pass.right_region_layout,
-        right_positions: pass.right_positions,
     })
 }
 
@@ -904,8 +1109,8 @@ where
     Ok(DualResidualSelectionFirstPass {
         left_has_match,
         matched_left_count: pass.total_matches,
+        selected_right_positions: pass.selected_right_positions,
         right_region_layout: pass.right_region_layout,
-        right_positions: pass.right_positions,
     })
 }
 
@@ -925,7 +1130,7 @@ where
         return Ok(None);
     }
 
-    let mut right_region_counts = BTreeMap::<i64, usize>::new();
+    let mut active_counts = BTreeMap::<usize, usize>::new();
     let mut previous_end = regions.end;
     let mut left_output = vec![0_i64; first_pass.total_matches];
     let mut right_output = vec![0_i64; first_pass.total_matches];
@@ -940,23 +1145,26 @@ where
         if start > previous_end {
             return Err("starts must be monotonically non-increasing".to_owned());
         }
-
-        for right_position in start..previous_end {
-            let right_region = regions.right_region[right_position];
-            if right_region != 0 {
-                *right_region_counts.entry(right_region).or_default() += 1;
-            }
-        }
+        activate_dual_ranked_positions(
+            &first_pass.right_region_layout,
+            start,
+            previous_end,
+            &mut active_counts,
+        )?;
         previous_end = start;
 
         if left_region == 0 || first_pass.left_match_counts[left_position] == 0 {
             continue;
         }
 
-        for (&right_region, &region_count) in right_region_counts.range(left_region..) {
-            let region_start = first_pass.right_region_layout[&right_region].1;
+        let first_rank = first_pass
+            .right_region_layout
+            .labels
+            .partition_point(|&label| label < left_region);
+        for (&rank, &region_count) in active_counts.range(first_rank..) {
+            let region_start = first_pass.right_region_layout.offsets[rank];
             for &right_position in
-                &first_pass.right_positions[region_start..region_start + region_count]
+                &first_pass.right_region_layout.positions[region_start..region_start + region_count]
             {
                 if predicates_pass(left_position, right_position) {
                     left_output[output_position] = left_index[regions.left_order[left_position]];
@@ -994,7 +1202,25 @@ where
         return Ok(None);
     }
 
-    let mut right_region_counts = BTreeMap::<i64, usize>::new();
+    if keep == Keep::Any {
+        let mut left_output = Vec::with_capacity(first_pass.matched_left_count);
+        let mut right_output = Vec::with_capacity(first_pass.matched_left_count);
+        for (left_position, right_position) in
+            first_pass.selected_right_positions.iter().enumerate()
+        {
+            let Some(right_position) = right_position else {
+                continue;
+            };
+            left_output.push(left_index[regions.left_order[left_position]]);
+            right_output.push(right_index[*right_position]);
+        }
+        return Ok(Some(MaterializedIndices {
+            left_index: left_output,
+            right_index: right_output,
+        }));
+    }
+
+    let mut active_counts = BTreeMap::<usize, usize>::new();
     let mut previous_end = regions.end;
     let mut left_output = vec![0_i64; first_pass.matched_left_count];
     let mut right_output = vec![0_i64; first_pass.matched_left_count];
@@ -1009,13 +1235,12 @@ where
         if start > previous_end {
             return Err("starts must be monotonically non-increasing".to_owned());
         }
-
-        for right_position in start..previous_end {
-            let right_region = regions.right_region[right_position];
-            if right_region != 0 {
-                *right_region_counts.entry(right_region).or_default() += 1;
-            }
-        }
+        activate_dual_ranked_positions(
+            &first_pass.right_region_layout,
+            start,
+            previous_end,
+            &mut active_counts,
+        )?;
         previous_end = start;
 
         if left_region == 0 || !first_pass.left_has_match[left_position] {
@@ -1023,11 +1248,14 @@ where
         }
 
         let mut selected: Option<(i64, usize)> = None;
-        'candidates: for (&right_region, &region_count) in right_region_counts.range(left_region..)
-        {
-            let region_start = first_pass.right_region_layout[&right_region].1;
+        let first_rank = first_pass
+            .right_region_layout
+            .labels
+            .partition_point(|&label| label < left_region);
+        'candidates: for (&rank, &region_count) in active_counts.range(first_rank..) {
+            let region_start = first_pass.right_region_layout.offsets[rank];
             for &right_position in
-                &first_pass.right_positions[region_start..region_start + region_count]
+                &first_pass.right_region_layout.positions[region_start..region_start + region_count]
             {
                 if !predicates_pass(left_position, right_position) {
                     continue;
@@ -1328,8 +1556,8 @@ pub fn dual_regions_indices<'py>(
             keep_all_second_pass(&regions, &first_pass, left_index_view, right_index_view)
         }
         Keep::Any => {
-            let first_pass = count_matching_left_rows(&regions)
-                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            let first_pass =
+                count_any_matches(&regions).map_err(pyo3::exceptions::PyValueError::new_err)?;
             keep_any_second_pass(&regions, &first_pass, left_index_view, right_index_view)
         }
         Keep::First | Keep::Last => {
@@ -1444,6 +1672,34 @@ fn n_region_indices_core(
     aligners: &[ArrayView1<'_, i64>],
     keep: Keep,
 ) -> Result<Option<MaterializedIndices>, String> {
+    n_region_indices_with_filter_core(
+        first_predicate,
+        range_predicates,
+        left_index,
+        right_index,
+        aligners,
+        keep,
+        |_, _| true,
+    )
+}
+
+/// Build n-region index pairs while applying an additional candidate filter.
+///
+/// The filter receives the original left position and the global right
+/// position. Range regions are still checked first, so residual predicates
+/// only run for candidates that survived every range predicate.
+fn n_region_indices_with_filter_core<F>(
+    first_predicate: &Predicate<'_>,
+    range_predicates: &[Predicate<'_>],
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    aligners: &[ArrayView1<'_, i64>],
+    keep: Keep,
+    candidate_pass: F,
+) -> Result<Option<MaterializedIndices>, String>
+where
+    F: Fn(usize, usize) -> bool,
+{
     // The first predicate establishes the canonical right order. Every later
     // predicate supplies an aligner that has already been prepared by Python,
     // so this core function only gathers values and performs the sweep.
@@ -1528,9 +1784,8 @@ fn n_region_indices_core(
         return Ok(None);
     }
 
-    let (right_region_layout, right_position_total) =
-        build_n_region_position_layout(&right_range_regions[1])?;
-    let mut right_positions = vec![0usize; right_position_total];
+    let right_region_layout =
+        build_ranked_region_position_layout(&right_range_regions[1], &starts, end)?;
 
     if keep != Keep::All {
         let mut selected_right_positions = vec![None; left_range_regions[0].len()];
@@ -1540,31 +1795,35 @@ fn n_region_indices_core(
             &starts,
             end,
             &right_region_layout,
-            &mut right_positions,
-            |left_position, right_position| match keep {
-                Keep::Any => {
-                    selected_right_positions[left_position] = Some(right_position);
-                    false
+            |left_position, right_position| {
+                if !candidate_pass(left_order[left_position], right_position) {
+                    return true;
                 }
-                Keep::First => {
-                    let selected = &mut selected_right_positions[left_position];
-                    if selected
-                        .is_none_or(|position| right_index[right_position] < right_index[position])
-                    {
-                        *selected = Some(right_position);
+                match keep {
+                    Keep::Any => {
+                        selected_right_positions[left_position] = Some(right_position);
+                        false
                     }
-                    true
-                }
-                Keep::Last => {
-                    let selected = &mut selected_right_positions[left_position];
-                    if selected
-                        .is_none_or(|position| right_index[right_position] > right_index[position])
-                    {
-                        *selected = Some(right_position);
+                    Keep::First => {
+                        let selected = &mut selected_right_positions[left_position];
+                        if selected.is_none_or(|position| {
+                            right_index[right_position] < right_index[position]
+                        }) {
+                            *selected = Some(right_position);
+                        }
+                        true
                     }
-                    true
+                    Keep::Last => {
+                        let selected = &mut selected_right_positions[left_position];
+                        if selected.is_none_or(|position| {
+                            right_index[right_position] > right_index[position]
+                        }) {
+                            *selected = Some(right_position);
+                        }
+                        true
+                    }
+                    Keep::All => unreachable!("keep='all' uses the two-pass path"),
                 }
-                Keep::All => unreachable!("keep='all' uses the two-pass path"),
             },
         )?;
 
@@ -1593,18 +1852,25 @@ fn n_region_indices_core(
     }
 
     let mut left_match_counts = vec![0usize; left_range_regions[0].len()];
-    let total_matches = visit_n_region_matches(
+    let _ = visit_n_region_matches(
         &left_range_regions,
         &right_range_regions,
         &starts,
         end,
         &right_region_layout,
-        &mut right_positions,
-        |left_position, _right_position| {
+        |left_position, right_position| {
+            if !candidate_pass(left_order[left_position], right_position) {
+                return true;
+            }
             left_match_counts[left_position] += 1;
             true
         },
     )?;
+    let total_matches = left_match_counts.iter().try_fold(0usize, |total, &count| {
+        total
+            .checked_add(count)
+            .ok_or("region result size exceeds platform capacity")
+    })?;
     if total_matches == 0 {
         return Ok(None);
     }
@@ -1612,20 +1878,23 @@ fn n_region_indices_core(
     let mut left_output = Vec::with_capacity(total_matches);
     let mut right_output = Vec::with_capacity(total_matches);
     let mut second_left_match_counts = vec![0usize; left_range_regions[0].len()];
-    let second_pass_matches = visit_n_region_matches(
+    let _ = visit_n_region_matches(
         &left_range_regions,
         &right_range_regions,
         &starts,
         end,
         &right_region_layout,
-        &mut right_positions,
         |left_position, right_position| {
+            if !candidate_pass(left_order[left_position], right_position) {
+                return true;
+            }
             second_left_match_counts[left_position] += 1;
             left_output.push(left_index[left_order[left_position]]);
             right_output.push(right_index[right_position]);
             true
         },
     )?;
+    let second_pass_matches = left_output.len();
 
     if second_left_match_counts != left_match_counts
         || second_pass_matches != total_matches
@@ -1778,11 +2047,123 @@ pub fn n_region_indices<'py>(
     )?))
 }
 
+/// Entry point for three or more range predicates followed by residual
+/// predicates.
+///
+/// Residual predicates are evaluated only after a candidate has passed every
+/// range predicate. `keep="all"` uses the same exact-size two-pass materializer
+/// as [`n_region_indices`], while the other keep modes select from the
+/// residual-filtered candidates.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+pub fn n_region_and_residual_indices<'py>(
+    py: Python<'py>,
+    left_index: &Bound<'py, PyAny>,
+    right_index: &Bound<'py, PyAny>,
+    first_predicate: &Bound<'py, PyTuple>,
+    range_predicates: &Bound<'py, PyList>,
+    aligners: &Bound<'py, PyList>,
+    residual_predicates: &Bound<'py, PyList>,
+    keep: &str,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    Keep::parse(keep)?;
+    if range_predicates.len() < 2 {
+        return Err(PyValueError::new_err(
+            "range_predicates must contain at least two predicates",
+        ));
+    }
+    if aligners.len() != range_predicates.len() {
+        return Err(PyValueError::new_err(
+            "aligners and range_predicates must have equal lengths",
+        ));
+    }
+
+    let first = parse_region_predicate(first_predicate)?;
+    validate_region_predicate(&first)?;
+
+    let mut predicates = Vec::with_capacity(range_predicates.len() + 1);
+    predicates.push(first);
+    for item in range_predicates.iter() {
+        let predicate = item
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("range predicates must be tuples"))?;
+        let predicate = parse_region_predicate(predicate)?;
+        validate_region_predicate(&predicate)?;
+        predicates.push(predicate);
+    }
+
+    let left_index = left_index.extract::<PyReadonlyArray1<'py, i64>>()?;
+    let right_index = right_index.extract::<PyReadonlyArray1<'py, i64>>()?;
+    let left_index_view = left_index.as_array();
+    let right_index_view = right_index.as_array();
+    check_predicate_lengths(&predicates, left_index_view.len(), right_index_view.len())?;
+
+    let aligner_arrays = aligners
+        .iter()
+        .map(|item| {
+            item.extract::<PyReadonlyArray1<'py, i64>>()
+                .map_err(|error| PyTypeError::new_err(error.to_string()))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    for aligner in &aligner_arrays {
+        ensure_equal_lengths_core(
+            "aligner",
+            aligner.as_array().len(),
+            "right_index",
+            right_index_view.len(),
+        )
+        .map_err(PyValueError::new_err)?;
+    }
+
+    let (residuals, metadata) = parse_predicates_with_nulls_strings(py, residual_predicates)?;
+    check_predicate_lengths(&residuals, left_index_view.len(), right_index_view.len())?;
+    let views = residuals.iter().map(Predicate::view).collect::<Vec<_>>();
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
+    let (first_predicate, range_predicates) = predicates
+        .split_first()
+        .expect("n_region_and_residual_indices requires a first predicate");
+    let aligner_views = aligner_arrays
+        .iter()
+        .map(|aligner| aligner.as_array())
+        .collect::<Vec<_>>();
+    let predicates_pass = |left_position, right_position| {
+        predicates_match_dispatch(
+            &views,
+            metadata_views.as_deref(),
+            left_position,
+            right_position,
+        )
+    };
+
+    let indices = n_region_indices_with_filter_core(
+        first_predicate,
+        range_predicates,
+        left_index_view,
+        right_index_view,
+        &aligner_views,
+        Keep::parse(keep)?,
+        predicates_pass,
+    )
+    .map_err(PyValueError::new_err)?;
+
+    let Some(indices) = indices else {
+        return Ok(None);
+    };
+    Ok(Some(result_dict(
+        py,
+        indices.left_index,
+        indices.right_index,
+        None,
+        None,
+    )?))
+}
+
 /// Register the standalone dual-region entry point.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dual_regions_indices, m)?)?;
     m.add_function(wrap_pyfunction!(dual_regions_and_residual_indices, m)?)?;
     m.add_function(wrap_pyfunction!(n_region_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(n_region_and_residual_indices, m)?)?;
     Ok(())
 }
 
@@ -1936,9 +2317,75 @@ mod tests {
                 )?
                 .ok_or_else(|| PyValueError::new_err("dual residual indices returned None"))?;
 
-                assert_eq!(pairs(&n_result)?, pairs(&dual_result)?, "keep={keep}");
+                let mut n_pairs = pairs(&n_result)?;
+                let mut dual_pairs = pairs(&dual_result)?;
+                n_pairs.sort_unstable();
+                dual_pairs.sort_unstable();
+                if keep == "any" {
+                    let mut n_left = n_pairs.iter().map(|&(left, _)| left).collect::<Vec<_>>();
+                    let mut dual_left =
+                        dual_pairs.iter().map(|&(left, _)| left).collect::<Vec<_>>();
+                    n_left.sort_unstable();
+                    dual_left.sort_unstable();
+                    assert_eq!(n_left, dual_left, "keep={keep}");
+                } else {
+                    assert_eq!(n_pairs, dual_pairs, "keep={keep}");
+                }
             }
 
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn n_region_and_residual_indices_filters_before_keep() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 200]);
+            let right_index = PyArray1::from_vec(py, vec![40_i64, 10, 30, 20]);
+            let first = predicate(py, &[1, 3], &[1, 2, 3, 4], "<=")?;
+            let second = predicate(py, &[1, 3], &[1, 2, 3, 4], "<=")?;
+            let third = predicate(py, &[1, 3], &[1, 2, 3, 4], "<=")?;
+            let residual = predicate(py, &[0, 1], &[0, 1, 2, 1], "!=")?;
+            let range_predicates = PyList::new(py, [second, third])?;
+            let residual_predicates = PyList::new(py, [residual])?;
+            let aligners = PyList::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]),
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]),
+                ],
+            )?;
+
+            let run = |keep| {
+                n_region_and_residual_indices(
+                    py,
+                    left_index.as_any(),
+                    right_index.as_any(),
+                    &first,
+                    &range_predicates,
+                    &aligners,
+                    &residual_predicates,
+                    keep,
+                )
+            };
+
+            let all = run("all")?.ok_or_else(|| PyValueError::new_err("all returned None"))?;
+            let mut all_pairs = pairs(&all)?;
+            all_pairs.sort_unstable();
+            assert_eq!(all_pairs, vec![(100, 10), (100, 20), (100, 30), (200, 30)]);
+
+            let any = run("any")?.ok_or_else(|| PyValueError::new_err("any returned None"))?;
+            assert_eq!(pairs(&any)?, vec![(200, 30), (100, 10)]);
+
+            let first_result =
+                run("first")?.ok_or_else(|| PyValueError::new_err("first returned None"))?;
+            assert_eq!(pairs(&first_result)?, vec![(200, 30), (100, 10)]);
+
+            let last_result =
+                run("last")?.ok_or_else(|| PyValueError::new_err("last returned None"))?;
+            assert_eq!(pairs(&last_result)?, vec![(200, 30), (100, 30)]);
             Ok(())
         })
         .unwrap();
