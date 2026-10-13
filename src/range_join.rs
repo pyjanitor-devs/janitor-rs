@@ -18,6 +18,22 @@
 //! reverse aggregation writes to right output slots and consumes left source
 //! arrays. Residual predicates are evaluated only after the two anchor
 //! windows have been intersected.
+//!
+//! # Layout contract
+//!
+//! The first predicate establishes the canonical right-side physical order.
+//! The second predicate may have been searched in a different sorted value
+//! order, but Python must provide its values and index map already aligned to
+//! that canonical order before this module intersects windows. Rust treats a
+//! window offset as a position in that prepared layout; it never sorts values
+//! or reconstructs a pandas index.
+//!
+//! # Window contract
+//!
+//! Every window is half-open: `[start, end)`. Empty windows are represented by
+//! `start == end` and are removed before index materialization or aggregation.
+//! This convention is important because `end` is allowed to equal the right
+//! length, while `start` may be zero.
 
 use numpy::ndarray::Array1;
 #[cfg(test)]
@@ -46,6 +62,9 @@ fn window_extreme_positions(
     ends: &[i64],
     minimum: bool,
 ) -> Result<Vec<i64>, String> {
+    // ELI5: inspect only the exact shelf belonging to each left row. Looking
+    // at a prefix or suffix would accidentally include right rows outside
+    // the intersection of the two range predicates.
     ensure_equal_lengths_core("range labels", starts.len(), "range starts", ends.len())?;
     let mut selected = Vec::with_capacity(starts.len());
     for (&start, &end) in starts.iter().zip(ends) {
@@ -81,6 +100,9 @@ fn parse_shared_index_range_predicate<'py>(
     left_index: &Bound<'py, PyAny>,
     right_index: &Bound<'py, PyAny>,
 ) -> PyResult<AnyParsedRangePredicate<'py>> {
+    // The shared-index ABI intentionally has only three fields. Physical
+    // labels belong to the outer call, so malformed six/eight-field tuples
+    // must not silently be interpreted as this contract.
     if tuple.len() != 3 {
         return Err(PyValueError::new_err(
             "shared-index range predicates must contain 3 elements",
@@ -204,6 +226,8 @@ pub(crate) fn intersect_windows(
     first: SingleJoinResult,
     second: SingleJoinResult,
 ) -> Result<SingleJoinResult, String> {
+    // ELI5: two searches give two rulers over the same right rows; taking the
+    // larger start and smaller end keeps only the part where both agree.
     ensure_equal_lengths_core(
         "first left window",
         first.left_positions.len(),
@@ -262,6 +286,15 @@ pub(crate) fn intersect_windows(
 }
 
 /// Build dual-range windows while dispatching each anchor independently.
+///
+/// The two anchors may use different NumPy dtypes. Each is binary-searched in
+/// its own typed value layout, then the resulting integer offsets are
+/// intersected without converting either value array to a common dtype.
+///
+/// # Errors
+///
+/// Returns an error when either parsed anchor cannot produce valid windows or
+/// when the two window collections do not share aligned left/right lengths.
 pub(crate) fn build_any_windows(
     first: &AnyParsedRangePredicate<'_>,
     second: &AnyParsedRangePredicate<'_>,
@@ -443,6 +476,13 @@ pub(crate) fn choose_range_windows(
 /// Returns `None` when the intersected windows contain no candidate. Otherwise
 /// returns a dictionary containing `left_index` and `right_index`, and, when
 /// requested, the half-open window arrays.
+///
+/// # Errors
+///
+/// Raises `ValueError` when the predicate count, tuple shape, index lengths,
+/// operator, keep value, or window boundaries violate the prepared-layout
+/// contract. Raises `TypeError` when an index or predicate field is not a
+/// one-dimensional NumPy-compatible value.
 #[pyfunction]
 pub fn range_join_indices<'py>(
     py: Python<'py>,
@@ -490,6 +530,10 @@ pub fn range_join_indices<'py>(
     Ok(Some(result_dict(py, left, right, None, None)?))
 }
 
+/// Register the basic and extended range-index and aggregation entry points.
+///
+/// Registration lives with the implementation so adding or removing a range
+/// kernel cannot leave the top-level module with a stale export list.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     macro_rules! add {
         ($($name:ident),+ $(,)?) => {
@@ -508,6 +552,30 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 /// Execute the range-extended join with independently typed anchors.
+///
+/// The first two anchors are converted into intersected windows. Every later
+/// predicate is retained as a residual filter and is evaluated only for a
+/// candidate inside that intersection. This is the shared implementation for
+/// the public index wrapper; aggregation has a parallel consumer because it
+/// must update state for every passing candidate rather than apply `keep`.
+///
+/// # Arguments
+///
+/// * `py` - Python interpreter token used for residual parsing and results.
+/// * `predicates` - At least two parsed predicate tuples.
+/// * `keep` - Selection policy applied after all residual predicates pass.
+/// * `first` - Parsed first range anchor defining the primary right layout.
+/// * `second` - Parsed second range anchor used to intersect that layout.
+///
+/// # Returns
+///
+/// Returns materialized physical index pairs, or `None` when no candidate
+/// survives the two anchors and residual filters.
+///
+/// # Errors
+///
+/// Returns an error for malformed residual predicates, length mismatches,
+/// invalid keep values, or invalid window boundaries.
 fn extended_join<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
@@ -568,6 +636,12 @@ fn extended_join<'py>(
 /// # Returns
 ///
 /// Returns materialized physical pairs, or `None` when no candidate survives.
+///
+/// # Errors
+///
+/// Raises `ValueError` for fewer than two predicates, malformed anchor tuples,
+/// incompatible lengths, unsupported operators, invalid keep values, or a
+/// residual predicate whose arrays do not match the shared physical maps.
 #[pyfunction]
 pub fn range_join_extended_indices<'py>(
     py: Python<'py>,
@@ -1545,6 +1619,32 @@ mod tests {
 /// aggregation helper consumes only the surviving windows. With no residual
 /// predicates this is the basic two-range operation; with later predicates it
 /// is the extended operation.
+///
+/// # Arguments
+///
+/// * `py` - Python interpreter token used to parse residuals and create the
+///   result tuple.
+/// * `predicates` - At least two three-element range tuples. The first two
+///   define the intersected windows; later tuples are residual predicates.
+/// * `left_index` - Physical left labels and, in forward mode, output slots.
+/// * `right_index` - Physical right labels and, in reverse mode, output
+///   slots.
+/// * `aggregations` - Non-empty source arrays, null masks, and operation
+///   names. Forward requests must be right-aligned; reverse requests must be
+///   left-aligned.
+/// * `return_matched` - Whether the result includes a boolean matched array.
+/// * `reverse` - Swap source/output sides while retaining the same candidates.
+///
+/// # Returns
+///
+/// Returns `(positions, matched?, results)` or `None` when no complete
+/// candidate survives. Result positions retain the supplied physical labels.
+///
+/// # Errors
+///
+/// Returns an error for fewer than two predicates, malformed tuples, length
+/// mismatches, unsupported residuals, invalid aggregation requests, or source
+/// arrays whose lengths do not match the selected source side.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aggregate_range_extended<'py>(
     py: Python<'py>,
@@ -1632,6 +1732,12 @@ pub(crate) fn aggregate_range_extended<'py>(
 /// Returns the standard aggregation tuple, or `None` when the two windows have
 /// no intersection. The output remains aligned to the supplied trimmed output
 /// layout.
+///
+/// # Errors
+///
+/// Returns an error for malformed anchors, mismatched index/value lengths,
+/// empty or invalid aggregation requests, or source arrays that are not
+/// aligned to the selected aggregation direction.
 #[pyfunction]
 pub fn range_join_aggregate<'py>(
     py: Python<'py>,
@@ -1678,6 +1784,12 @@ pub fn range_join_aggregate<'py>(
 ///
 /// Returns the standard reverse aggregation tuple, or `None` when no pair
 /// satisfies both range predicates.
+///
+/// # Errors
+///
+/// Returns an error for malformed anchors, mismatched index/value lengths,
+/// empty or invalid aggregation requests, or left-side source arrays that are
+/// not aligned with the supplied left index.
 #[pyfunction]
 pub fn range_join_aggregate_reverse<'py>(
     py: Python<'py>,
@@ -1726,6 +1838,12 @@ pub fn range_join_aggregate_reverse<'py>(
 ///
 /// Returns the standard forward aggregation tuple, or `None` when no complete
 /// candidate survives both range anchors and every residual predicate.
+///
+/// # Errors
+///
+/// Returns an error for malformed anchors or residual predicates, mismatched
+/// lengths, empty or invalid aggregation requests, or misaligned source
+/// arrays. Residual rejection is represented by `None`, not an error.
 #[pyfunction]
 pub fn range_join_extended_aggregate<'py>(
     py: Python<'py>,
@@ -1767,6 +1885,12 @@ pub fn range_join_extended_aggregate<'py>(
 ///
 /// Returns the standard reverse aggregation tuple, or `None` when no candidate
 /// survives the anchors and residual filters.
+///
+/// # Errors
+///
+/// Returns an error for malformed anchors or residual predicates, mismatched
+/// lengths, empty or invalid aggregation requests, or left-side source arrays
+/// that do not match the reverse source layout.
 #[pyfunction]
 pub fn range_join_extended_aggregate_reverse<'py>(
     py: Python<'py>,
