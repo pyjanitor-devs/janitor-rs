@@ -17,6 +17,12 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static DUAL_RANK_TREE_HITS: AtomicUsize = AtomicUsize::new(0);
+
 /// The second predicate's paths together with the first-predicate starts.
 pub(crate) struct DualRegionPaths {
     pub(crate) left_region: Vec<i64>,
@@ -2646,11 +2652,22 @@ where
     // The rank tree summarizes the complete dual-region candidate set. It is
     // safe only for the forward exact path: reverse aggregation reads values
     // from the left side, and residual aggregation must inspect every pair.
+    // The first-predicate window is only an upper bound for the legacy
+    // traversal: the second predicate may discard most of those positions.
+    // Count its nonzero region labels while walking the same monotonic window
+    // frontier, so selective second predicates do not make the tree look
+    // cheaper than the traversal they replace.
     let mut estimated_width = 0_usize;
     let mut estimate_previous_end = regions.end;
+    let mut estimated_active_width = 0_usize;
     for &start in &regions.starts {
         if start <= estimate_previous_end && start < regions.end {
-            estimated_width = estimated_width.saturating_add(regions.end.saturating_sub(start));
+            for &region in &regions.right_region[start..estimate_previous_end] {
+                if region != 0 {
+                    estimated_active_width = estimated_active_width.saturating_add(1);
+                }
+            }
+            estimated_width = estimated_width.saturating_add(estimated_active_width);
             estimate_previous_end = start;
         }
     }
@@ -2663,6 +2680,8 @@ where
             right_index.len(),
         )
     {
+        #[cfg(test)]
+        DUAL_RANK_TREE_HITS.fetch_add(1, Ordering::Relaxed);
         set.aggregate_dual_rank_tree(
             ArrayView1::from(regions.left_region.as_slice()),
             &regions.left_order,
@@ -3582,6 +3601,7 @@ mod tests {
     fn broad_dual_aggregation_uses_rank_tree_results() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
+            let tree_hits_before = DUAL_RANK_TREE_HITS.load(Ordering::Relaxed);
             let rows = 100;
             let left_index = PyArray1::from_vec(py, (0..rows as i64).collect());
             let right_index = PyArray1::from_vec(py, (0..rows as i64).collect());
@@ -3621,6 +3641,7 @@ mod tests {
                     vec![99; rows],
                 ]
             );
+            assert!(DUAL_RANK_TREE_HITS.load(Ordering::Relaxed) > tree_hits_before);
             Ok(())
         })
         .unwrap();

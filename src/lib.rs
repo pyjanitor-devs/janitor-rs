@@ -15,6 +15,12 @@ mod range_predicate;
 mod regions;
 mod single_range_predicate;
 
+/// Narrow Rust-only surface used by criterion benchmarks.
+#[doc(hidden)]
+pub mod bench_support {
+    pub use crate::regions::{dual_regions_aggregate, dual_regions_and_residual_aggregate};
+}
+
 /// Top-level composition point: each family owns and registers its own
 /// exports, so this function only has to know the surviving family names, not
 /// the ~900 individual dtype-specialized functions they expose.
