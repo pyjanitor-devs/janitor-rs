@@ -325,6 +325,45 @@ fn equi_large_group(c: &mut Criterion) {
     bench_equi_case(c, "equi_large_group", 16384, vec![8192], 16384);
 }
 
+fn bench_equi_rank_tree_only(c: &mut Criterion, name: &str, rows: usize) {
+    Python::initialize();
+    Python::attach(|py| {
+        let starts = PyArray1::from_vec(py, vec![0_i64; rows]);
+        let ends = PyArray1::from_vec(py, vec![rows as i64; rows]);
+        let left_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+        let right_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+        let ranges = PyList::empty(py);
+        let residuals = PyList::empty(py);
+        let aggregations = make_size_aggregation(py);
+        let mut group = c.benchmark_group(name);
+        group.bench_function("rank_tree", |b| {
+            b.iter(|| {
+                let result = equi_aggregate(
+                    py,
+                    left_index.readonly(),
+                    right_index.readonly(),
+                    Some(starts.readwrite()),
+                    Some(ends.readwrite()),
+                    &ranges,
+                    &residuals,
+                    &aggregations,
+                    false,
+                    false,
+                )
+                .unwrap();
+                black_box(result);
+            });
+        });
+        group.finish();
+    });
+}
+
+fn equi_very_large_rank_tree(c: &mut Criterion) {
+    bench_equi_rank_tree_only(c, "equi_rank_tree_64k", 65_536);
+    bench_equi_rank_tree_only(c, "equi_rank_tree_256k", 262_144);
+    bench_equi_rank_tree_only(c, "equi_rank_tree_1m", 1_048_576);
+}
+
 criterion_group!(
     benches,
     selective_second_predicate,
@@ -333,6 +372,7 @@ criterion_group!(
     equi_selective,
     equi_random,
     equi_broad,
-    equi_large_group
+    equi_large_group,
+    equi_very_large_rank_tree
 );
 criterion_main!(benches);
