@@ -1624,16 +1624,19 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use numpy::ndarray::Array1;
     use numpy::{PyArray1, PyArrayMethods};
-    use pyo3::Python;
+    use pyo3::{IntoPyObject, PyResult, Python};
 
     use super::{
         apply_equi_range_bound, build_equi_ne_indices_core, build_equi_only_indices_core,
         build_equi_range_indices_core, build_equi_uniq_residual_indices_core,
-        build_second_range_envelope, materialize_equi_windows, materialize_unordered_second_range,
-        narrow_unordered_second_range, unique_reverse_output_slots,
+        build_second_range_envelope, equi_aggregate, materialize_equi_windows,
+        materialize_unordered_second_range, narrow_unordered_second_range,
+        unique_reverse_output_slots,
     };
     use crate::compare_op::CompareOp;
     use crate::join_types::Keep;
+    use pyo3::exceptions::PyValueError;
+    use pyo3::types::{PyAnyMethods, PyList, PyListMethods, PyTuple, PyTupleMethods};
 
     #[test]
     fn reverse_unique_output_slots_collapse_aligned_duplicates() {
@@ -1643,6 +1646,64 @@ mod tests {
         assert_eq!(labels, vec![7, 3]);
         assert_eq!(slots.get(&7), Some(&0));
         assert_eq!(slots.get(&3), Some(&1));
+    }
+
+    #[test]
+    fn equi_aggregate_skips_eliminated_windows() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 101]);
+            let right_index = PyArray1::from_vec(py, vec![10_i64, 11]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, -1]);
+            let ends = PyArray1::from_vec(py, vec![2_i64, -1]);
+            let range = PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![2_i64, 100]).into_any(),
+                    PyArray1::from_vec(py, vec![3_i64, 4]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let ranges = PyList::new(py, [range])?;
+            let residuals = PyList::empty(py);
+            let aggregation = PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![10_i64, 13]).into_any(),
+                    PyArray1::from_vec(py, vec![false, false]).into_any(),
+                    "sum".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let aggregations = PyList::new(py, [aggregation])?;
+
+            let result = equi_aggregate(
+                py,
+                left_index.readonly(),
+                right_index.readonly(),
+                Some(starts.readwrite()),
+                Some(ends.readwrite()),
+                &ranges,
+                &residuals,
+                &aggregations,
+                true,
+                false,
+            )?
+            .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![100, 101]);
+            assert_eq!(
+                result.get_item(1)?.extract::<Vec<bool>>()?,
+                vec![true, false]
+            );
+            let sums = result
+                .get_item(2)?
+                .cast::<PyList>()?
+                .get_item(0)?
+                .extract::<Vec<i64>>()?;
+            assert_eq!(sums, vec![23, 0]);
+            Ok(())
+        })
+        .unwrap();
     }
     use crate::predicate::PredicateView;
     use crate::range_predicate::{AnyParsedRangePredicate, ParsedRangePredicate};
