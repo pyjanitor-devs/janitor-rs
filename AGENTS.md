@@ -415,6 +415,14 @@ work, while one width-eight query makes that regression obvious.
 
 ## Learned Patterns
 
+### [2026-10-12] Dual-region keep selection uses right-index values
+
+For the standalone dual-region index builder, `keep="first"` and
+`keep="last"` select the minimum or maximum actual `right_index` value among
+matching candidates. They must not use the physical position in the sorted or
+aligned right value array, because right-index labels are unique but are not
+guaranteed to be ordered.
+
 - Region aggregation consumes every pair passing the primary and residual
   predicates. `Keep` selection semantics (`all`, `first`, `last`, `any`) apply
   only to index-returning paths and must not be part of the aggregation API.
@@ -1363,3 +1371,65 @@ because their public Rust signatures mirror those kernel inputs.
 default threshold -- don't reach for this allow as a shortcut on a genuinely
 new function. Every other lint, and `-D warnings` itself, still applies in
 full.
+
+### [2026-10-10] Equi second-range extrema only support range comparisons
+
+The cumulative-envelope fast path in `src/equi_join.rs` is used only for the
+unordered second range predicate, and it is built from the post-first-range
+windows. Equality and inequality belong to the equi/residual paths and must
+not be added to that classifier.
+
+### [2026-10-10] Use the Rust test wrapper for local execution
+
+The raw `cargo test` command can compile successfully and then fail at runtime
+on macOS because it does not configure the selected Python library path. Always
+use `./scripts/test-rust.sh`; it selects Python 3.12, installs NumPy, sets
+`PYO3_PYTHON`, and exports the required dyld library path.
+
+### [2026-10-12] N-region right alignment is a paired Python/Rust contract
+
+**Context**: The three-or-more-range region endpoint was added alongside the
+dual-region endpoint. PyJanitor sorts each right range independently, while
+the first range defines the global right layout.
+
+**Learning**: `n_region_indices` receives the first predicate separately,
+followed by parallel `range_predicates` and `aligners` lists. Each aligner is
+the gather permutation from global right position to that predicate's sorted
+right position. Rust validates lengths and permutation safety but does not sort
+or infer the alignment. The first predicate must provide the monotonic global
+search path; later predicates are checked against the active candidates.
+
+**Recommendation**: Keep the Python dispatcher and Rust signature synchronized,
+and test the n-region path with independently shuffled right columns,
+duplicates, no matches, all keep modes, and a brute-force reference.
+
+### [2026-10-13] Keep n-region unchanged while adding dual maxima filtering
+
+**Context**: A cumulative right-region maximum was proposed as an early
+rejection before ranked dual-region searches. This optimization is for the
+dual paths only; the n-region implementation already has its own multi-path
+maximum checks and must not be changed as part of this work.
+
+**Recommendation**: Apply the cumulative-max filter to dual-region paths
+without modifying the n-region traversal or setup.
+### [2026-10-14] Equality-led range joins use negative windows as no-match sentinels
+
+**Context**: Reviewing the equality-led conditional-join kernels found that
+`starts`/`ends` can contain negative values after a range predicate removes
+all candidates for a left row. Treating those values as malformed input in
+the later candidate loop caused `join_agg` to raise instead of returning an
+unmatched row.
+
+**Learning**: In the three equality-led range paths
+(`build_equi_range_indices_core`,
+`build_equi_range_and_residual_indices_core`, and `equi_aggregate`), negative
+prepared windows are the established “no candidates” sentinel and must be
+skipped. Nonnegative windows still require ordinary ordering and bounds
+validation before they are cast or searched. This is specific to these
+prepared equi-range windows; it does not change unrelated kernels that treat
+negative indices as invalid input.
+
+**Recommendation**: Validate each nonnegative input window before range
+narrowing, preserve negative windows as inactive rows, and skip them in every
+later materialization or aggregation loop. Add or retain regression coverage
+for a mix of active and `-1` windows.

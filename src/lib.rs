@@ -47,11 +47,17 @@ mod registration_tests {
                 .expect("module creation must not fail");
             janitor_rs(&module).expect("registration must not fail");
             for name in [
-                "equi_join_indices",
+                "equi_range_indices",
+                "equi_range_and_residual_indices",
+                "equi_uniq_residual_indices",
+                "equi_aggregate",
                 "not_equals_aggregate_int64",
                 "range_join_indices",
                 "single_range_predicate_indices_int64",
-                "region_indices",
+                "dual_regions_indices",
+                "dual_regions_and_residual_indices",
+                "n_region_indices",
+                "n_region_and_residual_indices",
             ] {
                 assert!(module.getattr(name).is_ok(), "missing export: {name}");
             }

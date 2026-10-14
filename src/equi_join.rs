@@ -1,496 +1,104 @@
-//! Standalone issue #218 equi positional core.
+//! Materialize indices for equality-led conditional joins.
 //!
-//! PyJanitor owns scalar/MultiIndex construction, `get_indexer`, factorization,
-//! null semantics, sorting, and the mapping from sorted physical positions to
-//! original right positions. This file owns only duplicate-right equi matching.
+//! PyJanitor supplies one of two positional layouts:
 //!
-//! The Python side passes two related coordinate systems into this module:
+//! * unique equality keys: `left_index[i]` is aligned directly with
+//!   `right_index[i]`; and
+//! * duplicate equality keys: `starts[i]..ends[i]` is a half-open window into
+//!   `right_index` for `left_index[i]`.
 //!
-//! * `right_codes` contains one dense factorization code for each physical
-//!   right row. The code identifies the equi-key group for that row.
-//! * `right_index` contains the right labels to emit. It has the same physical
-//!   row order as `right_codes`, but it is not itself a factorization code.
-//!
-//! `left_indexer` contains one code per left row. `-1` means that
-//! `get_indexer` found no equi-key match and produces no output for that row.
-//! Nonnegative codes are looked up in the dense right-side metadata below.
-//!
-//! The `Keep::All` representation uses a flat positions array rather than a
-//! `Vec<Vec<usize>>`. `offsets[code]..offsets[code + 1]` identifies the slice
-//! in that flat array belonging to one code. This avoids one heap allocation
-//! per distinct equi key.
+//! The unique layout is deliberately window-free. It is used when the right
+//! equality keys are unique, including when range or residual predicates are
+//! evaluated on the already-aligned rows. The window layout is used when a
+//! left row may match multiple right rows.
+
+use numpy::ndarray::{s, ArrayView1, ArrayViewMut1};
+use numpy::{PyReadonlyArray1, PyReadwriteArray1};
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList, PyTuple};
+use std::cmp::Ordering;
+use std::collections::{hash_map::Entry, HashMap};
 
 use crate::aggregation_common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
 use crate::aggregation_common::ensure_equal_lengths_core;
-use crate::join_search::range_window;
-use crate::join_types::Keep;
+use crate::compare_op::CompareOp;
+use crate::join_search::partition_point_between;
+use crate::join_types::{result_dict, Keep};
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
-    predicates_match_dispatch, Predicate,
+    predicates_match_dispatch, NullMetadataView, Predicate, PredicateView,
 };
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
-use numpy::{ndarray::ArrayView1, PyArray1, PyReadonlyArray1};
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
 
-/// Dense lookup metadata for factorized right-side equi keys.
-///
-/// Each nonnegative factorization code is a direct index into the metadata
-/// vectors. The `All` representation stores every physical right position for
-/// a code in one flat buffer; `offsets[code]..offsets[code + 1]` identifies the
-/// corresponding slice. The single-position vectors are used by materialized
-/// joins with `Keep::Any`, `Keep::First`, or `Keep::Last`.
-#[derive(Debug)]
-pub(crate) struct DenseRightMetadata {
-    /// Dense code-to-physical-position metadata for one right layout.
-    ///
-    /// First and Last select by the emitted right label in right_index.
-    /// Any selects the first physical position encountered. All preserves
-    /// physical right-row order inside each code's flat position slice.
-    /// One physical right position for each code when `keep == Any`.
-    any: Vec<usize>,
-    /// The physical right position with the smallest right label for each
-    /// code when `keep == First`.
-    first: Vec<usize>,
-    /// The physical right position with the largest right label for each code
-    /// when `keep == Last`.
-    last: Vec<usize>,
-    /// Number of physical right rows for each code when `keep == All`.
-    pub(crate) counts: Vec<usize>,
-    /// Boundaries into `positions` when `keep == All`.
-    pub(crate) offsets: Vec<usize>,
-    /// Flattened physical right positions grouped by code when `keep == All`.
-    pub(crate) positions: Vec<usize>,
-}
+type IndexPairs = Option<(Vec<i64>, Vec<i64>)>;
 
-/// Optional materialized label pairs returned by an equi join.
-type EquiPairs = Option<(Vec<i64>, Vec<i64>)>;
-
-/// Decode an equi code while preserving `-1` as the no-match sentinel.
-///
-/// The caller supplies the side name so errors remain useful at the Python
-/// boundary. All nonnegative codes are returned as physical-position or
-/// metadata indexes; callers still apply any side-specific upper-bound check.
-pub(crate) fn decode_equi_code(code: i64, side: &str) -> Result<Option<usize>, String> {
-    if code < -1 {
-        return Err(format!("{side} codes must be greater than or equal to -1"));
-    }
-    if code == -1 {
-        return Ok(None);
-    }
-    usize::try_from(code)
-        .map(Some)
-        .map_err(|_| format!("invalid {side} code"))
-}
-
-/// Validate the public equi-join range-predicate contract.
-pub(crate) fn validate_equi_range_predicate_count(count: usize) -> PyResult<()> {
-    if count > 2 {
-        return Err(PyValueError::new_err(
-            "equi range path accepts at most two range predicates",
-        ));
-    }
-    Ok(())
-}
-
-/// Optional half-open range windows aligned one-for-one to left rows.
-pub(crate) type RangeWindows = Option<(Vec<usize>, Vec<usize>)>;
-
-/// Building blocks for a pure duplicate-right equi join.
-struct EquiBlocks {
-    left_index: Vec<i64>,
-    right_index: Vec<i64>,
-    left_indexer: Vec<i64>,
-    offsets: Vec<i64>,
-    positions: Vec<i64>,
-}
-
-/// Build the right-side lookup metadata needed by one `Keep` mode.
-///
-/// The factorization codes are expected to be dense: if the largest
-/// nonnegative code is `3`, the metadata has slots for codes `0` through `3`.
-/// A code slot may be empty if the caller supplies a sparse or malformed code
-/// sequence; the matching loop treats such a slot as having no match.
-///
-/// The selected mode controls which metadata is allocated:
-///
-/// * `Any` stores one physical position per code;
-/// * `First` stores the position with the smallest emitted right label;
-/// * `Last` stores the position with the largest emitted right label;
-/// * `All` stores counts, offsets, and one flat physical-position array.
-///
-/// # Arguments
-///
-/// * `right_index` - Emitted right labels in sorted physical-row order.
-/// * `right_codes` - One factorization code for each physical right row;
-///   `-1` rows are ignored.
-/// * `keep` - The output-selection mode that determines which metadata is
-///   necessary.
-///
-/// # Errors
-///
-/// Returns an error if the code and index arrays have different lengths, a
-/// code is below `-1`, a nonnegative code is outside the right physical
-/// layout, or if metadata sizes would overflow `usize`.
-pub(crate) fn build_dense_right_metadata(
-    right_index: ArrayView1<'_, i64>,
-    right_codes: ArrayView1<'_, i64>,
+/// Update one row's selected right position and report whether scanning may
+/// stop. `first` and `last` compare physical right labels, not sorted offsets.
+fn update_keep_selection(
+    selected: &mut Option<usize>,
+    candidate: usize,
     keep: Keep,
-) -> Result<DenseRightMetadata, String> {
-    ensure_equal_lengths_core(
-        "right index",
-        right_index.len(),
-        "right codes",
-        right_codes.len(),
-    )?;
-
-    // Validate every code before deriving `code_count`. In particular, an
-    // attacker-controlled i64::MAX must be rejected before it can become a
-    // vector length and trigger an enormous allocation.
-    for &raw_code in right_codes {
-        if let Some(code) = decode_equi_code(raw_code, "right")? {
-            if code >= right_index.len() {
-                return Err("right code exceeds the right index length".to_owned());
-            }
-        }
-    }
-
-    // Codes are zero-based, so the number of slots is the largest code plus
-    // one. `-1` is the no-match sentinel and does not create a slot.
-    let code_count = right_codes
-        .iter()
-        .copied()
-        .filter(|&code| code >= 0)
-        .max()
-        .map(|code| {
-            usize::try_from(code)
-                .map_err(|_| "right code is too large for the right index")?
-                .checked_add(1)
-                .ok_or("right code is too large for the right index")
-        })
-        .transpose()
-        .map_err(|_| "right code is too large for the right index")?
-        .unwrap_or(0);
-    // Allocate only the selected mode's single-position metadata. Keeping the
-    // other vectors empty avoids storing three copies of equivalent lookups.
-    // `usize::MAX` is an impossible physical position: valid positions are
-    // strictly less than `right_index.len()`, and an allocated array cannot
-    // have `usize::MAX` elements. It therefore safely represents "not set".
-    let mut any = if keep == Keep::Any {
-        vec![usize::MAX; code_count]
-    } else {
-        Vec::new()
-    };
-    let mut first = if keep == Keep::First {
-        vec![usize::MAX; code_count]
-    } else {
-        Vec::new()
-    };
-    let mut last = if keep == Keep::Last {
-        vec![usize::MAX; code_count]
-    } else {
-        Vec::new()
-    };
-    // Counts are needed only by `All`, where they determine both the flat
-    // storage size and each code's slice boundaries.
-    let mut counts: Vec<usize> = if keep == Keep::All {
-        vec![0; code_count]
-    } else {
-        Vec::new()
-    };
-    // Collect the mode-specific summary. The validation pass above already
-    // established the code invariant, so this pass does not re-check it.
-    for (position, &code) in right_codes.iter().enumerate() {
-        if code == -1 {
-            continue;
-        }
-        let code = usize::try_from(code).map_err(|_| "invalid right code")?;
-        if keep == Keep::All {
-            counts[code] = counts[code]
-                .checked_add(1)
-                .ok_or("equi join right metadata is too large")?;
-        }
-        if keep == Keep::Any && any[code] == usize::MAX {
-            any[code] = position;
-        }
-        if keep == Keep::First
-            && (first[code] == usize::MAX || right_index[position] < right_index[first[code]])
-        {
-            first[code] = position;
-        }
-        if keep == Keep::Last
-            && (last[code] == usize::MAX || right_index[position] > right_index[last[code]])
-        {
-            last[code] = position;
-        }
-    }
-
-    let (offsets, positions) = if keep == Keep::All {
-        // `offsets` has one more element than the number of codes because it
-        // stores both the start and the final end boundary. For code `c`, its
-        // positions live in `positions[offsets[c]..offsets[c + 1]]`.
-        let mut offsets: Vec<usize> = Vec::with_capacity(code_count + 1);
-        offsets.push(0);
-        for &count in &counts {
-            let next = offsets
-                .last()
-                .copied()
-                .unwrap_or(0)
-                .checked_add(count)
-                .ok_or("equi join right metadata is too large")?;
-            offsets.push(next);
-        }
-        // Allocate one contiguous buffer for all matching physical positions.
-        let mut positions = vec![0; *offsets.last().unwrap_or(&0)];
-        // Cursors begin at each code's start boundary and advance as positions
-        // are copied into the flat buffer. Keep `offsets` unchanged because it
-        // is the permanent lookup table.
-        let mut cursors = offsets[..code_count].to_vec();
-        // Second pass: preserve physical right-row order inside each code's
-        // flat slice. `-1` rows have no group and are skipped.
-        for (position, &code) in right_codes.iter().enumerate() {
-            if code == -1 {
-                continue;
-            }
-            let code = usize::try_from(code).map_err(|_| "invalid right code")?;
-            positions[cursors[code]] = position;
-            cursors[code] += 1;
-        }
-        (offsets, positions)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    Ok(DenseRightMetadata {
-        any,
-        first,
-        last,
-        counts,
-        offsets,
-        positions,
-    })
-}
-
-/// Return how many output pairs one left code contributes.
-///
-/// `None` means that the code is outside the metadata or has no right-side
-/// match. The result is `1` for the single-match modes and the group size for
-/// `Keep::All`. Keeping this logic in one helper makes the sizing pass and the
-/// output pass use exactly the same match-existence rules.
-fn matching_count(metadata: &DenseRightMetadata, code: usize, keep: Keep) -> Option<usize> {
+    right_index: ArrayView1<'_, i64>,
+) -> bool {
     match keep {
-        Keep::Any => metadata
-            .any
-            .get(code)
-            .filter(|&&position| position != usize::MAX)
-            .map(|_| 1),
-        Keep::First => metadata
-            .first
-            .get(code)
-            .filter(|&&position| position != usize::MAX)
-            .map(|_| 1),
-        Keep::Last => metadata
-            .last
-            .get(code)
-            .filter(|&&position| position != usize::MAX)
-            .map(|_| 1),
-        Keep::All => metadata
-            .counts
-            .get(code)
-            .copied()
-            .filter(|&count| count > 0),
-    }
-}
-
-/// Materialize a duplicate-right pure equi join.
-///
-/// The right metadata is keyed by dense factorization code. left_indexer
-/// supplies one such code per left row, with -1 meaning no candidate.
-/// First and Last compare emitted right labels; All emits physical right-row
-/// order within each code group.
-///
-/// # Arguments
-///
-/// * left_index - Public left labels aligned with left_indexer.
-/// * left_indexer - Dense right-key codes for left rows.
-/// * right_index - Public right labels in physical right-row order.
-/// * right_codes - Dense right-key codes aligned with right_index.
-/// * keep - Requested output selection mode.
-fn build_duplicate_equi_pairs_core(
-    left_index: ArrayView1<'_, i64>,
-    left_indexer: ArrayView1<'_, i64>,
-    right_index: ArrayView1<'_, i64>,
-    right_codes: ArrayView1<'_, i64>,
-    keep: Keep,
-) -> Result<EquiPairs, String> {
-    // Validate all parallel arrays before building metadata or entering either
-    // output pass. This makes the physical-row alignment explicit: every
-    // right code must describe exactly one right index entry, and every left
-    // indexer code must describe exactly one left index entry.
-    ensure_equal_lengths_core(
-        "left index",
-        left_index.len(),
-        "equi indexer",
-        left_indexer.len(),
-    )?;
-    ensure_equal_lengths_core(
-        "right index",
-        right_index.len(),
-        "duplicate codes",
-        right_codes.len(),
-    )?;
-    let metadata = build_dense_right_metadata(right_index, right_codes, keep)?;
-
-    // The single-match modes emit at most one result per left row. Their
-    // metadata already identifies the selected right position, so an exact
-    // sizing pass would only repeat the left-side scan. Allocate an upper
-    // bound and materialize each result in one pass instead.
-    if keep != Keep::All {
-        let mut left_output = Vec::with_capacity(left_indexer.len());
-        let mut right_output = Vec::with_capacity(left_indexer.len());
-        for row in 0..left_indexer.len() {
-            let Some(code) = decode_equi_code(left_indexer[row], "left")? else {
-                continue;
-            };
-            let selected = match keep {
-                Keep::Any => metadata.any.get(code),
-                Keep::First => metadata.first.get(code),
-                Keep::Last => metadata.last.get(code),
-                Keep::All => unreachable!("non-All branch selected Keep::All"),
+        Keep::Any => {
+            *selected = Some(candidate);
+            false
+        }
+        Keep::First => {
+            if selected.is_none_or(|current| right_index[candidate] < right_index[current]) {
+                *selected = Some(candidate);
             }
-            .copied()
-            .filter(|&position| position != usize::MAX);
-            let Some(position) = selected else {
-                continue;
-            };
-            left_output.push(left_index[row]);
-            right_output.push(right_index[position]);
+            true
         }
-        if left_output.is_empty() {
-            return Ok(None);
+        Keep::Last => {
+            if selected.is_none_or(|current| right_index[candidate] > right_index[current]) {
+                *selected = Some(candidate);
+            }
+            true
         }
-        debug_assert_eq!(left_output.len(), right_output.len());
-        return Ok(Some((left_output, right_output)));
+        Keep::All => unreachable!("keep='all' uses the all-matches path"),
     }
-
-    // First pass: calculate the exact number of output pairs. This lets the
-    // second pass allocate both result vectors once, with no growth or
-    // reallocation during matching. Keep::All is the only mode that can emit
-    // more than one result per left row, so it is the only mode that needs
-    // this exact sizing pass.
-    let mut output_len = 0_usize;
-    for row in 0..left_indexer.len() {
-        let Some(code) = decode_equi_code(left_indexer[row], "left")? else {
-            continue;
-        };
-        let Some(count) = matching_count(&metadata, code, keep) else {
-            continue;
-        };
-        output_len = output_len
-            .checked_add(count)
-            .ok_or("equi join output is too large")?;
-    }
-    if output_len == 0 {
-        return Ok(None);
-    }
-
-    let mut left_output = Vec::with_capacity(output_len);
-    let mut right_output = Vec::with_capacity(output_len);
-    // Second pass: materialize the labels selected by `keep`. The metadata
-    // stores physical right positions; `right_index[position]` converts each
-    // selected physical position to the label returned to Python.
-    for row in 0..left_indexer.len() {
-        let Some(code) = decode_equi_code(left_indexer[row], "left")? else {
-            continue;
-        };
-        if matching_count(&metadata, code, keep).is_none() {
-            continue;
-        }
-        let positions = match keep {
-            Keep::Any => std::slice::from_ref(&metadata.any[code]),
-            Keep::First => std::slice::from_ref(&metadata.first[code]),
-            Keep::Last => std::slice::from_ref(&metadata.last[code]),
-            Keep::All => &metadata.positions[metadata.offsets[code]..metadata.offsets[code + 1]],
-        };
-        for &position in positions {
-            left_output.push(left_index[row]);
-            right_output.push(right_index[position]);
-        }
-    }
-    debug_assert_eq!(left_output.len(), output_len);
-    debug_assert_eq!(right_output.len(), output_len);
-    Ok(Some((left_output, right_output)))
 }
 
-/// Build equi-match building blocks without materializing label pairs.
+/// Return the unique reverse-output labels and their dense aggregation slots.
 ///
-/// The returned offsets and positions are code-level metadata. They describe
-/// physical right positions, while left_index and right_index retain the
-/// public labels needed by downstream PyJanitor code.
-fn build_duplicate_equi_blocks_core(
-    left_index: ArrayView1<'_, i64>,
-    left_indexer: ArrayView1<'_, i64>,
+/// The unique-equality Python preparation aligns one right label beside every
+/// surviving left row. Repeated left keys therefore repeat the same right
+/// label. Reverse aggregation must collapse those repeated labels back to one
+/// output slot before updating the aggregation state.
+fn unique_reverse_output_slots(
     right_index: ArrayView1<'_, i64>,
-    right_equi_codes: ArrayView1<'_, i64>,
-) -> Result<Option<EquiBlocks>, String> {
-    ensure_equal_lengths_core(
-        "left index",
-        left_index.len(),
-        "equi indexer",
-        left_indexer.len(),
-    )?;
-    ensure_equal_lengths_core(
-        "right index",
-        right_index.len(),
-        "right equi codes",
-        right_equi_codes.len(),
-    )?;
-
-    let metadata = build_dense_right_metadata(right_index, right_equi_codes, Keep::All)?;
-    let mut matched = false;
-
-    for &left_code in left_indexer {
-        let Some(code) = decode_equi_code(left_code, "left")? else {
-            continue;
-        };
-        if metadata.counts.get(code).copied().unwrap_or(0) > 0 {
-            matched = true;
+) -> (Vec<i64>, HashMap<i64, usize>) {
+    let mut labels = Vec::with_capacity(right_index.len());
+    let mut slots = HashMap::with_capacity(right_index.len());
+    for &label in right_index {
+        if let Entry::Vacant(entry) = slots.entry(label) {
+            let slot = labels.len();
+            labels.push(label);
+            entry.insert(slot);
         }
     }
-
-    if !matched {
-        return Ok(None);
-    }
-    let offsets = metadata
-        .offsets
-        .iter()
-        .copied()
-        .map(|offset| i64::try_from(offset).map_err(|_| "equi join offsets exceed int64 capacity"))
-        .collect::<Result<Vec<_>, _>>()?;
-    let positions = metadata
-        .positions
-        .iter()
-        .copied()
-        .map(|position| {
-            i64::try_from(position).map_err(|_| "right position exceeds int64 capacity")
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(EquiBlocks {
-        left_index: left_index.to_vec(),
-        right_index: right_index.to_vec(),
-        left_indexer: left_indexer.to_vec(),
-        offsets,
-        positions,
-    }))
+    (labels, slots)
 }
 
-/// Find the first element in a sorted physical-position slice that is at
-/// least `target`.
-fn lower_bound(values: &[usize], target: usize) -> usize {
-    values.partition_point(|&value| value < target)
+pub fn validate_start_end(
+    start: i64,
+    end: i64,
+    right_index_len: usize,
+) -> Result<(usize, usize), String> {
+    let start = usize::try_from(start).map_err(|_| "start must be non-negative")?;
+    let end = usize::try_from(end).map_err(|_| "end must be non-negative")?;
+    if start > end {
+        return Err("start must not exceed end".to_owned());
+    }
+    if end > right_index_len {
+        return Err("end exceeds right index length".to_owned());
+    }
+    Ok((start, end))
 }
 
 /// Parse the three-field range tuples used by the equi entry points.
@@ -521,653 +129,919 @@ pub(crate) fn parse_equi_range_predicates<'py>(
         .collect()
 }
 
-/// Build one range predicate's half-open physical windows.
-///
-/// The value arrays are already aligned and the right values are already
-/// sorted by PyJanitor. This helper performs only validation and typed binary
-/// searches; it does not copy index labels or construct a building-block
-/// result.
-pub(crate) fn build_equi_range_bounds<'py>(
-    range: &AnyParsedRangePredicate<'py>,
-) -> Result<(Vec<usize>, Vec<usize>), String> {
-    range.validate_range_operator()?;
-    range.validate_lengths()?;
-    let left_len = range.left_len();
+/// Validate the public equi-join range-predicate contract.
+pub(crate) fn validate_equi_range_predicate_count(count: usize) -> PyResult<()> {
+    if count > 2 {
+        return Err(PyValueError::new_err(
+            "equi range path accepts at most two range predicates",
+        ));
+    }
+    Ok(())
+}
 
-    macro_rules! build_bounds {
+/// Apply one or two range predicates to equality windows and materialize pairs.
+///
+/// The first predicate is applied with a binary search over the right values,
+/// which are sorted for that predicate. If a second predicate is unordered,
+/// its post-first windows are narrowed with a cumulative min/max envelope and
+/// a second binary search before the exact predicate scan.
+///
+/// # Arguments
+///
+/// * `left_index` - Physical left-row labels for the compact left layout.
+/// * `right_index` - Physical right-row labels for the compact right layout.
+/// * `starts` - Mutable half-open right-window starts, aligned with
+///   `left_index`.
+/// * `ends` - Mutable half-open right-window ends, aligned with `left_index`.
+/// * `first_range` - The range predicate whose right values are sorted.
+/// * `second_range` - An optional second range predicate in the same layout.
+/// * `keep` - Match retention policy for final materialization.
+///
+/// # Errors
+///
+/// Returns an error for mismatched lengths, invalid windows, or a non-range
+/// comparator passed through the range path.
+fn build_equi_range_indices_core(
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    mut starts: ArrayViewMut1<'_, i64>,
+    mut ends: ArrayViewMut1<'_, i64>,
+    first_range: &AnyParsedRangePredicate<'_>,
+    second_range: Option<&AnyParsedRangePredicate<'_>>,
+    keep: Keep,
+) -> Result<IndexPairs, String> {
+    ensure_equal_lengths_core("left index", left_index.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("left index", left_index.len(), "ends", ends.len())?;
+    // Keep the equality windows intact: the first range narrows `starts` and
+    // `ends` in place, but the unordered second-range envelope must be built
+    // from the original group window rather than from overlapping narrowed
+    // windows that can overwrite one another.
+    let equality_windows = second_range.map(|_| (starts.to_owned(), ends.to_owned()));
+    for (&start, &end) in starts.iter().zip(ends.iter()) {
+        if start < 0 || end < 0 {
+            continue;
+        }
+        validate_start_end(start, end, right_index.len())?;
+    }
+    let has_active_window = apply_equi_range_windows(
+        first_range,
+        starts.view_mut(),
+        ends.view_mut(),
+        right_index.len(),
+    )?;
+    if !has_active_window {
+        return Ok(None);
+    }
+    if let Some(second_range) = second_range {
+        validate_equi_range_inputs(second_range, starts.len(), right_index.len())?;
+        if range_is_monotonic_for_windows(second_range, starts.view(), ends.view()) {
+            let has_active_window = apply_equi_range_windows(
+                second_range,
+                starts.view_mut(),
+                ends.view_mut(),
+                right_index.len(),
+            )?;
+            if !has_active_window {
+                return Ok(None);
+            }
+        } else {
+            let (equality_starts, equality_ends) = equality_windows
+                .as_ref()
+                .expect("second range must retain the equality windows");
+            return materialize_unordered_second_range(
+                left_index,
+                right_index,
+                starts.view_mut(),
+                ends.view_mut(),
+                second_range,
+                equality_starts.view(),
+                equality_ends.view(),
+                keep,
+            );
+        }
+    }
+
+    materialize_equi_windows(left_index, right_index, starts.view(), ends.view(), keep)
+}
+
+fn apply_equi_range_windows(
+    range: &AnyParsedRangePredicate<'_>,
+    starts: ArrayViewMut1<'_, i64>,
+    ends: ArrayViewMut1<'_, i64>,
+    right_index_len: usize,
+) -> Result<bool, String> {
+    validate_equi_range_inputs(range, starts.len(), right_index_len)?;
+
+    macro_rules! apply {
+        ($predicate:expr) => {{
+            let predicate = $predicate;
+            apply_equi_range_bound(
+                predicate.left.as_array(),
+                predicate.right.as_array(),
+                starts,
+                ends,
+                predicate.op,
+            )
+        }};
+    }
+    match range {
+        AnyParsedRangePredicate::I64(predicate) => apply!(predicate),
+        AnyParsedRangePredicate::I32(predicate) => apply!(predicate),
+        AnyParsedRangePredicate::I16(predicate) => apply!(predicate),
+        AnyParsedRangePredicate::I8(predicate) => apply!(predicate),
+        AnyParsedRangePredicate::U64(predicate) => apply!(predicate),
+        AnyParsedRangePredicate::U32(predicate) => apply!(predicate),
+        AnyParsedRangePredicate::U16(predicate) => apply!(predicate),
+        AnyParsedRangePredicate::U8(predicate) => apply!(predicate),
+        AnyParsedRangePredicate::F64(predicate) => apply!(predicate),
+        AnyParsedRangePredicate::F32(predicate) => apply!(predicate),
+    }
+}
+
+fn validate_equi_range_inputs(
+    range: &AnyParsedRangePredicate<'_>,
+    window_len: usize,
+    right_index_len: usize,
+) -> Result<(), String> {
+    range.validate_lengths()?;
+    ensure_equal_lengths_core("left values", range.left_len(), "windows", window_len)?;
+    ensure_equal_lengths_core(
+        "right values",
+        range.right_len(),
+        "right index",
+        right_index_len,
+    )?;
+    Ok(())
+}
+
+fn range_is_monotonic_for_windows(
+    range: &AnyParsedRangePredicate<'_>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+) -> bool {
+    macro_rules! check {
+        ($predicate:expr) => {{
+            let right = $predicate.right.as_array();
+            let mut bad_prefix = vec![0usize; right.len()];
+            for position in 1..right.len() {
+                bad_prefix[position] = bad_prefix[position - 1]
+                    + usize::from(!matches!(
+                        right[position - 1].partial_cmp(&right[position]),
+                        Some(Ordering::Less | Ordering::Equal)
+                    ));
+            }
+            for (&start, &end) in starts.iter().zip(ends.iter()) {
+                if start < 0 || end < 0 {
+                    continue;
+                }
+                let start = start as usize;
+                let end = end as usize;
+                if end > start + 1 && bad_prefix[end - 1] != bad_prefix[start] {
+                    return false;
+                }
+            }
+            true
+        }};
+    }
+
+    match range {
+        AnyParsedRangePredicate::I64(predicate) => check!(predicate),
+        AnyParsedRangePredicate::I32(predicate) => check!(predicate),
+        AnyParsedRangePredicate::I16(predicate) => check!(predicate),
+        AnyParsedRangePredicate::I8(predicate) => check!(predicate),
+        AnyParsedRangePredicate::U64(predicate) => check!(predicate),
+        AnyParsedRangePredicate::U32(predicate) => check!(predicate),
+        AnyParsedRangePredicate::U16(predicate) => check!(predicate),
+        AnyParsedRangePredicate::U8(predicate) => check!(predicate),
+        AnyParsedRangePredicate::F64(predicate) => check!(predicate),
+        AnyParsedRangePredicate::F32(predicate) => check!(predicate),
+    }
+}
+
+fn materialize_equi_windows(
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    keep: Keep,
+) -> Result<IndexPairs, String> {
+    materialize_equi_windows_and_residuals(
+        left_index,
+        right_index,
+        starts,
+        ends,
+        &[],
+        None,
+        None,
+        keep,
+    )
+}
+
+/// Materialize matches for an unordered second range predicate.
+///
+/// `starts` and `ends` already contain the windows surviving the first range.
+/// The function builds one cumulative envelope for each distinct active
+/// window, binary-searches that envelope to remove a provably impossible
+/// prefix or suffix, and then evaluates the original predicate exactly over
+/// the remaining window. The envelope is never treated as the final truth
+/// test.
+///
+/// PyJanitor filters nulls before entering this Rust path, so the supported
+/// inputs are expected to contain ordinary ordered values rather than `NaN`.
+///
+/// # Arguments
+///
+/// * `left_index` - Physical left-row labels aligned with the predicate's
+///   left values.
+/// * `right_index` - Physical right-row labels aligned with the predicate's
+///   right values.
+/// * `starts` - Mutable post-first-range half-open windows.
+/// * `ends` - Mutable post-first-range half-open windows.
+/// * `range` - The unordered second range predicate.
+/// * `equality_starts` - Original equality-window starts, captured before the
+///   first range narrows the mutable windows.
+/// * `equality_ends` - Original equality-window ends, paired with
+///   `equality_starts`.
+/// * `keep` - Match retention policy after exact filtering.
+///
+/// # Returns
+///
+/// `None` when no exact matches survive; otherwise the physical left/right
+/// index pairs selected by `keep`.
+#[allow(clippy::too_many_arguments)]
+fn materialize_unordered_second_range(
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    mut starts: ArrayViewMut1<'_, i64>,
+    mut ends: ArrayViewMut1<'_, i64>,
+    range: &AnyParsedRangePredicate<'_>,
+    equality_starts: ArrayView1<'_, i64>,
+    equality_ends: ArrayView1<'_, i64>,
+    keep: Keep,
+) -> Result<IndexPairs, String> {
+    if !narrow_unordered_second_range_for_predicate(
+        range,
+        equality_starts,
+        equality_ends,
+        starts.view_mut(),
+        ends.view_mut(),
+    )? {
+        return Ok(None);
+    }
+
+    macro_rules! materialize {
         ($predicate:expr) => {{
             let predicate = $predicate;
             let left = predicate.left.as_array();
             let right = predicate.right.as_array();
-            let mut starts = Vec::with_capacity(left_len);
-            let mut ends = Vec::with_capacity(left_len);
-            for &value in left {
-                let (start, end) = range_window(value, right, predicate.op);
-                starts.push(start);
-                ends.push(end);
-            }
-            Ok((starts, ends))
-        }};
-    }
-    match range {
-        AnyParsedRangePredicate::I64(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::I32(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::I16(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::I8(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::U64(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::U32(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::U16(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::U8(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::F64(predicate) => build_bounds!(predicate),
-        AnyParsedRangePredicate::F32(predicate) => build_bounds!(predicate),
-    }
-}
-
-/// Build one or two range windows without dropping empty left rows.
-///
-/// The existing dual-range materializer removes empty windows because that is
-/// convenient for ordinary range joins. Equi matching cannot do that: the
-/// `left_indexer` remains aligned to the original left rows. This helper keeps
-/// one `[start, end)` pair per left row and intersects the second range in
-/// place when both ranges share the same physical right layout.
-/// When `ranges` is empty, it returns `None` rather than allocating synthetic
-/// full-right windows.
-pub(crate) fn build_equi_range_windows<'py>(
-    ranges: &[AnyParsedRangePredicate<'py>],
-) -> Result<RangeWindows, String> {
-    if ranges.len() > 2 {
-        return Err("equi range path accepts at most two range predicates".to_owned());
-    }
-    if ranges.is_empty() {
-        return Ok(None);
-    }
-
-    let first = build_equi_range_bounds(&ranges[0])?;
-    let mut starts = first.0;
-    let mut ends = first.1;
-    if let Some(second) = ranges.get(1) {
-        let second = build_equi_range_bounds(second)?;
-        ensure_equal_lengths_core(
-            "first range windows",
-            starts.len(),
-            "second range windows",
-            second.0.len(),
-        )?;
-        for row in 0..starts.len() {
-            starts[row] = starts[row].max(second.0[row]);
-            ends[row] = ends[row].min(second.1[row]);
-        }
-    }
-    Ok(Some((starts, ends)))
-}
-
-/// Return the physical right positions for one equi code after its range
-/// window has been applied.
-///
-/// The returned slice borrows the dense metadata and remains ordered by
-/// physical right position. Empty or unknown code groups return an empty
-/// slice; invalid range windows return an error.
-pub(crate) fn equi_candidate_slice<'a>(
-    code: usize,
-    metadata: &'a DenseRightMetadata,
-    windows: Option<(&[usize], &[usize])>,
-    row: usize,
-    right_len: usize,
-) -> Result<&'a [usize], String> {
-    if metadata.counts.get(code).copied().unwrap_or(0) == 0 {
-        return Ok(&[]);
-    }
-    let Some(&group_start) = metadata.offsets.get(code) else {
-        return Ok(&[]);
-    };
-    let group_end = metadata.offsets[code + 1];
-    let group = &metadata.positions[group_start..group_end];
-    let Some((starts, ends)) = windows else {
-        return Ok(group);
-    };
-    if ends[row] > right_len {
-        return Err("equi range window is out of bounds".to_owned());
-    }
-    if starts[row] >= ends[row] {
-        return Ok(&[]);
-    }
-    let first = lower_bound(group, starts[row]);
-    let last = lower_bound(group, ends[row]);
-    Ok(&group[first..last])
-}
-
-/// Visit duplicate-right equi candidates that survive the range window and
-/// residual predicates for one left row.
-///
-/// The right positions for one code are sorted physical positions. Two lower
-/// bounds therefore reduce the code slice to the intersection with the
-/// row's half-open range window before residual predicates are evaluated. When
-/// `windows` is `None`, the entire equi-code slice is used.
-#[allow(clippy::too_many_arguments)]
-fn visit_filtered_equi_candidates<F>(
-    row: usize,
-    left_code: i64,
-    metadata: &DenseRightMetadata,
-    windows: Option<(&[usize], &[usize])>,
-    right_len: usize,
-    predicates: &[crate::predicate::PredicateView<'_>],
-    null_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
-    mut visit: F,
-) -> Result<usize, String>
-where
-    F: FnMut(usize),
-{
-    let Some(code) = decode_equi_code(left_code, "left")? else {
-        return Ok(0);
-    };
-    if metadata.counts.get(code).copied().unwrap_or(0) == 0 {
-        return Ok(0);
-    }
-    let group = equi_candidate_slice(code, metadata, windows, row, right_len)?;
-    let mut count = 0_usize;
-    for &right_position in group {
-        if !predicates_match_dispatch(predicates, null_metadata, row, right_position) {
-            continue;
-        }
-        count = count
-            .checked_add(1)
-            .ok_or("equi join result size exceeds platform capacity")?;
-        visit(right_position);
-    }
-    Ok(count)
-}
-
-/// Materialize duplicate-right equi candidates after range and residual
-/// filtering.
-///
-/// All left-side inputs use one row coordinate system. The left indexer,
-/// optional windows, and predicate views must therefore have one entry per
-/// left row. The right index and metadata use one shared physical right
-/// coordinate system.
-///
-/// Keep::Any selects the first surviving physical candidate, while
-/// Keep::First and Keep::Last select the surviving candidate with the
-/// smallest or largest emitted right label. Keep::All preserves every
-/// surviving physical candidate.
-#[allow(clippy::too_many_arguments)]
-fn build_filtered_duplicate_equi_pairs_core(
-    left_index: ArrayView1<'_, i64>,
-    left_indexer: ArrayView1<'_, i64>,
-    right_index: ArrayView1<'_, i64>,
-    metadata: &DenseRightMetadata,
-    windows: Option<(&[usize], &[usize])>,
-    predicates: &[crate::predicate::PredicateView<'_>],
-    null_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
-    keep: Keep,
-) -> Result<EquiPairs, String> {
-    ensure_equal_lengths_core(
-        "left index",
-        left_index.len(),
-        "equi indexer",
-        left_indexer.len(),
-    )?;
-    if let Some((starts, ends)) = windows {
-        ensure_equal_lengths_core(
-            "equi starts",
-            starts.len(),
-            "left indexer",
-            left_indexer.len(),
-        )?;
-        ensure_equal_lengths_core("equi ends", ends.len(), "left indexer", left_indexer.len())?;
-    }
-
-    // A non-All keep emits at most one result for each left row. It does not
-    // need the exact result length, so select the result while visiting the
-    // candidates and evaluate residual predicates only once.
-    if keep != Keep::All {
-        let mut left_output = Vec::with_capacity(left_indexer.len());
-        let mut right_output = Vec::with_capacity(left_indexer.len());
-        for row in 0..left_indexer.len() {
-            let mut selected = None;
-            visit_filtered_equi_candidates(
-                row,
-                left_indexer[row],
-                metadata,
-                windows,
-                right_index.len(),
-                predicates,
-                null_metadata,
-                |right_position| match keep {
-                    Keep::Any => {
-                        if selected.is_none() {
-                            selected = Some(right_position);
+            if keep == Keep::All {
+                let mut output_capacity = 0_usize;
+                for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
+                    if start < 0 || end < 0 {
+                        continue;
+                    }
+                    let start = start as usize;
+                    let end = end as usize;
+                    for right_position in start..end {
+                        if predicate.op.apply(&left[row], &right[right_position]) {
+                            output_capacity = output_capacity
+                                .checked_add(1)
+                                .ok_or("equi-join result size exceeds platform capacity")?;
                         }
                     }
-                    Keep::First => {
-                        if selected.is_none()
-                            || right_index[right_position] < right_index[selected.unwrap()]
-                        {
-                            selected = Some(right_position);
+                }
+                if output_capacity == 0 {
+                    return Ok(None);
+                }
+                let mut left_output = Vec::with_capacity(output_capacity);
+                let mut right_output = Vec::with_capacity(output_capacity);
+                for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
+                    if start < 0 || end < 0 {
+                        continue;
+                    }
+                    let start = start as usize;
+                    let end = end as usize;
+                    for right_position in start..end {
+                        if predicate.op.apply(&left[row], &right[right_position]) {
+                            left_output.push(left_index[row]);
+                            right_output.push(right_index[right_position]);
                         }
                     }
-                    Keep::Last => {
-                        if selected.is_none()
-                            || right_index[right_position] > right_index[selected.unwrap()]
-                        {
-                            selected = Some(right_position);
-                        }
-                    }
-                    Keep::All => unreachable!("non-All branch selected Keep::All"),
-                },
-            )?;
-            if let Some(right_position) = selected {
-                left_output.push(left_index[row]);
-                right_output.push(right_index[right_position]);
+                }
+                return Ok(Some((left_output, right_output)));
             }
-        }
-        if left_output.is_empty() {
-            return Ok(None);
-        }
-        debug_assert_eq!(left_output.len(), right_output.len());
-        return Ok(Some((left_output, right_output)));
-    }
 
-    // Keep::All can produce an arbitrary number of pairs per left row. When
-    // there are no range windows or residual predicates, the dense equi
-    // metadata already contains the exact number of candidates for each left
-    // code. Compute that capacity without revisiting any predicates, avoiding
-    // repeated vector growth while retaining the single-pass materialization.
-    // Filtered paths continue to use the left-row count as an inexpensive
-    // capacity estimate because discovering their exact size would require
-    // evaluating the range and residual predicates a second time.
-    let output_capacity = if windows.is_none() && predicates.is_empty() {
-        let mut output_capacity = 0usize;
-        for &code in left_indexer.iter() {
-            if let Some(code) = decode_equi_code(code, "left")? {
-                output_capacity = output_capacity
-                    .checked_add(metadata.counts.get(code).copied().unwrap_or(0))
-                    .ok_or("equi join output is too large")?;
-            }
-        }
-        output_capacity
-    } else {
-        left_indexer.len()
-    };
-    let mut left_output = Vec::with_capacity(output_capacity);
-    let mut right_output = Vec::with_capacity(output_capacity);
-    for row in 0..left_indexer.len() {
-        visit_filtered_equi_candidates(
-            row,
-            left_indexer[row],
-            metadata,
-            windows,
-            right_index.len(),
-            predicates,
-            null_metadata,
-            |right_position| match keep {
-                Keep::All => {
+            let mut left_output = Vec::with_capacity(left_index.len());
+            let mut right_output = Vec::with_capacity(left_index.len());
+            for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
+                if start < 0 || end < 0 {
+                    continue;
+                }
+                let start = start as usize;
+                let end = end as usize;
+                let mut selected = None;
+                for right_position in start..end {
+                    if !predicate.op.apply(&left[row], &right[right_position]) {
+                        continue;
+                    }
+                    if !update_keep_selection(&mut selected, right_position, keep, right_index) {
+                        break;
+                    }
+                }
+                if let Some(right_position) = selected {
                     left_output.push(left_index[row]);
                     right_output.push(right_index[right_position]);
                 }
-                Keep::Any | Keep::First | Keep::Last => {
-                    unreachable!("Keep::All branch is the only branch used here")
-                }
-            },
-        )?;
+            }
+            if left_output.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some((left_output, right_output)))
+            }
+        }};
     }
-    if left_output.is_empty() {
-        return Ok(None);
+
+    match range {
+        AnyParsedRangePredicate::I64(predicate) => materialize!(predicate),
+        AnyParsedRangePredicate::I32(predicate) => materialize!(predicate),
+        AnyParsedRangePredicate::I16(predicate) => materialize!(predicate),
+        AnyParsedRangePredicate::I8(predicate) => materialize!(predicate),
+        AnyParsedRangePredicate::U64(predicate) => materialize!(predicate),
+        AnyParsedRangePredicate::U32(predicate) => materialize!(predicate),
+        AnyParsedRangePredicate::U16(predicate) => materialize!(predicate),
+        AnyParsedRangePredicate::U8(predicate) => materialize!(predicate),
+        AnyParsedRangePredicate::F64(predicate) => materialize!(predicate),
+        AnyParsedRangePredicate::F32(predicate) => materialize!(predicate),
     }
-    debug_assert_eq!(left_output.len(), right_output.len());
-    Ok(Some((left_output, right_output)))
 }
 
-/// Materialize the unique-right path after residual filtering.
+/// Build and apply the second-range envelope for already narrowed windows.
 ///
-/// A unique right equi indexer contains at most one physical right candidate
-/// per left row. Range predicates are supplied as residual predicates on this
-/// path, so no range windows or duplicate-position metadata are required.
-fn build_filtered_unique_equi_pairs_core(
-    left_index: ArrayView1<'_, i64>,
-    left_indexer: ArrayView1<'_, i64>,
-    right_index: ArrayView1<'_, i64>,
-    predicates: &[crate::predicate::PredicateView<'_>],
-    null_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
-) -> Result<EquiPairs, String> {
-    ensure_equal_lengths_core(
-        "left index",
-        left_index.len(),
-        "equi indexer",
-        left_indexer.len(),
-    )?;
-    let mut left_output = Vec::with_capacity(left_indexer.len());
-    let mut right_output = Vec::with_capacity(left_indexer.len());
-    for row in 0..left_indexer.len() {
-        let Some(right_position) = decode_equi_code(left_indexer[row], "left")? else {
-            continue;
-        };
-        if right_position >= right_index.len()
-            || !predicates_match_dispatch(predicates, null_metadata, row, right_position)
-        {
-            continue;
-        }
-        left_output.push(left_index[row]);
-        right_output.push(right_index[right_position]);
-    }
-    if left_output.is_empty() {
-        return Ok(None);
-    }
-    debug_assert_eq!(left_output.len(), right_output.len());
-    Ok(Some((left_output, right_output)))
-}
-
-/// Copy three-field range tuples into ordinary residual tuples.
-///
-/// The unique-right path has one equi candidate per left row, so a range
-/// predicate is simply another filter. The range tuple carries only its value
-/// arrays and operator; the global index arrays provide the shared physical
-/// coordinate system.
-pub(crate) fn append_range_residuals<'py>(
-    py: Python<'py>,
-    ranges: &Bound<'py, PyList>,
-    residuals: &Bound<'py, PyList>,
-) -> PyResult<Bound<'py, PyList>> {
-    let combined = PyList::empty(py);
-    for item in ranges.iter() {
-        let tuple = item.cast::<PyTuple>()?;
-        if tuple.len() != 3 {
-            return Err(PyValueError::new_err(
-                "equi range predicates must contain 3 elements",
-            ));
-        }
-        combined.append(item)?;
-    }
-    for item in residuals.iter() {
-        combined.append(item)?;
-    }
-    Ok(combined)
-}
-
-/// Build equi-join indices with optional range and residual predicates.
-///
-/// Range tuples use the PyJanitor three-field representation:
-///
-/// ```text
-/// (left_values, right_values, operator)
-/// ```
-///
-/// Residual tuples use the existing three- or six-field representation parsed
-/// by [`parse_predicates_with_nulls_strings`]. The six-field form is reserved
-/// for null-aware `!=` and retains the repository's existing null semantics.
-///
-/// Unique right keys use one direct candidate per left row. Duplicate right
-/// keys build dense physical-position metadata; range windows are binary
-/// searched inside the matching equi-code slice before residual predicates and
-/// `keep` are applied.
+/// This helper is shared by direct index materialization and duplicate-key
+/// aggregation. Both paths narrow candidate windows before the exact scan;
+/// the residual check remains necessary because the envelope is only a safe
+/// pruning proof.
 ///
 /// # Arguments
 ///
-/// * `left_index` - Global int64 left labels, aligned with `left_indexer` and
-///   all range/residual left arrays.
-/// * `right_index` - Global int64 right labels in the physical order used by
-///   `right_codes` and all range/residual right arrays.
-/// * `left_indexer` - Dense equi codes for left rows; `-1` means no match.
-/// * `right_equi_codes` - Optional dense right equi codes, one per right row.
-///   `None` selects the unique-right fast path.
-/// * `range_predicates` - Zero, one, or two three-field range tuples.
-/// * `residual_predicates` - Remaining three- or six-field predicate tuples.
-/// * `keep` - One of `"any"`, `"first"`, `"last"`, or `"all"`.
+/// * `range` - The unordered second range predicate and its aligned values.
+/// * `equality_starts` / `equality_ends` - Original equality windows used to
+///   build the cumulative envelope before the first range narrows candidates.
+/// * `starts` - Mutable post-first-range window starts.
+/// * `ends` - Mutable post-first-range window ends.
+///
+/// # Returns
+///
+/// `true` when at least one candidate window remains after envelope narrowing.
+fn narrow_unordered_second_range_for_predicate(
+    range: &AnyParsedRangePredicate<'_>,
+    equality_starts: ArrayView1<'_, i64>,
+    equality_ends: ArrayView1<'_, i64>,
+    starts: ArrayViewMut1<'_, i64>,
+    ends: ArrayViewMut1<'_, i64>,
+) -> Result<bool, String> {
+    macro_rules! narrow {
+        ($predicate:expr) => {{
+            let predicate = $predicate;
+            let left = predicate.left.as_array();
+            let right = predicate.right.as_array();
+            let use_cummax = matches!(predicate.op, CompareOp::Lt | CompareOp::Le);
+            let mut equality_windows = Vec::new();
+            let mut seen_windows = std::collections::HashSet::new();
+            for (&start, &end) in equality_starts.iter().zip(equality_ends.iter()) {
+                if start < 0 || end < 0 {
+                    continue;
+                }
+                let window = (start as usize, end as usize);
+                if seen_windows.insert(window) {
+                    equality_windows.push(window);
+                }
+            }
+            let envelope = build_second_range_envelope(right, &equality_windows, use_cummax);
+            narrow_unordered_second_range(left, &envelope, starts, ends, predicate.op)
+        }};
+    }
+
+    match range {
+        AnyParsedRangePredicate::I64(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::I32(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::I16(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::I8(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::U64(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::U32(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::U16(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::U8(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::F64(predicate) => narrow!(predicate),
+        AnyParsedRangePredicate::F32(predicate) => narrow!(predicate),
+    }
+}
+
+/// Build one cumulative envelope for each equality window.
+///
+/// The envelope is reset at every equality window, so values from a
+/// neighboring equality group cannot affect the binary search.
+///
+/// When `use_cummax` is true, the envelope is a prefix maximum and is
+/// non-decreasing. Otherwise it is a suffix minimum and is also
+/// non-decreasing when read from left to right.
+///
+/// # Arguments
+///
+/// * `values` - Unordered second-range values in the prepared right layout.
+/// * `equality_windows` - Distinct active post-first-range windows.
+/// * `use_cummax` - Select the prefix-maximum or suffix-minimum envelope.
+///
+/// # Returns
+///
+/// An envelope indexed in the same coordinate system as `values`.
+fn build_second_range_envelope<T: PartialOrd + Copy>(
+    values: ArrayView1<'_, T>,
+    equality_windows: &[(usize, usize)],
+    use_cummax: bool,
+) -> Vec<T> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let mut envelope = vec![values[0]; values.len()];
+    for &(start, end) in equality_windows {
+        if start >= end {
+            continue;
+        }
+        if use_cummax {
+            let mut current = values[start];
+            for position in start..end {
+                let value = values[position];
+                if matches!(value.partial_cmp(&current), Some(Ordering::Greater)) {
+                    current = value;
+                }
+                envelope[position] = current;
+            }
+        } else {
+            let mut current = values[end - 1];
+            for position in (start..end).rev() {
+                let value = values[position];
+                if matches!(value.partial_cmp(&current), Some(Ordering::Less)) {
+                    current = value;
+                }
+                envelope[position] = current;
+            }
+        }
+    }
+    envelope
+}
+
+/// Narrow the second-range windows using a monotonic cumulative envelope.
+///
+/// The raw second-range values may be unordered. The envelope only proves
+/// that a prefix or suffix cannot contain a match; the caller still performs
+/// the exact predicate check over the narrowed window.
+///
+/// # Arguments
+///
+/// * `left` - Second-range left values, one per active window.
+/// * `envelope` - Monotonic cumulative envelope in right-position space.
+/// * `starts` - Mutable post-first-range window starts.
+/// * `ends` - Mutable post-first-range window ends.
+/// * `op` - One of `<`, `<=`, `>`, or `>=`; equality operators are invalid.
+///
+/// # Returns
+///
+/// `true` when at least one narrowed window remains active.
+fn narrow_unordered_second_range<T: PartialOrd + Copy>(
+    left: ArrayView1<'_, T>,
+    envelope: &[T],
+    mut starts: ArrayViewMut1<'_, i64>,
+    mut ends: ArrayViewMut1<'_, i64>,
+    op: CompareOp,
+) -> Result<bool, String> {
+    let envelope = ArrayView1::from(envelope);
+    let mut has_active_window = false;
+    for row in 0..left.len() {
+        if starts[row] < 0 || ends[row] < 0 {
+            continue;
+        }
+        let old_start = starts[row] as usize;
+        let old_end = ends[row] as usize;
+        let boundary = match op {
+            // For left <(=) right, the prefix cummax is non-decreasing.
+            CompareOp::Lt => {
+                partition_point_between(envelope, old_start, old_end, |value| value <= left[row])
+            }
+            CompareOp::Le => {
+                partition_point_between(envelope, old_start, old_end, |value| value < left[row])
+            }
+            // For left >(=) right, the suffix cummin is non-decreasing.
+            CompareOp::Gt => {
+                partition_point_between(envelope, old_start, old_end, |value| value < left[row])
+            }
+            CompareOp::Ge => {
+                partition_point_between(envelope, old_start, old_end, |value| value <= left[row])
+            }
+            CompareOp::Eq | CompareOp::Ne => {
+                return Err("unordered second range requires a range comparator".to_owned())
+            }
+        };
+        match op {
+            CompareOp::Lt | CompareOp::Le => {
+                starts[row] = if boundary == old_end {
+                    -1
+                } else {
+                    has_active_window = true;
+                    boundary as i64
+                };
+            }
+            CompareOp::Gt | CompareOp::Ge => {
+                ends[row] = if boundary == old_start {
+                    -1
+                } else {
+                    has_active_window = true;
+                    boundary as i64
+                };
+            }
+            CompareOp::Eq | CompareOp::Ne => unreachable!(),
+        }
+    }
+    Ok(has_active_window)
+}
+
+fn range_matches_at(
+    range: &AnyParsedRangePredicate<'_>,
+    left_position: usize,
+    right_position: usize,
+) -> bool {
+    macro_rules! matches {
+        ($predicate:expr) => {
+            $predicate.op.apply(
+                &$predicate.left.as_array()[left_position],
+                &$predicate.right.as_array()[right_position],
+            )
+        };
+    }
+    match range {
+        AnyParsedRangePredicate::I64(predicate) => matches!(predicate),
+        AnyParsedRangePredicate::I32(predicate) => matches!(predicate),
+        AnyParsedRangePredicate::I16(predicate) => matches!(predicate),
+        AnyParsedRangePredicate::I8(predicate) => matches!(predicate),
+        AnyParsedRangePredicate::U64(predicate) => matches!(predicate),
+        AnyParsedRangePredicate::U32(predicate) => matches!(predicate),
+        AnyParsedRangePredicate::U16(predicate) => matches!(predicate),
+        AnyParsedRangePredicate::U8(predicate) => matches!(predicate),
+        AnyParsedRangePredicate::F64(predicate) => matches!(predicate),
+        AnyParsedRangePredicate::F32(predicate) => matches!(predicate),
+    }
+}
+
+fn apply_equi_range_bound<T: PartialOrd + Copy>(
+    left: ArrayView1<'_, T>,
+    right: ArrayView1<'_, T>,
+    mut starts: ArrayViewMut1<'_, i64>,
+    mut ends: ArrayViewMut1<'_, i64>,
+    op: CompareOp,
+) -> Result<bool, String> {
+    let mut has_active_window = false;
+    for row in 0..left.len() {
+        if starts[row] < 0 || ends[row] < 0 {
+            continue;
+        }
+        let old_start = starts[row] as usize;
+        let old_end = ends[row] as usize;
+        let boundary = match op {
+            CompareOp::Lt => {
+                partition_point_between(right, old_start, old_end, |value| value <= left[row])
+            }
+            CompareOp::Le => {
+                partition_point_between(right, old_start, old_end, |value| value < left[row])
+            }
+            CompareOp::Gt => {
+                partition_point_between(right, old_start, old_end, |value| value < left[row])
+            }
+            CompareOp::Ge => {
+                partition_point_between(right, old_start, old_end, |value| value <= left[row])
+            }
+            CompareOp::Eq | CompareOp::Ne => {
+                return Err("range bound requires a range comparator".to_owned())
+            }
+        };
+
+        match op {
+            CompareOp::Lt | CompareOp::Le => {
+                starts[row] = if boundary == old_end {
+                    -1
+                } else {
+                    has_active_window = true;
+                    boundary as i64
+                };
+            }
+            CompareOp::Gt | CompareOp::Ge => {
+                ends[row] = if boundary == old_start {
+                    -1
+                } else {
+                    has_active_window = true;
+                    boundary as i64
+                };
+            }
+            CompareOp::Eq | CompareOp::Ne => unreachable!(),
+        }
+    }
+    Ok(has_active_window)
+}
+
+#[pyfunction]
+pub fn equi_range_indices<'py>(
+    py: Python<'py>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    mut starts: PyReadwriteArray1<'py, i64>,
+    mut ends: PyReadwriteArray1<'py, i64>,
+    range_predicates: &Bound<'py, PyList>,
+    keep: &str,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    if range_predicates.is_empty() {
+        return Err(PyValueError::new_err("range_predicates must not be empty"));
+    }
+    validate_equi_range_predicate_count(range_predicates.len())?;
+    let keep = Keep::parse(keep)?;
+    let left_index_array = left_index;
+    let right_index_array = right_index;
+    let left_index = left_index_array.as_array();
+    let right_index = right_index_array.as_array();
+    let starts = starts.as_array_mut();
+    let ends = ends.as_array_mut();
+    let ranges = parse_equi_range_predicates(
+        range_predicates,
+        left_index_array.as_any(),
+        right_index_array.as_any(),
+    )?;
+    let first_range = ranges
+        .first()
+        .ok_or_else(|| PyValueError::new_err("missing first range predicate"))?;
+    let second_range = if ranges.len() == 2 {
+        Some(
+            ranges
+                .get(1)
+                .ok_or_else(|| PyValueError::new_err("missing second range predicate"))?,
+        )
+    } else {
+        None
+    };
+    let result = build_equi_range_indices_core(
+        left_index,
+        right_index,
+        starts,
+        ends,
+        first_range,
+        second_range,
+        keep,
+    )
+    .map_err(PyValueError::new_err)?;
+    result
+        .map(|(left, right)| result_dict(py, left, right, None, None))
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_equi_windows_and_residuals(
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    residual_predicates: &[PredicateView<'_>],
+    null_metadata: Option<&[NullMetadataView<'_>]>,
+    additional_range: Option<&AnyParsedRangePredicate<'_>>,
+    keep: Keep,
+) -> Result<IndexPairs, String> {
+    let matches = |row: usize, right_position: usize| {
+        predicates_match_dispatch(residual_predicates, null_metadata, row, right_position)
+            && additional_range
+                .map(|range| range_matches_at(range, row, right_position))
+                .unwrap_or(true)
+    };
+    if keep == Keep::All {
+        let mut output_capacity = 0_usize;
+        for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
+            if start < 0 || end < 0 {
+                continue;
+            }
+            for right_position in start as usize..end as usize {
+                if matches(row, right_position) {
+                    output_capacity = output_capacity
+                        .checked_add(1)
+                        .ok_or("equi-join result size exceeds platform capacity")?;
+                }
+            }
+        }
+        if output_capacity == 0 {
+            return Ok(None);
+        }
+        let mut left_output = Vec::with_capacity(output_capacity);
+        let mut right_output = Vec::with_capacity(output_capacity);
+        for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
+            if start < 0 || end < 0 {
+                continue;
+            }
+            for right_position in start as usize..end as usize {
+                if matches(row, right_position) {
+                    left_output.push(left_index[row]);
+                    right_output.push(right_index[right_position]);
+                }
+            }
+        }
+        return Ok(Some((left_output, right_output)));
+    }
+
+    let mut left_output = Vec::with_capacity(left_index.len());
+    let mut right_output = Vec::with_capacity(left_index.len());
+    for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
+        if start < 0 || end <= start {
+            continue;
+        }
+        let mut selected = None;
+        for right_position in start as usize..end as usize {
+            if !matches(row, right_position) {
+                continue;
+            }
+            if !update_keep_selection(&mut selected, right_position, keep, right_index) {
+                break;
+            }
+        }
+        if let Some(right_position) = selected {
+            left_output.push(left_index[row]);
+            right_output.push(right_index[right_position]);
+        }
+    }
+    if left_output.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some((left_output, right_output)))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_equi_range_and_residual_indices_core(
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    mut starts: ArrayViewMut1<'_, i64>,
+    mut ends: ArrayViewMut1<'_, i64>,
+    first_range: &AnyParsedRangePredicate<'_>,
+    second_range: Option<&AnyParsedRangePredicate<'_>>,
+    residual_predicates: &[PredicateView<'_>],
+    null_metadata: Option<&[NullMetadataView<'_>]>,
+    keep: Keep,
+) -> Result<IndexPairs, String> {
+    ensure_equal_lengths_core("left index", left_index.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("left index", left_index.len(), "ends", ends.len())?;
+    for (&start, &end) in starts.iter().zip(ends.iter()) {
+        if start < 0 || end < 0 {
+            continue;
+        }
+        validate_start_end(start, end, right_index.len())?;
+    }
+    let equality_windows = second_range.map(|_| (starts.to_owned(), ends.to_owned()));
+
+    let has_active_window = apply_equi_range_windows(
+        first_range,
+        starts.view_mut(),
+        ends.view_mut(),
+        right_index.len(),
+    )?;
+    if !has_active_window {
+        return Ok(None);
+    }
+    if let Some(second_range) = second_range {
+        validate_equi_range_inputs(second_range, starts.len(), right_index.len())?;
+        if range_is_monotonic_for_windows(second_range, starts.view(), ends.view()) {
+            let has_active_window = apply_equi_range_windows(
+                second_range,
+                starts.view_mut(),
+                ends.view_mut(),
+                right_index.len(),
+            )?;
+            if !has_active_window {
+                return Ok(None);
+            }
+        } else {
+            let (equality_starts, equality_ends) = equality_windows
+                .as_ref()
+                .expect("second range must retain the equality windows");
+            if !narrow_unordered_second_range_for_predicate(
+                second_range,
+                equality_starts.view(),
+                equality_ends.view(),
+                starts.view_mut(),
+                ends.view_mut(),
+            )? {
+                return Ok(None);
+            }
+            return materialize_equi_windows_and_residuals(
+                left_index,
+                right_index,
+                starts.view(),
+                ends.view(),
+                residual_predicates,
+                null_metadata,
+                Some(second_range),
+                keep,
+            );
+        }
+    }
+
+    materialize_equi_windows_and_residuals(
+        left_index,
+        right_index,
+        starts.view(),
+        ends.view(),
+        residual_predicates,
+        null_metadata,
+        None,
+        keep,
+    )
+}
+
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-pub fn equi_join_filtered_indices<'py>(
+pub fn equi_range_and_residual_indices<'py>(
     py: Python<'py>,
-    left_index: &Bound<'py, PyAny>,
-    right_index: &Bound<'py, PyAny>,
-    left_indexer: PyReadonlyArray1<'py, i64>,
-    right_equi_codes: Option<PyReadonlyArray1<'py, i64>>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    mut starts: PyReadwriteArray1<'py, i64>,
+    mut ends: PyReadwriteArray1<'py, i64>,
     range_predicates: &Bound<'py, PyList>,
     residual_predicates: &Bound<'py, PyList>,
     keep: &str,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
-    let keep = Keep::parse(keep)?;
-    let left_index_array = left_index.extract::<PyReadonlyArray1<'py, i64>>()?;
-    let right_index_array = right_index.extract::<PyReadonlyArray1<'py, i64>>()?;
+    if range_predicates.is_empty() {
+        return Err(PyValueError::new_err("range_predicates must not be empty"));
+    }
     validate_equi_range_predicate_count(range_predicates.len())?;
-
-    let (parsed, metadata) = if right_equi_codes.is_none() {
-        let combined = append_range_residuals(py, range_predicates, residual_predicates)?;
-        parse_predicates_with_nulls_strings(py, &combined)?
-    } else {
-        parse_predicates_with_nulls_strings(py, residual_predicates)?
-    };
-    check_predicate_lengths(
-        &parsed,
-        left_index_array.as_array().len(),
-        right_index_array.as_array().len(),
+    let keep = Keep::parse(keep)?;
+    let left_index_array = left_index;
+    let right_index_array = right_index;
+    let left_index = left_index_array.as_array();
+    let right_index = right_index_array.as_array();
+    let starts = starts.as_array_mut();
+    let ends = ends.as_array_mut();
+    let ranges = parse_equi_range_predicates(
+        range_predicates,
+        left_index_array.as_any(),
+        right_index_array.as_any(),
     )?;
+    let first_range = ranges
+        .first()
+        .ok_or_else(|| PyValueError::new_err("missing first range predicate"))?;
+    let second_range = if ranges.len() == 2 {
+        Some(
+            ranges
+                .get(1)
+                .ok_or_else(|| PyValueError::new_err("missing second range predicate"))?,
+        )
+    } else {
+        None
+    };
+    let (parsed, metadata) = parse_predicates_with_nulls_strings(py, residual_predicates)?;
+    check_predicate_lengths(&parsed, left_index.len(), right_index.len())?;
     let views: Vec<_> = parsed.iter().map(Predicate::view).collect();
     let metadata_views = metadata.as_deref().map(null_metadata_views);
-
-    let pairs = if let Some(right_codes) = right_equi_codes {
-        ensure_equal_lengths_core(
-            "right index",
-            right_index_array.as_array().len(),
-            "duplicate codes",
-            right_codes.as_array().len(),
-        )
-        .map_err(PyValueError::new_err)?;
-        let ranges = parse_equi_range_predicates(range_predicates, left_index, right_index)?;
-        let range_windows = build_equi_range_windows(&ranges).map_err(PyValueError::new_err)?;
-        let windows = range_windows
-            .as_ref()
-            .map(|(starts, ends)| (starts.as_slice(), ends.as_slice()));
-        let metadata = build_dense_right_metadata(
-            right_index_array.as_array(),
-            right_codes.as_array(),
-            Keep::All,
-        )
-        .map_err(PyValueError::new_err)?;
-        build_filtered_duplicate_equi_pairs_core(
-            left_index_array.as_array(),
-            left_indexer.as_array(),
-            right_index_array.as_array(),
-            &metadata,
-            windows,
-            &views,
-            metadata_views.as_deref(),
-            keep,
-        )
-        .map_err(PyValueError::new_err)?
-    } else {
-        build_filtered_unique_equi_pairs_core(
-            left_index_array.as_array(),
-            left_indexer.as_array(),
-            right_index_array.as_array(),
-            &views,
-            metadata_views.as_deref(),
-        )
-        .map_err(PyValueError::new_err)?
-    };
-
-    pairs
-        .map(|(left_output, right_output)| {
-            crate::join_types::result_dict(py, left_output, right_output, None, None)
-        })
-        .transpose()
-}
-
-/// Build indices for a pure equi join with duplicate right keys.
-///
-/// PyJanitor handles the unique-right case directly. This function is for the
-/// duplicate-right case, where Python has already factorized the right equi
-/// values and computed the left indexer.
-///
-/// `right_equi_codes` contains dense factorization codes, not emitted right
-/// labels. The emitted labels come from `right_index`. Both right arrays use
-/// the same physical row order.
-///
-/// # Arguments
-///
-/// * `py` - Python interpreter token used to build the result dictionary.
-/// * `left_index` - Original left labels, one per left row.
-/// * `right_index` - Original right labels in physical right-row order.
-/// * `left_indexer` - Dense right-key codes returned by the left lookup;
-///   `-1` means no equi match.
-/// * `right_equi_codes` - Dense right factorization codes, aligned one-for-one
-///   with `right_index`; `-1` entries are ignored.
-/// * `keep` - String form of the shared `Keep` mode: `"any"`, `"first"`,
-///   `"last"`, or `"all"`.
-///
-/// # Returns
-///
-/// `None` when no left row has a matching right key. Otherwise, returns the
-/// standard PyJanitor dictionary containing `left_index` and `right_index`
-/// output arrays.
-///
-/// # Errors
-///
-/// Raises `ValueError` for an invalid `keep` value, misaligned input lengths,
-/// codes below `-1`, or positional metadata that cannot be represented.
-#[pyfunction]
-pub fn equi_join_indices<'py>(
-    py: Python<'py>,
-    left_index: PyReadonlyArray1<'py, i64>,
-    right_index: PyReadonlyArray1<'py, i64>,
-    left_indexer: PyReadonlyArray1<'py, i64>,
-    right_equi_codes: PyReadonlyArray1<'py, i64>,
-    keep: &str,
-) -> PyResult<Option<Bound<'py, PyDict>>> {
-    let keep = Keep::parse(keep)?;
-    let pairs = build_duplicate_equi_pairs_core(
-        left_index.as_array(),
-        left_indexer.as_array(),
-        right_index.as_array(),
-        right_equi_codes.as_array(),
+    let result = build_equi_range_and_residual_indices_core(
+        left_index,
+        right_index,
+        starts,
+        ends,
+        first_range,
+        second_range,
+        &views,
+        metadata_views.as_deref(),
         keep,
     )
     .map_err(PyValueError::new_err)?;
-    pairs
-        .map(|(left_output, right_output)| {
-            crate::join_types::result_dict(py, left_output, right_output, None, None)
-        })
+    result
+        .map(|(left, right)| result_dict(py, left, right, None, None))
         .transpose()
 }
 
-/// Build pure duplicate-right equi-join blocks for PyJanitor.
+/// Aggregate candidates from the prepared equi layout.
 ///
-/// Unlike [`equi_join_indices`], this function does not materialize one pair
-/// for every matching left/right row. It returns the original labels, the
-/// original left indexer, and right-code metadata:
-///
-/// ```text
-/// positions[offsets[code] .. offsets[code + 1]]
-/// ```
-///
-/// `None` means no left equi code matched a non-empty right group. PyJanitor
-/// receives the dictionary unchanged; `keep`, ranges, residuals, and
-/// aggregation do not belong on this path.
+/// Unique equality matches use aligned left/right rows. Duplicate equality
+/// matches use `starts..ends` windows. A non-monotonic second range is first
+/// narrowed with the cumulative envelope, then remains an exact per-candidate
+/// residual check for correctness.
 #[pyfunction]
-pub fn equi_join_building_blocks<'py>(
+#[allow(clippy::too_many_arguments)]
+pub fn equi_aggregate<'py>(
     py: Python<'py>,
     left_index: PyReadonlyArray1<'py, i64>,
     right_index: PyReadonlyArray1<'py, i64>,
-    left_indexer: PyReadonlyArray1<'py, i64>,
-    right_equi_codes: PyReadonlyArray1<'py, i64>,
-) -> PyResult<Option<Bound<'py, PyDict>>> {
-    let blocks = build_duplicate_equi_blocks_core(
-        left_index.as_array(),
-        left_indexer.as_array(),
-        right_index.as_array(),
-        right_equi_codes.as_array(),
-    )
-    .map_err(PyValueError::new_err)?;
-
-    blocks
-        .map(|blocks| {
-            let result = PyDict::new(py);
-            result.set_item("left_index", PyArray1::from_vec(py, blocks.left_index))?;
-            result.set_item("right_index", PyArray1::from_vec(py, blocks.right_index))?;
-            result.set_item("left_indexer", PyArray1::from_vec(py, blocks.left_indexer))?;
-            result.set_item("offsets", PyArray1::from_vec(py, blocks.offsets))?;
-            result.set_item("positions", PyArray1::from_vec(py, blocks.positions))?;
-            Ok(result)
-        })
-        .transpose()
-}
-
-pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(equi_join_indices, m)?)?;
-    m.add_function(wrap_pyfunction!(equi_join_building_blocks, m)?)?;
-    m.add_function(wrap_pyfunction!(equi_join_filtered_indices, m)?)?;
-    m.add_function(wrap_pyfunction!(equi_join_aggregate, m)?)?;
-    Ok(())
-}
-
-/// Aggregate an equi-led join without materializing matching pairs.
-///
-/// PyJanitor supplies arrays in one shared physical coordinate system. The
-/// left indexer contains either direct right positions (unique right keys) or
-/// dense right-key codes (duplicate right keys). When duplicate codes are
-/// present, this function builds `DenseRightMetadata` once and visits only the
-/// physical right positions belonging to each left code. Optional range
-/// windows narrow those groups before residual predicates are evaluated.
-///
-/// Forward aggregation uses left rows as output slots and right rows as source
-/// values. Reverse aggregation uses right rows as output slots and left rows
-/// as source values. `AggregationSet` preserves the existing neutral values,
-/// null handling, extrema sentinels, and matched-mask semantics.
-///
-/// The output tuple follows the existing aggregation contract:
-/// `(output_positions, matched, aggregation_arrays)` when `return_matched` is
-/// true, and `(output_positions, aggregation_arrays)` otherwise. `None` means
-/// that no candidate survived the equi, range, and residual predicates.
-///
-/// # Arguments
-///
-/// * `py` - Python interpreter token required to create Python return values.
-/// * `left_index` - Int64 labels for the left physical layout, one per left
-///   predicate row.
-/// * `right_index` - Int64 labels for the right physical layout, one per
-///   physical right position. These labels may represent a sorted layout.
-/// * `left_indexer` - One int64 equi result per left row. `-1` means no equi
-///   candidate; otherwise it is a direct right position or dense right code.
-/// * `right_equi_codes` - Optional one-code-per-right-row array. `None` means
-///   right equi keys are unique; `Some` means duplicate-key metadata is
-///   required. Codes must be `-1` or nonnegative.
-/// * `range_predicates` - Zero, one, or two three-field tuples containing
-///   `(left_values, right_values, operator)`. With duplicate right keys, the
-///   tuples are used as range windows. With unique right keys, they are
-///   evaluated as residual predicates. Their right values must share the
-///   physical layout described by `right_index`.
-/// * `residual_predicates` - Remaining predicate tuples, including ordinary
-///   three-field comparisons and six-field null-aware `!=` comparisons.
-/// * `aggregations` - Non-empty Rust aggregation specifications prepared by
-///   PyJanitor, such as `sum`, `count`, `size`, `prod`, `min`, or `max`.
-/// * `return_matched` - Whether to include one boolean matched value per
-///   output slot.
-/// * `reverse` - Whether to aggregate left source values into right output
-///   slots instead of right source values into left output slots.
-///
-/// # Errors
-///
-/// Returns a Python `ValueError` for mismatched indexer/code lengths, invalid
-/// codes, malformed predicates, unsupported operators, invalid range windows,
-/// or missing aggregation specifications.
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-pub fn equi_join_aggregate<'py>(
-    py: Python<'py>,
-    left_index: &Bound<'py, PyAny>,
-    right_index: &Bound<'py, PyAny>,
-    left_indexer: PyReadonlyArray1<'py, i64>,
-    right_equi_codes: Option<PyReadonlyArray1<'py, i64>>,
+    starts: Option<PyReadwriteArray1<'py, i64>>,
+    ends: Option<PyReadwriteArray1<'py, i64>>,
     range_predicates: &Bound<'py, PyList>,
     residual_predicates: &Bound<'py, PyList>,
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    let left_index_array = left_index.extract::<PyReadonlyArray1<'py, i64>>()?;
-    let right_index_array = right_index.extract::<PyReadonlyArray1<'py, i64>>()?;
-    let left_index_values = left_index_array.as_array();
-    let right_index_values = right_index_array.as_array();
-    let left_indexer = left_indexer.as_array();
-
+    let left_index_array = left_index;
+    let right_index_array = right_index;
+    let left_index = left_index_array.as_array();
+    let right_index = right_index_array.as_array();
     let inputs = parse_inputs(aggregations)?;
     if inputs.is_empty() {
         return Err(PyValueError::new_err(
@@ -1175,99 +1049,153 @@ pub fn equi_join_aggregate<'py>(
         ));
     }
     validate_equi_range_predicate_count(range_predicates.len())?;
-    ensure_equal_lengths_core(
-        "left index",
-        left_index_values.len(),
-        "equi indexer",
-        left_indexer.len(),
-    )
-    .map_err(PyValueError::new_err)?;
-    let output_len = if reverse {
-        right_index_values.len()
+    if starts.is_some() != ends.is_some() {
+        return Err(PyValueError::new_err(
+            "starts and ends must be provided together",
+        ));
+    }
+
+    let (parsed, metadata) = parse_predicates_with_nulls_strings(py, residual_predicates)?;
+    check_predicate_lengths(&parsed, left_index.len(), right_index.len())?;
+    let views: Vec<_> = parsed.iter().map(Predicate::view).collect();
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
+    let ranges = parse_equi_range_predicates(
+        range_predicates,
+        left_index_array.as_any(),
+        right_index_array.as_any(),
+    )?;
+
+    let (reverse_output_positions, reverse_output_slots) = if reverse && starts.is_none() {
+        let (positions, slots) = unique_reverse_output_slots(right_index);
+        (Some(positions), Some(slots))
     } else {
-        left_index_values.len()
+        (None, None)
+    };
+    let output_len = if let Some(positions) = &reverse_output_positions {
+        positions.len()
+    } else if reverse {
+        right_index.len()
+    } else {
+        left_index.len()
     };
     let source_len = if reverse {
-        left_index_values.len()
+        left_index.len()
     } else {
-        right_index_values.len()
+        right_index.len()
     };
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
 
-    let (parsed, metadata, windows, groups) = if let Some(right_codes) = right_equi_codes {
-        ensure_equal_lengths_core(
-            "right index",
-            right_index_values.len(),
-            "right equi codes",
-            right_codes.as_array().len(),
-        )
-        .map_err(PyValueError::new_err)?;
-        let (parsed, metadata) = parse_predicates_with_nulls_strings(py, residual_predicates)?;
-        let ranges = parse_equi_range_predicates(range_predicates, left_index, right_index)?;
-        let windows = build_equi_range_windows(&ranges).map_err(PyValueError::new_err)?;
-        let groups =
-            build_dense_right_metadata(right_index_values, right_codes.as_array(), Keep::All)
-                .map_err(PyValueError::new_err)?;
-        (parsed, metadata, windows, Some(groups))
-    } else {
-        let combined = append_range_residuals(py, range_predicates, residual_predicates)?;
-        let (parsed, metadata) = parse_predicates_with_nulls_strings(py, &combined)?;
-        (parsed, metadata, None, None)
-    };
-
-    check_predicate_lengths(&parsed, left_index_values.len(), right_index_values.len())?;
-    let views = parsed.iter().map(Predicate::view).collect::<Vec<_>>();
-    let metadata_views = metadata.as_deref().map(null_metadata_views);
-    let windows = windows
-        .as_ref()
-        .map(|(starts, ends)| (starts.as_slice(), ends.as_slice()));
-
-    if let Some(groups) = groups {
-        for row in 0..left_indexer.len() {
-            let Some(code) =
-                decode_equi_code(left_indexer[row], "left").map_err(PyValueError::new_err)?
-            else {
+    let mut starts_owner = starts;
+    let mut ends_owner = ends;
+    let mut starts = starts_owner.as_mut().map(|values| values.as_array_mut());
+    let mut ends = ends_owner.as_mut().map(|values| values.as_array_mut());
+    let mut demoted_second = None;
+    if let (Some(starts), Some(ends)) = (starts.as_mut(), ends.as_mut()) {
+        ensure_equal_lengths_core("left index", left_index.len(), "starts", starts.len())
+            .map_err(PyValueError::new_err)?;
+        ensure_equal_lengths_core("left index", left_index.len(), "ends", ends.len())
+            .map_err(PyValueError::new_err)?;
+        for (&start, &end) in starts.iter().zip(ends.iter()) {
+            if start < 0 || end < 0 {
                 continue;
-            };
-            let candidates =
-                equi_candidate_slice(code, &groups, windows, row, right_index_values.len())
-                    .map_err(PyValueError::new_err)?;
-            for &right_position in candidates {
-                if !predicates_match_dispatch(
-                    &views,
-                    metadata_views.as_deref(),
-                    row,
-                    right_position,
-                ) {
-                    continue;
+            }
+            validate_start_end(start, end, right_index.len()).map_err(PyValueError::new_err)?;
+        }
+        let equality_windows = (ranges.len() > 1).then(|| (starts.to_owned(), ends.to_owned()));
+        if let Some(first_range) = ranges.first() {
+            apply_equi_range_windows(
+                first_range,
+                starts.view_mut(),
+                ends.view_mut(),
+                right_index.len(),
+            )
+            .map_err(PyValueError::new_err)?;
+        }
+        if let Some(second_range) = ranges.get(1) {
+            validate_equi_range_inputs(second_range, starts.len(), right_index.len())
+                .map_err(PyValueError::new_err)?;
+            if range_is_monotonic_for_windows(second_range, starts.view(), ends.view()) {
+                apply_equi_range_windows(
+                    second_range,
+                    starts.view_mut(),
+                    ends.view_mut(),
+                    right_index.len(),
+                )
+                .map_err(PyValueError::new_err)?;
+            } else {
+                let (equality_starts, equality_ends) = equality_windows
+                    .as_ref()
+                    .expect("second range must retain the equality windows");
+                if !narrow_unordered_second_range_for_predicate(
+                    second_range,
+                    equality_starts.view(),
+                    equality_ends.view(),
+                    starts.view_mut(),
+                    ends.view_mut(),
+                )
+                .map_err(PyValueError::new_err)?
+                {
+                    return Ok(None);
                 }
-                if reverse {
-                    set.update(row, right_position);
-                } else {
-                    set.update(right_position, row);
-                }
+                demoted_second = Some(second_range);
             }
         }
     } else {
-        for row in 0..left_indexer.len() {
-            let Some(code) =
-                decode_equi_code(left_indexer[row], "left").map_err(PyValueError::new_err)?
-            else {
+        for range in &ranges {
+            validate_equi_range_inputs(range, left_index.len(), right_index.len())
+                .map_err(PyValueError::new_err)?;
+        }
+    }
+
+    for row in 0..left_index.len() {
+        let candidate_start = starts
+            .as_ref()
+            .and_then(|values| values.view().get(row).copied())
+            .unwrap_or(row as i64);
+        let candidate_end = ends
+            .as_ref()
+            .and_then(|values| values.view().get(row).copied())
+            .unwrap_or(candidate_start + 1);
+        if candidate_start < 0 || candidate_end < 0 {
+            continue;
+        }
+        let (candidate_start, candidate_end) = if starts.is_some() {
+            validate_start_end(candidate_start, candidate_end, right_index.len())
+                .map_err(PyValueError::new_err)?
+        } else if candidate_start as usize >= right_index.len() {
+            continue;
+        } else {
+            (candidate_start as usize, candidate_end as usize)
+        };
+
+        for right_position in candidate_start..candidate_end {
+            if !predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position) {
                 continue;
-            };
-            let right_position = code;
-            if right_position >= right_index_values.len()
-                || !predicates_match_dispatch(
-                    &views,
-                    metadata_views.as_deref(),
-                    row,
-                    right_position,
-                )
+            }
+            if starts.is_none()
+                && ranges
+                    .iter()
+                    .any(|range| !range_matches_at(range, row, right_position))
             {
                 continue;
             }
+            if let Some(range) = demoted_second {
+                if !range_matches_at(range, row, right_position) {
+                    continue;
+                }
+            }
             if reverse {
-                set.update(row, right_position);
+                let output_position = if let Some(slots) = &reverse_output_slots {
+                    // ELI5: several aligned rows can point to the same right
+                    // record; put all of them in that record's one bucket.
+                    slots
+                        .get(&right_index[right_position])
+                        .copied()
+                        .expect("every reverse candidate must have an output slot")
+                } else {
+                    right_position
+                };
+                set.update(row, output_position);
             } else {
                 set.update(right_position, row);
             }
@@ -1278,9 +1206,13 @@ pub fn equi_join_aggregate<'py>(
         return Ok(None);
     }
     let output_positions = if reverse {
-        Some(right_index_values)
+        reverse_output_positions
+            .as_ref()
+            .map_or(Some(right_index), |positions| {
+                Some(ArrayView1::from(positions.as_slice()))
+            })
     } else {
-        Some(left_index_values)
+        Some(left_index)
     };
     Ok(Some(make_results_with_positions(
         py,
@@ -1291,862 +1223,1020 @@ pub fn equi_join_aggregate<'py>(
     )?))
 }
 
-#[cfg(test)]
-mod aggregation_tests {
-    use super::*;
-    use numpy::{PyArray1, PyArrayMethods};
+/// Materialize aligned unique-equality rows after residual filtering.
+///
+/// The caller has already matched equality keys and projected the right side
+/// into the same row order as the left side. Consequently, candidate `i` is
+/// always the pair `(left_index[i], right_index[i])`; there is no right-side
+/// search and no equality window to expand. The residual predicates are
+/// evaluated at `(i, i)` and may be empty when the caller only needs to
+/// materialize the unique equality pairs.
+///
+/// ELI5: each left row has its one-and-only right partner written beside it.
+/// We compare each pair in the same row, keep the rows that pass, and copy
+/// their labels to the output.
+///
+/// # Arguments
+///
+/// * `left_index` - Physical or public labels for the prepared left rows.
+/// * `right_index` - Physical or public labels for the prepared right rows,
+///   aligned one-for-one with `left_index`.
+/// * `predicates` - Residual predicates whose left and right value arrays are
+///   both aligned to the two index arrays. An empty slice means that every
+///   aligned equality pair is accepted.
+/// * `null_metadata` - Optional null-semantics metadata aligned with
+///   `predicates`.
+///
+/// # Errors
+///
+/// Returns an error when the two index arrays have different lengths.
+///
+/// # Returns
+///
+/// `Ok(None)` when every aligned pair is filtered out or the inputs are
+/// empty; otherwise, `Ok(Some((left_labels, right_labels)))`.
+fn build_equi_uniq_residual_indices_core(
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    predicates: &[PredicateView<'_>],
+    null_metadata: Option<&[NullMetadataView<'_>]>,
+) -> Result<IndexPairs, String> {
+    ensure_equal_lengths_core(
+        "left index",
+        left_index.len(),
+        "right index",
+        right_index.len(),
+    )?;
+    let mut positions = Vec::with_capacity(left_index.len());
+    for row in 0..left_index.len() {
+        if !predicates_match_dispatch(predicates, null_metadata, row, row) {
+            continue;
+        }
+        positions.push(row);
+    }
+    if positions.is_empty() {
+        return Ok(None);
+    }
+    let mut left_output = Vec::with_capacity(positions.len());
+    let mut right_output = Vec::with_capacity(positions.len());
+    for &left_position in positions.iter() {
+        let right_position = left_position;
+        left_output.push(left_index[left_position]);
+        right_output.push(right_index[right_position]);
+    }
+    Ok(Some((left_output, right_output)))
+}
 
-    fn sum_aggregation<'py>(py: Python<'py>, values: Vec<i64>) -> PyResult<Bound<'py, PyList>> {
-        let values = PyArray1::from_vec(py, values);
-        let nulls = PyArray1::from_vec(py, vec![false; values.len()?]);
-        let aggregation = PyTuple::new(
-            py,
-            [
-                values.into_any(),
-                nulls.into_any(),
-                "sum".into_pyobject(py)?.into_any(),
-            ],
-        )?;
-        PyList::new(py, [aggregation])
+/// Build index pairs for unique equality keys and aligned residual predicates.
+///
+/// This is the Python-facing wrapper for
+/// [`build_equi_uniq_residual_indices_core`]. It is used after PyJanitor has
+/// established that every surviving right equality key is unique and has
+/// projected the matching right rows into left-row order.
+///
+/// # Arguments
+///
+/// * `left_index` - One-dimensional `int64` array of prepared left labels or
+///   physical positions.
+/// * `right_index` - One-dimensional `int64` array of prepared right labels or
+///   physical positions. It must have the same length as `left_index`; entry
+///   `i` is the unique equality match for entry `i` on the left.
+/// * `residual_predicates` - Python list of predicate tuples. Each tuple is
+///   parsed using the shared predicate parser, and its value arrays must be
+///   aligned to `left_index` and `right_index`. The list may be empty.
+///
+/// # Returns
+///
+/// A dictionary containing `left_index` and `right_index`, or `None` when no
+/// aligned pair survives the residual predicates.
+#[pyfunction]
+pub fn equi_uniq_residual_indices<'py>(
+    py: Python<'py>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    residual_predicates: &Bound<'py, PyList>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let left_index = left_index.as_array();
+    let right_index = right_index.as_array();
+    let (parsed, metadata) = parse_predicates_with_nulls_strings(py, residual_predicates)?;
+    check_predicate_lengths(&parsed, left_index.len(), right_index.len())?;
+    let views: Vec<_> = parsed.iter().map(Predicate::view).collect();
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
+    let result = build_equi_uniq_residual_indices_core(
+        left_index,
+        right_index,
+        &views,
+        metadata_views.as_deref(),
+    )
+    .map_err(PyValueError::new_err)?;
+    result
+        .map(|(left, right)| result_dict(py, left, right, None, None))
+        .transpose()
+}
+
+/// Build index pairs for unique equality keys with at least one predicate.
+///
+/// This compatibility wrapper retains the older non-empty-predicate
+/// contract. New callers that may have zero aligned predicates should use
+/// [`equi_uniq_residual_indices`] instead.
+///
+/// # Arguments
+///
+/// * `left_index` - Prepared left labels or physical positions.
+/// * `right_index` - Prepared right labels or physical positions aligned
+///   one-for-one with `left_index`.
+/// * `residual_predicates` - Non-empty list of aligned predicate tuples.
+///
+/// # Returns
+///
+/// A dictionary containing the surviving aligned index pairs, or `None` when
+/// no pair satisfies the predicates.
+#[pyfunction]
+pub fn equi_uniq_indices<'py>(
+    py: Python<'py>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    residual_predicates: &Bound<'py, PyList>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    if residual_predicates.is_empty() {
+        return Err(PyValueError::new_err(
+            "residual_predicates must not be empty",
+        ));
+    }
+    equi_uniq_residual_indices(py, left_index, right_index, residual_predicates)
+}
+
+fn build_equi_ne_indices_core(
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    predicates: &[PredicateView<'_>],
+    null_metadata: Option<&[NullMetadataView<'_>]>,
+    keep: Keep,
+) -> Result<IndexPairs, String> {
+    ensure_equal_lengths_core("left index", left_index.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("left index", left_index.len(), "ends", ends.len())?;
+
+    let right_index_len = right_index.len();
+    if keep == Keep::All {
+        let mut total = 0_usize;
+        for (left_position, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+            let (start, end) = validate_start_end(*start, *end, right_index_len)?;
+            for right_position in start..end {
+                if !predicates_match_dispatch(
+                    predicates,
+                    null_metadata,
+                    left_position,
+                    right_position,
+                ) {
+                    continue;
+                }
+                total = total
+                    .checked_add(1)
+                    .ok_or("equi-join result size exceeds platform capacity")?;
+            }
+        }
+        if total == 0 {
+            return Ok(None);
+        }
+        let mut left_output = Vec::with_capacity(total);
+        let mut right_output = Vec::with_capacity(total);
+        for (left_position, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+            let (start, end) = validate_start_end(*start, *end, right_index_len)?;
+            for right_position in start..end {
+                if !predicates_match_dispatch(
+                    predicates,
+                    null_metadata,
+                    left_position,
+                    right_position,
+                ) {
+                    continue;
+                }
+                left_output.push(left_index[left_position]);
+                right_output.push(right_index[right_position]);
+            }
+        }
+        return Ok(Some((left_output, right_output)));
     }
 
-    fn all_aggregations<'py>(py: Python<'py>, values: Vec<i64>) -> PyResult<Bound<'py, PyList>> {
-        let values = PyArray1::from_vec(py, values);
-        let nulls = PyArray1::from_vec(py, vec![false; values.len()?]);
-        PyList::new(
-            py,
-            [
-                PyTuple::new(
-                    py,
-                    [
-                        values.clone().into_any(),
-                        nulls.clone().into_any(),
-                        "sum".into_pyobject(py)?.into_any(),
-                    ],
-                )?,
-                PyTuple::new(
-                    py,
-                    [
-                        values.clone().into_any(),
-                        nulls.clone().into_any(),
-                        "prod".into_pyobject(py)?.into_any(),
-                    ],
-                )?,
-                PyTuple::new(
-                    py,
-                    [
-                        values.clone().into_any(),
-                        nulls.clone().into_any(),
-                        "min".into_pyobject(py)?.into_any(),
-                    ],
-                )?,
-                PyTuple::new(
-                    py,
-                    [
-                        values.clone().into_any(),
-                        nulls.clone().into_any(),
-                        "max".into_pyobject(py)?.into_any(),
-                    ],
-                )?,
-                PyTuple::new(
-                    py,
-                    [
-                        "*".into_pyobject(py)?.into_any(),
-                        nulls.into_any(),
-                        "count".into_pyobject(py)?.into_any(),
-                    ],
-                )?,
-                PyTuple::new(
-                    py,
-                    [
-                        "*".into_pyobject(py)?.into_any(),
-                        "size".into_pyobject(py)?.into_any(),
-                    ],
-                )?,
-            ],
-        )
+    let mut left_output = Vec::with_capacity(left_index.len());
+    let mut right_output = Vec::with_capacity(left_index.len());
+    for (left_position, (start, end)) in starts.iter().zip(ends.iter()).enumerate() {
+        let (start, end) = validate_start_end(*start, *end, right_index_len)?;
+        let mut selected = None;
+        for right_position in start..end {
+            if !predicates_match_dispatch(predicates, null_metadata, left_position, right_position)
+            {
+                continue;
+            }
+            if !update_keep_selection(&mut selected, right_position, keep, right_index) {
+                break;
+            }
+        }
+        if let Some(right_position) = selected {
+            left_output.push(left_index[left_position]);
+            right_output.push(right_index[right_position]);
+        }
+    }
+    if left_output.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some((left_output, right_output)))
+    }
+}
+
+#[pyfunction]
+pub fn equi_ne_indices<'py>(
+    py: Python<'py>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    starts: PyReadonlyArray1<'py, i64>,
+    ends: PyReadonlyArray1<'py, i64>,
+    residual_predicates: &Bound<'py, PyList>,
+    keep: &str,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    if residual_predicates.is_empty() {
+        return Err(PyValueError::new_err(
+            "residual_predicates must not be empty",
+        ));
+    }
+    let left_index = left_index.as_array();
+    let right_index = right_index.as_array();
+    let keep = Keep::parse(keep)?;
+    let starts = starts.as_array();
+    let ends = ends.as_array();
+    let (parsed, metadata) = parse_predicates_with_nulls_strings(py, residual_predicates)?;
+    check_predicate_lengths(&parsed, left_index.len(), right_index.len())?;
+    let views: Vec<_> = parsed.iter().map(Predicate::view).collect();
+    let metadata_views = metadata.as_deref().map(null_metadata_views);
+
+    let result = build_equi_ne_indices_core(
+        left_index,
+        right_index,
+        starts,
+        ends,
+        &views,
+        metadata_views.as_deref(),
+        keep,
+    )
+    .map_err(PyValueError::new_err)?;
+    result
+        .map(|(left, right)| result_dict(py, left, right, None, None))
+        .transpose()
+}
+
+fn build_equi_only_indices_core(
+    left_index: ArrayView1<'_, i64>,
+    right_index: ArrayView1<'_, i64>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    right_index_is_ordered: bool,
+    keep: Keep,
+) -> Result<IndexPairs, String> {
+    ensure_equal_lengths_core("left index", left_index.len(), "starts", starts.len())?;
+    ensure_equal_lengths_core("left index", left_index.len(), "ends", ends.len())?;
+
+    let mut start_positions = Vec::with_capacity(starts.len());
+    let mut end_positions = Vec::with_capacity(ends.len());
+    let right_index_len = right_index.len();
+    for (&start, &end) in starts.iter().zip(ends) {
+        let (start, end) = validate_start_end(start, end, right_index_len)?;
+        start_positions.push(start);
+        end_positions.push(end);
     }
 
-    fn empty_predicates<'py>(py: Python<'py>) -> Bound<'py, PyList> {
-        PyList::empty(py)
+    if starts.is_empty() {
+        return Ok(None);
     }
 
-    #[test]
-    fn unique_equi_aggregation_handles_forward_reverse_and_unmatched_rows() {
-        Python::initialize();
-        Python::attach(|py| -> PyResult<()> {
-            let left_index = PyArray1::from_vec(py, vec![10_i64, 11]);
-            let right_index = PyArray1::from_vec(py, vec![20_i64, 21]);
-            let left_indexer = PyArray1::from_vec(py, vec![1_i64, -1]);
-            let ranges = empty_predicates(py);
-            let residuals = empty_predicates(py);
-            let aggregations = sum_aggregation(py, vec![5, 7])?;
-
-            let forward = equi_join_aggregate(
-                py,
-                &left_index,
-                &right_index,
-                left_indexer.readonly(),
-                None,
-                &ranges,
-                &residuals,
-                &aggregations,
-                true,
-                false,
-            )?
-            .expect("the matched unique equi row should aggregate");
-            assert_eq!(forward.get_item(0)?.extract::<Vec<i64>>()?, vec![10, 11]);
-            assert_eq!(
-                forward.get_item(1)?.extract::<Vec<bool>>()?,
-                vec![true, false]
-            );
-            let forward_item = forward.get_item(2)?;
-            let forward_values = forward_item.cast::<PyList>()?;
-            assert_eq!(
-                forward_values.get_item(0)?.extract::<Vec<i64>>()?,
-                vec![7, 0]
-            );
-
-            let reverse = equi_join_aggregate(
-                py,
-                &left_index,
-                &right_index,
-                left_indexer.readonly(),
-                None,
-                &ranges,
-                &residuals,
-                &aggregations,
-                true,
-                true,
-            )?
-            .expect("the matched unique equi row should aggregate in reverse");
-            assert_eq!(reverse.get_item(0)?.extract::<Vec<i64>>()?, vec![20, 21]);
-            assert_eq!(
-                reverse.get_item(1)?.extract::<Vec<bool>>()?,
-                vec![false, true]
-            );
-            let reverse_item = reverse.get_item(2)?;
-            let reverse_values = reverse_item.cast::<PyList>()?;
-            assert_eq!(
-                reverse_values.get_item(0)?.extract::<Vec<i64>>()?,
-                vec![0, 5]
-            );
-            Ok(())
-        })
-        .unwrap();
+    if keep == Keep::All {
+        let mut output_capacity = 0_usize;
+        for (&start, &end) in start_positions.iter().zip(&end_positions) {
+            output_capacity = output_capacity
+                .checked_add(end - start)
+                .ok_or("equi-join result size exceeds platform capacity")?;
+        }
+        if output_capacity == 0 {
+            return Ok(None);
+        }
+        let mut left_output = Vec::with_capacity(output_capacity);
+        let mut right_output = Vec::with_capacity(output_capacity);
+        for (row, (&start, &end)) in start_positions.iter().zip(&end_positions).enumerate() {
+            for &right_label in right_index.slice(s![start..end]).iter() {
+                left_output.push(left_index[row]);
+                right_output.push(right_label);
+            }
+        }
+        return Ok(Some((left_output, right_output)));
     }
 
-    #[test]
-    fn duplicate_equi_aggregation_visits_each_matching_right_position() {
-        Python::initialize();
-        Python::attach(|py| -> PyResult<()> {
-            let left_index = PyArray1::from_vec(py, vec![10_i64, 11]);
-            let right_index = PyArray1::from_vec(py, vec![20_i64, 21, 22]);
-            let left_indexer = PyArray1::from_vec(py, vec![0_i64, 1]);
-            let right_codes = PyArray1::from_vec(py, vec![0_i64, 1, 0]);
-            let ranges = empty_predicates(py);
-            let residuals = empty_predicates(py);
-            let aggregations = sum_aggregation(py, vec![5, 7, 9])?;
-
-            let forward = equi_join_aggregate(
-                py,
-                &left_index,
-                &right_index,
-                left_indexer.readonly(),
-                Some(right_codes.readonly()),
-                &ranges,
-                &residuals,
-                &aggregations,
-                true,
-                false,
-            )?
-            .expect("duplicate equi candidates should aggregate");
-            let forward_item = forward.get_item(2)?;
-            let forward_values = forward_item.cast::<PyList>()?;
-            assert_eq!(
-                forward_values.get_item(0)?.extract::<Vec<i64>>()?,
-                vec![14, 7]
-            );
-
-            let reverse = equi_join_aggregate(
-                py,
-                &left_index,
-                &right_index,
-                left_indexer.readonly(),
-                Some(right_codes.readonly()),
-                &ranges,
-                &residuals,
-                &sum_aggregation(py, vec![2, 3])?,
-                true,
-                true,
-            )?
-            .expect("duplicate equi candidates should aggregate in reverse");
-            let reverse_item = reverse.get_item(2)?;
-            let reverse_values = reverse_item.cast::<PyList>()?;
-            assert_eq!(
-                reverse_values.get_item(0)?.extract::<Vec<i64>>()?,
-                vec![2, 3, 2]
-            );
-            Ok(())
-        })
-        .unwrap();
+    let mut left_output = Vec::with_capacity(left_index.len());
+    let mut right_output = Vec::with_capacity(left_index.len());
+    for (row, (&start, &end)) in start_positions.iter().zip(&end_positions).enumerate() {
+        let right_label = match keep {
+            Keep::Any => right_index[start],
+            Keep::First if right_index_is_ordered => right_index[start],
+            Keep::Last if right_index_is_ordered => right_index[end - 1],
+            Keep::First => *right_index
+                .slice(s![start..end])
+                .iter()
+                .min()
+                .ok_or("equi-join window is empty")?,
+            Keep::Last => *right_index
+                .slice(s![start..end])
+                .iter()
+                .max()
+                .ok_or("equi-join window is empty")?,
+            Keep::All => unreachable!(),
+        };
+        left_output.push(left_index[row]);
+        right_output.push(right_label);
     }
+    Ok(Some((left_output, right_output)))
+}
 
-    #[test]
-    fn duplicate_equi_aggregation_intersects_ranges_and_filters_residuals() {
-        Python::initialize();
-        Python::attach(|py| -> PyResult<()> {
-            let left_index = PyArray1::from_vec(py, vec![10_i64]);
-            let right_index = PyArray1::from_vec(py, vec![20_i64, 21, 22]);
-            let left_indexer = PyArray1::from_vec(py, vec![0_i64]);
-            let right_codes = PyArray1::from_vec(py, vec![0_i64, 0, 1]);
-            let ranges = PyList::new(
-                py,
-                [PyTuple::new(
-                    py,
-                    [
-                        PyArray1::from_vec(py, vec![2_i64]).into_any(),
-                        PyArray1::from_vec(py, vec![1_i64, 3, 5]).into_any(),
-                        "<".into_pyobject(py)?.into_any(),
-                    ],
-                )?],
-            )?;
-            let residuals = PyList::new(
-                py,
-                [PyTuple::new(
-                    py,
-                    [
-                        PyArray1::from_vec(py, vec![2_i64]).into_any(),
-                        PyArray1::from_vec(py, vec![0_i64, 2, 4]).into_any(),
-                        "==".into_pyobject(py)?.into_any(),
-                    ],
-                )?],
-            )?;
-            let aggregations = sum_aggregation(py, vec![10, 20, 30])?;
-            let result = equi_join_aggregate(
-                py,
-                &left_index,
-                &right_index,
-                left_indexer.readonly(),
-                Some(right_codes.readonly()),
-                &ranges,
-                &residuals,
-                &aggregations,
-                true,
-                false,
-            )?
-            .expect("the range and residual should leave one candidate");
-            let values_item = result.get_item(2)?;
-            let values = values_item.cast::<PyList>()?;
-            assert_eq!(values.get_item(0)?.extract::<Vec<i64>>()?, vec![20]);
-            Ok(())
-        })
-        .unwrap();
-    }
+/// Materialize equi-join index pairs from prepared equality windows.
+///
+/// `starts[row]..ends[row]` is the half-open right-side equality window for
+/// `left_index[row]`. `first` and `last` select the smallest or largest right
+/// label in each window when the right labels are unordered; when they are
+/// monotonic increasing, the window boundaries provide those values directly.
+/// `any` selects the first physical right entry, and `all` emits every entry.
+///
+/// # Arguments
+///
+/// * `left_index` - Prepared left labels or physical positions, one per
+///   equality window.
+/// * `right_index` - Right labels or physical positions arranged in the same
+///   layout referenced by `starts` and `ends`.
+/// * `starts` - Inclusive right-window starts, one per left row.
+/// * `ends` - Exclusive right-window ends, one per left row.
+/// * `right_index_is_ordered` - Whether `right_index` is monotonic increasing;
+///   this allows constant-time `first`/`last` selection.
+/// * `keep` - One of `all`, `any`, `first`, or `last`.
+///
+/// # Returns
+///
+/// A dictionary containing the materialized index pairs, or `None` when the
+/// windows contain no rows.
+#[pyfunction]
+pub fn equi_only_indices<'py>(
+    py: Python<'py>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    starts: PyReadonlyArray1<'py, i64>,
+    ends: PyReadonlyArray1<'py, i64>,
+    right_index_is_ordered: bool,
+    keep: &str,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let keep = Keep::parse(keep)?;
+    let left_index = left_index.as_array();
+    let right_index = right_index.as_array();
+    let starts = starts.as_array();
+    let ends = ends.as_array();
+    let result = build_equi_only_indices_core(
+        left_index,
+        right_index,
+        starts,
+        ends,
+        right_index_is_ordered,
+        keep,
+    )
+    .map_err(PyValueError::new_err)?;
+    result
+        .map(|(left, right)| result_dict(py, left, right, None, None))
+        .transpose()
+}
 
-    #[test]
-    fn duplicate_equi_aggregation_supports_all_operations_without_matched() {
-        Python::initialize();
-        Python::attach(|py| -> PyResult<()> {
-            let left_index = PyArray1::from_vec(py, vec![10_i64, 11]);
-            let right_index = PyArray1::from_vec(py, vec![20_i64, 21, 22]);
-            let left_indexer = PyArray1::from_vec(py, vec![0_i64, 1]);
-            let right_codes = PyArray1::from_vec(py, vec![0_i64, 1, 0]);
-            let result = equi_join_aggregate(
-                py,
-                &left_index,
-                &right_index,
-                left_indexer.readonly(),
-                Some(right_codes.readonly()),
-                &empty_predicates(py),
-                &empty_predicates(py),
-                &all_aggregations(py, vec![2, 3, 4])?,
-                false,
-                false,
-            )?
-            .expect("duplicate equi candidates should aggregate");
-
-            assert_eq!(result.len(), 2);
-            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![10, 11]);
-            let outputs_item = result.get_item(1)?;
-            let outputs = outputs_item.cast::<PyList>()?;
-            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![6, 3]);
-            assert_eq!(outputs.get_item(1)?.extract::<Vec<i64>>()?, vec![8, 3]);
-            assert_eq!(outputs.get_item(2)?.extract::<Vec<i64>>()?, vec![0, 1]);
-            assert_eq!(outputs.get_item(3)?.extract::<Vec<i64>>()?, vec![2, 1]);
-            assert_eq!(outputs.get_item(4)?.extract::<Vec<i64>>()?, vec![2, 1]);
-            assert_eq!(outputs.get_item(5)?.extract::<Vec<i64>>()?, vec![2, 1]);
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn unique_equi_aggregation_applies_range_as_a_residual() {
-        Python::initialize();
-        Python::attach(|py| -> PyResult<()> {
-            let left_index = PyArray1::from_vec(py, vec![10_i64]);
-            let right_index = PyArray1::from_vec(py, vec![20_i64, 21]);
-            let left_indexer = PyArray1::from_vec(py, vec![1_i64]);
-            let ranges = PyList::new(
-                py,
-                [PyTuple::new(
-                    py,
-                    [
-                        PyArray1::from_vec(py, vec![2_i64]).into_any(),
-                        PyArray1::from_vec(py, vec![1_i64, 3]).into_any(),
-                        "<".into_pyobject(py)?.into_any(),
-                    ],
-                )?],
-            )?;
-            let result = equi_join_aggregate(
-                py,
-                &left_index,
-                &right_index,
-                left_indexer.readonly(),
-                None,
-                &ranges,
-                &empty_predicates(py),
-                &sum_aggregation(py, vec![9])?,
-                true,
-                true,
-            )?
-            .expect("the unique equi candidate should satisfy the range");
-
-            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![20, 21]);
-            assert_eq!(
-                result.get_item(1)?.extract::<Vec<bool>>()?,
-                vec![false, true]
-            );
-            let outputs_item = result.get_item(2)?;
-            let outputs = outputs_item.cast::<PyList>()?;
-            assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, vec![0, 9]);
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn duplicate_equi_reverse_aggregation_intersects_two_ranges() {
-        Python::initialize();
-        Python::attach(|py| -> PyResult<()> {
-            let left_index = PyArray1::from_vec(py, vec![10_i64]);
-            let right_index = PyArray1::from_vec(py, vec![20_i64, 21, 22, 23]);
-            let left_indexer = PyArray1::from_vec(py, vec![0_i64]);
-            let right_codes = PyArray1::from_vec(py, vec![0_i64, 0, 0, 0]);
-            let ranges = PyList::new(
-                py,
-                [
-                    PyTuple::new(
-                        py,
-                        [
-                            PyArray1::from_vec(py, vec![2_i64]).into_any(),
-                            PyArray1::from_vec(py, vec![1_i64, 3, 5, 7]).into_any(),
-                            "<".into_pyobject(py)?.into_any(),
-                        ],
-                    )?,
-                    PyTuple::new(
-                        py,
-                        [
-                            PyArray1::from_vec(py, vec![3_i64]).into_any(),
-                            PyArray1::from_vec(py, vec![0_i64, 2, 4, 6]).into_any(),
-                            "<=".into_pyobject(py)?.into_any(),
-                        ],
-                    )?,
-                ],
-            )?;
-            let result = equi_join_aggregate(
-                py,
-                &left_index,
-                &right_index,
-                left_indexer.readonly(),
-                Some(right_codes.readonly()),
-                &ranges,
-                &empty_predicates(py),
-                &sum_aggregation(py, vec![9])?,
-                true,
-                true,
-            )?
-            .expect("the two ranges should leave two reverse candidates");
-
-            assert_eq!(
-                result.get_item(0)?.extract::<Vec<i64>>()?,
-                vec![20, 21, 22, 23]
-            );
-            assert_eq!(
-                result.get_item(1)?.extract::<Vec<bool>>()?,
-                vec![false, false, true, true]
-            );
-            let outputs_item = result.get_item(2)?;
-            let outputs = outputs_item.cast::<PyList>()?;
-            assert_eq!(
-                outputs.get_item(0)?.extract::<Vec<i64>>()?,
-                vec![0, 0, 9, 9]
-            );
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn equi_aggregation_rejects_malformed_duplicate_codes() {
-        Python::initialize();
-        Python::attach(|py| -> PyResult<()> {
-            let error = equi_join_aggregate(
-                py,
-                &PyArray1::from_vec(py, vec![10_i64]),
-                &PyArray1::from_vec(py, vec![20_i64]),
-                PyArray1::from_vec(py, vec![0_i64]).readonly(),
-                Some(PyArray1::from_vec(py, vec![i64::MAX]).readonly()),
-                &empty_predicates(py),
-                &empty_predicates(py),
-                &sum_aggregation(py, vec![5])?,
-                true,
-                false,
-            )
-            .unwrap_err();
-            assert!(error
-                .to_string()
-                .contains("right code exceeds the right index length"));
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn equi_aggregation_checks_empty_aggregations_before_lengths() {
-        Python::initialize();
-        Python::attach(|py| -> PyResult<()> {
-            let left_index = PyArray1::from_vec(py, vec![10_i64]);
-            let right_index = PyArray1::from_vec(py, vec![20_i64]);
-            let left_indexer = PyArray1::from_vec(py, Vec::<i64>::new());
-            let aggregations = PyList::empty(py);
-            let error = equi_join_aggregate(
-                py,
-                &left_index,
-                &right_index,
-                left_indexer.readonly(),
-                None,
-                &empty_predicates(py),
-                &empty_predicates(py),
-                &aggregations,
-                true,
-                false,
-            )
-            .unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "ValueError: at least one aggregation is required"
-            );
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn equi_aggregation_returns_none_when_no_candidate_survives() {
-        Python::initialize();
-        Python::attach(|py| -> PyResult<()> {
-            let left_index = PyArray1::from_vec(py, vec![10_i64]);
-            let right_index = PyArray1::from_vec(py, vec![20_i64]);
-            let left_indexer = PyArray1::from_vec(py, vec![-1_i64]);
-            let result = equi_join_aggregate(
-                py,
-                &left_index,
-                &right_index,
-                left_indexer.readonly(),
-                None,
-                &empty_predicates(py),
-                &empty_predicates(py),
-                &sum_aggregation(py, vec![5])?,
-                true,
-                false,
-            )?;
-            assert!(result.is_none());
-            Ok(())
-        })
-        .unwrap();
-    }
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(equi_only_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(equi_uniq_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(equi_uniq_residual_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(equi_ne_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(equi_range_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(equi_range_and_residual_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(equi_aggregate, m)?)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use numpy::ndarray::Array1;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::{IntoPyObject, PyResult, Python};
+
+    use super::{
+        apply_equi_range_bound, build_equi_ne_indices_core, build_equi_only_indices_core,
+        build_equi_range_indices_core, build_equi_uniq_residual_indices_core,
+        build_second_range_envelope, equi_aggregate, materialize_equi_windows,
+        materialize_unordered_second_range, narrow_unordered_second_range,
+        unique_reverse_output_slots,
+    };
     use crate::compare_op::CompareOp;
+    use crate::join_types::Keep;
+    use pyo3::exceptions::PyValueError;
+    use pyo3::types::{PyAnyMethods, PyList, PyListMethods, PyTuple, PyTupleMethods};
+
+    #[test]
+    fn reverse_unique_output_slots_collapse_aligned_duplicates() {
+        let right_index = Array1::from_vec(vec![7_i64, 7, 3, 7]);
+        let (labels, slots) = unique_reverse_output_slots(right_index.view());
+
+        assert_eq!(labels, vec![7, 3]);
+        assert_eq!(slots.get(&7), Some(&0));
+        assert_eq!(slots.get(&3), Some(&1));
+    }
+
+    #[test]
+    fn equi_aggregate_skips_eliminated_windows() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 101]);
+            let right_index = PyArray1::from_vec(py, vec![10_i64, 11]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, -1]);
+            let ends = PyArray1::from_vec(py, vec![2_i64, -1]);
+            let range = PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![2_i64, 100]).into_any(),
+                    PyArray1::from_vec(py, vec![3_i64, 4]).into_any(),
+                    "<".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let ranges = PyList::new(py, [range])?;
+            let residuals = PyList::empty(py);
+            let aggregation = PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![10_i64, 13]).into_any(),
+                    PyArray1::from_vec(py, vec![false, false]).into_any(),
+                    "sum".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let aggregations = PyList::new(py, [aggregation])?;
+
+            let result = equi_aggregate(
+                py,
+                left_index.readonly(),
+                right_index.readonly(),
+                Some(starts.readwrite()),
+                Some(ends.readwrite()),
+                &ranges,
+                &residuals,
+                &aggregations,
+                true,
+                false,
+            )?
+            .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+
+            assert_eq!(result.get_item(0)?.extract::<Vec<i64>>()?, vec![100, 101]);
+            assert_eq!(
+                result.get_item(1)?.extract::<Vec<bool>>()?,
+                vec![true, false]
+            );
+            let sums = result
+                .get_item(2)?
+                .cast::<PyList>()?
+                .get_item(0)?
+                .extract::<Vec<i64>>()?;
+            assert_eq!(sums, vec![23, 0]);
+            Ok(())
+        })
+        .unwrap();
+    }
     use crate::predicate::PredicateView;
-    use numpy::ndarray::array;
+    use crate::range_predicate::{AnyParsedRangePredicate, ParsedRangePredicate};
 
     #[test]
-    fn dense_metadata_tracks_codes_and_right_length() {
-        let metadata = build_dense_right_metadata(
-            array![12_i64, 5, 9, 7].view(),
-            array![3_i64, 1, 3, -1].view(),
-            Keep::All,
-        )
-        .unwrap();
-        assert_eq!(metadata.counts, vec![0, 1, 0, 2]);
-        assert_eq!(metadata.offsets, vec![0, 0, 1, 1, 3]);
-        assert_eq!(metadata.positions, vec![1, 0, 2]);
+    fn unordered_second_range_envelope_is_directional() {
+        let right = Array1::from_vec(vec![8_i64, 2, 6, 1, 7, 3]);
+        let windows = [(0, 3), (3, 6)];
+        assert_eq!(
+            build_second_range_envelope(right.view(), &windows, true),
+            vec![8, 8, 8, 1, 7, 7]
+        );
+        assert_eq!(
+            build_second_range_envelope(right.view(), &windows, false),
+            vec![2, 2, 6, 1, 3, 3]
+        );
     }
 
     #[test]
-    fn duplicate_equi_keep_modes_use_dense_codes() {
-        let left_index = array![10_i64, 11, 12];
-        let left_indexer = array![3_i64, 1, -1];
-        let right_index = array![12_i64, 5, 9, 7];
-        let right_codes = array![3_i64, 1, 3, -1];
+    fn unordered_second_range_narrowing_matches_bruteforce() {
+        let right = Array1::from_vec(vec![8_i64, 2, 6, 1, 7, 3, 9, 0]);
+        let windows = [(0, 4), (4, 8)];
+        let left = Array1::from_vec(vec![0_i64, 5, 10, 4, 8]);
+        let original_starts = [0_i64, 0, 0, 4, 4];
+        let original_ends = [4_i64, 4, 4, 8, 8];
 
-        let any = build_duplicate_equi_pairs_core(
-            left_index.view(),
-            left_indexer.view(),
-            right_index.view(),
-            right_codes.view(),
-            Keep::Any,
-        )
-        .unwrap();
-        assert_eq!(any.unwrap().1, vec![12, 5]);
+        for op in [CompareOp::Lt, CompareOp::Le, CompareOp::Gt, CompareOp::Ge] {
+            let use_cummax = matches!(op, CompareOp::Lt | CompareOp::Le);
+            let envelope = build_second_range_envelope(right.view(), &windows, use_cummax);
+            let mut starts = Array1::from_vec(original_starts.to_vec());
+            let mut ends = Array1::from_vec(original_ends.to_vec());
+            narrow_unordered_second_range(
+                left.view(),
+                &envelope,
+                starts.view_mut(),
+                ends.view_mut(),
+                op,
+            )
+            .unwrap();
 
-        let first = build_duplicate_equi_pairs_core(
-            left_index.view(),
-            left_indexer.view(),
-            right_index.view(),
-            right_codes.view(),
+            let mut expected = Vec::new();
+            let mut actual = Vec::new();
+            for row in 0..left.len() {
+                for position in original_starts[row] as usize..original_ends[row] as usize {
+                    if op.apply(&left[row], &right[position]) {
+                        expected.push((row, position));
+                    }
+                }
+                if starts[row] >= 0 && ends[row] >= 0 {
+                    for position in starts[row] as usize..ends[row] as usize {
+                        if op.apply(&left[row], &right[position]) {
+                            actual.push((row, position));
+                        }
+                    }
+                }
+            }
+            assert_eq!(actual, expected, "operator: {op:?}");
+        }
+    }
+
+    #[test]
+    fn unordered_second_range_uses_original_equality_windows() {
+        Python::initialize();
+        Python::attach(|py| {
+            let first_range = AnyParsedRangePredicate::I64(ParsedRangePredicate {
+                left: PyArray1::from_vec(py, vec![0_i64, 2]).readonly(),
+                left_index: PyArray1::from_vec(py, vec![100_i64, 101]).readonly(),
+                right: PyArray1::from_vec(py, vec![1_i64, 2, 3, 4]).readonly(),
+                right_index: PyArray1::from_vec(py, vec![10_i64, 11, 12, 13]).readonly(),
+                op: CompareOp::Lt,
+            });
+            let second_range = AnyParsedRangePredicate::I64(ParsedRangePredicate {
+                left: PyArray1::from_vec(py, vec![50_i64, 0]).readonly(),
+                left_index: PyArray1::from_vec(py, vec![100_i64, 101]).readonly(),
+                right: PyArray1::from_vec(py, vec![1_i64, 100, 2, 3]).readonly(),
+                right_index: PyArray1::from_vec(py, vec![10_i64, 11, 12, 13]).readonly(),
+                op: CompareOp::Lt,
+            });
+            let left_index = Array1::from_vec(vec![100_i64, 101]);
+            let right_index = Array1::from_vec(vec![10_i64, 11, 12, 13]);
+            let mut starts = Array1::from_vec(vec![0_i64, 0]);
+            let mut ends = Array1::from_vec(vec![4_i64, 4]);
+
+            let result = build_equi_range_indices_core(
+                left_index.view(),
+                right_index.view(),
+                starts.view_mut(),
+                ends.view_mut(),
+                &first_range,
+                Some(&second_range),
+                Keep::All,
+            )
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(result.0, vec![100, 101, 101]);
+            assert_eq!(result.1, vec![11, 12, 13]);
+        });
+    }
+
+    #[test]
+    fn unordered_right_labels_select_extrema() {
+        let left = Array1::from_vec(vec![10, 11]);
+        let right = Array1::from_vec(vec![8, 2, 6, 1, 7, 3]);
+        let starts = Array1::from_vec(vec![0, 3]);
+        let ends = Array1::from_vec(vec![3, 6]);
+        let result = build_equi_only_indices_core(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            false,
             Keep::First,
-        )
-        .unwrap();
-        assert_eq!(first.unwrap().1, vec![9, 5]);
-
-        let last = build_duplicate_equi_pairs_core(
-            left_index.view(),
-            left_indexer.view(),
-            right_index.view(),
-            right_codes.view(),
-            Keep::Last,
-        )
-        .unwrap();
-        assert_eq!(last.unwrap().1, vec![12, 5]);
-
-        let all = build_duplicate_equi_pairs_core(
-            left_index.view(),
-            left_indexer.view(),
-            right_index.view(),
-            right_codes.view(),
-            Keep::All,
-        )
-        .unwrap();
-        assert_eq!(all.unwrap().1, vec![12, 9, 5]);
-    }
-
-    #[test]
-    fn duplicate_equi_builds_per_left_offsets_and_positions() {
-        let blocks = build_duplicate_equi_blocks_core(
-            array![10_i64, 11, 12].view(),
-            array![3_i64, 1, -1].view(),
-            array![12_i64, 5, 9, 7].view(),
-            array![3_i64, 1, 3, -1].view(),
         )
         .unwrap()
         .unwrap();
+        assert_eq!(result.0, vec![10, 11]);
+        assert_eq!(result.1, vec![2, 1]);
 
-        assert_eq!(blocks.left_index, vec![10, 11, 12]);
-        assert_eq!(blocks.right_index, vec![12, 5, 9, 7]);
-        assert_eq!(blocks.left_indexer, vec![3, 1, -1]);
-        assert_eq!(blocks.offsets, vec![0, 0, 1, 1, 3]);
-        assert_eq!(blocks.positions, vec![1, 0, 2]);
+        let result = build_equi_only_indices_core(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            false,
+            Keep::Last,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.1, vec![8, 7]);
     }
 
     #[test]
-    fn duplicate_equi_unfiltered_out_of_range_left_code_is_no_match() {
-        let right_index = array![10_i64];
-        let right_codes = array![0_i64];
-        let metadata =
-            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
+    fn all_uses_exact_window_width() {
+        let left = Array1::from_vec(vec![10, 11]);
+        let right = Array1::from_vec(vec![8, 2, 6, 1, 7, 3]);
+        let starts = Array1::from_vec(vec![0, 3]);
+        let ends = Array1::from_vec(vec![3, 6]);
+        let result = build_equi_only_indices_core(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            false,
+            Keep::All,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.0, vec![10, 10, 10, 11, 11, 11]);
+        assert_eq!(result.1, vec![8, 2, 6, 1, 7, 3]);
+    }
 
-        let result = build_filtered_duplicate_equi_pairs_core(
-            array![20_i64].view(),
-            array![1_i64].view(),
+    #[test]
+    fn rejects_invalid_windows() {
+        let left = Array1::from_vec(vec![10]);
+        let right = Array1::from_vec(vec![1, 2]);
+        let starts = Array1::from_vec(vec![1]);
+        let ends = Array1::from_vec(vec![3]);
+        let result = build_equi_only_indices_core(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            true,
+            Keep::Any,
+        );
+        assert_eq!(result, Err("end exceeds right index length".to_owned()));
+    }
+
+    #[test]
+    fn ordered_windows_use_constant_time_boundaries() {
+        let left = Array1::from_vec(vec![10, 11]);
+        let right = Array1::from_vec(vec![2, 4, 8, 1, 5, 9]);
+        let starts = Array1::from_vec(vec![0, 3]);
+        let ends = Array1::from_vec(vec![3, 6]);
+
+        let first = build_equi_only_indices_core(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            true,
+            Keep::First,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.1, vec![2, 1]);
+
+        let last = build_equi_only_indices_core(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            true,
+            Keep::Last,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(last.1, vec![8, 9]);
+    }
+
+    #[test]
+    fn ne_keep_modes_apply_residual_predicates() {
+        let left_index = Array1::from_vec(vec![10]);
+        let right_index = Array1::from_vec(vec![1, 9, 2]);
+        let starts = Array1::from_vec(vec![0]);
+        let ends = Array1::from_vec(vec![3]);
+        let left_values = Array1::from_vec(vec![5]);
+        let right_values = Array1::from_vec(vec![1, 9, 2]);
+        let predicate = PredicateView::I64(left_values.view(), right_values.view(), CompareOp::Gt);
+        let predicates = [predicate];
+
+        let all = build_equi_ne_indices_core(
+            left_index.view(),
             right_index.view(),
-            &metadata,
-            None,
-            &[],
+            starts.view(),
+            ends.view(),
+            &predicates,
             None,
             Keep::All,
         )
+        .unwrap()
         .unwrap();
+        assert_eq!(all.0, vec![10, 10]);
+        assert_eq!(all.1, vec![1, 2]);
 
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn duplicate_equi_range_uses_binary_searched_code_slice() {
-        let right_index = array![12_i64, 5, 9, 7, 3];
-        let right_codes = array![3_i64, 1, 3, 3, 1];
-        let metadata =
-            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
-        let result = build_filtered_duplicate_equi_pairs_core(
-            array![10_i64].view(),
-            array![3_i64].view(),
+        let any = build_equi_ne_indices_core(
+            left_index.view(),
             right_index.view(),
-            &metadata,
-            Some((&[2][..], &[4][..])),
-            &[],
+            starts.view(),
+            ends.view(),
+            &predicates,
             None,
-            Keep::All,
+            Keep::Any,
         )
+        .unwrap()
         .unwrap();
-        assert_eq!(result.unwrap().1, vec![9, 7]);
-    }
+        assert_eq!(any.1, vec![1]);
 
-    #[test]
-    fn duplicate_equi_range_applies_keep_after_window() {
-        let right_index = array![100_i64, 50, 90, 70];
-        let right_codes = array![2_i64, 2, 2, 2];
-        let metadata =
-            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
-        let first = build_filtered_duplicate_equi_pairs_core(
-            array![10_i64].view(),
-            array![2_i64].view(),
+        let first = build_equi_ne_indices_core(
+            left_index.view(),
             right_index.view(),
-            &metadata,
-            Some((&[1][..], &[4][..])),
-            &[],
+            starts.view(),
+            ends.view(),
+            &predicates,
             None,
             Keep::First,
         )
+        .unwrap()
         .unwrap();
-        assert_eq!(first.unwrap().1, vec![50]);
+        assert_eq!(first.1, vec![1]);
 
-        let last = build_filtered_duplicate_equi_pairs_core(
-            array![10_i64].view(),
-            array![2_i64].view(),
+        let last = build_equi_ne_indices_core(
+            left_index.view(),
             right_index.view(),
-            &metadata,
-            Some((&[1][..], &[3][..])),
-            &[],
+            starts.view(),
+            ends.view(),
+            &predicates,
             None,
             Keep::Last,
         )
+        .unwrap()
         .unwrap();
-        assert_eq!(last.unwrap().1, vec![90]);
+        assert_eq!(last.1, vec![2]);
+    }
 
-        let any = build_filtered_duplicate_equi_pairs_core(
-            array![10_i64].view(),
-            array![2_i64].view(),
+    #[test]
+    fn ne_first_keeps_a_match_at_right_position_zero() {
+        let left_index = Array1::from_vec(vec![10]);
+        let right_index = Array1::from_vec(vec![1, 9]);
+        let starts = Array1::from_vec(vec![0]);
+        let ends = Array1::from_vec(vec![2]);
+        let left_values = Array1::from_vec(vec![10]);
+        let right_values = Array1::from_vec(vec![1, 9]);
+        let predicate = PredicateView::I64(left_values.view(), right_values.view(), CompareOp::Gt);
+
+        let result = build_equi_ne_indices_core(
+            left_index.view(),
             right_index.view(),
-            &metadata,
-            Some((&[1][..], &[4][..])),
-            &[],
+            starts.view(),
+            ends.view(),
+            &[predicate],
+            None,
+            Keep::First,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.1, vec![1]);
+    }
+
+    #[test]
+    fn ne_returns_none_when_residual_filters_every_candidate() {
+        let left_index = Array1::from_vec(vec![10]);
+        let right_index = Array1::from_vec(vec![1, 2]);
+        let starts = Array1::from_vec(vec![0]);
+        let ends = Array1::from_vec(vec![2]);
+        let left_values = Array1::from_vec(vec![0]);
+        let right_values = Array1::from_vec(vec![1, 2]);
+        let predicate = PredicateView::I64(left_values.view(), right_values.view(), CompareOp::Gt);
+
+        let result = build_equi_ne_indices_core(
+            left_index.view(),
+            right_index.view(),
+            starts.view(),
+            ends.view(),
+            &[predicate],
             None,
             Keep::Any,
         )
         .unwrap();
-        assert_eq!(any.unwrap().1, vec![50]);
+        assert_eq!(result, None);
+    }
 
-        let all = build_filtered_duplicate_equi_pairs_core(
-            array![10_i64].view(),
-            array![2_i64].view(),
-            right_index.view(),
-            &metadata,
-            Some((&[1][..], &[4][..])),
-            &[],
-            None,
+    #[test]
+    fn unique_ne_without_residuals_pairs_aligned_rows() {
+        let left = Array1::from_vec(vec![10, 11, 12]);
+        let right = Array1::from_vec(vec![20, 21, 22]);
+        let result = build_equi_uniq_residual_indices_core(left.view(), right.view(), &[], None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.0, vec![10, 11, 12]);
+        assert_eq!(result.1, vec![20, 21, 22]);
+    }
+
+    #[test]
+    fn unique_residual_filters_aligned_rows() {
+        let left = Array1::from_vec(vec![10, 11, 12]);
+        let right = Array1::from_vec(vec![20, 21, 22]);
+        let left_values = Array1::from_vec(vec![1, 5, 3]);
+        let right_values = Array1::from_vec(vec![2, 4, 3]);
+        let predicate = PredicateView::I64(left_values.view(), right_values.view(), CompareOp::Gt);
+
+        let result =
+            build_equi_uniq_residual_indices_core(left.view(), right.view(), &[predicate], None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(result.0, vec![11]);
+        assert_eq!(result.1, vec![21]);
+    }
+
+    #[test]
+    fn unique_ne_rejects_misaligned_rows() {
+        let left = Array1::from_vec(vec![10, 11]);
+        let right = Array1::from_vec(vec![20]);
+        let result = build_equi_uniq_residual_indices_core(left.view(), right.view(), &[], None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn range_windows_apply_keep_modes() {
+        let left = Array1::from_vec(vec![10]);
+        let right = Array1::from_vec(vec![8, 2, 6]);
+        let starts = Array1::from_vec(vec![0]);
+        let ends = Array1::from_vec(vec![3]);
+
+        let all = materialize_equi_windows(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
             Keep::All,
         )
+        .unwrap()
         .unwrap();
-        assert_eq!(all.unwrap().1, vec![50, 90, 70]);
-    }
+        assert_eq!(all.1, vec![8, 2, 6]);
 
-    #[test]
-    fn duplicate_equi_rejects_codes_below_minus_one() {
-        let error = build_duplicate_equi_pairs_core(
-            array![10_i64].view(),
-            array![-2_i64].view(),
-            array![100_i64].view(),
-            array![0_i64].view(),
-            Keep::All,
+        let any = materialize_equi_windows(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            Keep::Any,
         )
-        .unwrap_err();
-        assert_eq!(error, "left codes must be greater than or equal to -1");
-
-        let error = build_duplicate_equi_pairs_core(
-            array![10_i64].view(),
-            array![0_i64].view(),
-            array![100_i64].view(),
-            array![-2_i64].view(),
-            Keep::All,
-        )
-        .unwrap_err();
-        assert_eq!(error, "right codes must be greater than or equal to -1");
-    }
-
-    #[test]
-    fn duplicate_equi_rejects_codes_outside_right_layout_before_allocation() {
-        let error = build_duplicate_equi_pairs_core(
-            array![10_i64].view(),
-            array![0_i64].view(),
-            array![100_i64].view(),
-            array![i64::MAX].view(),
-            Keep::All,
-        )
-        .unwrap_err();
-        assert_eq!(error, "right code exceeds the right index length");
-    }
-
-    #[test]
-    fn duplicate_equi_rejects_codes_outside_right_layout() {
-        let error = build_duplicate_equi_pairs_core(
-            array![10_i64, 11].view(),
-            array![1_i64, 2].view(),
-            array![100_i64, 200].view(),
-            array![0_i64, 2].view(),
-            Keep::All,
-        )
-        .unwrap_err();
-
-        assert_eq!(error, "right code exceeds the right index length");
-    }
-
-    #[test]
-    fn duplicate_equi_empty_right_side_produces_no_match() {
-        let result = build_duplicate_equi_pairs_core(
-            array![10_i64, 11].view(),
-            array![-1_i64, 0].view(),
-            array![].view(),
-            array![].view(),
-            Keep::All,
-        )
+        .unwrap()
         .unwrap();
+        assert_eq!(any.1, vec![8]);
 
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn duplicate_equi_empty_range_window_produces_no_match() {
-        let right_index = array![10_i64, 20, 30];
-        let right_codes = array![0_i64, 0, 0];
-        let metadata =
-            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
-
-        let result = build_filtered_duplicate_equi_pairs_core(
-            array![1_i64].view(),
-            array![0_i64].view(),
-            right_index.view(),
-            &metadata,
-            Some((&[2][..], &[2][..])),
-            &[],
-            None,
-            Keep::All,
+        let first = materialize_equi_windows(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            Keep::First,
         )
+        .unwrap()
         .unwrap();
+        assert_eq!(first.1, vec![2]);
 
-        assert!(result.is_none());
+        let last = materialize_equi_windows(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            Keep::Last,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(last.1, vec![8]);
     }
 
     #[test]
-    fn duplicate_equi_residual_can_remove_every_candidate() {
-        let right_index = array![10_i64, 20];
-        let right_codes = array![0_i64, 0];
-        let metadata =
-            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
-        let left_values = array![1_i64];
-        let right_values = array![2_i64, 3];
-        let predicates = vec![PredicateView::I64(
-            left_values.view(),
-            right_values.view(),
-            CompareOp::Eq,
-        )];
+    fn range_bound_reports_when_every_window_is_eliminated() {
+        let left = Array1::from_vec(vec![5]);
+        let right = Array1::from_vec(vec![1, 2, 3, 4]);
+        let mut starts = Array1::from_vec(vec![0]);
+        let mut ends = Array1::from_vec(vec![4]);
 
-        let result = build_filtered_duplicate_equi_pairs_core(
-            array![1_i64].view(),
-            array![0_i64].view(),
-            right_index.view(),
-            &metadata,
-            None,
-            &predicates,
-            None,
-            Keep::All,
+        let has_active_window = apply_equi_range_bound(
+            left.view(),
+            right.view(),
+            starts.view_mut(),
+            ends.view_mut(),
+            CompareOp::Lt,
         )
         .unwrap();
 
-        assert!(result.is_none());
+        assert!(!has_active_window);
+        assert_eq!(starts.to_vec(), vec![-1]);
+        assert_eq!(ends.to_vec(), vec![4]);
     }
 
     #[test]
-    fn duplicate_equi_residual_keeps_only_surviving_candidates() {
-        let right_index = array![10_i64, 20];
-        let right_codes = array![0_i64, 0];
-        let metadata =
-            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
-        let left_values = array![1_i64];
-        let right_values = array![1_i64, 2];
-        let predicates = vec![PredicateView::I64(
-            left_values.view(),
-            right_values.view(),
-            CompareOp::Eq,
-        )];
+    fn range_bound_preserves_partial_window_alignment() {
+        let left = Array1::from_vec(vec![2, 5]);
+        let right = Array1::from_vec(vec![1, 2, 3, 4, 5]);
+        let mut starts = Array1::from_vec(vec![0, 0]);
+        let mut ends = Array1::from_vec(vec![5, 5]);
 
-        let result = build_filtered_duplicate_equi_pairs_core(
-            array![1_i64].view(),
-            array![0_i64].view(),
-            right_index.view(),
-            &metadata,
-            None,
-            &predicates,
-            None,
-            Keep::All,
+        let has_active_window = apply_equi_range_bound(
+            left.view(),
+            right.view(),
+            starts.view_mut(),
+            ends.view_mut(),
+            CompareOp::Lt,
         )
         .unwrap();
 
-        assert_eq!(result.unwrap().1, vec![10]);
+        assert!(has_active_window);
+        assert_eq!(starts.to_vec(), vec![2, -1]);
+        assert_eq!(ends.to_vec(), vec![5, 5]);
     }
 
     #[test]
-    fn duplicate_equi_filtered_validates_left_alignment() {
-        let right_index = array![10_i64];
-        let right_codes = array![0_i64];
-        let metadata =
-            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
+    fn range_bound_uses_correct_half_open_boundaries() {
+        let left = Array1::from_vec(vec![2]);
+        let right = Array1::from_vec(vec![1, 2, 3]);
 
-        let error = build_filtered_duplicate_equi_pairs_core(
-            array![1_i64].view(),
-            array![0_i64, 0].view(),
-            right_index.view(),
-            &metadata,
-            None,
-            &[],
-            None,
-            Keep::All,
+        let mut starts = Array1::from_vec(vec![0]);
+        let mut ends = Array1::from_vec(vec![3]);
+        assert!(apply_equi_range_bound(
+            left.view(),
+            right.view(),
+            starts.view_mut(),
+            ends.view_mut(),
+            CompareOp::Lt,
         )
-        .unwrap_err();
+        .unwrap());
+        assert_eq!(starts.to_vec(), vec![2]);
 
-        assert_eq!(
-            error,
-            "left index and equi indexer must have equal lengths; got 1 and 2"
-        );
+        let mut starts = Array1::from_vec(vec![0]);
+        let mut ends = Array1::from_vec(vec![3]);
+        assert!(apply_equi_range_bound(
+            left.view(),
+            right.view(),
+            starts.view_mut(),
+            ends.view_mut(),
+            CompareOp::Le,
+        )
+        .unwrap());
+        assert_eq!(starts.to_vec(), vec![1]);
+
+        let mut starts = Array1::from_vec(vec![0]);
+        let mut ends = Array1::from_vec(vec![3]);
+        assert!(apply_equi_range_bound(
+            left.view(),
+            right.view(),
+            starts.view_mut(),
+            ends.view_mut(),
+            CompareOp::Gt,
+        )
+        .unwrap());
+        assert_eq!(ends.to_vec(), vec![1]);
+
+        let mut starts = Array1::from_vec(vec![0]);
+        let mut ends = Array1::from_vec(vec![3]);
+        assert!(apply_equi_range_bound(
+            left.view(),
+            right.view(),
+            starts.view_mut(),
+            ends.view_mut(),
+            CompareOp::Ge,
+        )
+        .unwrap());
+        assert_eq!(ends.to_vec(), vec![2]);
     }
 
     #[test]
-    fn duplicate_equi_filtered_validates_window_alignment() {
-        let right_index = array![10_i64];
-        let right_codes = array![0_i64];
-        let metadata =
-            build_dense_right_metadata(right_index.view(), right_codes.view(), Keep::All).unwrap();
-
-        let error = build_filtered_duplicate_equi_pairs_core(
-            array![1_i64].view(),
-            array![0_i64].view(),
-            right_index.view(),
-            &metadata,
-            Some((&[0, 0][..], &[1][..])),
-            &[],
-            None,
-            Keep::All,
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            "equi starts and left indexer must have equal lengths; got 2 and 1"
-        );
+    fn unordered_second_range_applies_all_keep_modes() {
+        Python::initialize();
+        Python::attach(|py| {
+            let range = AnyParsedRangePredicate::I64(ParsedRangePredicate {
+                left: PyArray1::from_vec(py, vec![3_i64]).readonly(),
+                left_index: PyArray1::from_vec(py, vec![0_i64]).readonly(),
+                right: PyArray1::from_vec(py, vec![4_i64, 1, 3, 2]).readonly(),
+                right_index: PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]).readonly(),
+                op: CompareOp::Gt,
+            });
+            let left_index = Array1::from_vec(vec![10]);
+            let right_index = Array1::from_vec(vec![10, 11, 12, 13]);
+            for (keep, expected) in [
+                (Keep::All, vec![11, 13]),
+                (Keep::Any, vec![11]),
+                (Keep::First, vec![11]),
+                (Keep::Last, vec![13]),
+            ] {
+                let mut starts = Array1::from_vec(vec![0]);
+                let mut ends = Array1::from_vec(vec![4]);
+                let equality_starts = starts.clone();
+                let equality_ends = ends.clone();
+                let result = materialize_unordered_second_range(
+                    left_index.view(),
+                    right_index.view(),
+                    starts.view_mut(),
+                    ends.view_mut(),
+                    &range,
+                    equality_starts.view(),
+                    equality_ends.view(),
+                    keep,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(result.1, expected);
+            }
+        });
     }
 }
