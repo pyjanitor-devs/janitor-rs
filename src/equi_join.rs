@@ -664,30 +664,31 @@ fn narrow_unordered_second_range<T: PartialOrd + Copy>(
     Ok(has_active_window)
 }
 
-fn range_matches_at(
-    range: &AnyParsedRangePredicate<'_>,
-    left_position: usize,
-    right_position: usize,
-) -> bool {
-    macro_rules! matches {
-        ($predicate:expr) => {
-            $predicate.op.apply(
-                &$predicate.left.as_array()[left_position],
-                &$predicate.right.as_array()[right_position],
+/// Borrow a range predicate as a residual-style view.
+///
+/// Building the NumPy views once keeps per-candidate range checks as cheap
+/// as residual predicate checks.
+fn range_predicate_view<'a>(range: &'a AnyParsedRangePredicate<'_>) -> PredicateView<'a> {
+    macro_rules! view {
+        ($variant:ident, $predicate:expr) => {
+            PredicateView::$variant(
+                $predicate.left.as_array(),
+                $predicate.right.as_array(),
+                $predicate.op,
             )
         };
     }
     match range {
-        AnyParsedRangePredicate::I64(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::I32(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::I16(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::I8(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::U64(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::U32(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::U16(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::U8(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::F64(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::F32(predicate) => matches!(predicate),
+        AnyParsedRangePredicate::I64(predicate) => view!(I64, predicate),
+        AnyParsedRangePredicate::I32(predicate) => view!(I32, predicate),
+        AnyParsedRangePredicate::I16(predicate) => view!(I16, predicate),
+        AnyParsedRangePredicate::I8(predicate) => view!(I8, predicate),
+        AnyParsedRangePredicate::U64(predicate) => view!(U64, predicate),
+        AnyParsedRangePredicate::U32(predicate) => view!(U32, predicate),
+        AnyParsedRangePredicate::U16(predicate) => view!(U16, predicate),
+        AnyParsedRangePredicate::U8(predicate) => view!(U8, predicate),
+        AnyParsedRangePredicate::F64(predicate) => view!(F64, predicate),
+        AnyParsedRangePredicate::F32(predicate) => view!(F32, predicate),
     }
 }
 
@@ -810,10 +811,12 @@ fn materialize_equi_windows_and_residuals(
     additional_range: Option<&AnyParsedRangePredicate<'_>>,
     keep: Keep,
 ) -> Result<IndexPairs, String> {
+    let additional_view = additional_range.map(range_predicate_view);
     let matches = |row: usize, right_position: usize| {
         predicates_match_dispatch(residual_predicates, null_metadata, row, right_position)
-            && additional_range
-                .map(|range| range_matches_at(range, row, right_position))
+            && additional_view
+                .as_ref()
+                .map(|view| view.matches(row, right_position))
                 .unwrap_or(true)
     };
     if keep == Keep::All {
@@ -1147,6 +1150,8 @@ pub fn equi_aggregate<'py>(
         }
     }
 
+    let range_views: Vec<_> = ranges.iter().map(range_predicate_view).collect();
+    let demoted_view = demoted_second.map(range_predicate_view);
     for row in 0..left_index.len() {
         let candidate_start = starts
             .as_ref()
@@ -1173,14 +1178,14 @@ pub fn equi_aggregate<'py>(
                 continue;
             }
             if starts.is_none()
-                && ranges
+                && range_views
                     .iter()
-                    .any(|range| !range_matches_at(range, row, right_position))
+                    .any(|view| !view.matches(row, right_position))
             {
                 continue;
             }
-            if let Some(range) = demoted_second {
-                if !range_matches_at(range, row, right_position) {
+            if let Some(view) = &demoted_view {
+                if !view.matches(row, right_position) {
                     continue;
                 }
             }
