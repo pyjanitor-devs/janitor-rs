@@ -449,15 +449,17 @@ impl<'a> AggregationSet<'a> {
 
         for row in 0..left_region.len() {
             let start = starts[row];
-            if start >= previous_end || start >= right_region.len() {
+            if start > previous_end || start >= right_region.len() {
                 continue;
             }
-            for position in (start..previous_end).rev() {
-                let leaf = tree_size + ranks[&right_region[position]];
-                tree.update(position, leaf);
-                tree.rebuild_path(leaf);
+            if start < previous_end {
+                for position in (start..previous_end).rev() {
+                    let leaf = tree_size + ranks[&right_region[position]];
+                    tree.update(position, leaf);
+                    tree.rebuild_path(leaf);
+                }
+                previous_end = start;
             }
-            previous_end = start;
 
             if !left_has_match[row] || left_region[row] == 0 {
                 continue;

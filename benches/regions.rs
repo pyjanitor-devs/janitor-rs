@@ -2,7 +2,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use janitor_rs::{dual_regions_aggregate, dual_regions_aggregate_legacy};
+use janitor_rs::bench_support::{dual_regions_aggregate, dual_regions_aggregate_legacy};
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
@@ -11,6 +11,7 @@ use std::hint::black_box;
 struct CountingAllocator;
 
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static BASE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -59,13 +60,15 @@ fn record_free(bytes: usize) {
 }
 
 fn reset_peak() {
-    PEAK_BYTES.store(LIVE_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
+    let live = LIVE_BYTES.load(Ordering::Relaxed);
+    BASE_BYTES.store(live, Ordering::Relaxed);
+    PEAK_BYTES.store(live, Ordering::Relaxed);
 }
 
 fn peak_delta() -> usize {
     PEAK_BYTES
         .load(Ordering::Relaxed)
-        .saturating_sub(LIVE_BYTES.load(Ordering::Relaxed))
+        .saturating_sub(BASE_BYTES.load(Ordering::Relaxed))
 }
 
 struct Prepared<'py> {
@@ -177,6 +180,7 @@ fn call(prepared: &Prepared<'_>, py: Python<'_>, optimized: bool) {
 }
 
 fn benchmark_regions(c: &mut Criterion) {
+    Python::initialize();
     let mut group = c.benchmark_group("dual_region_aggregation");
     for size in [128, 512, 2048] {
         Python::attach(|py| {
