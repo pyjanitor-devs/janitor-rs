@@ -888,9 +888,6 @@ fn build_equi_range_and_residual_indices_core(
     ensure_equal_lengths_core("left index", left_index.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("left index", left_index.len(), "ends", ends.len())?;
     for (&start, &end) in starts.iter().zip(ends.iter()) {
-        if start < 0 || end < 0 {
-            continue;
-        }
         validate_start_end(start, end, right_index.len())?;
     }
     let equality_windows = second_range.map(|_| (starts.to_owned(), ends.to_owned()));
