@@ -187,7 +187,10 @@ fn call(prepared: &Prepared<'_>, py: Python<'_>, optimized: bool) {
 fn benchmark_regions(c: &mut Criterion) {
     Python::initialize();
     let mut group = c.benchmark_group("dual_region_aggregation");
-    for size in [1_024, 8_192, 65_536] {
+    // Large fixtures make the asymptotic difference visible, while a smaller
+    // sample count keeps the deliberately retained legacy baseline practical.
+    group.sample_size(20);
+    for size in [1_024, 8_192, 65_536, 262_144, 1_048_576] {
         Python::attach(|py| {
             let prepared = prepare(py, size);
             for (name, optimized) in [("legacy", false), ("rank_tree", true)] {
