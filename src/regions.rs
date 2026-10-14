@@ -992,7 +992,7 @@ fn activate_ranked_positions(
     layout: &RankedRegionPositionLayout,
     start: usize,
     previous_end: usize,
-    active_counts: &mut [usize],
+    active_counts: &mut BTreeMap<usize, usize>,
 ) -> Result<(), String> {
     if start > previous_end {
         return Err("starts must be monotonically non-increasing".to_owned());
@@ -1002,7 +1002,8 @@ fn activate_ranked_positions(
         if rank == usize::MAX {
             continue;
         }
-        active_counts[rank] = active_counts[rank]
+        let count = active_counts.entry(rank).or_default();
+        *count = count
             .checked_add(1)
             .ok_or("region result size exceeds platform capacity")?;
     }
@@ -1073,7 +1074,7 @@ where
         ensure_equal_lengths_core("right region", region.len(), "first right region", end)?;
     }
 
-    let mut active_counts = vec![0usize; right_region_layout.labels.len()];
+    let mut active_counts = BTreeMap::<usize, usize>::new();
     let mut right_region_maxima = vec![0_i64; right_regions.len()];
     let mut previous_end = end;
     let mut total_matches = 0usize;
@@ -1106,9 +1107,7 @@ where
         let first_rank = right_region_layout
             .labels
             .partition_point(|&label| label < second_left_region);
-        'candidate_regions: for (rank, &region_count) in
-            active_counts.iter().enumerate().skip(first_rank)
-        {
+        'candidate_regions: for (&rank, &region_count) in active_counts.range(first_rank..) {
             let region_offset = right_region_layout.offsets[rank];
             for &right_position in
                 &right_region_layout.positions[region_offset..region_offset + region_count]
@@ -2615,6 +2614,12 @@ fn aggregate_dual_region_core<'py, F>(
 where
     F: Fn(usize, usize) -> bool,
 {
+    let inputs = parse_inputs(aggregations)?;
+    if inputs.is_empty() {
+        return Err(PyValueError::new_err(
+            "at least one aggregation is required",
+        ));
+    }
     let Some(regions) = build_dual_region_paths(first, second, left_index, right_index, &aligner)
         .map_err(PyValueError::new_err)?
     else {
@@ -2625,12 +2630,6 @@ where
     } else {
         (Some(left_index), left_index.len(), right_index.len())
     };
-    let inputs = parse_inputs(aggregations)?;
-    if inputs.is_empty() {
-        return Err(PyValueError::new_err(
-            "at least one aggregation is required",
-        ));
-    }
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
 
     let (left_has_match, any_left_match) =
@@ -2718,6 +2717,12 @@ fn aggregate_n_region_core<'py, F>(
 where
     F: Fn(usize, usize) -> bool,
 {
+    let inputs = parse_inputs(aggregations)?;
+    if inputs.is_empty() {
+        return Err(PyValueError::new_err(
+            "at least one aggregation is required",
+        ));
+    }
     let Some(paths) =
         build_n_region_candidate_paths(&first, ranges, left_index, right_index, aligners)
             .map_err(PyValueError::new_err)?
@@ -2729,12 +2734,6 @@ where
     } else {
         (Some(left_index), left_index.len(), right_index.len())
     };
-    let inputs = parse_inputs(aggregations)?;
-    if inputs.is_empty() {
-        return Err(PyValueError::new_err(
-            "at least one aggregation is required",
-        ));
-    }
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
     visit_n_region_matches(
         &paths.left_regions,

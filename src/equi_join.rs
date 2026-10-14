@@ -178,9 +178,6 @@ fn build_equi_range_indices_core(
     // windows that can overwrite one another.
     let equality_windows = second_range.map(|_| (starts.to_owned(), ends.to_owned()));
     for (&start, &end) in starts.iter().zip(ends.iter()) {
-        if start < 0 || end < 0 {
-            continue;
-        }
         validate_start_end(start, end, right_index.len())?;
     }
     let has_active_window = apply_equi_range_windows(
@@ -282,23 +279,21 @@ fn range_is_monotonic_for_windows(
     macro_rules! check {
         ($predicate:expr) => {{
             let right = $predicate.right.as_array();
+            let mut bad_prefix = vec![0usize; right.len()];
+            for position in 1..right.len() {
+                bad_prefix[position] = bad_prefix[position - 1]
+                    + usize::from(!matches!(
+                        right[position - 1].partial_cmp(&right[position]),
+                        Some(Ordering::Less | Ordering::Equal)
+                    ));
+            }
             for (&start, &end) in starts.iter().zip(ends.iter()) {
                 if start < 0 || end < 0 {
                     continue;
                 }
                 let start = start as usize;
                 let end = end as usize;
-                if right
-                    .slice(s![start..end])
-                    .windows(2)
-                    .into_iter()
-                    .any(|window| {
-                        !matches!(
-                            window[0].partial_cmp(&window[1]),
-                            Some(Ordering::Less | Ordering::Equal)
-                        )
-                    })
-                {
+                if end > start + 1 && bad_prefix[end - 1] != bad_prefix[start] {
                     return false;
                 }
             }
@@ -479,10 +474,10 @@ fn materialize_unordered_second_range(
 
 /// Build and apply the second-range envelope for already narrowed windows.
 ///
-/// This helper is shared by direct index materialization and the aggregation
-/// path. Both paths must narrow the candidate windows before their exact
-/// predicate/residual scan; otherwise aggregation would silently retain the
-/// slower full-window behavior.
+/// This helper is shared by direct index materialization and duplicate-key
+/// aggregation. Both paths narrow candidate windows before the exact scan;
+/// the residual check remains necessary because the envelope is only a safe
+/// pruning proof.
 ///
 /// # Arguments
 ///
@@ -1023,8 +1018,9 @@ pub fn equi_range_and_residual_indices<'py>(
 /// Aggregate candidates from the prepared equi layout.
 ///
 /// Unique equality matches use aligned left/right rows. Duplicate equality
-/// matches use `starts..ends` windows. Range windows are narrowed before the
-/// candidate loop; a non-monotonic second range remains a residual check.
+/// matches use `starts..ends` windows. A non-monotonic second range is first
+/// narrowed with the cumulative envelope, then remains an exact per-candidate
+/// residual check for correctness.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn equi_aggregate<'py>(
@@ -1097,9 +1093,6 @@ pub fn equi_aggregate<'py>(
         ensure_equal_lengths_core("left index", left_index.len(), "ends", ends.len())
             .map_err(PyValueError::new_err)?;
         for (&start, &end) in starts.iter().zip(ends.iter()) {
-            if start < 0 || end < 0 {
-                continue;
-            }
             validate_start_end(start, end, right_index.len()).map_err(PyValueError::new_err)?;
         }
         let equality_windows = (ranges.len() > 1).then(|| (starts.to_owned(), ends.to_owned()));
@@ -1157,9 +1150,6 @@ pub fn equi_aggregate<'py>(
             .as_ref()
             .and_then(|values| values.view().get(row).copied())
             .unwrap_or(candidate_start + 1);
-        if candidate_start < 0 || candidate_end < 0 {
-            continue;
-        }
         let (candidate_start, candidate_end) = if starts.is_some() {
             validate_start_end(candidate_start, candidate_end, right_index.len())
                 .map_err(PyValueError::new_err)?
