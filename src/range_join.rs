@@ -56,6 +56,29 @@ use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_stri
 use crate::range_predicate::parse_any_range_predicate;
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
+/// Select the smallest or largest physical label in each half-open window.
+///
+/// The returned values are positions into `labels`, not the labels themselves.
+/// This helper searches each exact interior window rather than treating it as
+/// a prefix or suffix of the right-hand layout.
+///
+/// # Arguments
+///
+/// * `labels` - Right-side physical labels in sorted-layout order.
+/// * `starts` - Inclusive window starts, one per logical left row.
+/// * `ends` - Exclusive window ends, one per logical left row.
+/// * `minimum` - Select the smallest position label when true; otherwise
+///   select the largest.
+///
+/// # Returns
+///
+/// One selected position per window, encoded as `i64` for the public index
+/// contract.
+///
+/// # Errors
+///
+/// Returns an error when the window arrays have different lengths, a boundary
+/// is negative, a window is empty, or an end exceeds `labels.len()`.
 fn window_extreme_positions(
     labels: &[i64],
     starts: &[i64],
@@ -95,6 +118,22 @@ fn window_extreme_positions(
 /// shared `left_index` and `right_index` are supplied once by
 /// [`range_join_indices`], preventing the two anchors from carrying
 /// inconsistent physical layouts.
+///
+/// # Arguments
+///
+/// * `tuple` - Three-element `(left_values, right_values, operator)` tuple.
+/// * `left_index` - Physical positions paired with the left values.
+/// * `right_index` - Physical positions paired with the sorted right values.
+///
+/// # Returns
+///
+/// A parsed range predicate borrowing the Python objects supplied by the
+/// caller.
+///
+/// # Errors
+///
+/// Returns a Python `ValueError` when `tuple` does not contain exactly three
+/// elements, or a parsing/type error when one of its fields is invalid.
 fn parse_shared_index_range_predicate<'py>(
     tuple: &Bound<'py, PyTuple>,
     left_index: &Bound<'py, PyAny>,
@@ -222,6 +261,24 @@ pub(crate) fn build_windows<T: PartialOrd + Copy>(
 /// is outside the Rust contract and must be prevented by PyJanitor's alignment
 /// step. This keeps the dual-range path from paying an O(right_len) defensive
 /// scan on every call.
+///
+/// # Arguments
+///
+/// * `first` - The first anchor's windows, labels, and physical positions.
+/// * `second` - The second anchor's windows, aligned to the first anchor's
+///   left and right layouts.
+///
+/// # Returns
+///
+/// A new [`SingleJoinResult`] containing the row-wise intersection. Empty
+/// intersections are retained as equal start/end boundaries for later stages
+/// to remove.
+///
+/// # Errors
+///
+/// Returns an error when the window arrays or physical maps have incompatible
+/// lengths, or when a window boundary is outside the corresponding right
+/// layout.
 pub(crate) fn intersect_windows(
     first: SingleJoinResult,
     second: SingleJoinResult,
@@ -295,6 +352,15 @@ pub(crate) fn intersect_windows(
 ///
 /// Returns an error when either parsed anchor cannot produce valid windows or
 /// when the two window collections do not share aligned left/right lengths.
+///
+/// # Arguments
+///
+/// * `first` - The first parsed range anchor and canonical right layout.
+/// * `second` - The second parsed range anchor, aligned to `first`.
+///
+/// # Returns
+///
+/// The row-wise intersection of the two anchors as half-open windows.
 pub(crate) fn build_any_windows(
     first: &AnyParsedRangePredicate<'_>,
     second: &AnyParsedRangePredicate<'_>,
@@ -534,6 +600,10 @@ pub fn range_join_indices<'py>(
 ///
 /// Registration lives with the implementation so adding or removing a range
 /// kernel cannot leave the top-level module with a stale export list.
+///
+/// # Arguments
+///
+/// * `m` - Python module receiving the range-join functions.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     macro_rules! add {
         ($($name:ident),+ $(,)?) => {
