@@ -81,8 +81,13 @@ struct Prepared<'py> {
 }
 
 fn prepare<'py>(py: Python<'py>, size: usize) -> Prepared<'py> {
-    let left_values = vec![1_i64; size];
-    let right_values: Vec<i64> = (1..=size as i64).collect();
+    // Keep the candidate window fixed while the input grows. This makes the
+    // legacy traversal measurable at large sizes instead of accidentally
+    // turning the benchmark into an unbounded quadratic stress test.
+    const WINDOW: usize = 64;
+    assert!(size >= WINDOW);
+    let left_values = vec![(size - WINDOW) as i64; size];
+    let right_values: Vec<i64> = (0..size as i64).collect();
     let left = PyArray1::from_vec(py, (0..size as i64).collect());
     let right = PyArray1::from_vec(py, (0..size as i64).collect());
     let first = PyTuple::new(
@@ -182,7 +187,7 @@ fn call(prepared: &Prepared<'_>, py: Python<'_>, optimized: bool) {
 fn benchmark_regions(c: &mut Criterion) {
     Python::initialize();
     let mut group = c.benchmark_group("dual_region_aggregation");
-    for size in [128, 512, 2048] {
+    for size in [1_024, 8_192, 65_536] {
         Python::attach(|py| {
             let prepared = prepare(py, size);
             for (name, optimized) in [("legacy", false), ("rank_tree", true)] {
