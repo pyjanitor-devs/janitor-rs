@@ -2870,39 +2870,6 @@ pub fn dual_regions_aggregate<'py>(
     )
 }
 
-/// Run dual-region aggregation with the pre-rank-tree traversal.
-///
-/// This is intentionally not registered as a Python function. It exists for
-/// repository benchmarks so the optimized and legacy algorithms can be
-/// measured on the same prepared inputs without adding a production switch.
-#[doc(hidden)]
-pub fn dual_regions_aggregate_legacy<'py>(
-    py: Python<'py>,
-    left_index: &Bound<'py, PyAny>,
-    right_index: &Bound<'py, PyAny>,
-    first_predicate: &Bound<'py, PyTuple>,
-    second_predicate: &Bound<'py, PyTuple>,
-    aligner: PyReadonlyArray1<'py, i64>,
-    aggregations: &Bound<'py, PyList>,
-    return_matched: bool,
-) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    let left = left_index.extract::<PyReadonlyArray1<'py, i64>>()?;
-    let right = right_index.extract::<PyReadonlyArray1<'py, i64>>()?;
-    aggregate_dual_region_core(
-        py,
-        left.as_array(),
-        right.as_array(),
-        parse_region_predicate(first_predicate)?,
-        parse_region_predicate(second_predicate)?,
-        aligner.as_array(),
-        aggregations,
-        return_matched,
-        false,
-        false,
-        |_, _| true,
-    )
-}
-
 /// Aggregate every pair satisfying two range predicates in reverse.
 ///
 /// This direction reads aggregation values from the left side and writes one
