@@ -38,6 +38,75 @@ pub(crate) struct RankedRegionPositionLayout {
     positions: Vec<usize>,
 }
 
+/// Point-update/suffix-query tree for the best right index at each rank.
+///
+/// ELI5: as the sweep exposes another right row, update its region's bucket.
+/// A suffix query then skips all ineligible buckets in O(log R), instead of
+/// scanning every active region for every left row.
+struct RankedExtremeTree {
+    min: Vec<Option<i64>>,
+    max: Vec<Option<i64>>,
+    base: usize,
+}
+
+impl RankedExtremeTree {
+    fn new(rank_count: usize) -> Self {
+        let base = rank_count.max(1).next_power_of_two();
+        Self {
+            min: vec![None; base * 2],
+            max: vec![None; base * 2],
+            base,
+        }
+    }
+
+    fn update(&mut self, rank: usize, value: i64) {
+        let mut node = self.base + rank;
+        self.min[node] = Some(self.min[node].map_or(value, |current| current.min(value)));
+        self.max[node] = Some(self.max[node].map_or(value, |current| current.max(value)));
+        node /= 2;
+        while node > 0 {
+            self.min[node] = min_optional(self.min[node * 2], self.min[node * 2 + 1]);
+            self.max[node] = max_optional(self.max[node * 2], self.max[node * 2 + 1]);
+            node /= 2;
+        }
+    }
+
+    fn suffix_extreme(&self, start: usize, keep: Keep) -> Option<i64> {
+        let mut left = self.base + start;
+        let mut right = self.base * 2;
+        let mut result = None;
+        while left < right {
+            if left % 2 == 1 {
+                result = match keep {
+                    Keep::First => min_optional(result, self.min[left]),
+                    Keep::Last => max_optional(result, self.max[left]),
+                    _ => unreachable!("ranked extrema only supports first/last"),
+                };
+                left += 1;
+            }
+            if right % 2 == 1 {
+                right -= 1;
+                result = match keep {
+                    Keep::First => min_optional(result, self.min[right]),
+                    Keep::Last => max_optional(result, self.max[right]),
+                    _ => unreachable!("ranked extrema only supports first/last"),
+                };
+            }
+            left /= 2;
+            right /= 2;
+        }
+        result
+    }
+}
+
+fn min_optional(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    left.into_iter().chain(right).min()
+}
+
+fn max_optional(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    left.into_iter().chain(right).max()
+}
+
 /// Counts produced by the first pass of `keep="all"` materialization.
 pub(crate) struct KeepAllFirstPass {
     pub(crate) left_match_counts: Vec<usize>,
@@ -97,32 +166,8 @@ pub(crate) struct AnyMatchPass {
 ///
 /// Returns an error when starts are not monotonically non-increasing.
 fn dual_region_match_filter(regions: &DualRegionPaths) -> Result<(Vec<bool>, bool), String> {
-    let mut left_has_match = vec![false; regions.left_region.len()];
-    let mut any_left_match = false;
-    let mut max_right_region = i64::MIN;
-    let mut previous_end = regions.end;
-
-    for (left_position, (&start, &left_region)) in
-        regions.starts.iter().zip(&regions.left_region).enumerate()
-    {
-        if start == regions.end {
-            continue;
-        }
-        if start > previous_end {
-            return Err("starts must be monotonically non-increasing".to_owned());
-        }
-
-        for &right_region in &regions.right_region[start..previous_end] {
-            max_right_region = max_right_region.max(right_region);
-        }
-        previous_end = start;
-
-        let has_match = left_region != 0 && left_region <= max_right_region;
-        left_has_match[left_position] = has_match;
-        any_left_match |= has_match;
-    }
-
-    Ok((left_has_match, any_left_match))
+    let pass = count_matching_left_rows(regions)?;
+    Ok((pass.left_has_match, pass.match_count != 0))
 }
 
 /// Parse a three-element region predicate using shared left/right indices.
@@ -561,7 +606,7 @@ pub(crate) fn keep_first_last_second_pass(
 
     let right_region_layout =
         build_ranked_region_position_layout(&regions.right_region, &regions.starts, regions.end)?;
-    let mut active_best = BTreeMap::<usize, i64>::new();
+    let mut active_best = RankedExtremeTree::new(right_region_layout.labels.len());
     let mut left_output = Vec::with_capacity(first_pass.match_count);
     let mut right_output = Vec::with_capacity(first_pass.match_count);
     let mut previous_end = regions.end;
@@ -582,13 +627,7 @@ pub(crate) fn keep_first_last_second_pass(
                 continue;
             }
 
-            let right_value = right_index[right_position];
-            let selected = active_best.entry(rank).or_insert(right_value);
-            if keep == Keep::Last {
-                *selected = (*selected).max(right_value);
-            } else {
-                *selected = (*selected).min(right_value);
-            }
+            active_best.update(rank, right_index[right_position]);
         }
         previous_end = start;
 
@@ -599,17 +638,7 @@ pub(crate) fn keep_first_last_second_pass(
         let first_rank = right_region_layout
             .labels
             .partition_point(|&label| label < left_region);
-        let selected = if keep == Keep::Last {
-            active_best
-                .range(first_rank..)
-                .map(|(_, &value)| value)
-                .max()
-        } else {
-            active_best
-                .range(first_rank..)
-                .map(|(_, &value)| value)
-                .min()
-        };
+        let selected = active_best.suffix_extreme(first_rank, keep);
         let Some(right_value) = selected else {
             continue;
         };
@@ -2126,94 +2155,24 @@ fn n_region_indices_with_filter_core<F>(
 where
     F: Fn(usize, usize) -> bool,
 {
-    // The first predicate establishes the canonical right order. Every later
-    // predicate supplies an aligner that has already been prepared by Python,
-    // so this core function only gathers values and performs the sweep.
-    // Aggregation callers should share this traversal but update aggregate
-    // state for every passing candidate; `keep` is for index selection only.
-    ensure_equal_lengths_core(
-        "first left predicate",
-        first_predicate.left_len(),
-        "left_index",
-        left_index.len(),
-    )?;
-    ensure_equal_lengths_core(
-        "first right predicate",
-        first_predicate.right_len(),
-        "right_index",
-        right_index.len(),
-    )?;
-    if range_predicates.len() < 2 {
-        return Err("n-region paths require at least three predicates".to_owned());
-    }
-    if range_predicates.len() != aligners.len() {
-        return Err("range predicates and aligners must have equal lengths".to_owned());
-    }
-    for predicate in range_predicates {
-        ensure_equal_lengths_core(
-            "range left predicate",
-            predicate.left_len(),
-            "left_index",
-            left_index.len(),
-        )?;
-        ensure_equal_lengths_core(
-            "range right predicate",
-            predicate.right_len(),
-            "right_index",
-            right_index.len(),
-        )?;
-    }
-
-    // `left_index` and `right_index` are output labels, not region offsets.
-    // The value arrays inside each predicate may have been sorted or aligned;
-    // these two arrays retain the physical row identity that Python expects.
-    let Some(first_regions) = build_region_paths(first_predicate, None, None, None)? else {
+    let Some(paths) = build_n_region_candidate_paths(
+        first_predicate,
+        range_predicates,
+        left_index,
+        right_index,
+        aligners,
+    )?
+    else {
         return Ok(None);
     };
-    let (first_left_region, first_right_region) = first_regions;
-
-    let mut left_range_regions = Vec::with_capacity(range_predicates.len() + 1);
-    let mut right_range_regions = Vec::with_capacity(range_predicates.len() + 1);
-    left_range_regions.push(first_left_region);
-    right_range_regions.push(first_right_region);
-
-    for (predicate, aligner) in range_predicates.iter().zip(aligners) {
-        let Some((left_region, right_region)) =
-            build_region_paths(predicate, Some(aligner), None, None)?
-        else {
-            return Ok(None);
-        };
-        left_range_regions.push(left_region);
-        right_range_regions.push(right_region);
-    }
-
-    mask_zero_regions(&mut left_range_regions)?;
-
-    if left_range_regions[0].iter().all(|&region| region == 0) {
-        return Ok(None);
-    }
-
-    let left_order = descending_left_order(&left_range_regions[0]);
-    for region in &mut left_range_regions {
-        *region = reorder_left_region(region, &left_order);
-    }
-
-    let first_right_region = &right_range_regions[0];
-    // Compute starts before applying the shared zero mask. The first right
-    // path is monotonic at this point, which is the invariant required by
-    // `partition_point`; propagating zeros later can create internal holes.
-    let Some(starts) = n_region_starts(&left_range_regions[0], first_right_region)? else {
-        return Ok(None);
-    };
-    let end = first_right_region.len();
-
-    mask_zero_regions(&mut right_range_regions)?;
-    if right_range_regions[0].iter().all(|&region| region == 0) {
-        return Ok(None);
-    }
-
-    let right_region_layout =
-        build_ranked_region_position_layout(&right_range_regions[1], &starts, end)?;
+    let NRegionCandidatePaths {
+        left_regions: left_range_regions,
+        right_regions: right_range_regions,
+        starts,
+        end,
+        left_order,
+        right_region_layout,
+    } = paths;
 
     if keep != Keep::All {
         let mut selected_right_positions = vec![None; left_range_regions[0].len()];

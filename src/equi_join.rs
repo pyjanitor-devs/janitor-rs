@@ -25,6 +25,7 @@ use crate::aggregation_common::aggregation::{
 };
 use crate::aggregation_common::ensure_equal_lengths_core;
 use crate::compare_op::CompareOp;
+use crate::join_search::partition_point_between;
 use crate::join_types::{result_dict, Keep};
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
@@ -33,6 +34,35 @@ use crate::predicate::{
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
 type IndexPairs = Option<(Vec<i64>, Vec<i64>)>;
+
+/// Update one row's selected right position and report whether scanning may
+/// stop. `first` and `last` compare physical right labels, not sorted offsets.
+fn update_keep_selection(
+    selected: &mut Option<usize>,
+    candidate: usize,
+    keep: Keep,
+    right_index: ArrayView1<'_, i64>,
+) -> bool {
+    match keep {
+        Keep::Any => {
+            *selected = Some(candidate);
+            false
+        }
+        Keep::First => {
+            if selected.is_none_or(|current| right_index[candidate] < right_index[current]) {
+                *selected = Some(candidate);
+            }
+            true
+        }
+        Keep::Last => {
+            if selected.is_none_or(|current| right_index[candidate] > right_index[current]) {
+                *selected = Some(candidate);
+            }
+            true
+        }
+        Keep::All => unreachable!("keep='all' uses the all-matches path"),
+    }
+}
 
 /// Return the unique reverse-output labels and their dense aggregation slots.
 ///
@@ -297,71 +327,16 @@ fn materialize_equi_windows(
     ends: ArrayView1<'_, i64>,
     keep: Keep,
 ) -> Result<IndexPairs, String> {
-    if keep == Keep::All {
-        let mut output_capacity = 0_usize;
-        for (&start, &end) in starts.iter().zip(ends.iter()) {
-            if start < 0 || end < 0 {
-                continue;
-            }
-            output_capacity = output_capacity
-                .checked_add(end as usize - start as usize)
-                .ok_or("equi-join result size exceeds platform capacity")?;
-        }
-        if output_capacity == 0 {
-            return Ok(None);
-        }
-        let mut left_output = Vec::with_capacity(output_capacity);
-        let mut right_output = Vec::with_capacity(output_capacity);
-        for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
-            if start < 0 || end < 0 {
-                continue;
-            }
-            for &right_label in right_index.slice(s![start as usize..end as usize]).iter() {
-                left_output.push(left_index[row]);
-                right_output.push(right_label);
-            }
-        }
-        return Ok(Some((left_output, right_output)));
-    }
-
-    let mut left_output = Vec::with_capacity(left_index.len());
-    let mut right_output = Vec::with_capacity(left_index.len());
-    for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
-        if start < 0 || end <= start {
-            continue;
-        }
-        let mut selected = None;
-        for right_position in start as usize..end as usize {
-            selected = match (keep, selected) {
-                (Keep::Any, _) => Some(right_position),
-                (Keep::First, None) => Some(right_position),
-                (Keep::First, Some(current))
-                    if right_index[right_position] < right_index[current] =>
-                {
-                    Some(right_position)
-                }
-                (Keep::Last, None) => Some(right_position),
-                (Keep::Last, Some(current))
-                    if right_index[right_position] > right_index[current] =>
-                {
-                    Some(right_position)
-                }
-                (_, current) => current,
-            };
-            if keep == Keep::Any {
-                break;
-            }
-        }
-        if let Some(right_position) = selected {
-            left_output.push(left_index[row]);
-            right_output.push(right_index[right_position]);
-        }
-    }
-    if left_output.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some((left_output, right_output)))
-    }
+    materialize_equi_windows_and_residuals(
+        left_index,
+        right_index,
+        starts,
+        ends,
+        &[],
+        None,
+        None,
+        keep,
+    )
 }
 
 /// Materialize matches for an unordered second range predicate.
@@ -430,7 +405,7 @@ fn materialize_unordered_second_range(
                     let start = start as usize;
                     let end = end as usize;
                     for right_position in start..end {
-                        if range_value_matches(left[row], right[right_position], predicate.op) {
+                        if predicate.op.apply(&left[row], &right[right_position]) {
                             output_capacity = output_capacity
                                 .checked_add(1)
                                 .ok_or("equi-join result size exceeds platform capacity")?;
@@ -449,7 +424,7 @@ fn materialize_unordered_second_range(
                     let start = start as usize;
                     let end = end as usize;
                     for right_position in start..end {
-                        if range_value_matches(left[row], right[right_position], predicate.op) {
+                        if predicate.op.apply(&left[row], &right[right_position]) {
                             left_output.push(left_index[row]);
                             right_output.push(right_index[right_position]);
                         }
@@ -468,29 +443,11 @@ fn materialize_unordered_second_range(
                 let end = end as usize;
                 let mut selected = None;
                 for right_position in start..end {
-                    if !range_value_matches(left[row], right[right_position], predicate.op) {
+                    if !predicate.op.apply(&left[row], &right[right_position]) {
                         continue;
                     }
-                    match keep {
-                        Keep::Any => {
-                            selected = Some(right_position);
-                            break;
-                        }
-                        Keep::First
-                            if selected.is_none_or(|current| {
-                                right_index[right_position] < right_index[current]
-                            }) =>
-                        {
-                            selected = Some(right_position)
-                        }
-                        Keep::Last
-                            if selected.is_none_or(|current| {
-                                right_index[right_position] > right_index[current]
-                            }) =>
-                        {
-                            selected = Some(right_position)
-                        }
-                        Keep::All | Keep::First | Keep::Last => {}
+                    if !update_keep_selection(&mut selected, right_position, keep, right_index) {
+                        break;
                     }
                 }
                 if let Some(right_position) = selected {
@@ -578,17 +535,6 @@ fn narrow_unordered_second_range_for_predicate(
         AnyParsedRangePredicate::U8(predicate) => narrow!(predicate),
         AnyParsedRangePredicate::F64(predicate) => narrow!(predicate),
         AnyParsedRangePredicate::F32(predicate) => narrow!(predicate),
-    }
-}
-
-fn range_value_matches<T: PartialOrd>(left: T, right: T, op: CompareOp) -> bool {
-    match op {
-        CompareOp::Lt => left < right,
-        CompareOp::Le => left <= right,
-        CompareOp::Gt => left > right,
-        CompareOp::Ge => left >= right,
-        CompareOp::Eq => left == right,
-        CompareOp::Ne => left != right,
     }
 }
 
@@ -727,10 +673,9 @@ fn range_matches_at(
 ) -> bool {
     macro_rules! matches {
         ($predicate:expr) => {
-            range_value_matches(
-                $predicate.left.as_array()[left_position],
-                $predicate.right.as_array()[right_position],
-                $predicate.op,
+            $predicate.op.apply(
+                &$predicate.left.as_array()[left_position],
+                &$predicate.right.as_array()[right_position],
             )
         };
     }
@@ -746,36 +691,6 @@ fn range_matches_at(
         AnyParsedRangePredicate::F64(predicate) => matches!(predicate),
         AnyParsedRangePredicate::F32(predicate) => matches!(predicate),
     }
-}
-
-/// Return the first offset at which `predicate` is false within `[start, end)`.
-///
-/// The returned offset is relative to `values`, not to the supplied window.
-/// This helper is kept local because bounded partitioning is specific to
-/// narrowing prepared equi-join windows.
-fn partition_point_between<T: PartialOrd + Copy>(
-    values: ArrayView1<'_, T>,
-    start: usize,
-    end: usize,
-    predicate: impl Fn(T) -> bool,
-) -> usize {
-    debug_assert!(start <= end);
-    debug_assert!(end <= values.len());
-
-    if let Some(slice) = values.as_slice() {
-        return start + slice[start..end].partition_point(|value| predicate(*value));
-    }
-    let mut low = start;
-    let mut high = end;
-    while low < high {
-        let middle = low + ((high - low) >> 1);
-        if predicate(values[middle]) {
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
-    }
-    low
 }
 
 fn apply_equi_range_bound<T: PartialOrd + Copy>(
@@ -947,23 +862,7 @@ fn materialize_equi_windows_and_residuals(
             if !matches(row, right_position) {
                 continue;
             }
-            selected = match (keep, selected) {
-                (Keep::Any, _) => Some(right_position),
-                (Keep::First, None) => Some(right_position),
-                (Keep::First, Some(current))
-                    if right_index[right_position] < right_index[current] =>
-                {
-                    Some(right_position)
-                }
-                (Keep::Last, None) => Some(right_position),
-                (Keep::Last, Some(current))
-                    if right_index[right_position] > right_index[current] =>
-                {
-                    Some(right_position)
-                }
-                (_, current) => current,
-            };
-            if keep == Keep::Any {
+            if !update_keep_selection(&mut selected, right_position, keep, right_index) {
                 break;
             }
         }
@@ -1532,27 +1431,8 @@ fn build_equi_ne_indices_core(
             {
                 continue;
             }
-            match keep {
-                Keep::Any => {
-                    selected = Some(right_position);
-                    break;
-                }
-                Keep::First
-                    if selected.is_none_or(|position| {
-                        right_index[right_position] < right_index[position]
-                    }) =>
-                {
-                    selected = Some(right_position)
-                }
-                Keep::Last
-                    if selected.is_none_or(|position| {
-                        right_index[right_position] > right_index[position]
-                    }) =>
-                {
-                    selected = Some(right_position)
-                }
-                Keep::All => unreachable!(),
-                Keep::First | Keep::Last => {}
+            if !update_keep_selection(&mut selected, right_position, keep, right_index) {
+                break;
             }
         }
         if let Some(right_position) = selected {
@@ -1751,7 +1631,7 @@ mod tests {
         apply_equi_range_bound, build_equi_ne_indices_core, build_equi_only_indices_core,
         build_equi_range_indices_core, build_equi_uniq_residual_indices_core,
         build_second_range_envelope, materialize_equi_windows, materialize_unordered_second_range,
-        narrow_unordered_second_range, range_value_matches, unique_reverse_output_slots,
+        narrow_unordered_second_range, unique_reverse_output_slots,
     };
     use crate::compare_op::CompareOp;
     use crate::join_types::Keep;
@@ -1808,13 +1688,13 @@ mod tests {
             let mut actual = Vec::new();
             for row in 0..left.len() {
                 for position in original_starts[row] as usize..original_ends[row] as usize {
-                    if range_value_matches(left[row], right[position], op) {
+                    if op.apply(&left[row], &right[position]) {
                         expected.push((row, position));
                     }
                 }
                 if starts[row] >= 0 && ends[row] >= 0 {
                     for position in starts[row] as usize..ends[row] as usize {
-                        if range_value_matches(left[row], right[position], op) {
+                        if op.apply(&left[row], &right[position]) {
                             actual.push((row, position));
                         }
                     }

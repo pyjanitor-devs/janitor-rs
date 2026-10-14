@@ -52,9 +52,6 @@ use crate::join_candidate_materialization::materialize_range_candidates;
 use crate::join_search::range_window;
 use crate::join_types::{result_dict, Keep, SingleJoinResult};
 use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
-#[cfg(test)]
-#[cfg(test)]
-use crate::range_predicate::parse_any_range_predicate;
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
 /// Select the smallest or largest physical label in each half-open window.
@@ -1005,7 +1002,13 @@ mod tests {
                         operator.into_pyobject(py)?.into_any(),
                     ],
                 )?;
-                let parsed = parse_any_range_predicate(&predicate, false)?;
+                let parsed = parse_any_range_parts(
+                    &predicate.get_item(0)?,
+                    &predicate.get_item(1)?,
+                    &predicate.get_item(2)?,
+                    &predicate.get_item(3)?,
+                    &predicate.get_item(5)?,
+                )?;
                 let windows = parsed.windows(true).map_err(PyValueError::new_err)?;
                 assert_eq!(windows.left_positions, vec![0], "operator {operator}");
                 assert_eq!(windows.starts, vec![expected_start], "operator {operator}");
@@ -1035,7 +1038,13 @@ mod tests {
                         operator.into_pyobject(py)?.into_any(),
                     ],
                 )?;
-                let parsed = parse_any_range_predicate(&predicate, false)?;
+                let parsed = parse_any_range_parts(
+                    &predicate.get_item(0)?,
+                    &predicate.get_item(1)?,
+                    &predicate.get_item(2)?,
+                    &predicate.get_item(3)?,
+                    &predicate.get_item(5)?,
+                )?;
                 let windows = parsed.windows(true).map_err(PyValueError::new_err)?;
                 assert_eq!(windows.left_positions, vec![0, 1], "operator {operator}");
                 assert_eq!(windows.starts, expected_starts, "operator {operator}");

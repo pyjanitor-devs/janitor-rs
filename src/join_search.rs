@@ -29,6 +29,31 @@ pub(crate) fn partition_point<T: PartialOrd + Copy>(
     low
 }
 
+/// Return the first false predicate offset within `[start, end)`.
+pub(crate) fn partition_point_between<T: PartialOrd + Copy>(
+    values: ArrayView1<'_, T>,
+    start: usize,
+    end: usize,
+    predicate: impl Fn(T) -> bool,
+) -> usize {
+    debug_assert!(start <= end);
+    debug_assert!(end <= values.len());
+    if let Some(slice) = values.as_slice() {
+        return start + slice[start..end].partition_point(|value| predicate(*value));
+    }
+    let mut low = start;
+    let mut high = end;
+    while low < high {
+        let middle = low + ((high - low) >> 1);
+        if predicate(values[middle]) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
 /// Return the half-open right-side window satisfying one range predicate.
 ///
 /// `right` must be sorted in ascending order. The returned values are offsets
