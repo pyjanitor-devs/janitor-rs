@@ -2658,7 +2658,9 @@ where
     // traversal: the second predicate may discard most of those positions.
     // Count its nonzero region labels while walking the same monotonic window
     // frontier, so selective second predicates do not make the tree look
-    // cheaper than the traversal they replace.
+    // cheaper than the traversal they replace. This is a uniform-share
+    // approximation, not a conservative bound, and is only a switching
+    // heuristic.
     let mut estimated_width = 0_usize;
     let mut estimate_previous_end = regions.end;
     let mut estimated_active_width = 0_usize;
