@@ -178,6 +178,9 @@ fn build_equi_range_indices_core(
     // windows that can overwrite one another.
     let equality_windows = second_range.map(|_| (starts.to_owned(), ends.to_owned()));
     for (&start, &end) in starts.iter().zip(ends.iter()) {
+        if start < 0 || end < 0 {
+            continue;
+        }
         validate_start_end(start, end, right_index.len())?;
     }
     let has_active_window = apply_equi_range_windows(
@@ -888,6 +891,9 @@ fn build_equi_range_and_residual_indices_core(
     ensure_equal_lengths_core("left index", left_index.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("left index", left_index.len(), "ends", ends.len())?;
     for (&start, &end) in starts.iter().zip(ends.iter()) {
+        if start < 0 || end < 0 {
+            continue;
+        }
         validate_start_end(start, end, right_index.len())?;
     }
     let equality_windows = second_range.map(|_| (starts.to_owned(), ends.to_owned()));
@@ -1090,6 +1096,9 @@ pub fn equi_aggregate<'py>(
         ensure_equal_lengths_core("left index", left_index.len(), "ends", ends.len())
             .map_err(PyValueError::new_err)?;
         for (&start, &end) in starts.iter().zip(ends.iter()) {
+            if start < 0 || end < 0 {
+                continue;
+            }
             validate_start_end(start, end, right_index.len()).map_err(PyValueError::new_err)?;
         }
         let equality_windows = (ranges.len() > 1).then(|| (starts.to_owned(), ends.to_owned()));
@@ -1147,6 +1156,9 @@ pub fn equi_aggregate<'py>(
             .as_ref()
             .and_then(|values| values.view().get(row).copied())
             .unwrap_or(candidate_start + 1);
+        if candidate_start < 0 || candidate_end < 0 {
+            continue;
+        }
         let (candidate_start, candidate_end) = if starts.is_some() {
             validate_start_end(candidate_start, candidate_end, right_index.len())
                 .map_err(PyValueError::new_err)?
