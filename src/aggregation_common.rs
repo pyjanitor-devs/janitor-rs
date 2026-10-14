@@ -100,7 +100,3 @@ pub(crate) fn ensure_equal_lengths_core(
         ))
     }
 }
-
-pub(crate) fn checked_end(end: i64, len: usize) -> Option<usize> {
-    usize::try_from(end).ok().filter(|&end| end <= len)
-}

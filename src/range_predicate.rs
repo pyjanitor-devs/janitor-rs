@@ -30,6 +30,7 @@
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+#[cfg(test)]
 use pyo3::types::PyTuple;
 
 use crate::aggregation_common::ensure_equal_lengths_core;
@@ -155,6 +156,7 @@ pub(crate) enum AnyParsedRangePredicate<'py> {
 /// output-position maps around the ordinary five-field range predicate. The
 /// kernel should not need to remember those numeric tuple positions, so this
 /// struct keeps the parsed range and metadata together.
+#[cfg(test)]
 pub(crate) struct ParsedAggregationRangeAnchor<'py> {
     /// Typed range data used by binary-search/window construction.
     pub(crate) range: AnyParsedRangePredicate<'py>,
@@ -165,9 +167,6 @@ pub(crate) struct ParsedAggregationRangeAnchor<'py> {
     /// the output layout returned to Python; they are not source-position
     /// maps for reading aggregation values.
     pub(crate) left_output_positions: Option<PyReadonlyArray1<'py, i64>>,
-    /// Optional compact output labels for reverse aggregation. The reverse
-    /// accumulator still reads source positions from the aligned region maps.
-    pub(crate) right_output_positions: Option<PyReadonlyArray1<'py, i64>>,
 }
 
 /// Parse one aggregation range anchor without exposing tuple positions to a
@@ -201,6 +200,7 @@ pub(crate) struct ParsedAggregationRangeAnchor<'py> {
 /// Returns `ValueError` for malformed tuple lengths, non-boolean ordering
 /// flags, unsupported dtypes/operators, unequal value/index lengths, or
 /// output maps whose lengths do not match their source arrays.
+#[cfg(test)]
 pub(crate) fn parse_aggregation_range_anchor<'py>(
     tuple: &Bound<'py, PyTuple>,
     first: bool,
@@ -277,7 +277,6 @@ pub(crate) fn parse_aggregation_range_anchor<'py>(
         range,
         ordered,
         left_output_positions,
-        right_output_positions,
     })
 }
 
@@ -338,6 +337,7 @@ impl AnyParsedRangePredicate<'_> {
     /// region anchor. Keeping this check on the named representation ensures
     /// both six/eight-field first anchors and five-field second anchors use
     /// the same error and validation rule.
+    #[cfg(test)]
     pub(crate) fn validate_range_operator(&self) -> Result<(), String> {
         // This check is deliberately separate from CompareOp parsing: parsing
         // answers “is this a known operator?”, while this method answers “is
@@ -554,6 +554,7 @@ impl AnyParsedRangePredicate<'_> {
 /// validation is deliberately exposed separately through
 /// [`AnyParsedRangePredicate::validate_lengths`] because ordinary range
 /// windows and region construction validate at different stages.
+#[cfg(test)]
 pub(crate) fn parse_any_range_predicate<'py>(
     tuple: &Bound<'py, PyTuple>,
     extended: bool,

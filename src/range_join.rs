@@ -53,6 +53,7 @@ use crate::join_search::range_window;
 use crate::join_types::{result_dict, Keep, SingleJoinResult};
 use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
 #[cfg(test)]
+#[cfg(test)]
 use crate::range_predicate::parse_any_range_predicate;
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
