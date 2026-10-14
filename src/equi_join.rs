@@ -1150,7 +1150,13 @@ pub fn equi_aggregate<'py>(
         }
     }
 
-    let range_views: Vec<_> = ranges.iter().map(range_predicate_view).collect();
+    // ELI5: precomputed windows already applied the ranges, so only the
+    // aligned no-window layout needs to re-check every range per candidate.
+    let range_views: Vec<_> = if starts.is_none() {
+        ranges.iter().map(range_predicate_view).collect()
+    } else {
+        Vec::new()
+    };
     let demoted_view = demoted_second.map(range_predicate_view);
     for row in 0..left_index.len() {
         let candidate_start = starts
@@ -1177,10 +1183,9 @@ pub fn equi_aggregate<'py>(
             if !predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position) {
                 continue;
             }
-            if starts.is_none()
-                && range_views
-                    .iter()
-                    .any(|view| !view.matches(row, right_position))
+            if range_views
+                .iter()
+                .any(|view| !view.matches(row, right_position))
             {
                 continue;
             }
@@ -1706,6 +1711,135 @@ mod tests {
                 .get_item(0)?
                 .extract::<Vec<i64>>()?;
             assert_eq!(sums, vec![23, 0]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn equi_range_tuple<'py>(
+        py: Python<'py>,
+        left: Vec<i64>,
+        right: Vec<i64>,
+        operator: &str,
+    ) -> PyResult<pyo3::Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            [
+                PyArray1::from_vec(py, left).into_any(),
+                PyArray1::from_vec(py, right).into_any(),
+                operator.into_pyobject(py)?.into_any(),
+            ],
+        )
+    }
+
+    fn equi_sum_aggregations<'py>(
+        py: Python<'py>,
+        values: Vec<i64>,
+    ) -> PyResult<pyo3::Bound<'py, PyList>> {
+        let mask = vec![false; values.len()];
+        let aggregation = PyTuple::new(
+            py,
+            [
+                PyArray1::from_vec(py, values).into_any(),
+                PyArray1::from_vec(py, mask).into_any(),
+                "sum".into_pyobject(py)?.into_any(),
+            ],
+        )?;
+        PyList::new(py, [aggregation])
+    }
+
+    fn equi_sum_result(result: &pyo3::Bound<'_, PyTuple>) -> PyResult<(Vec<bool>, Vec<i64>)> {
+        let matched = result.get_item(1)?.extract::<Vec<bool>>()?;
+        let sums = result
+            .get_item(2)?
+            .cast::<PyList>()?
+            .get_item(0)?
+            .extract::<Vec<i64>>()?;
+        Ok((matched, sums))
+    }
+
+    #[test]
+    fn equi_aggregate_without_windows_checks_every_range_per_row() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // ELI5: with no windows, row `i` may only pair with right
+            // position `i`, and each range can independently veto that pair.
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 101, 102]);
+            let right_index = PyArray1::from_vec(py, vec![10_i64, 11, 12]);
+            let ranges = PyList::new(
+                py,
+                [
+                    equi_range_tuple(py, vec![1, 5, 1], vec![2, 2, 2], "<")?,
+                    equi_range_tuple(py, vec![9, 9, 0], vec![3, 3, 3], ">")?,
+                ],
+            )?;
+            let residuals = PyList::empty(py);
+            let aggregations = equi_sum_aggregations(py, vec![10, 13, 17])?;
+
+            let result = equi_aggregate(
+                py,
+                left_index.readonly(),
+                right_index.readonly(),
+                None,
+                None,
+                &ranges,
+                &residuals,
+                &aggregations,
+                true,
+                false,
+            )?
+            .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+
+            let (matched, sums) = equi_sum_result(&result)?;
+            assert_eq!(matched, vec![true, false, false]);
+            assert_eq!(sums, vec![10, 0, 0]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn equi_aggregate_filters_demoted_second_range_per_candidate() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // ELI5: the second range's right values `[5, 1, 7, 2]` are not
+            // sorted inside the shared key window, so they cannot shrink the
+            // window and must be checked candidate by candidate instead.
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 101]);
+            let right_index = PyArray1::from_vec(py, vec![10_i64, 11, 12, 13]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 0]);
+            let ends = PyArray1::from_vec(py, vec![4_i64, 4]);
+            let ranges = PyList::new(
+                py,
+                [
+                    equi_range_tuple(py, vec![0, 2], vec![1, 2, 3, 4], "<")?,
+                    equi_range_tuple(py, vec![6, 1], vec![5, 1, 7, 2], ">")?,
+                ],
+            )?;
+            let residuals = PyList::empty(py);
+            let aggregations = equi_sum_aggregations(py, vec![10, 20, 30, 40])?;
+
+            let result = equi_aggregate(
+                py,
+                left_index.readonly(),
+                right_index.readonly(),
+                Some(starts.readwrite()),
+                Some(ends.readwrite()),
+                &ranges,
+                &residuals,
+                &aggregations,
+                true,
+                false,
+            )?
+            .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+
+            // Row 0: first range keeps every position; second keeps right
+            // values 5, 1 and 2 (< 6), so 10 + 20 + 40.
+            // Row 1: first range keeps positions 2 and 3; second needs a
+            // right value below 1, which neither has.
+            let (matched, sums) = equi_sum_result(&result)?;
+            assert_eq!(matched, vec![true, false]);
+            assert_eq!(sums, vec![70, 0]);
             Ok(())
         })
         .unwrap();
