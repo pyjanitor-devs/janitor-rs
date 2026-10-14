@@ -20,6 +20,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, HashMap};
 
+use crate::aggregation_common::adaptive::should_use_segment_tree;
 use crate::aggregation_common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
@@ -83,6 +84,64 @@ fn unique_reverse_output_slots(
         }
     }
     (labels, slots)
+}
+
+/// Decide whether equality-window trees can amortize their build cost.
+///
+/// ELI5: a tree must first read every book on each equality shelf, so a few
+/// tiny shelves are cheaper to scan directly. Count each shelf's build width
+/// once and compare it with the total widths requested by the left rows.
+fn should_use_equi_rank_tree(
+    query_starts: ArrayView1<'_, i64>,
+    query_ends: ArrayView1<'_, i64>,
+    equality_starts: ArrayView1<'_, i64>,
+    equality_ends: ArrayView1<'_, i64>,
+) -> bool {
+    let mut row_start = 0;
+    let mut query_count = 0;
+    let mut total_query_width = 0_usize;
+    let mut total_tree_width = 0_usize;
+    while row_start < query_starts.len() {
+        let equality_start = equality_starts[row_start];
+        let equality_end = equality_ends[row_start];
+        let mut row_end = row_start + 1;
+        while row_end < query_starts.len()
+            && equality_starts[row_end] == equality_start
+            && equality_ends[row_end] == equality_end
+        {
+            row_end += 1;
+        }
+        let (Ok(equality_start), Ok(equality_end)) = (
+            usize::try_from(equality_start),
+            usize::try_from(equality_end),
+        ) else {
+            row_start = row_end;
+            continue;
+        };
+        if equality_start >= equality_end {
+            row_start = row_end;
+            continue;
+        }
+        total_tree_width = total_tree_width.saturating_add(equality_end - equality_start);
+        for row in row_start..row_end {
+            let (Ok(query_start), Ok(query_end)) = (
+                usize::try_from(query_starts[row]),
+                usize::try_from(query_ends[row]),
+            ) else {
+                continue;
+            };
+            if query_start <= query_end
+                && query_start >= equality_start
+                && query_end <= equality_end
+            {
+                query_count += 1;
+                total_query_width =
+                    total_query_width.saturating_add(query_end.saturating_sub(query_start));
+            }
+        }
+        row_start = row_end;
+    }
+    should_use_segment_tree(query_count, total_query_width, total_tree_width)
 }
 
 pub fn validate_start_end(
@@ -1092,6 +1151,15 @@ pub fn equi_aggregate<'py>(
     let mut ends_owner = ends;
     let mut starts = starts_owner.as_mut().map(|values| values.as_array_mut());
     let mut ends = ends_owner.as_mut().map(|values| values.as_array_mut());
+    let equality_windows = starts.as_ref().map(|values| {
+        (
+            values.view().to_owned(),
+            ends.as_ref()
+                .expect("starts and ends are paired")
+                .view()
+                .to_owned(),
+        )
+    });
     let mut demoted_second = None;
     if let (Some(starts), Some(ends)) = (starts.as_mut(), ends.as_mut()) {
         ensure_equal_lengths_core("left index", left_index.len(), "starts", starts.len())
@@ -1104,7 +1172,6 @@ pub fn equi_aggregate<'py>(
             }
             validate_start_end(start, end, right_index.len()).map_err(PyValueError::new_err)?;
         }
-        let equality_windows = (ranges.len() > 1).then(|| (starts.to_owned(), ends.to_owned()));
         if let Some(first_range) = ranges.first() {
             apply_equi_range_windows(
                 first_range,
@@ -1158,6 +1225,42 @@ pub fn equi_aggregate<'py>(
         Vec::new()
     };
     let demoted_view = demoted_second.map(range_predicate_view);
+
+    if !reverse
+        && residual_predicates.is_empty()
+        && demoted_view.is_none()
+        && set.supports_dual_rank_tree()
+    {
+        if let (Some(starts), Some(ends), Some((equality_starts, equality_ends))) =
+            (starts.as_ref(), ends.as_ref(), equality_windows.as_ref())
+        {
+            if should_use_equi_rank_tree(
+                starts.view(),
+                ends.view(),
+                equality_starts.view(),
+                equality_ends.view(),
+            ) {
+                set.aggregate_equi_rank_tree(
+                    starts.view(),
+                    ends.view(),
+                    equality_starts.view(),
+                    equality_ends.view(),
+                    &inputs,
+                );
+                if set.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(make_results_with_positions(
+                    py,
+                    set,
+                    Some(left_index),
+                    output_len,
+                    return_matched,
+                )?));
+            }
+        }
+    }
+
     for row in 0..left_index.len() {
         let candidate_start = starts
             .as_ref()
@@ -1641,7 +1744,7 @@ mod tests {
         build_equi_range_indices_core, build_equi_uniq_residual_indices_core,
         build_second_range_envelope, equi_aggregate, materialize_equi_windows,
         materialize_unordered_second_range, narrow_unordered_second_range,
-        unique_reverse_output_slots,
+        should_use_equi_rank_tree, unique_reverse_output_slots,
     };
     use crate::compare_op::CompareOp;
     use crate::join_types::Keep;
@@ -1711,6 +1814,143 @@ mod tests {
                 .get_item(0)?
                 .extract::<Vec<i64>>()?;
             assert_eq!(sums, vec![23, 0]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn equi_aggregate_rank_tree_handles_duplicate_groups_and_nulls() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, (100_i64..117).collect());
+            let right_index = PyArray1::from_vec(py, (10_i64..74).collect());
+            // Each equality group has repeated left rows and a broad
+            // window. The two groups are large enough to cross the adaptive
+            // tree threshold while still making the expected reductions
+            // easy to check.
+            let starts =
+                PyArray1::from_vec(py, vec![0_i64; 9].into_iter().chain(vec![32; 8]).collect());
+            let ends =
+                PyArray1::from_vec(py, vec![32_i64; 9].into_iter().chain(vec![64; 8]).collect());
+            assert!(should_use_equi_rank_tree(
+                starts.readonly().as_array(),
+                ends.readonly().as_array(),
+                starts.readonly().as_array(),
+                ends.readonly().as_array(),
+            ));
+            let ranges = PyList::new(
+                py,
+                [equi_range_tuple(
+                    py,
+                    vec![32_i64; 9].into_iter().chain(vec![64; 8]).collect(),
+                    (0_i64..64).collect(),
+                    ">",
+                )?],
+            )?;
+            let residuals = PyList::empty(py);
+            let values = PyArray1::from_vec(py, (0_i64..64).collect());
+            let nulls = PyArray1::from_vec(
+                py,
+                (0..64).map(|position| position == 33).collect::<Vec<_>>(),
+            );
+            let aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            "size".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            nulls.clone().into_any(),
+                            "count".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "min".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.into_any(),
+                            nulls.into_any(),
+                            "max".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+
+            let result = equi_aggregate(
+                py,
+                left_index.readonly(),
+                right_index.readonly(),
+                Some(starts.readwrite()),
+                Some(ends.readwrite()),
+                &ranges,
+                &residuals,
+                &aggregations,
+                true,
+                false,
+            )?
+            .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+
+            assert_eq!(result.get_item(1)?.extract::<Vec<bool>>()?, vec![true; 17]);
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(
+                outputs.get_item(0)?.extract::<Vec<i64>>()?,
+                vec![32; 9]
+                    .into_iter()
+                    .chain(vec![32; 8])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(1)?.extract::<Vec<i64>>()?,
+                vec![32; 9]
+                    .into_iter()
+                    .chain(vec![31; 8])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(2)?.extract::<Vec<i64>>()?,
+                vec![496; 9]
+                    .into_iter()
+                    .chain(vec![1487; 8])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(3)?.extract::<Vec<i64>>()?,
+                vec![0; 9]
+                    .into_iter()
+                    .chain(vec![32; 8])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(4)?.extract::<Vec<i64>>()?,
+                vec![31; 9]
+                    .into_iter()
+                    .chain(vec![63; 8])
+                    .collect::<Vec<_>>()
+            );
             Ok(())
         })
         .unwrap();
