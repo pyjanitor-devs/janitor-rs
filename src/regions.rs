@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
+use crate::aggregation_common::adaptive::should_use_segment_tree;
 use crate::aggregation_common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
@@ -15,6 +16,14 @@ use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
+
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static DUAL_RANK_TREE_HITS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// The second predicate's paths together with the first-predicate starts.
 pub(crate) struct DualRegionPaths {
@@ -2609,6 +2618,7 @@ fn aggregate_dual_region_core<'py, F>(
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
     reverse: bool,
+    allow_rank_tree: bool,
     candidate_pass: F,
 ) -> PyResult<Option<Bound<'py, PyTuple>>>
 where
@@ -2640,6 +2650,75 @@ where
     let layout =
         build_ranked_region_position_layout(&regions.right_region, &regions.starts, regions.end)
             .map_err(PyValueError::new_err)?;
+
+    // The rank tree summarizes the complete dual-region candidate set. It is
+    // safe only for the forward exact path: reverse aggregation reads values
+    // from the left side, and residual aggregation must inspect every pair.
+    // The first-predicate window is only an upper bound for the legacy
+    // traversal: the second predicate may discard most of those positions.
+    // Count its nonzero region labels while walking the same monotonic window
+    // frontier, so selective second predicates do not make the tree look
+    // cheaper than the traversal they replace. This is a uniform-share
+    // approximation, not a conservative bound, and is only a switching
+    // heuristic.
+    let mut estimated_width = 0_usize;
+    let mut estimate_previous_end = regions.end;
+    let mut estimated_active_width = 0_usize;
+    let total_ranked_positions = layout.positions.len();
+    for (row, &start) in regions.starts.iter().enumerate() {
+        if start <= estimate_previous_end && start < regions.end {
+            for &region in &regions.right_region[start..estimate_previous_end] {
+                if region != 0 {
+                    estimated_active_width = estimated_active_width.saturating_add(1);
+                }
+            }
+            estimate_previous_end = start;
+        }
+        if left_has_match[row] && regions.left_region[row] != 0 && total_ranked_positions != 0 {
+            let threshold = layout
+                .labels
+                .partition_point(|label| *label < regions.left_region[row]);
+            if threshold < layout.labels.len() {
+                let suffix_positions = total_ranked_positions - layout.offsets[threshold];
+                let candidate_estimate = estimated_active_width.saturating_mul(suffix_positions)
+                    / total_ranked_positions;
+                estimated_width = estimated_width.saturating_add(candidate_estimate.max(1));
+            }
+        }
+    }
+    if allow_rank_tree
+        && !reverse
+        && set.supports_dual_rank_tree()
+        && should_use_segment_tree(
+            regions.left_region.len(),
+            estimated_width,
+            right_index.len(),
+        )
+    {
+        #[cfg(test)]
+        DUAL_RANK_TREE_HITS.with(|hits| hits.set(hits.get() + 1));
+        set.aggregate_dual_rank_tree(
+            ArrayView1::from(regions.left_region.as_slice()),
+            &regions.left_order,
+            ArrayView1::from(regions.right_region.as_slice()),
+            &layout.labels,
+            &layout.ranks,
+            ArrayView1::from(regions.starts.as_slice()),
+            &left_has_match,
+            &inputs,
+        );
+        if set.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(make_results_with_positions(
+            py,
+            set,
+            output_positions,
+            output_len,
+            return_matched,
+        )?));
+    }
+
     let mut active_counts = BTreeMap::<usize, usize>::new();
     let mut previous_end = regions.end;
     for (left_position, (&start, &left_region)) in
@@ -2823,6 +2902,7 @@ pub fn dual_regions_aggregate<'py>(
         aggregations,
         return_matched,
         false,
+        true,
         |_, _| true,
     )
 }
@@ -2874,6 +2954,7 @@ pub fn dual_regions_aggregate_reverse<'py>(
         aggregations,
         return_matched,
         true,
+        false,
         |_, _| true,
     )
 }
@@ -2927,6 +3008,7 @@ pub fn dual_regions_and_residual_aggregate<'py>(
         aligner.as_array(),
         aggregations,
         return_matched,
+        false,
         false,
         move |left_position, right_position| {
             predicates_match_dispatch(
@@ -2988,6 +3070,7 @@ pub fn dual_regions_and_residual_aggregate_reverse<'py>(
         aggregations,
         return_matched,
         true,
+        false,
         move |left_position, right_position| {
             predicates_match_dispatch(
                 &views,
@@ -3526,6 +3609,272 @@ mod tests {
                 // aggregation contract; sum/product return values.
                 vec![vec![10, 7], vec![0, 2], vec![3, 3], vec![24, 12]]
             );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn broad_dual_aggregation_uses_rank_tree_results() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let tree_hits_before = DUAL_RANK_TREE_HITS.with(Cell::get);
+            let rows = 100;
+            let left_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+            let right_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+            let left_values: Vec<i64> = (1..=rows as i64).collect();
+            let right_values: Vec<i64> = (1..=rows as i64).collect();
+            let first = predicate(py, &left_values, &right_values, "<=")?;
+            let second = predicate(py, &left_values, &right_values, "<=")?;
+            let aligner = PyArray1::from_vec(py, (0..rows as i64).collect()).readonly();
+            let aggregations = PyList::new(
+                py,
+                [
+                    aggregation_input(py, &right_values, "sum")?,
+                    aggregation_input(py, &right_values, "min")?,
+                    aggregation_input(py, &right_values, "max")?,
+                ],
+            )?;
+
+            let result = dual_regions_aggregate(
+                py,
+                left_index.as_any(),
+                right_index.as_any(),
+                &first,
+                &second,
+                aligner,
+                &aggregations,
+                false,
+            )?
+            .ok_or_else(|| PyValueError::new_err("broad aggregation returned None"))?;
+
+            assert_eq!(
+                aggregate_outputs(&result)?,
+                vec![
+                    (0..rows)
+                        .map(|row| ((row + 1 + rows) * (rows - row) / 2) as i64)
+                        .collect(),
+                    (0..rows as i64).collect(),
+                    vec![99; rows],
+                ]
+            );
+            assert!(DUAL_RANK_TREE_HITS.with(Cell::get) > tree_hits_before);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// One randomized dual-region aggregation result, decoded for comparison.
+    ///
+    /// Min/max positions are converted to values because tied extrema may
+    /// legitimately report different positions.
+    type DecodedDualAggregation = (
+        Vec<bool>,
+        Vec<i64>,
+        Vec<Option<i64>>,
+        Vec<Option<i64>>,
+        Vec<i64>,
+        Vec<i64>,
+    );
+
+    #[test]
+    fn randomized_dual_aggregation_matches_brute_force() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // ELI5: a fixed xorshift seed makes the "random" cases identical on
+            // every run, so a failure always reproduces.
+            let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+            let mut next = |bound: i64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % bound as u64) as i64
+            };
+            let operators = ["<", "<=", ">", ">="];
+            let mut tree_cases = 0;
+            let mut legacy_cases = 0;
+            for case in 0..400 {
+                let first_operator = operators[case % 4];
+                let second_operator = operators[(case / 4) % 4];
+                let rows = 40 + next(80) as usize;
+                let keyspace = 1 + next(rows as i64);
+                // Small keyspaces force duplicate keys; unsorted left values
+                // force a non-identity `left_order`.
+                let left_first: Vec<i64> = (0..rows).map(|_| next(keyspace / 3 + 1)).collect();
+                let left_second: Vec<i64> = (0..rows).map(|_| next(keyspace + 2)).collect();
+                let right_first: Vec<i64> = (0..rows).map(|_| next(keyspace + 1)).collect();
+                let right_second: Vec<i64> = (0..rows).map(|_| next(keyspace + 1)).collect();
+                let values: Vec<i64> = (0..rows).map(|_| next(2_000_000) - 1_000_000).collect();
+                let nulls: Vec<bool> = (0..rows).map(|_| next(5) == 0).collect();
+
+                // Build the caller contract: the first predicate's right side
+                // defines the global order, each predicate's right values are
+                // sorted for its operator, and the aligner maps each global
+                // position to the second predicate's sorted position.
+                let ascending = |operator: &str| operator == "<" || operator == "<=";
+                let mut global: Vec<usize> = (0..rows).collect();
+                global.sort_by_key(|&row| right_first[row]);
+                if !ascending(first_operator) {
+                    global.reverse();
+                }
+                let mut second_sorted: Vec<usize> = (0..rows).collect();
+                second_sorted.sort_by_key(|&row| right_second[row]);
+                if !ascending(second_operator) {
+                    second_sorted.reverse();
+                }
+                let mut second_position = vec![0_usize; rows];
+                for (position, &row) in second_sorted.iter().enumerate() {
+                    second_position[row] = position;
+                }
+                let global_values: Vec<i64> = global.iter().map(|&row| values[row]).collect();
+                let global_nulls: Vec<bool> = global.iter().map(|&row| nulls[row]).collect();
+
+                let value_input = |operation: &str| -> PyResult<Bound<'_, PyTuple>> {
+                    PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, global_values.clone()).into_any(),
+                            PyArray1::from_vec(py, global_nulls.clone()).into_any(),
+                            operation.into_pyobject(py)?.into_any(),
+                        ],
+                    )
+                };
+                let aggregations = PyList::new(
+                    py,
+                    [
+                        value_input("sum")?,
+                        value_input("min")?,
+                        value_input("max")?,
+                        PyTuple::new(
+                            py,
+                            [
+                                "*".into_pyobject(py)?.into_any(),
+                                PyArray1::from_vec(py, global_nulls.clone()).into_any(),
+                                "count".into_pyobject(py)?.into_any(),
+                            ],
+                        )?,
+                        PyTuple::new(
+                            py,
+                            [
+                                "*".into_pyobject(py)?.into_any(),
+                                "size".into_pyobject(py)?.into_any(),
+                            ],
+                        )?,
+                    ],
+                )?;
+                let left_index =
+                    PyArray1::from_vec(py, (0..rows as i64).map(|v| v + 1000).collect());
+                let right_index =
+                    PyArray1::from_vec(py, global.iter().map(|&row| row as i64).collect());
+                let first = predicate(
+                    py,
+                    &left_first,
+                    &global
+                        .iter()
+                        .map(|&row| right_first[row])
+                        .collect::<Vec<_>>(),
+                    first_operator,
+                )?;
+                let second = predicate(
+                    py,
+                    &left_second,
+                    &second_sorted
+                        .iter()
+                        .map(|&row| right_second[row])
+                        .collect::<Vec<_>>(),
+                    second_operator,
+                )?;
+                let aligner = PyArray1::from_vec(
+                    py,
+                    global
+                        .iter()
+                        .map(|&row| second_position[row] as i64)
+                        .collect(),
+                )
+                .readonly();
+
+                let tree_hits_before = DUAL_RANK_TREE_HITS.with(Cell::get);
+                let result = dual_regions_aggregate(
+                    py,
+                    left_index.as_any(),
+                    right_index.as_any(),
+                    &first,
+                    &second,
+                    aligner,
+                    &aggregations,
+                    true,
+                )?;
+                if DUAL_RANK_TREE_HITS.with(Cell::get) > tree_hits_before {
+                    tree_cases += 1;
+                } else {
+                    legacy_cases += 1;
+                }
+
+                let mut sums = vec![0_i64; rows];
+                let mut minimums: Vec<Option<i64>> = vec![None; rows];
+                let mut maximums: Vec<Option<i64>> = vec![None; rows];
+                let mut counts = vec![0_i64; rows];
+                let mut sizes = vec![0_i64; rows];
+                for left in 0..rows {
+                    for right in 0..rows {
+                        if !matches(left_first[left], right_first[right], first_operator)
+                            || !matches(left_second[left], right_second[right], second_operator)
+                        {
+                            continue;
+                        }
+                        sizes[left] += 1;
+                        if nulls[right] {
+                            continue;
+                        }
+                        let value = values[right];
+                        sums[left] += value;
+                        counts[left] += 1;
+                        minimums[left] = Some(minimums[left].map_or(value, |m| m.min(value)));
+                        maximums[left] = Some(maximums[left].map_or(value, |m| m.max(value)));
+                    }
+                }
+                let expected: Option<DecodedDualAggregation> =
+                    sizes.iter().any(|&size| size != 0).then(|| {
+                        let matched = sizes.iter().map(|&size| size != 0).collect();
+                        (matched, sums, minimums, maximums, counts, sizes)
+                    });
+
+                let actual = result
+                    .map(|result| -> PyResult<DecodedDualAggregation> {
+                        let matched = result.get_item(1)?.extract::<Vec<bool>>()?;
+                        let outputs = result
+                            .get_item(2)?
+                            .cast::<PyList>()?
+                            .iter()
+                            .map(|output| output.extract::<Vec<i64>>())
+                            .collect::<PyResult<Vec<_>>>()?;
+                        let position_values = |positions: &[i64]| {
+                            positions
+                                .iter()
+                                .map(|&position| {
+                                    (position >= 0).then(|| global_values[position as usize])
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        Ok((
+                            matched,
+                            outputs[0].clone(),
+                            position_values(&outputs[1]),
+                            position_values(&outputs[2]),
+                            outputs[3].clone(),
+                            outputs[4].clone(),
+                        ))
+                    })
+                    .transpose()?;
+                assert_eq!(
+                    actual, expected,
+                    "case {case}: {first_operator} then {second_operator}"
+                );
+            }
+            // Both strategies must be exercised, or this test proves nothing
+            // about the adaptive switch.
+            assert!(tree_cases > 50, "rank tree ran in only {tree_cases} cases");
+            assert!(legacy_cases > 50, "legacy ran in only {legacy_cases} cases");
             Ok(())
         })
         .unwrap();
