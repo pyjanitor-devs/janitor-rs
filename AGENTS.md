@@ -1412,3 +1412,24 @@ maximum checks and must not be changed as part of this work.
 
 **Recommendation**: Apply the cumulative-max filter to dual-region paths
 without modifying the n-region traversal or setup.
+### [2026-10-14] Equality-led range joins use negative windows as no-match sentinels
+
+**Context**: Reviewing the equality-led conditional-join kernels found that
+`starts`/`ends` can contain negative values after a range predicate removes
+all candidates for a left row. Treating those values as malformed input in
+the later candidate loop caused `join_agg` to raise instead of returning an
+unmatched row.
+
+**Learning**: In the three equality-led range paths
+(`build_equi_range_indices_core`,
+`build_equi_range_and_residual_indices_core`, and `equi_aggregate`), negative
+prepared windows are the established “no candidates” sentinel and must be
+skipped. Nonnegative windows still require ordinary ordering and bounds
+validation before they are cast or searched. This is specific to these
+prepared equi-range windows; it does not change unrelated kernels that treat
+negative indices as invalid input.
+
+**Recommendation**: Validate each nonnegative input window before range
+narrowing, preserve negative windows as inactive rows, and skip them in every
+later materialization or aggregation loop. Add or retain regression coverage
+for a mix of active and `-1` windows.
