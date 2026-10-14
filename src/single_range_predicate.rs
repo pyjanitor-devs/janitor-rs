@@ -596,9 +596,10 @@ fn materialize_range_first_indices<'py, T: Element + PartialOrd + Copy>(
     }
     let (parsed, metadata) = parse_predicates_with_nulls_strings(py, &residuals)?;
     check_predicate_lengths(&parsed, left.as_array().len(), right.as_array().len())?;
+    let left_index_view = left_index.as_array();
     let (all_starts, all_ends) = range_window_bounds(
         left.as_array(),
-        left_index.as_array(),
+        left_index_view,
         right.as_array(),
         right_index.as_array(),
         operator,
@@ -616,9 +617,7 @@ fn materialize_range_first_indices<'py, T: Element + PartialOrd + Copy>(
             continue;
         }
         windows.left_positions.push(left_position);
-        windows
-            .left_index
-            .push(left_index.as_array()[left_position]);
+        windows.left_index.push(left_index_view[left_position]);
         windows.starts.push(start);
         windows.ends.push(end);
     }

@@ -664,30 +664,31 @@ fn narrow_unordered_second_range<T: PartialOrd + Copy>(
     Ok(has_active_window)
 }
 
-fn range_matches_at(
-    range: &AnyParsedRangePredicate<'_>,
-    left_position: usize,
-    right_position: usize,
-) -> bool {
-    macro_rules! matches {
-        ($predicate:expr) => {
-            $predicate.op.apply(
-                &$predicate.left.as_array()[left_position],
-                &$predicate.right.as_array()[right_position],
+/// Borrow a range predicate as a residual-style view.
+///
+/// Building the NumPy views once keeps per-candidate range checks as cheap
+/// as residual predicate checks.
+fn range_predicate_view<'a>(range: &'a AnyParsedRangePredicate<'_>) -> PredicateView<'a> {
+    macro_rules! view {
+        ($variant:ident, $predicate:expr) => {
+            PredicateView::$variant(
+                $predicate.left.as_array(),
+                $predicate.right.as_array(),
+                $predicate.op,
             )
         };
     }
     match range {
-        AnyParsedRangePredicate::I64(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::I32(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::I16(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::I8(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::U64(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::U32(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::U16(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::U8(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::F64(predicate) => matches!(predicate),
-        AnyParsedRangePredicate::F32(predicate) => matches!(predicate),
+        AnyParsedRangePredicate::I64(predicate) => view!(I64, predicate),
+        AnyParsedRangePredicate::I32(predicate) => view!(I32, predicate),
+        AnyParsedRangePredicate::I16(predicate) => view!(I16, predicate),
+        AnyParsedRangePredicate::I8(predicate) => view!(I8, predicate),
+        AnyParsedRangePredicate::U64(predicate) => view!(U64, predicate),
+        AnyParsedRangePredicate::U32(predicate) => view!(U32, predicate),
+        AnyParsedRangePredicate::U16(predicate) => view!(U16, predicate),
+        AnyParsedRangePredicate::U8(predicate) => view!(U8, predicate),
+        AnyParsedRangePredicate::F64(predicate) => view!(F64, predicate),
+        AnyParsedRangePredicate::F32(predicate) => view!(F32, predicate),
     }
 }
 
@@ -810,10 +811,12 @@ fn materialize_equi_windows_and_residuals(
     additional_range: Option<&AnyParsedRangePredicate<'_>>,
     keep: Keep,
 ) -> Result<IndexPairs, String> {
+    let additional_view = additional_range.map(range_predicate_view);
     let matches = |row: usize, right_position: usize| {
         predicates_match_dispatch(residual_predicates, null_metadata, row, right_position)
-            && additional_range
-                .map(|range| range_matches_at(range, row, right_position))
+            && additional_view
+                .as_ref()
+                .map(|view| view.matches(row, right_position))
                 .unwrap_or(true)
     };
     if keep == Keep::All {
@@ -1147,6 +1150,14 @@ pub fn equi_aggregate<'py>(
         }
     }
 
+    // ELI5: precomputed windows already applied the ranges, so only the
+    // aligned no-window layout needs to re-check every range per candidate.
+    let range_views: Vec<_> = if starts.is_none() {
+        ranges.iter().map(range_predicate_view).collect()
+    } else {
+        Vec::new()
+    };
+    let demoted_view = demoted_second.map(range_predicate_view);
     for row in 0..left_index.len() {
         let candidate_start = starts
             .as_ref()
@@ -1172,15 +1183,14 @@ pub fn equi_aggregate<'py>(
             if !predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position) {
                 continue;
             }
-            if starts.is_none()
-                && ranges
-                    .iter()
-                    .any(|range| !range_matches_at(range, row, right_position))
+            if range_views
+                .iter()
+                .any(|view| !view.matches(row, right_position))
             {
                 continue;
             }
-            if let Some(range) = demoted_second {
-                if !range_matches_at(range, row, right_position) {
+            if let Some(view) = &demoted_view {
+                if !view.matches(row, right_position) {
                     continue;
                 }
             }
@@ -1701,6 +1711,135 @@ mod tests {
                 .get_item(0)?
                 .extract::<Vec<i64>>()?;
             assert_eq!(sums, vec![23, 0]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn equi_range_tuple<'py>(
+        py: Python<'py>,
+        left: Vec<i64>,
+        right: Vec<i64>,
+        operator: &str,
+    ) -> PyResult<pyo3::Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            [
+                PyArray1::from_vec(py, left).into_any(),
+                PyArray1::from_vec(py, right).into_any(),
+                operator.into_pyobject(py)?.into_any(),
+            ],
+        )
+    }
+
+    fn equi_sum_aggregations<'py>(
+        py: Python<'py>,
+        values: Vec<i64>,
+    ) -> PyResult<pyo3::Bound<'py, PyList>> {
+        let mask = vec![false; values.len()];
+        let aggregation = PyTuple::new(
+            py,
+            [
+                PyArray1::from_vec(py, values).into_any(),
+                PyArray1::from_vec(py, mask).into_any(),
+                "sum".into_pyobject(py)?.into_any(),
+            ],
+        )?;
+        PyList::new(py, [aggregation])
+    }
+
+    fn equi_sum_result(result: &pyo3::Bound<'_, PyTuple>) -> PyResult<(Vec<bool>, Vec<i64>)> {
+        let matched = result.get_item(1)?.extract::<Vec<bool>>()?;
+        let sums = result
+            .get_item(2)?
+            .cast::<PyList>()?
+            .get_item(0)?
+            .extract::<Vec<i64>>()?;
+        Ok((matched, sums))
+    }
+
+    #[test]
+    fn equi_aggregate_without_windows_checks_every_range_per_row() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // ELI5: with no windows, row `i` may only pair with right
+            // position `i`, and each range can independently veto that pair.
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 101, 102]);
+            let right_index = PyArray1::from_vec(py, vec![10_i64, 11, 12]);
+            let ranges = PyList::new(
+                py,
+                [
+                    equi_range_tuple(py, vec![1, 5, 1], vec![2, 2, 2], "<")?,
+                    equi_range_tuple(py, vec![9, 9, 0], vec![3, 3, 3], ">")?,
+                ],
+            )?;
+            let residuals = PyList::empty(py);
+            let aggregations = equi_sum_aggregations(py, vec![10, 13, 17])?;
+
+            let result = equi_aggregate(
+                py,
+                left_index.readonly(),
+                right_index.readonly(),
+                None,
+                None,
+                &ranges,
+                &residuals,
+                &aggregations,
+                true,
+                false,
+            )?
+            .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+
+            let (matched, sums) = equi_sum_result(&result)?;
+            assert_eq!(matched, vec![true, false, false]);
+            assert_eq!(sums, vec![10, 0, 0]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn equi_aggregate_filters_demoted_second_range_per_candidate() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // ELI5: the second range's right values `[5, 1, 7, 2]` are not
+            // sorted inside the shared key window, so they cannot shrink the
+            // window and must be checked candidate by candidate instead.
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 101]);
+            let right_index = PyArray1::from_vec(py, vec![10_i64, 11, 12, 13]);
+            let starts = PyArray1::from_vec(py, vec![0_i64, 0]);
+            let ends = PyArray1::from_vec(py, vec![4_i64, 4]);
+            let ranges = PyList::new(
+                py,
+                [
+                    equi_range_tuple(py, vec![0, 2], vec![1, 2, 3, 4], "<")?,
+                    equi_range_tuple(py, vec![6, 1], vec![5, 1, 7, 2], ">")?,
+                ],
+            )?;
+            let residuals = PyList::empty(py);
+            let aggregations = equi_sum_aggregations(py, vec![10, 20, 30, 40])?;
+
+            let result = equi_aggregate(
+                py,
+                left_index.readonly(),
+                right_index.readonly(),
+                Some(starts.readwrite()),
+                Some(ends.readwrite()),
+                &ranges,
+                &residuals,
+                &aggregations,
+                true,
+                false,
+            )?
+            .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+
+            // Row 0: first range keeps every position; second keeps right
+            // values 5, 1 and 2 (< 6), so 10 + 20 + 40.
+            // Row 1: first range keeps positions 2 and 3; second needs a
+            // right value below 1, which neither has.
+            let (matched, sums) = equi_sum_result(&result)?;
+            assert_eq!(matched, vec![true, false]);
+            assert_eq!(sums, vec![70, 0]);
             Ok(())
         })
         .unwrap();
