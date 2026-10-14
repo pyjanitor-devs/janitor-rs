@@ -15,6 +15,9 @@ mod range_predicate;
 mod regions;
 mod single_range_predicate;
 
+#[doc(hidden)]
+pub use regions::{dual_regions_aggregate, dual_regions_aggregate_legacy};
+
 /// Top-level composition point: each family owns and registers its own
 /// exports, so this function only has to know the surviving family names, not
 /// the ~900 individual dtype-specialized functions they expose.
