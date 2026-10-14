@@ -4,6 +4,14 @@ All notable changes to janitor-rs are documented here.
 
 ## [Unreleased]
 
+## [0.6.4](https://github.com/pyjanitor-devs/janitor-rs/compare/v0.6.3...v0.6.4) - 2026-10-14
+
+### Other
+
+- add dual-region rank segment tree ([#239](https://github.com/pyjanitor-devs/janitor-rs/pull/239))
+- build range predicate views once per equi call ([#240](https://github.com/pyjanitor-devs/janitor-rs/pull/240))
+- Implement Rust kernels for equality-led interval-overlap joins ([#235](https://github.com/pyjanitor-devs/janitor-rs/pull/235))
+
 ## [0.6.3](https://github.com/pyjanitor-devs/janitor-rs/compare/v0.6.2...v0.6.3) - 2026-10-04
 
 ### Other
