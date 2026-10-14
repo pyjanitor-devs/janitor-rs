@@ -3664,6 +3664,222 @@ mod tests {
         .unwrap();
     }
 
+    /// One randomized dual-region aggregation result, decoded for comparison.
+    ///
+    /// Min/max positions are converted to values because tied extrema may
+    /// legitimately report different positions.
+    type DecodedDualAggregation = (
+        Vec<bool>,
+        Vec<i64>,
+        Vec<Option<i64>>,
+        Vec<Option<i64>>,
+        Vec<i64>,
+        Vec<i64>,
+    );
+
+    #[test]
+    fn randomized_dual_aggregation_matches_brute_force() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // ELI5: a fixed xorshift seed makes the "random" cases identical on
+            // every run, so a failure always reproduces.
+            let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+            let mut next = |bound: i64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % bound as u64) as i64
+            };
+            let operators = ["<", "<=", ">", ">="];
+            let mut tree_cases = 0;
+            let mut legacy_cases = 0;
+            for case in 0..400 {
+                let first_operator = operators[case % 4];
+                let second_operator = operators[(case / 4) % 4];
+                let rows = 40 + next(80) as usize;
+                let keyspace = 1 + next(rows as i64);
+                // Small keyspaces force duplicate keys; unsorted left values
+                // force a non-identity `left_order`.
+                let left_first: Vec<i64> = (0..rows).map(|_| next(keyspace / 3 + 1)).collect();
+                let left_second: Vec<i64> = (0..rows).map(|_| next(keyspace + 2)).collect();
+                let right_first: Vec<i64> = (0..rows).map(|_| next(keyspace + 1)).collect();
+                let right_second: Vec<i64> = (0..rows).map(|_| next(keyspace + 1)).collect();
+                let values: Vec<i64> = (0..rows).map(|_| next(2_000_000) - 1_000_000).collect();
+                let nulls: Vec<bool> = (0..rows).map(|_| next(5) == 0).collect();
+
+                // Build the caller contract: the first predicate's right side
+                // defines the global order, each predicate's right values are
+                // sorted for its operator, and the aligner maps each global
+                // position to the second predicate's sorted position.
+                let ascending = |operator: &str| operator == "<" || operator == "<=";
+                let mut global: Vec<usize> = (0..rows).collect();
+                global.sort_by_key(|&row| right_first[row]);
+                if !ascending(first_operator) {
+                    global.reverse();
+                }
+                let mut second_sorted: Vec<usize> = (0..rows).collect();
+                second_sorted.sort_by_key(|&row| right_second[row]);
+                if !ascending(second_operator) {
+                    second_sorted.reverse();
+                }
+                let mut second_position = vec![0_usize; rows];
+                for (position, &row) in second_sorted.iter().enumerate() {
+                    second_position[row] = position;
+                }
+                let global_values: Vec<i64> = global.iter().map(|&row| values[row]).collect();
+                let global_nulls: Vec<bool> = global.iter().map(|&row| nulls[row]).collect();
+
+                let value_input = |operation: &str| -> PyResult<Bound<'_, PyTuple>> {
+                    PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, global_values.clone()).into_any(),
+                            PyArray1::from_vec(py, global_nulls.clone()).into_any(),
+                            operation.into_pyobject(py)?.into_any(),
+                        ],
+                    )
+                };
+                let aggregations = PyList::new(
+                    py,
+                    [
+                        value_input("sum")?,
+                        value_input("min")?,
+                        value_input("max")?,
+                        PyTuple::new(
+                            py,
+                            [
+                                "*".into_pyobject(py)?.into_any(),
+                                PyArray1::from_vec(py, global_nulls.clone()).into_any(),
+                                "count".into_pyobject(py)?.into_any(),
+                            ],
+                        )?,
+                        PyTuple::new(
+                            py,
+                            [
+                                "*".into_pyobject(py)?.into_any(),
+                                "size".into_pyobject(py)?.into_any(),
+                            ],
+                        )?,
+                    ],
+                )?;
+                let left_index =
+                    PyArray1::from_vec(py, (0..rows as i64).map(|v| v + 1000).collect());
+                let right_index =
+                    PyArray1::from_vec(py, global.iter().map(|&row| row as i64).collect());
+                let first = predicate(
+                    py,
+                    &left_first,
+                    &global
+                        .iter()
+                        .map(|&row| right_first[row])
+                        .collect::<Vec<_>>(),
+                    first_operator,
+                )?;
+                let second = predicate(
+                    py,
+                    &left_second,
+                    &second_sorted
+                        .iter()
+                        .map(|&row| right_second[row])
+                        .collect::<Vec<_>>(),
+                    second_operator,
+                )?;
+                let aligner = PyArray1::from_vec(
+                    py,
+                    global
+                        .iter()
+                        .map(|&row| second_position[row] as i64)
+                        .collect(),
+                )
+                .readonly();
+
+                let tree_hits_before = DUAL_RANK_TREE_HITS.with(Cell::get);
+                let result = dual_regions_aggregate(
+                    py,
+                    left_index.as_any(),
+                    right_index.as_any(),
+                    &first,
+                    &second,
+                    aligner,
+                    &aggregations,
+                    true,
+                )?;
+                if DUAL_RANK_TREE_HITS.with(Cell::get) > tree_hits_before {
+                    tree_cases += 1;
+                } else {
+                    legacy_cases += 1;
+                }
+
+                let mut sums = vec![0_i64; rows];
+                let mut minimums: Vec<Option<i64>> = vec![None; rows];
+                let mut maximums: Vec<Option<i64>> = vec![None; rows];
+                let mut counts = vec![0_i64; rows];
+                let mut sizes = vec![0_i64; rows];
+                for left in 0..rows {
+                    for right in 0..rows {
+                        if !matches(left_first[left], right_first[right], first_operator)
+                            || !matches(left_second[left], right_second[right], second_operator)
+                        {
+                            continue;
+                        }
+                        sizes[left] += 1;
+                        if nulls[right] {
+                            continue;
+                        }
+                        let value = values[right];
+                        sums[left] += value;
+                        counts[left] += 1;
+                        minimums[left] = Some(minimums[left].map_or(value, |m| m.min(value)));
+                        maximums[left] = Some(maximums[left].map_or(value, |m| m.max(value)));
+                    }
+                }
+                let expected: Option<DecodedDualAggregation> =
+                    sizes.iter().any(|&size| size != 0).then(|| {
+                        let matched = sizes.iter().map(|&size| size != 0).collect();
+                        (matched, sums, minimums, maximums, counts, sizes)
+                    });
+
+                let actual = result
+                    .map(|result| -> PyResult<DecodedDualAggregation> {
+                        let matched = result.get_item(1)?.extract::<Vec<bool>>()?;
+                        let outputs = result
+                            .get_item(2)?
+                            .cast::<PyList>()?
+                            .iter()
+                            .map(|output| output.extract::<Vec<i64>>())
+                            .collect::<PyResult<Vec<_>>>()?;
+                        let position_values = |positions: &[i64]| {
+                            positions
+                                .iter()
+                                .map(|&position| {
+                                    (position >= 0).then(|| global_values[position as usize])
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        Ok((
+                            matched,
+                            outputs[0].clone(),
+                            position_values(&outputs[1]),
+                            position_values(&outputs[2]),
+                            outputs[3].clone(),
+                            outputs[4].clone(),
+                        ))
+                    })
+                    .transpose()?;
+                assert_eq!(
+                    actual, expected,
+                    "case {case}: {first_operator} then {second_operator}"
+                );
+            }
+            // Both strategies must be exercised, or this test proves nothing
+            // about the adaptive switch.
+            assert!(tree_cases > 50, "rank tree ran in only {tree_cases} cases");
+            assert!(legacy_cases > 50, "legacy ran in only {legacy_cases} cases");
+            Ok(())
+        })
+        .unwrap();
+    }
+
     fn expected_pairs(
         left_index: &[i64],
         left_values: &[Vec<i64>],
