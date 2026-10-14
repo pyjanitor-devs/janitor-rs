@@ -142,6 +142,11 @@ fn build_equi_range_indices_core(
 ) -> Result<IndexPairs, String> {
     ensure_equal_lengths_core("left index", left_index.len(), "starts", starts.len())?;
     ensure_equal_lengths_core("left index", left_index.len(), "ends", ends.len())?;
+    // Keep the equality windows intact: the first range narrows `starts` and
+    // `ends` in place, but the unordered second-range envelope must be built
+    // from the original group window rather than from overlapping narrowed
+    // windows that can overwrite one another.
+    let equality_windows = second_range.map(|_| (starts.to_owned(), ends.to_owned()));
     for (&start, &end) in starts.iter().zip(ends.iter()) {
         if start < 0 || end < 0 {
             continue;
@@ -170,12 +175,17 @@ fn build_equi_range_indices_core(
                 return Ok(None);
             }
         } else {
+            let (equality_starts, equality_ends) = equality_windows
+                .as_ref()
+                .expect("second range must retain the equality windows");
             return materialize_unordered_second_range(
                 left_index,
                 right_index,
                 starts.view_mut(),
                 ends.view_mut(),
                 second_range,
+                equality_starts.view(),
+                equality_ends.view(),
                 keep,
             );
         }
@@ -375,21 +385,34 @@ fn materialize_equi_windows(
 /// * `starts` - Mutable post-first-range half-open windows.
 /// * `ends` - Mutable post-first-range half-open windows.
 /// * `range` - The unordered second range predicate.
+/// * `equality_starts` - Original equality-window starts, captured before the
+///   first range narrows the mutable windows.
+/// * `equality_ends` - Original equality-window ends, paired with
+///   `equality_starts`.
 /// * `keep` - Match retention policy after exact filtering.
 ///
 /// # Returns
 ///
 /// `None` when no exact matches survive; otherwise the physical left/right
 /// index pairs selected by `keep`.
+#[allow(clippy::too_many_arguments)]
 fn materialize_unordered_second_range(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     mut starts: ArrayViewMut1<'_, i64>,
     mut ends: ArrayViewMut1<'_, i64>,
     range: &AnyParsedRangePredicate<'_>,
+    equality_starts: ArrayView1<'_, i64>,
+    equality_ends: ArrayView1<'_, i64>,
     keep: Keep,
 ) -> Result<IndexPairs, String> {
-    if !narrow_unordered_second_range_for_predicate(range, starts.view_mut(), ends.view_mut())? {
+    if !narrow_unordered_second_range_for_predicate(
+        range,
+        equality_starts,
+        equality_ends,
+        starts.view_mut(),
+        ends.view_mut(),
+    )? {
         return Ok(None);
     }
 
@@ -507,6 +530,8 @@ fn materialize_unordered_second_range(
 /// # Arguments
 ///
 /// * `range` - The unordered second range predicate and its aligned values.
+/// * `equality_starts` / `equality_ends` - Original equality windows used to
+///   build the cumulative envelope before the first range narrows candidates.
 /// * `starts` - Mutable post-first-range window starts.
 /// * `ends` - Mutable post-first-range window ends.
 ///
@@ -515,6 +540,8 @@ fn materialize_unordered_second_range(
 /// `true` when at least one candidate window remains after envelope narrowing.
 fn narrow_unordered_second_range_for_predicate(
     range: &AnyParsedRangePredicate<'_>,
+    equality_starts: ArrayView1<'_, i64>,
+    equality_ends: ArrayView1<'_, i64>,
     starts: ArrayViewMut1<'_, i64>,
     ends: ArrayViewMut1<'_, i64>,
 ) -> Result<bool, String> {
@@ -526,7 +553,7 @@ fn narrow_unordered_second_range_for_predicate(
             let use_cummax = matches!(predicate.op, CompareOp::Lt | CompareOp::Le);
             let mut equality_windows = Vec::new();
             let mut seen_windows = std::collections::HashSet::new();
-            for (&start, &end) in starts.iter().zip(ends.iter()) {
+            for (&start, &end) in equality_starts.iter().zip(equality_ends.iter()) {
                 if start < 0 || end < 0 {
                     continue;
                 }
@@ -972,6 +999,7 @@ fn build_equi_range_and_residual_indices_core(
         }
         validate_start_end(start, end, right_index.len())?;
     }
+    let equality_windows = second_range.map(|_| (starts.to_owned(), ends.to_owned()));
 
     let has_active_window = apply_equi_range_windows(
         first_range,
@@ -995,8 +1023,13 @@ fn build_equi_range_and_residual_indices_core(
                 return Ok(None);
             }
         } else {
+            let (equality_starts, equality_ends) = equality_windows
+                .as_ref()
+                .expect("second range must retain the equality windows");
             if !narrow_unordered_second_range_for_predicate(
                 second_range,
+                equality_starts.view(),
+                equality_ends.view(),
                 starts.view_mut(),
                 ends.view_mut(),
             )? {
@@ -1170,6 +1203,7 @@ pub fn equi_aggregate<'py>(
             }
             validate_start_end(start, end, right_index.len()).map_err(PyValueError::new_err)?;
         }
+        let equality_windows = (ranges.len() > 1).then(|| (starts.to_owned(), ends.to_owned()));
         if let Some(first_range) = ranges.first() {
             apply_equi_range_windows(
                 first_range,
@@ -1191,6 +1225,20 @@ pub fn equi_aggregate<'py>(
                 )
                 .map_err(PyValueError::new_err)?;
             } else {
+                let (equality_starts, equality_ends) = equality_windows
+                    .as_ref()
+                    .expect("second range must retain the equality windows");
+                if !narrow_unordered_second_range_for_predicate(
+                    second_range,
+                    equality_starts.view(),
+                    equality_ends.view(),
+                    starts.view_mut(),
+                    ends.view_mut(),
+                )
+                .map_err(PyValueError::new_err)?
+                {
+                    return Ok(None);
+                }
                 demoted_second = Some(second_range);
             }
         }
@@ -1701,8 +1749,8 @@ mod tests {
 
     use super::{
         apply_equi_range_bound, build_equi_ne_indices_core, build_equi_only_indices_core,
-        build_equi_uniq_residual_indices_core, build_second_range_envelope,
-        materialize_equi_windows, materialize_unordered_second_range,
+        build_equi_range_indices_core, build_equi_uniq_residual_indices_core,
+        build_second_range_envelope, materialize_equi_windows, materialize_unordered_second_range,
         narrow_unordered_second_range, range_value_matches, unique_reverse_output_slots,
     };
     use crate::compare_op::CompareOp;
@@ -1774,6 +1822,46 @@ mod tests {
             }
             assert_eq!(actual, expected, "operator: {op:?}");
         }
+    }
+
+    #[test]
+    fn unordered_second_range_uses_original_equality_windows() {
+        Python::initialize();
+        Python::attach(|py| {
+            let first_range = AnyParsedRangePredicate::I64(ParsedRangePredicate {
+                left: PyArray1::from_vec(py, vec![0_i64, 2]).readonly(),
+                left_index: PyArray1::from_vec(py, vec![100_i64, 101]).readonly(),
+                right: PyArray1::from_vec(py, vec![1_i64, 2, 3, 4]).readonly(),
+                right_index: PyArray1::from_vec(py, vec![10_i64, 11, 12, 13]).readonly(),
+                op: CompareOp::Lt,
+            });
+            let second_range = AnyParsedRangePredicate::I64(ParsedRangePredicate {
+                left: PyArray1::from_vec(py, vec![50_i64, 0]).readonly(),
+                left_index: PyArray1::from_vec(py, vec![100_i64, 101]).readonly(),
+                right: PyArray1::from_vec(py, vec![1_i64, 100, 2, 3]).readonly(),
+                right_index: PyArray1::from_vec(py, vec![10_i64, 11, 12, 13]).readonly(),
+                op: CompareOp::Lt,
+            });
+            let left_index = Array1::from_vec(vec![100_i64, 101]);
+            let right_index = Array1::from_vec(vec![10_i64, 11, 12, 13]);
+            let mut starts = Array1::from_vec(vec![0_i64, 0]);
+            let mut ends = Array1::from_vec(vec![4_i64, 4]);
+
+            let result = build_equi_range_indices_core(
+                left_index.view(),
+                right_index.view(),
+                starts.view_mut(),
+                ends.view_mut(),
+                &first_range,
+                Some(&second_range),
+                Keep::All,
+            )
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(result.0, vec![100, 101, 101]);
+            assert_eq!(result.1, vec![11, 12, 13]);
+        });
     }
 
     #[test]
@@ -2193,12 +2281,16 @@ mod tests {
             ] {
                 let mut starts = Array1::from_vec(vec![0]);
                 let mut ends = Array1::from_vec(vec![4]);
+                let equality_starts = starts.clone();
+                let equality_ends = ends.clone();
                 let result = materialize_unordered_second_range(
                     left_index.view(),
                     right_index.view(),
                     starts.view_mut(),
                     ends.view_mut(),
                     &range,
+                    equality_starts.view(),
+                    equality_ends.view(),
                     keep,
                 )
                 .unwrap()
