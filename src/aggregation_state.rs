@@ -407,6 +407,209 @@ impl<'a> AggregationSet<'a> {
         }
     }
 
+    /// Aggregate dual-region candidates with an insert-only rank segment tree.
+    ///
+    /// ELI5: each newly exposed right row is filed into the leaf for its
+    /// region value. Parent nodes summarize complete groups of leaves, so a
+    /// left row can merge a logarithmic number of rank blocks instead of
+    /// visiting every matching right row.
+    ///
+    /// This path intentionally supports only associative integer operations,
+    /// counts, and extrema. Floating-point operations and products retain the
+    /// direct traversal because changing encounter order would change their
+    /// numerical behavior.
+    pub(crate) fn aggregate_dual_rank_tree(
+        &mut self,
+        left_region: ArrayView1<'_, i64>,
+        right_region: ArrayView1<'_, i64>,
+        starts: ArrayView1<'_, usize>,
+        left_has_match: &[bool],
+        inputs: &'a [AggregationInput<'_>],
+    ) {
+        let mut rank_values = right_region.iter().copied().collect::<Vec<_>>();
+        rank_values.sort_unstable();
+        rank_values.dedup();
+        if rank_values.is_empty() {
+            return;
+        }
+
+        let tree_size = rank_values.len().next_power_of_two();
+        let tree_output_len = tree_size.saturating_mul(2);
+        if tree_output_len == 0 {
+            return;
+        }
+        let mut ranks = std::collections::BTreeMap::new();
+        for (rank, value) in rank_values.iter().copied().enumerate() {
+            ranks.insert(value, rank);
+        }
+
+        let mut tree = AggregationSet::new(tree_output_len, right_region.len(), inputs, true)
+            .expect("dual rank tree inputs were validated by the caller");
+        let mut previous_end = right_region.len();
+
+        for row in 0..left_region.len() {
+            let start = starts[row];
+            if start >= previous_end || start >= right_region.len() {
+                continue;
+            }
+            for position in (start..previous_end).rev() {
+                let leaf = tree_size + ranks[&right_region[position]];
+                tree.update(position, leaf);
+                tree.rebuild_path(leaf);
+            }
+            previous_end = start;
+
+            if !left_has_match[row] || left_region[row] == 0 {
+                continue;
+            }
+
+            let threshold = rank_values.partition_point(|value| *value < left_region[row]);
+            if threshold == rank_values.len() {
+                continue;
+            }
+            let mut left = tree_size + threshold;
+            let mut right = tree_size + rank_values.len();
+            let mut left_nodes = Vec::new();
+            let mut right_nodes = Vec::new();
+            while left < right {
+                if left & 1 == 1 {
+                    left_nodes.push(left);
+                    left += 1;
+                }
+                if right & 1 == 1 {
+                    right -= 1;
+                    right_nodes.push(right);
+                }
+                left /= 2;
+                right /= 2;
+            }
+            for node in left_nodes.into_iter().chain(right_nodes.into_iter().rev()) {
+                self.merge_output_from(&tree, node, row);
+            }
+        }
+    }
+
+    /// Recompute the rank-tree ancestors after inserting one right position.
+    fn rebuild_path(&mut self, leaf: usize) {
+        let mut node = leaf / 2;
+        while node > 0 {
+            self.copy_output_within(node * 2, node);
+            self.merge_output_within(node * 2 + 1, node);
+            node /= 2;
+        }
+    }
+
+    fn copy_output_within(&mut self, source: usize, target: usize) {
+        if let Some(matched) = &mut self.matched {
+            matched[target] = matched[source];
+        }
+        for state in &mut self.states {
+            match state {
+                State::CountAll => {}
+                State::CountNonNullMask(_, values)
+                | State::Sum(_, values)
+                | State::Min(_, values)
+                | State::Max(_, values) => values[target] = values[source],
+                State::SumU64(_, _, values) => values[target] = values[source],
+                State::SumF32(..)
+                | State::SumF64(..)
+                | State::Product(..)
+                | State::ProductU64(..)
+                | State::ProductF32(..)
+                | State::ProductF64(..) => {
+                    unreachable!("unsupported dual rank tree state")
+                }
+            }
+        }
+        if let Some(values) = &mut self.count_all {
+            values[target] = values[source];
+        }
+    }
+
+    fn merge_output_within(&mut self, source: usize, target: usize) {
+        if let Some(matched) = &mut self.matched {
+            matched[target] |= matched[source];
+        }
+        for state in &mut self.states {
+            match state {
+                State::CountAll => {}
+                State::CountNonNullMask(_, values) | State::Sum(_, values) => {
+                    values[target] = values[target].wrapping_add(values[source]);
+                }
+                State::SumU64(_, _, values) => {
+                    values[target] = values[target].wrapping_add(values[source]);
+                }
+                State::Min(view, values) => {
+                    values[target] = better_extreme(view, values[target], values[source], true);
+                }
+                State::Max(view, values) => {
+                    values[target] = better_extreme(view, values[target], values[source], false);
+                }
+                State::SumF32(..)
+                | State::SumF64(..)
+                | State::Product(..)
+                | State::ProductU64(..)
+                | State::ProductF32(..)
+                | State::ProductF64(..) => {
+                    unreachable!("unsupported dual rank tree state")
+                }
+            }
+        }
+        if let Some(values) = &mut self.count_all {
+            values[target] = values[target].wrapping_add(values[source]);
+        }
+    }
+
+    fn merge_output_from(&mut self, source: &Self, source_position: usize, target: usize) {
+        let source_matched = source
+            .matched
+            .as_ref()
+            .is_some_and(|matched| matched[source_position]);
+        if let Some(matched) = &mut self.matched {
+            matched[target] |= source_matched;
+        }
+        for (destination, source_state) in self.states.iter_mut().zip(&source.states) {
+            match (destination, source_state) {
+                (State::CountAll, State::CountAll) => {}
+                (State::CountNonNullMask(_, values), State::CountNonNullMask(_, source_values))
+                | (State::Sum(_, values), State::Sum(_, source_values)) => {
+                    values[target] = values[target].wrapping_add(source_values[source_position]);
+                }
+                (State::SumU64(_, _, values), State::SumU64(_, _, source_values)) => {
+                    values[target] = values[target].wrapping_add(source_values[source_position]);
+                }
+                (State::Min(view, values), State::Min(_, source_values)) => {
+                    values[target] =
+                        better_extreme(view, values[target], source_values[source_position], true);
+                }
+                (State::Max(view, values), State::Max(_, source_values)) => {
+                    values[target] =
+                        better_extreme(view, values[target], source_values[source_position], false);
+                }
+                _ => unreachable!("dual rank tree state mismatch"),
+            }
+        }
+        if let (Some(values), Some(source_values)) = (&mut self.count_all, &source.count_all) {
+            values[target] = values[target].wrapping_add(source_values[source_position]);
+        }
+        self.successful |= source_matched;
+    }
+
+    /// Whether every requested operation is supported by the rank tree.
+    pub(crate) fn supports_dual_rank_tree(&self) -> bool {
+        self.states.iter().all(|state| {
+            matches!(
+                state,
+                State::CountAll
+                    | State::CountNonNullMask(..)
+                    | State::Sum(..)
+                    | State::SumU64(..)
+                    | State::Min(..)
+                    | State::Max(..)
+            )
+        })
+    }
+
     /// Aggregate starts-only suffixes, selecting the same adaptive strategy
     /// used by the existing single-operation forward kernels.
     ///

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
+use crate::aggregation_common::adaptive::should_use_segment_tree;
 use crate::aggregation_common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
@@ -2609,6 +2610,7 @@ fn aggregate_dual_region_core<'py, F>(
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
     reverse: bool,
+    allow_rank_tree: bool,
     candidate_pass: F,
 ) -> PyResult<Option<Bound<'py, PyTuple>>>
 where
@@ -2640,6 +2642,46 @@ where
     let layout =
         build_ranked_region_position_layout(&regions.right_region, &regions.starts, regions.end)
             .map_err(PyValueError::new_err)?;
+
+    // The rank tree summarizes the complete dual-region candidate set. It is
+    // safe only for the forward exact path: reverse aggregation reads values
+    // from the left side, and residual aggregation must inspect every pair.
+    let mut estimated_width = 0_usize;
+    let mut estimate_previous_end = regions.end;
+    for &start in &regions.starts {
+        if start <= estimate_previous_end && start < regions.end {
+            estimated_width = estimated_width.saturating_add(regions.end.saturating_sub(start));
+            estimate_previous_end = start;
+        }
+    }
+    if allow_rank_tree
+        && !reverse
+        && set.supports_dual_rank_tree()
+        && should_use_segment_tree(
+            regions.left_region.len(),
+            estimated_width,
+            right_index.len(),
+        )
+    {
+        set.aggregate_dual_rank_tree(
+            ArrayView1::from(regions.left_region.as_slice()),
+            ArrayView1::from(regions.right_region.as_slice()),
+            ArrayView1::from(regions.starts.as_slice()),
+            &left_has_match,
+            &inputs,
+        );
+        if set.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(make_results_with_positions(
+            py,
+            set,
+            output_positions,
+            output_len,
+            return_matched,
+        )?));
+    }
+
     let mut active_counts = BTreeMap::<usize, usize>::new();
     let mut previous_end = regions.end;
     for (left_position, (&start, &left_region)) in
@@ -2823,6 +2865,7 @@ pub fn dual_regions_aggregate<'py>(
         aggregations,
         return_matched,
         false,
+        true,
         |_, _| true,
     )
 }
@@ -2874,6 +2917,7 @@ pub fn dual_regions_aggregate_reverse<'py>(
         aggregations,
         return_matched,
         true,
+        false,
         |_, _| true,
     )
 }
@@ -2927,6 +2971,7 @@ pub fn dual_regions_and_residual_aggregate<'py>(
         aligner.as_array(),
         aggregations,
         return_matched,
+        false,
         false,
         move |left_position, right_position| {
             predicates_match_dispatch(
@@ -2988,6 +3033,7 @@ pub fn dual_regions_and_residual_aggregate_reverse<'py>(
         aggregations,
         return_matched,
         true,
+        false,
         move |left_position, right_position| {
             predicates_match_dispatch(
                 &views,
@@ -3525,6 +3571,48 @@ mod tests {
                 // `min`/`max` return source positions, matching the existing
                 // aggregation contract; sum/product return values.
                 vec![vec![10, 7], vec![0, 2], vec![3, 3], vec![24, 12]]
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn broad_dual_aggregation_uses_rank_tree_results() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let rows = 100;
+            let left_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+            let right_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+            let left_values = vec![1_i64; rows];
+            let right_values: Vec<i64> = (1..=rows as i64).collect();
+            let first = predicate(py, &left_values, &right_values, "<=")?;
+            let second = predicate(py, &left_values, &right_values, "<=")?;
+            let aligner = PyArray1::from_vec(py, (0..rows as i64).collect()).readonly();
+            let aggregations = PyList::new(
+                py,
+                [
+                    aggregation_input(py, &right_values, "sum")?,
+                    aggregation_input(py, &right_values, "min")?,
+                    aggregation_input(py, &right_values, "max")?,
+                ],
+            )?;
+
+            let result = dual_regions_aggregate(
+                py,
+                left_index.as_any(),
+                right_index.as_any(),
+                &first,
+                &second,
+                aligner,
+                &aggregations,
+                false,
+            )?
+            .ok_or_else(|| PyValueError::new_err("broad aggregation returned None"))?;
+
+            assert_eq!(
+                aggregate_outputs(&result)?,
+                vec![vec![5050; rows], vec![0; rows], vec![99; rows]]
             );
             Ok(())
         })
