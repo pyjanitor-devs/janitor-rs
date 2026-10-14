@@ -418,35 +418,33 @@ impl<'a> AggregationSet<'a> {
     /// counts, and extrema. Floating-point sums and products retain the direct
     /// traversal because changing encounter order would change their
     /// numerical behavior; floating-point extrema remain order-independent.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn aggregate_dual_rank_tree(
         &mut self,
         left_region: ArrayView1<'_, i64>,
         left_order: &[usize],
         right_region: ArrayView1<'_, i64>,
+        right_labels: &[i64],
+        right_ranks: &[usize],
         starts: ArrayView1<'_, usize>,
         left_has_match: &[bool],
         inputs: &'a [AggregationInput<'_>],
     ) {
-        let mut rank_values = right_region.iter().copied().collect::<Vec<_>>();
-        rank_values.sort_unstable();
-        rank_values.dedup();
-        if rank_values.is_empty() {
+        if right_labels.is_empty() {
             return;
         }
 
-        let tree_size = rank_values.len().next_power_of_two();
+        let tree_size = right_labels.len().next_power_of_two();
         let tree_output_len = tree_size.saturating_mul(2);
         if tree_output_len == 0 {
             return;
-        }
-        let mut ranks = std::collections::BTreeMap::new();
-        for (rank, value) in rank_values.iter().copied().enumerate() {
-            ranks.insert(value, rank);
         }
 
         let mut tree = AggregationSet::new(tree_output_len, right_region.len(), inputs, true)
             .expect("dual rank tree inputs were validated by the caller");
         let mut previous_end = right_region.len();
+        let mut left_nodes = Vec::new();
+        let mut right_nodes = Vec::new();
 
         for row in 0..left_region.len() {
             let start = starts[row];
@@ -455,7 +453,11 @@ impl<'a> AggregationSet<'a> {
             }
             if start < previous_end {
                 for position in (start..previous_end).rev() {
-                    let leaf = tree_size + ranks[&right_region[position]];
+                    let rank = right_ranks[position];
+                    if rank == usize::MAX {
+                        continue;
+                    }
+                    let leaf = tree_size + rank;
                     tree.update(position, leaf);
                     tree.rebuild_path(leaf);
                 }
@@ -466,14 +468,14 @@ impl<'a> AggregationSet<'a> {
                 continue;
             }
 
-            let threshold = rank_values.partition_point(|value| *value < left_region[row]);
-            if threshold == rank_values.len() {
+            let threshold = right_labels.partition_point(|value| *value < left_region[row]);
+            if threshold == right_labels.len() {
                 continue;
             }
+            left_nodes.clear();
+            right_nodes.clear();
             let mut left = tree_size + threshold;
-            let mut right = tree_size + rank_values.len();
-            let mut left_nodes = Vec::new();
-            let mut right_nodes = Vec::new();
+            let mut right = tree_size + right_labels.len();
             while left < right {
                 if left & 1 == 1 {
                     left_nodes.push(left);
@@ -486,7 +488,7 @@ impl<'a> AggregationSet<'a> {
                 left /= 2;
                 right /= 2;
             }
-            for node in left_nodes.into_iter().chain(right_nodes.into_iter().rev()) {
+            for &node in left_nodes.iter().chain(right_nodes.iter().rev()) {
                 self.merge_output_from(&tree, node, left_order[row]);
             }
         }

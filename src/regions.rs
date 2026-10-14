@@ -18,10 +18,12 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 #[cfg(test)]
-static DUAL_RANK_TREE_HITS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static DUAL_RANK_TREE_HITS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// The second predicate's paths together with the first-predicate starts.
 pub(crate) struct DualRegionPaths {
@@ -2660,15 +2662,26 @@ where
     let mut estimated_width = 0_usize;
     let mut estimate_previous_end = regions.end;
     let mut estimated_active_width = 0_usize;
-    for &start in &regions.starts {
+    let total_ranked_positions = layout.positions.len();
+    for (row, &start) in regions.starts.iter().enumerate() {
         if start <= estimate_previous_end && start < regions.end {
             for &region in &regions.right_region[start..estimate_previous_end] {
                 if region != 0 {
                     estimated_active_width = estimated_active_width.saturating_add(1);
                 }
             }
-            estimated_width = estimated_width.saturating_add(estimated_active_width);
             estimate_previous_end = start;
+        }
+        if left_has_match[row] && regions.left_region[row] != 0 && total_ranked_positions != 0 {
+            let threshold = layout
+                .labels
+                .partition_point(|label| *label < regions.left_region[row]);
+            if threshold < layout.labels.len() {
+                let suffix_positions = total_ranked_positions - layout.offsets[threshold];
+                let candidate_estimate = estimated_active_width.saturating_mul(suffix_positions)
+                    / total_ranked_positions;
+                estimated_width = estimated_width.saturating_add(candidate_estimate.max(1));
+            }
         }
     }
     if allow_rank_tree
@@ -2681,11 +2694,13 @@ where
         )
     {
         #[cfg(test)]
-        DUAL_RANK_TREE_HITS.fetch_add(1, Ordering::Relaxed);
+        DUAL_RANK_TREE_HITS.with(|hits| hits.set(hits.get() + 1));
         set.aggregate_dual_rank_tree(
             ArrayView1::from(regions.left_region.as_slice()),
             &regions.left_order,
             ArrayView1::from(regions.right_region.as_slice()),
+            &layout.labels,
+            &layout.ranks,
             ArrayView1::from(regions.starts.as_slice()),
             &left_has_match,
             &inputs,
@@ -3601,7 +3616,7 @@ mod tests {
     fn broad_dual_aggregation_uses_rank_tree_results() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
-            let tree_hits_before = DUAL_RANK_TREE_HITS.load(Ordering::Relaxed);
+            let tree_hits_before = DUAL_RANK_TREE_HITS.with(Cell::get);
             let rows = 100;
             let left_index = PyArray1::from_vec(py, (0..rows as i64).collect());
             let right_index = PyArray1::from_vec(py, (0..rows as i64).collect());
@@ -3641,7 +3656,7 @@ mod tests {
                     vec![99; rows],
                 ]
             );
-            assert!(DUAL_RANK_TREE_HITS.load(Ordering::Relaxed) > tree_hits_before);
+            assert!(DUAL_RANK_TREE_HITS.with(Cell::get) > tree_hits_before);
             Ok(())
         })
         .unwrap();
