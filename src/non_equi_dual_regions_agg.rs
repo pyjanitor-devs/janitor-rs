@@ -6,6 +6,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 use std::collections::BTreeMap;
 
+use crate::aggs::adaptive::should_use_segment_tree;
 use crate::aggs::aggregation::{make_results, parse_inputs, AggregationSet};
 use crate::aggs::{ensure_equal_lengths, ensure_nonempty_core};
 use crate::compare::common::{add_right_region, checked_region_start, GroupState};
@@ -60,22 +61,46 @@ pub fn aggregate_dual_regions<'py>(
         ));
     }
     let mut set = AggregationSet::new(left.len(), right.len(), &inputs)?;
-    let mut next = vec![-1_i64; right.len()];
-    let mut groups = BTreeMap::<i64, GroupState>::new();
-    let mut previous_end = right.len();
-    for row in 0..left.len() {
-        let Some(start) = checked_region_start(starts[row], right.len(), previous_end)
+
+    // The rank tree is worthwhile only for repeated broad suffixes. The
+    // estimate is intentionally conservative: it uses the exposed right
+    // suffix width, so selective region thresholds stay on the exact
+    // candidate-enumeration fallback rather than paying tree construction
+    // cost for little work.
+    let mut estimated_width = 0_usize;
+    let mut estimate_previous_end = right.len();
+    for start in starts.iter() {
+        let Some(start) = checked_region_start(*start, right.len(), estimate_previous_end)
             .map_err(PyValueError::new_err)?
         else {
             continue;
         };
-        add_right_region(right, start, previous_end, &mut next, &mut groups);
-        previous_end = start;
-        for (_, state) in groups.range(left[row]..) {
-            let mut position = state.head;
-            while position >= 0 {
-                set.update(position as usize, row);
-                position = next[position as usize];
+        estimated_width = estimated_width.saturating_add(right.len() - start);
+        estimate_previous_end = start;
+    }
+    let use_rank_tree = set.supports_dual_rank_tree()
+        && should_use_segment_tree(left.len(), estimated_width, right.len());
+
+    if use_rank_tree {
+        set.aggregate_dual_rank_tree(left, right, starts, &inputs);
+    } else {
+        let mut next = vec![-1_i64; right.len()];
+        let mut groups = BTreeMap::<i64, GroupState>::new();
+        let mut previous_end = right.len();
+        for row in 0..left.len() {
+            let Some(start) = checked_region_start(starts[row], right.len(), previous_end)
+                .map_err(PyValueError::new_err)?
+            else {
+                continue;
+            };
+            add_right_region(right, start, previous_end, &mut next, &mut groups);
+            previous_end = start;
+            for (_, state) in groups.range(left[row]..) {
+                let mut position = state.head;
+                while position >= 0 {
+                    set.update(position as usize, row);
+                    position = next[position as usize];
+                }
             }
         }
     }
@@ -133,6 +158,131 @@ mod tests {
             assert_eq!(
                 result.get_item(0).unwrap().extract::<Vec<i64>>().unwrap(),
                 vec![2, 1]
+            );
+        });
+    }
+
+    #[test]
+    fn broad_integer_regions_use_rank_tree_for_mixed_aggregations() {
+        Python::initialize();
+        Python::attach(|py| {
+            let rows = 100;
+            let left = PyArray1::from_vec(py, vec![0_i64; rows]);
+            let right = PyArray1::from_vec(py, (0..rows as i64).collect());
+            let starts = PyArray1::from_vec(py, (0..rows as i64).rev().collect());
+            let values = PyArray1::from_vec(py, (0..rows as i64).collect());
+            let mask_values: Vec<bool> = (0..rows).map(|position| position % 7 == 0).collect();
+            let mask = PyArray1::from_vec(py, mask_values.clone());
+            let count = PyTuple::new(
+                py,
+                [
+                    values.clone().into_any(),
+                    mask.clone().into_any(),
+                    "count".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap();
+            let aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py).unwrap().into_any(),
+                            "size".into_pyobject(py).unwrap().into_any(),
+                        ],
+                    )
+                    .unwrap(),
+                    count,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            mask.clone().into_any(),
+                            "sum".into_pyobject(py).unwrap().into_any(),
+                        ],
+                    )
+                    .unwrap(),
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            mask.clone().into_any(),
+                            "min".into_pyobject(py).unwrap().into_any(),
+                        ],
+                    )
+                    .unwrap(),
+                    PyTuple::new(
+                        py,
+                        [
+                            values.into_any(),
+                            mask.into_any(),
+                            "max".into_pyobject(py).unwrap().into_any(),
+                        ],
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+
+            let result = aggregate_dual_regions(
+                py,
+                left.readonly(),
+                right.readonly(),
+                starts.readonly(),
+                &aggregations,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(result
+                .get_item(0)
+                .unwrap()
+                .extract::<Vec<bool>>()
+                .unwrap()
+                .iter()
+                .all(|v| *v));
+            let outputs_item = result.get_item(1).unwrap();
+            let outputs = outputs_item.cast::<PyList>().unwrap();
+            assert_eq!(
+                outputs.get_item(0).unwrap().extract::<Vec<i64>>().unwrap(),
+                (1..=rows as i64).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(1).unwrap().extract::<Vec<i64>>().unwrap(),
+                (0..rows as i64)
+                    .rev()
+                    .map(|start| {
+                        (start..rows as i64)
+                            .filter(|position| !mask_values[*position as usize])
+                            .count() as i64
+                    })
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(2).unwrap().extract::<Vec<i64>>().unwrap(),
+                (0..rows as i64)
+                    .rev()
+                    .map(|start| {
+                        (start..rows as i64)
+                            .filter(|position| !mask_values[*position as usize])
+                            .sum::<i64>()
+                    })
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(3).unwrap().extract::<Vec<i64>>().unwrap(),
+                (0..rows as i64)
+                    .rev()
+                    .map(|start| {
+                        (start..rows as i64)
+                            .find(|position| !mask_values[*position as usize])
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(4).unwrap().extract::<Vec<i64>>().unwrap(),
+                vec![99; rows]
             );
         });
     }

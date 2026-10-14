@@ -64,6 +64,25 @@ fn requests<'py>(
     PyList::new(py, [sum, product, min, max, count_nonnull, count_all])
 }
 
+fn dual_rank_tree_requests<'py>(
+    py: Python<'py>,
+    values: &Bound<'py, PyArray1<i64>>,
+    mask: &Bound<'py, PyArray1<bool>>,
+) -> PyResult<Bound<'py, PyList>> {
+    let sum = request(py, values, mask, "sum")?;
+    let min = request(py, values, mask, "min")?;
+    let max = request(py, values, mask, "max")?;
+    let count = request(py, values, mask, "count")?;
+    let size = PyTuple::new(
+        py,
+        [
+            "*".into_pyobject(py)?.into_any(),
+            "size".into_pyobject(py)?.into_any(),
+        ],
+    )?;
+    PyList::new(py, [sum, min, max, count, size])
+}
+
 fn make_call<'py>(
     py: Python<'py>,
     module: &Bound<'py, PyModule>,
@@ -83,9 +102,20 @@ fn make_call<'py>(
             .map(|position| scenario.mixed_nulls && position % 5 == 0)
             .collect(),
     );
-    let aggregations = requests(py, &values, &mask)?;
+    let aggregations = if name == "aggregate_dual_regions" {
+        dual_rank_tree_requests(py, &values, &mask)?
+    } else {
+        requests(py, &values, &mask)?
+    };
     let function = module.getattr(name)?.unbind();
-    let (starts, ends): (Vec<i64>, Vec<i64>) = if scenario.broad {
+    let (starts, ends): (Vec<i64>, Vec<i64>) = if name == "aggregate_dual_regions" {
+        (
+            (0..shape.left_len)
+                .map(|row| shape.right_len.saturating_sub(row + 1) as i64)
+                .collect(),
+            Vec::new(),
+        )
+    } else if scenario.broad {
         (
             vec![0_i64; shape.left_len],
             vec![shape.right_len as i64; shape.left_len],
@@ -132,6 +162,20 @@ fn make_call<'py>(
                     starts.into_any(),
                     ends.into_any(),
                     shape.right_len.into_pyobject(py)?.into_any(),
+                    aggregations.into_any(),
+                ],
+            )?
+        }
+        "aggregate_dual_regions" => {
+            let left_region = PyArray1::from_vec(py, vec![0_i64; shape.left_len]);
+            let right_region = PyArray1::from_vec(py, (0..shape.right_len as i64).collect());
+            let starts = PyArray1::from_vec(py, starts);
+            PyTuple::new(
+                py,
+                [
+                    left_region.into_any(),
+                    right_region.into_any(),
+                    starts.into_any(),
                     aggregations.into_any(),
                 ],
             )?
@@ -193,6 +237,7 @@ fn bench(c: &mut Criterion) {
                     "aggregate_starts",
                     "aggregate_ends",
                     "aggregate_starts_ends",
+                    "aggregate_dual_regions",
                 ] {
                     let call = make_call(py, &module, name, shape, scenario)
                         .expect("benchmark fixture must satisfy wrapper preconditions");
