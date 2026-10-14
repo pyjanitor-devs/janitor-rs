@@ -414,13 +414,14 @@ impl<'a> AggregationSet<'a> {
     /// left row can merge a logarithmic number of rank blocks instead of
     /// visiting every matching right row.
     ///
-    /// This path intentionally supports only associative integer operations,
-    /// counts, and extrema. Floating-point operations and products retain the
-    /// direct traversal because changing encounter order would change their
-    /// numerical behavior.
+    /// This path intentionally supports associative integer operations,
+    /// counts, and extrema. Floating-point sums and products retain the direct
+    /// traversal because changing encounter order would change their
+    /// numerical behavior; floating-point extrema remain order-independent.
     pub(crate) fn aggregate_dual_rank_tree(
         &mut self,
         left_region: ArrayView1<'_, i64>,
+        left_order: &[usize],
         right_region: ArrayView1<'_, i64>,
         starts: ArrayView1<'_, usize>,
         left_has_match: &[bool],
@@ -486,7 +487,7 @@ impl<'a> AggregationSet<'a> {
                 right /= 2;
             }
             for node in left_nodes.into_iter().chain(right_nodes.into_iter().rev()) {
-                self.merge_output_from(&tree, node, row);
+                self.merge_output_from(&tree, node, left_order[row]);
             }
         }
     }

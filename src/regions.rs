@@ -2665,6 +2665,7 @@ where
     {
         set.aggregate_dual_rank_tree(
             ArrayView1::from(regions.left_region.as_slice()),
+            &regions.left_order,
             ArrayView1::from(regions.right_region.as_slice()),
             ArrayView1::from(regions.starts.as_slice()),
             &left_has_match,
@@ -3584,7 +3585,7 @@ mod tests {
             let rows = 100;
             let left_index = PyArray1::from_vec(py, (0..rows as i64).collect());
             let right_index = PyArray1::from_vec(py, (0..rows as i64).collect());
-            let left_values = vec![1_i64; rows];
+            let left_values: Vec<i64> = (1..=rows as i64).collect();
             let right_values: Vec<i64> = (1..=rows as i64).collect();
             let first = predicate(py, &left_values, &right_values, "<=")?;
             let second = predicate(py, &left_values, &right_values, "<=")?;
@@ -3612,7 +3613,13 @@ mod tests {
 
             assert_eq!(
                 aggregate_outputs(&result)?,
-                vec![vec![5050; rows], vec![0; rows], vec![99; rows]]
+                vec![
+                    (0..rows)
+                        .map(|row| ((row + 1 + rows) * (rows - row) / 2) as i64)
+                        .collect(),
+                    (0..rows as i64).collect(),
+                    vec![99; rows],
+                ]
             );
             Ok(())
         })
