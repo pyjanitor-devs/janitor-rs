@@ -1098,7 +1098,8 @@ impl<'a> AggregationSet<'a> {
     /// floating-point reductions because it retains source encounter order.
     ///
     /// For broad batches, associative integer operations and min/max use a
-    /// forest of iterative segment trees, one per disjoint queried span. For:
+    /// one iterative segment tree over the disjoint queried spans packed end
+    /// to end. For:
     ///
     /// ```text
     /// right = [2, 3, 4, 5, 1, 6, 7, 8]
@@ -2297,9 +2298,8 @@ fn update_signed_segment_ranges(
             continue;
         };
 
-        // The caller's source boundaries are half-open. Add `length` to map
-        // them into the leaf portion of the flat tree without changing the
-        // inclusive/exclusive meaning of either boundary.
+        // `packed_range` has already mapped the caller's source boundaries
+        // into the leaf portion of the flat tree.
         let mut total = if product { 1_i64 } else { 0_i64 };
 
         // Move both boundaries toward their common parent. Whenever a
@@ -2379,8 +2379,9 @@ fn update_u64_segment_ranges(
             continue;
         };
 
-        // Translate source positions to leaf positions. The end remains
-        // exclusive, so the query includes exactly `start..end`.
+        // `packed_range` has already translated source positions to leaf
+        // positions. The end remains exclusive, so the query includes
+        // exactly `start..end`.
         let mut total = if product { 1_u64 } else { 0_u64 };
         while start < end {
             if start & 1 == 1 {
@@ -2643,8 +2644,8 @@ fn update_extreme_segment_ranges(
             continue;
         };
 
-        // Move from source coordinates into the leaf half of the flat tree;
-        // `end` remains exclusive throughout the query.
+        // `packed_range` has already moved source coordinates into the leaf
+        // half of the flat tree; `end` remains exclusive throughout.
         let mut winner = -1_i64;
         while start < end {
             if start & 1 == 1 {
