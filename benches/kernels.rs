@@ -465,13 +465,16 @@ fn equi_many_groups(c: &mut Criterion) {
     Python::initialize();
     Python::attach(|py| {
         let group_count = 2_048_usize;
-        let queries_per_group = 4_usize;
+        let queries_per_group = 8_usize;
         let left_rows = group_count * queries_per_group;
-        let group_stride = 1_024_i64;
-        let window_width = 512_i64;
+        let group_stride = 256_i64;
+        let window_width = 224_i64;
         let right_rows = group_count * group_stride as usize;
         let starts_values: Vec<_> = (0..left_rows)
-            .map(|row| (row / queries_per_group) as i64 * group_stride)
+            .map(|row| {
+                (row / queries_per_group) as i64 * group_stride
+                    + (row % queries_per_group) as i64 * 4
+            })
             .collect();
         let ends_values: Vec<_> = starts_values
             .iter()
