@@ -1,8 +1,9 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use janitor_rs::bench_support::{
-    dual_regions_aggregate, dual_regions_and_residual_aggregate, equi_aggregate_bench,
+    adaptive_extreme_positions, dual_regions_aggregate, dual_regions_and_residual_aggregate,
+    equi_aggregate_bench,
 };
-use numpy::{PyArray1, PyArrayMethods};
+use numpy::{ndarray::ArrayView1, PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 use std::hint::black_box;
@@ -551,6 +552,119 @@ fn equi_very_large_starts_ends(c: &mut Criterion) {
     bench_equi_starts_ends_only(c, "equi_starts_ends_1m", 1_048_576);
 }
 
+/// Reference the pre-optimization left-to-right scan, including result storage.
+///
+/// `labels` supplies physical labels, `ranges` supplies valid half-open offsets,
+/// and `minimum` chooses first/smallest versus last/largest. Like the adaptive
+/// helper, this returns offsets rather than physical labels. Fixtures are built
+/// outside timing; allocation and destruction of each answer stay inside it.
+fn direct_extrema(labels: &[i64], ranges: &[(usize, usize)], minimum: bool) -> Vec<usize> {
+    ranges
+        .iter()
+        .map(|&(start, end)| {
+            let mut winner = start;
+            for position in start + 1..end {
+                if (minimum && labels[position] < labels[winner])
+                    || (!minimum && labels[position] > labels[winner])
+                {
+                    winner = position;
+                }
+            }
+            winner
+        })
+        .collect()
+}
+
+/// Compare direct/adaptive extrema with setup excluded and result parity checked.
+///
+/// ELI5: time both a hand search and the shelf index on the same shopping list.
+/// Tiny and sparse cases expose setup overhead; broad cases expose repeated
+/// scanning costs. Repeated labels stress equal winners at the helper level;
+/// Python's physical row-position maps are normally unique.
+fn range_extrema(c: &mut Criterion) {
+    let mut group = c.benchmark_group("range_extrema");
+    for (name, length, queries, width) in [
+        ("tiny", 32_usize, 2_usize, 8_usize),
+        ("large", 4_096, 128, 2_048),
+        ("very_large", 65_536, 512, 8_192),
+        ("super_large", 1_048_576, 1_024, 32_768),
+        ("sparse_large_column", 1_048_576, 64, 8),
+        ("cutoff_below", 64, 8, 51),
+        ("cutoff_at", 64, 8, 52),
+        ("cutoff_above", 64, 8, 53),
+    ] {
+        let ranges = (0..queries)
+            .map(|row| {
+                if name.starts_with("cutoff_") {
+                    // At span 64 and eight queries, total width 416 is the
+                    // strict crossover. These batches total 415/416/417.
+                    return (
+                        0,
+                        match row {
+                            0 => 64,
+                            1..=6 => 50,
+                            _ => width,
+                        },
+                    );
+                }
+                let start = row * 7919 % (length - width + 1);
+                (start, start + width)
+            })
+            .collect::<Vec<_>>();
+        for repeated in [false, true] {
+            let distribution = if repeated { "repeated" } else { "unique" };
+            // Odd multiplication permutes power-of-two-sized unique fixtures.
+            let labels = (0..length)
+                .map(|position| {
+                    let label = (position * 7919) % length;
+                    if repeated {
+                        (label % 97.min(length / 4)) as i64
+                    } else {
+                        label as i64
+                    }
+                })
+                .collect::<Vec<_>>();
+            for minimum in [true, false] {
+                let keep = if minimum { "first" } else { "last" };
+                let direct = direct_extrema(&labels, &ranges, minimum);
+                let adaptive = adaptive_extreme_positions(
+                    ArrayView1::from(labels.as_slice()),
+                    &ranges,
+                    minimum,
+                )
+                .unwrap();
+                assert_eq!(
+                    direct.iter().map(|&p| labels[p]).collect::<Vec<_>>(),
+                    adaptive.iter().map(|&p| labels[p]).collect::<Vec<_>>()
+                );
+                let case = format!("{name}/{distribution}/{keep}");
+                group.bench_function(format!("{case}/direct"), |b| {
+                    b.iter(|| {
+                        black_box(direct_extrema(
+                            black_box(&labels),
+                            black_box(&ranges),
+                            black_box(minimum),
+                        ))
+                    })
+                });
+                group.bench_function(format!("{case}/adaptive"), |b| {
+                    b.iter(|| {
+                        black_box(
+                            adaptive_extreme_positions(
+                                black_box(ArrayView1::from(labels.as_slice())),
+                                black_box(&ranges),
+                                black_box(minimum),
+                            )
+                            .unwrap(),
+                        )
+                    })
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     selective_second_predicate,
@@ -562,6 +676,7 @@ criterion_group!(
     equi_large_group,
     equi_compact_group,
     equi_many_groups,
-    equi_very_large_starts_ends
+    equi_very_large_starts_ends,
+    range_extrema
 );
 criterion_main!(benches);

@@ -35,7 +35,7 @@
 //! This convention is important because `end` is allowed to equal the right
 //! length, while `start` may be zero.
 
-use numpy::ndarray::{Array1, ArrayView1};
+use numpy::ndarray::ArrayView1;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -54,10 +54,14 @@ use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_stri
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 #[cfg(test)]
-static EXTREME_TREE_HITS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // ELI5: each test thread keeps its own tally, so a neighboring test cannot
+    // accidentally supply the branch evidence that this test is missing.
+    pub(crate) static EXTREME_TREE_HITS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// Select the smallest or largest physical label in each half-open window by scanning.
 ///
@@ -132,15 +136,15 @@ fn extreme_positions_direct(
 ///
 /// # Returns
 ///
-/// One selected position in `labels` per input range, in input order. Ties
-/// select the leftmost position because candidates replace one another only
-/// on a strict improvement. An empty `ranges` slice returns an empty vector.
+/// One selected position in `labels` per input range, in input order. Equal
+/// labels may select different offsets in the direct and tree paths, but the
+/// returned label is identical. An empty `ranges` slice returns an empty vector.
 ///
 /// # Errors
 ///
 /// Returns an error for an empty, reversed, or out-of-bounds range, or when a
 /// tree allocation cannot be represented by the platform's `usize` capacity.
-pub(crate) fn adaptive_extreme_positions(
+pub fn adaptive_extreme_positions(
     labels: ArrayView1<'_, i64>,
     ranges: &[(usize, usize)],
     minimum: bool,
@@ -171,7 +175,7 @@ pub(crate) fn adaptive_extreme_positions(
     }
 
     #[cfg(test)]
-    EXTREME_TREE_HITS.fetch_add(1, Ordering::Relaxed);
+    EXTREME_TREE_HITS.with(|hits| hits.set(hits.get() + 1));
 
     // ELI5: each tree node remembers the winning original position for its
     // slice, so a query combines a few summaries instead of rescanning rows.
@@ -220,8 +224,11 @@ pub(crate) fn adaptive_extreme_positions(
 /// `usize::MAX` is an internal empty-candidate sentinel. It cannot be a real
 /// position because every valid position is smaller than `labels.len()`;
 /// handling it here lets an iterative tree query combine partial slices
-/// without inventing a fake label value. Strict comparison preserves the
-/// leftmost position when labels tie.
+/// without inventing a fake label value. Strict comparison retains the first
+/// argument on ties; tree query traversal need not visit positions in order.
+///
+/// ELI5: the marker is an empty seat, not a contestant. Only occupied seats
+/// participate in the label comparison, so the marker is never used to index.
 ///
 /// # Arguments
 ///
@@ -233,8 +240,7 @@ pub(crate) fn adaptive_extreme_positions(
 ///
 /// # Returns
 ///
-/// The winning real candidate, or the real candidate when the other side is
-/// the empty sentinel.
+/// The winning candidate, or `usize::MAX` if both candidates are empty.
 fn choose_extreme_position(
     labels: ArrayView1<'_, i64>,
     left: usize,
@@ -257,53 +263,6 @@ fn choose_extreme_position(
     } else {
         left
     }
-}
-
-/// Select extrema for the public range-window path.
-///
-/// This adapter retains the signed `i64` boundary representation used by the
-/// NumPy-facing API, converts validated boundaries to internal `usize`
-/// offsets, delegates to [`adaptive_extreme_positions`], and converts the
-/// selected offsets back to the public `i64` representation.
-///
-/// # Arguments
-///
-/// * `labels` - Right-side physical labels in prepared layout order.
-/// * `starts` - Inclusive window starts, one per logical left row.
-/// * `ends` - Exclusive window ends, paired with `starts`.
-/// * `minimum` - Select the smallest label when `true`; select the largest
-///   label when `false`.
-///
-/// # Returns
-///
-/// One selected physical offset per valid input window, encoded as `i64` for
-/// the Python-facing contract.
-///
-/// # Errors
-///
-/// Returns an error for mismatched parallel-array lengths, negative bounds,
-/// empty or out-of-bounds windows, or an offset that cannot fit in `i64`.
-fn window_extreme_positions(
-    labels: &[i64],
-    starts: &[i64],
-    ends: &[i64],
-    minimum: bool,
-) -> Result<Vec<i64>, String> {
-    ensure_equal_lengths_core("range labels", starts.len(), "range starts", ends.len())?;
-    let mut ranges = Vec::with_capacity(starts.len());
-    for (&start, &end) in starts.iter().zip(ends) {
-        let start = usize::try_from(start).map_err(|_| "range start is negative".to_owned())?;
-        let end = usize::try_from(end).map_err(|_| "range end is negative".to_owned())?;
-        ranges.push((start, end));
-    }
-    adaptive_extreme_positions(ArrayView1::from(labels), &ranges, minimum).and_then(|positions| {
-        positions
-            .into_iter()
-            .map(|position| {
-                i64::try_from(position).map_err(|_| "range position exceeds int64".to_owned())
-            })
-            .collect()
-    })
 }
 
 /// Parse one basic dual-range anchor using shared physical index arrays.
@@ -567,7 +526,7 @@ pub(crate) fn build_any_windows(
 /// Unlike a single non-equi join, a dual-range join can produce an interior
 /// window such as `[2, 4)`. Prefix and suffix extrema cannot answer that
 /// shape because they include positions outside the intersection. The
-/// The extrema helper provides the correct arbitrary-window query and chooses
+/// extrema helper provides the correct arbitrary-window query and chooses
 /// between direct scans and a segment tree using the shared adaptive workload
 /// guard.
 ///
@@ -578,6 +537,8 @@ pub(crate) fn build_any_windows(
 /// * `keep` - Selection mode. `first` means the smallest right label,
 ///   `last` the largest, `any` the first physical label, and `all` every
 ///   label in each window.
+/// * `right_index_is_ordered` - Whether labels increase within each prepared
+///   window, allowing first/last selection from its endpoints.
 ///
 /// # Returns
 ///
@@ -587,11 +548,9 @@ pub(crate) fn build_any_windows(
 ///
 /// # Errors
 ///
-/// Returns an error if an internal window boundary cannot be represented by
-/// the public int64 boundary contract, or if an extrema kernel returns an
-/// invalid position. The latter indicates a violated internal window
-/// invariant rather than a normal no-match result; empty windows are removed
-/// by [`build_windows`].
+/// Returns an error for an invalid extrema window, overflowing result/tree
+/// size, failed result reservation, or an invalid selected position. Empty
+/// windows are removed by [`build_any_windows`] before reaching this helper.
 pub(crate) fn choose_range_windows(
     windows: &SingleJoinResult,
     keep: Keep,
@@ -656,47 +615,20 @@ pub(crate) fn choose_range_windows(
         return Ok((output_left, output_right));
     }
 
-    // The reusable min/max helper accepts signed int64 boundaries because
-    // that is the public NumPy representation. Convert the internal usize
-    // windows with a checked cast before handing them to those kernels.
-    let starts: Array1<i64> = windows
+    // ELI5: windows already use the helper's native offset format. Pair them
+    // once instead of taking a detour through signed NumPy-style arrays.
+    let ranges = windows
         .starts
         .iter()
-        .map(|&value| {
-            i64::try_from(value).map_err(|_| "range window start exceeds int64 capacity".to_owned())
-        })
-        .collect::<Result<_, _>>()?;
-    let ends: Array1<i64> = windows
-        .ends
-        .iter()
-        .map(|&value| {
-            i64::try_from(value).map_err(|_| "range window end exceeds int64 capacity".to_owned())
-        })
-        .collect::<Result<_, _>>()?;
-    // Range inputs have already had null rows removed by PyJanitor. The
-    // helper returns offsets into `labels`, not public labels; the final loop
-    // performs that conversion.
-    let selected_positions = match keep {
-        Keep::First => window_extreme_positions(
-            labels,
-            starts.as_slice().unwrap(),
-            ends.as_slice().unwrap(),
-            true,
-        )?,
-        Keep::Last => window_extreme_positions(
-            labels,
-            starts.as_slice().unwrap(),
-            ends.as_slice().unwrap(),
-            false,
-        )?,
-        Keep::Any | Keep::All => unreachable!(),
-    };
+        .copied()
+        .zip(windows.ends.iter().copied())
+        .collect::<Vec<_>>();
+    let selected_positions =
+        adaptive_extreme_positions(ArrayView1::from(labels), &ranges, keep == Keep::First)?;
 
     let mut output_left = Vec::with_capacity(windows.left_index.len());
     let mut output_right = Vec::with_capacity(windows.left_index.len());
     for (row, &position) in selected_positions.iter().enumerate() {
-        let position = usize::try_from(position)
-            .map_err(|_| "range window selection returned an invalid position")?;
         let label = *labels
             .get(position)
             .ok_or("range window selection returned an out-of-bounds position")?;
@@ -1365,16 +1297,12 @@ mod tests {
             .map(|row| (row * 8, row * 8 + 512))
             .collect::<Vec<_>>();
 
-        let before = EXTREME_TREE_HITS.load(Ordering::Relaxed);
+        let before = EXTREME_TREE_HITS.get();
         let labels_view = ArrayView1::from(labels.as_slice());
         let minimum = adaptive_extreme_positions(labels_view, &ranges, true).unwrap();
+        assert_eq!(EXTREME_TREE_HITS.get(), before + 1);
         let maximum = adaptive_extreme_positions(labels_view, &ranges, false).unwrap();
-        let after = EXTREME_TREE_HITS.load(Ordering::Relaxed);
-
-        assert!(
-            after > before,
-            "broad workload did not execute the tree branch"
-        );
+        assert_eq!(EXTREME_TREE_HITS.get(), before + 2);
         assert_eq!(
             minimum,
             extreme_positions_direct(labels_view, &ranges, true)
@@ -1383,6 +1311,103 @@ mod tests {
             maximum,
             extreme_positions_direct(labels_view, &ranges, false)
         );
+
+        let windows = SingleJoinResult {
+            left_index: (100..164).collect(),
+            right_index: labels.clone(),
+            starts: ranges.iter().map(|&(start, _)| start).collect(),
+            ends: ranges.iter().map(|&(_, end)| end).collect(),
+            ..Default::default()
+        };
+        for (keep, positions) in [(Keep::First, minimum), (Keep::Last, maximum)] {
+            let before = EXTREME_TREE_HITS.get();
+            let result = choose_range_windows(&windows, keep, false).unwrap();
+            assert_eq!(EXTREME_TREE_HITS.get(), before + 1);
+            assert_eq!(result.0, windows.left_index);
+            assert_eq!(
+                result.1,
+                positions.iter().map(|&p| labels[p]).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_extrema_counter_is_thread_local() {
+        let before = EXTREME_TREE_HITS.get();
+        std::thread::spawn(|| {
+            let labels = Array1::from_iter(0..64);
+            let ranges = vec![(0, 64); 16];
+            assert_eq!(EXTREME_TREE_HITS.get(), 0);
+            adaptive_extreme_positions(labels.view(), &ranges, true).unwrap();
+            assert_eq!(EXTREME_TREE_HITS.get(), 1);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(EXTREME_TREE_HITS.get(), before);
+    }
+
+    #[test]
+    fn adaptive_extrema_dispatch_boundaries_and_invalid_ranges() {
+        let labels = Array1::from_iter((0..64).map(|p| (p * 17) % 64));
+        // At span 64 and eight queries the guard requires total width > 416:
+        // 5 * 64 build work + 2 * 8 * ceil(log2(64)) query work.
+        for (width, tree_hits) in [(51, 0), (52, 0), (53, 1)] {
+            let mut ranges = vec![(0, 64)];
+            ranges.extend(vec![(0, 50); 6]);
+            ranges.push((0, width));
+            for minimum in [true, false] {
+                let before = EXTREME_TREE_HITS.get();
+                let result = adaptive_extreme_positions(labels.view(), &ranges, minimum).unwrap();
+                assert_eq!(EXTREME_TREE_HITS.get(), before + tree_hits);
+                assert_eq!(
+                    result,
+                    extreme_positions_direct(labels.view(), &ranges, minimum)
+                );
+            }
+        }
+        for ranges in [vec![], vec![(0, 1)], vec![(0, 64); 3]] {
+            let before = EXTREME_TREE_HITS.get();
+            assert_eq!(
+                adaptive_extreme_positions(labels.view(), &ranges, true).unwrap(),
+                extreme_positions_direct(labels.view(), &ranges, true)
+            );
+            assert_eq!(EXTREME_TREE_HITS.get(), before);
+        }
+        for range in [(0, 0), (64, 64), (65, 65), (1, 0), (0, 65), (usize::MAX, 1)] {
+            assert_eq!(
+                adaptive_extreme_positions(labels.view(), &[range], true),
+                Err("range window is empty or out of bounds".to_owned())
+            );
+        }
+        assert!(adaptive_extreme_positions(ArrayView1::from(&[]), &[], true)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn adaptive_extrema_handles_non_power_of_two_spans_ties_and_strides() {
+        // Offset the queried span and reverse the view: neither contiguous
+        // storage nor a power-of-two tree length is part of the contract.
+        let labels = Array1::from_iter((0..1031).map(|p| ((p * 7919) % 97) as i64));
+        let view = labels.slice(numpy::ndarray::s![..;-1]);
+        let ranges = (0..64)
+            .map(|p| (3 + p * 8, 516 + p * 8))
+            .collect::<Vec<_>>();
+        for minimum in [true, false] {
+            let before = EXTREME_TREE_HITS.get();
+            let result = adaptive_extreme_positions(view, &ranges, minimum).unwrap();
+            assert_eq!(EXTREME_TREE_HITS.get(), before + 1);
+            let expected = extreme_positions_direct(view, &ranges, minimum);
+            for (actual, expected) in result.into_iter().zip(expected) {
+                assert_eq!(view[actual], view[expected]);
+            }
+        }
+        assert_eq!(
+            choose_extreme_position(view, usize::MAX, usize::MAX, true),
+            usize::MAX
+        );
+        assert_eq!(choose_extreme_position(view, usize::MAX, 0, true), 0);
+        assert_eq!(choose_extreme_position(view, 0, usize::MAX, false), 0);
     }
 
     #[test]
