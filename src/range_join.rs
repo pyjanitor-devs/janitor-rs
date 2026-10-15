@@ -117,9 +117,10 @@ fn extreme_positions_direct(
 ///
 /// The adaptive policy compares the estimated work of scanning every queried
 /// element (`total_width`) with building and querying one segment tree over
-/// the union span (`span_len`). Direct scans remain preferable for small or
-/// sparse workloads; a tree is useful when overlapping queries can reuse the
-/// same summaries.
+/// the hull (`span_len`): the contiguous interval from the smallest start to
+/// the largest end, including any gaps between queried windows. Direct scans
+/// remain preferable for small or sparse workloads; a tree is useful when
+/// overlapping queries can reuse the same summaries.
 ///
 /// ELI5: a short list of small shelves is faster to inspect by hand, but many
 /// overlapping shelves are cheaper to answer from a shared index of summaries.
@@ -167,8 +168,9 @@ pub fn adaptive_extreme_positions(
         return Ok(Vec::new());
     }
 
-    // ELI5: cover only the smallest aisle containing every query, not the
-    // entire right table. That keeps unrelated positions out of the index.
+    // ELI5: the aisle runs from the first queried shelf to the last, including
+    // all shelves in between even when no query visits them. This hull trims
+    // positions outside those endpoints but does not pack away internal gaps.
     let span_len = span_end - span_start;
     if !should_use_segment_tree(ranges.len(), total_width, span_len) {
         return Ok(extreme_positions_direct(labels, ranges, minimum));

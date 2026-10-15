@@ -417,6 +417,12 @@ work, while one width-eight query makes that regression obvious.
 
 ## Learned Patterns
 
+### [2026-10-15] Distinguish a window hull from its union
+
+The extrema tree in `range_join.rs` covers the contiguous hull from the
+smallest start to the largest end, including unqueried gaps. Call this a hull,
+not a union or packed span; removing those gaps is separate work in #251.
+
 ### [2026-10-15] Isolate adaptive branch evidence and measure performance claims
 
 **Context**: Review of PR #250 found a shared atomic branch counter that could
