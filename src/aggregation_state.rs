@@ -1097,8 +1097,8 @@ impl<'a> AggregationSet<'a> {
     /// range walk. That walk is also the numerically correct choice for
     /// floating-point reductions because it retains source encounter order.
     ///
-    /// For broad batches, associative integer operations and min/max use a
-    /// one iterative segment tree over the disjoint queried spans packed end
+    /// For broad batches, associative integer operations and min/max use one
+    /// iterative segment tree over the disjoint queried spans packed end
     /// to end. For:
     ///
     /// ```text
