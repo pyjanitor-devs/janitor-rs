@@ -390,6 +390,127 @@ fn equi_large_group(c: &mut Criterion) {
     bench_equi_case(c, "equi_large_group", 16384, vec![8192], 16384);
 }
 
+/// Reproduce issue #243's shape: a million-row source, a small queried
+/// equality group, and many overlapping windows inside that group. The
+/// aggregation list includes a non-null count so the compact prefix path is
+/// benchmarked alongside the integer reductions.
+fn equi_compact_group(c: &mut Criterion) {
+    Python::initialize();
+    Python::attach(|py| {
+        let left_rows = 2_000_usize;
+        let right_rows = 1_000_000_usize;
+        let group_start = 496_000_i64;
+        let window_width = 2_048_i64;
+        let starts_values: Vec<_> = (0..left_rows)
+            .map(|row| group_start + (row % 4) as i64 * window_width)
+            .collect();
+        let ends_values: Vec<_> = starts_values
+            .iter()
+            .map(|&start| start + window_width)
+            .collect();
+        let left_index = PyArray1::from_vec(py, (0..left_rows as i64).collect());
+        let right_index = PyArray1::from_vec(py, (0..right_rows as i64).collect());
+        let ranges = PyList::empty(py);
+        let residuals = PyList::empty(py);
+        let aggregations = make_large_aggregations(py, right_rows);
+        let mut group = c.benchmark_group("equi_compact_group");
+        group.bench_function("aggregate_starts_ends", |b| {
+            b.iter(|| {
+                let starts = PyArray1::from_vec(py, starts_values.clone());
+                let ends = PyArray1::from_vec(py, ends_values.clone());
+                let result = equi_aggregate_bench(
+                    py,
+                    left_index.readonly(),
+                    right_index.readonly(),
+                    Some(starts.readwrite()),
+                    Some(ends.readwrite()),
+                    &ranges,
+                    &residuals,
+                    &aggregations,
+                    false,
+                    false,
+                    true,
+                )
+                .unwrap();
+                black_box(result);
+            });
+        });
+        group.bench_function("direct", |b| {
+            b.iter(|| {
+                let starts = PyArray1::from_vec(py, starts_values.clone());
+                let ends = PyArray1::from_vec(py, ends_values.clone());
+                let result = equi_aggregate_bench(
+                    py,
+                    left_index.readonly(),
+                    right_index.readonly(),
+                    Some(starts.readwrite()),
+                    Some(ends.readwrite()),
+                    &ranges,
+                    &residuals,
+                    &aggregations,
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+                black_box(result);
+            });
+        });
+        group.finish();
+    });
+}
+
+/// Exercise the packed layout with thousands of separated queried spans.
+fn equi_many_groups(c: &mut Criterion) {
+    Python::initialize();
+    Python::attach(|py| {
+        let group_count = 2_048_usize;
+        let queries_per_group = 8_usize;
+        let left_rows = group_count * queries_per_group;
+        let group_stride = 256_i64;
+        let window_width = 224_i64;
+        let right_rows = group_count * group_stride as usize;
+        let starts_values: Vec<_> = (0..left_rows)
+            .map(|row| {
+                (row / queries_per_group) as i64 * group_stride
+                    + (row % queries_per_group) as i64 * 4
+            })
+            .collect();
+        let ends_values: Vec<_> = starts_values
+            .iter()
+            .map(|&start| start + window_width)
+            .collect();
+        let left_index = PyArray1::from_vec(py, (0..left_rows as i64).collect());
+        let right_index = PyArray1::from_vec(py, (0..right_rows as i64).collect());
+        let ranges = PyList::empty(py);
+        let residuals = PyList::empty(py);
+        let aggregations = make_large_aggregations(py, right_rows);
+        let mut group = c.benchmark_group("equi_many_groups");
+        group.bench_function("aggregate_starts_ends", |b| {
+            b.iter(|| {
+                let starts = PyArray1::from_vec(py, starts_values.clone());
+                let ends = PyArray1::from_vec(py, ends_values.clone());
+                let result = equi_aggregate_bench(
+                    py,
+                    left_index.readonly(),
+                    right_index.readonly(),
+                    Some(starts.readwrite()),
+                    Some(ends.readwrite()),
+                    &ranges,
+                    &residuals,
+                    &aggregations,
+                    false,
+                    false,
+                    true,
+                )
+                .unwrap();
+                black_box(result);
+            });
+        });
+        group.finish();
+    });
+}
+
 fn bench_equi_starts_ends_only(c: &mut Criterion, name: &str, rows: usize) {
     Python::initialize();
     Python::attach(|py| {
@@ -439,6 +560,8 @@ criterion_group!(
     equi_random,
     equi_broad,
     equi_large_group,
+    equi_compact_group,
+    equi_many_groups,
     equi_very_large_starts_ends
 );
 criterion_main!(benches);

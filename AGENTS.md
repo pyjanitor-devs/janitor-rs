@@ -127,8 +127,10 @@ shape -- a `macro_rules!` block defines one `#[pyfunction]` body once, then
 that macro is instantiated once per supported dtype (`int64`, `int32`,
 `int16`, `int8`, `uint64`, `uint32`, `uint16`, `uint8`, `f32`, `f64`).
 Integer and float variants are usually separate macros (`generic_compute` vs
-`generic_compute_floats`) because floats need Neumaier/Kahan compensated
-summation, ints don't.
+`generic_compute_floats`) because floats use Kahan compensated summation,
+following pandas' `group_sum` implementation
+([source](https://github.com/pandas-dev/pandas/blob/main/pandas/_libs/groupby.pyx));
+ints don't.
 
 ---
 

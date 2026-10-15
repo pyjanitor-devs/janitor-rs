@@ -1097,8 +1097,9 @@ impl<'a> AggregationSet<'a> {
     /// range walk. That walk is also the numerically correct choice for
     /// floating-point reductions because it retains source encounter order.
     ///
-    /// For broad batches, associative integer operations and min/max use an
-    /// iterative segment tree. For:
+    /// For broad batches, associative integer operations and min/max use one
+    /// iterative segment tree over the disjoint queried spans packed end
+    /// to end. For:
     ///
     /// ```text
     /// right = [2, 3, 4, 5, 1, 6, 7, 8]
@@ -1156,9 +1157,17 @@ impl<'a> AggregationSet<'a> {
             // end. Saturation keeps this advisory cost calculation bounded.
             width = width.saturating_add(end - start);
         }
+        // ELI5: each tree only needs the contiguous source slice touched by
+        // its cluster of queries. Keeping original positions in the leaves
+        // preserves min/max results without allocating across gaps between
+        // separate equality groups.
+        let queried_spans = queried_source_spans(&ranges);
+        let range_clusters = assign_range_clusters(&ranges, &queried_spans);
+        let packed_layout = PackedSpanLayout::new(&queried_spans, &range_clusters);
         // The tree is useful only for broad, repeated, overlapping ranges;
-        // the adaptive helper also rejects small batches and narrow queries.
-        let use_tree = should_use_segment_tree(ranges.len(), width, self.source_len);
+        // estimate its build cost using the compact span it will actually
+        // materialize, not the full source array.
+        let use_tree = should_use_segment_tree(ranges.len(), width, packed_layout.length);
 
         // Dispatch all requested reductions over the same set of ranges. The
         // associative integer and extreme operations may use the tree; float
@@ -1168,13 +1177,18 @@ impl<'a> AggregationSet<'a> {
                 State::CountAll => {}
                 State::CountNonNullMask(nulls, output) => {
                     if use_tree {
-                        let mut prefix = vec![0_i64; self.source_len + 1];
-                        for position in 0..self.source_len {
-                            prefix[position + 1] = prefix[position] + i64::from(!nulls[position]);
+                        let mut prefix = vec![0_i64; packed_layout.length + 1];
+                        for (cluster, &(span_start, span_end)) in queried_spans.iter().enumerate() {
+                            let offset = packed_layout.offsets[cluster];
+                            for position in span_start..span_end {
+                                let packed_position = offset + position - span_start;
+                                prefix[packed_position + 1] =
+                                    prefix[packed_position] + i64::from(!nulls[position]);
+                            }
                         }
                         for (row, range) in ranges.iter().enumerate() {
-                            if let Some((start, end)) = range {
-                                output[row] = prefix[*end] - prefix[*start];
+                            if let Some((start, end)) = packed_layout.data_range(row, *range) {
+                                output[row] = prefix[end] - prefix[start];
                             }
                         }
                     } else {
@@ -1189,14 +1203,21 @@ impl<'a> AggregationSet<'a> {
                 }
                 State::Sum(view, output) => {
                     if use_tree {
-                        update_signed_segment_ranges(view, output, &ranges, false);
+                        update_signed_segment_ranges(view, output, &ranges, &packed_layout, false);
                     } else {
                         update_signed_ranges(view, output, &ranges, false);
                     }
                 }
                 State::SumU64(values, nulls, output) => {
                     if use_tree {
-                        update_u64_segment_ranges(values, nulls, output, &ranges, false);
+                        update_u64_segment_ranges(
+                            values,
+                            nulls,
+                            output,
+                            &ranges,
+                            &packed_layout,
+                            false,
+                        );
                     } else {
                         update_u64_ranges(values, nulls, output, &ranges, false);
                     }
@@ -1209,14 +1230,21 @@ impl<'a> AggregationSet<'a> {
                 }
                 State::Product(view, output) => {
                     if use_tree {
-                        update_signed_segment_ranges(view, output, &ranges, true);
+                        update_signed_segment_ranges(view, output, &ranges, &packed_layout, true);
                     } else {
                         update_signed_ranges(view, output, &ranges, true);
                     }
                 }
                 State::ProductU64(values, nulls, output) => {
                     if use_tree {
-                        update_u64_segment_ranges(values, nulls, output, &ranges, true);
+                        update_u64_segment_ranges(
+                            values,
+                            nulls,
+                            output,
+                            &ranges,
+                            &packed_layout,
+                            true,
+                        );
                     } else {
                         update_u64_ranges(values, nulls, output, &ranges, true);
                     }
@@ -1229,14 +1257,14 @@ impl<'a> AggregationSet<'a> {
                 }
                 State::Min(view, output) => {
                     if use_tree {
-                        update_extreme_segment_ranges(view, output, &ranges, true);
+                        update_extreme_segment_ranges(view, output, &ranges, &packed_layout, true);
                     } else {
                         update_extreme_ranges(view, output, &ranges, true, false, false);
                     }
                 }
                 State::Max(view, output) => {
                     if use_tree {
-                        update_extreme_segment_ranges(view, output, &ranges, false);
+                        update_extreme_segment_ranges(view, output, &ranges, &packed_layout, false);
                     } else {
                         update_extreme_ranges(view, output, &ranges, false, false, false);
                     }
@@ -2137,6 +2165,85 @@ fn use_running_tables(query_count: usize, total_width: usize, source_len: usize)
         && should_use_running_aggregation(query_count, total_width, source_len)
 }
 
+/// Find disjoint contiguous source spans covering all valid requests.
+fn queried_source_spans(ranges: &[Option<(usize, usize)>]) -> Vec<(usize, usize)> {
+    let mut intervals: Vec<_> = ranges.iter().flatten().copied().collect();
+    intervals.sort_unstable();
+    let mut spans = Vec::new();
+    for (start, end) in intervals {
+        if let Some((_, current_end)) = spans.last_mut() {
+            if start <= *current_end {
+                *current_end = (*current_end).max(end);
+                continue;
+            }
+        }
+        spans.push((start, end));
+    }
+    spans
+}
+
+/// Assign each valid request to its disjoint source span.
+fn assign_range_clusters(
+    ranges: &[Option<(usize, usize)>],
+    spans: &[(usize, usize)],
+) -> Vec<Option<usize>> {
+    ranges
+        .iter()
+        .map(|range| {
+            let (start, end) = (*range)?;
+            // Spans are sorted and disjoint. Find the first span whose end
+            // is beyond this range, then check that the range starts inside
+            // it; this avoids scanning every span for every row.
+            let cluster = spans.partition_point(|&(_, span_end)| span_end <= start);
+            spans
+                .get(cluster)
+                .filter(|&&(span_start, span_end)| start >= span_start && end <= span_end)
+                .map(|_| cluster)
+        })
+        .collect()
+}
+
+/// Coordinates for one segment tree whose leaves are the queried spans laid
+/// end to end, with unqueried gaps omitted.
+struct PackedSpanLayout<'a> {
+    spans: &'a [(usize, usize)],
+    clusters: &'a [Option<usize>],
+    offsets: Vec<usize>,
+    length: usize,
+}
+
+impl<'a> PackedSpanLayout<'a> {
+    fn new(spans: &'a [(usize, usize)], clusters: &'a [Option<usize>]) -> Self {
+        let mut offsets = Vec::with_capacity(spans.len());
+        let mut length = 0;
+        for &(start, end) in spans {
+            offsets.push(length);
+            length += end - start;
+        }
+        Self {
+            spans,
+            clusters,
+            offsets,
+            length,
+        }
+    }
+
+    /// Convert one original source range to packed data coordinates.
+    fn data_range(&self, row: usize, range: Option<(usize, usize)>) -> Option<(usize, usize)> {
+        let cluster = self.clusters[row]?;
+        let (start, end) = range?;
+        let (span_start, _) = self.spans[cluster];
+        let offset = self.offsets[cluster];
+        Some((offset + start - span_start, offset + end - span_start))
+    }
+
+    /// Convert one original source range to its half-open packed-tree range.
+    fn packed_range(&self, row: usize, range: Option<(usize, usize)>) -> Option<(usize, usize)> {
+        let (start, end) = self.data_range(row, range)?;
+        Some((self.length + start, self.length + end))
+    }
+}
+
 /// Answer arbitrary integer ranges with an iterative segment tree.
 ///
 /// Range-only starts/ends queries cannot use one prefix or suffix table, but
@@ -2152,9 +2259,10 @@ fn update_signed_segment_ranges(
     view: &View<'_>,
     output: &mut [i64],
     ranges: &[Option<(usize, usize)>],
+    layout: &PackedSpanLayout<'_>,
     product: bool,
 ) {
-    let length = view.nulls.len();
+    let length = layout.length;
 
     // Start every leaf with the operation identity. A null value must not
     // change a sum or product, so null leaves are zero for addition and one
@@ -2164,9 +2272,12 @@ fn update_signed_segment_ranges(
     // Install valid source values in the leaf half of the tree. The boolean
     // mask is authoritative; the numeric value is never inspected for
     // sentinel or null-like content.
-    for position in 0..length {
-        if !view.nulls[position] {
-            tree[length + position] = as_i64(&view.values, position);
+    for (cluster, &(span_start, span_end)) in layout.spans.iter().enumerate() {
+        let offset = layout.offsets[cluster];
+        for position in span_start..span_end {
+            if !view.nulls[position] {
+                tree[length + offset + position - span_start] = as_i64(&view.values, position);
+            }
         }
     }
 
@@ -2183,15 +2294,12 @@ fn update_signed_segment_ranges(
     // Answer each requested range independently. `None` means that the
     // boundary row was invalid and therefore contributes no output value.
     for (row, range) in ranges.iter().enumerate() {
-        let Some((mut start, mut end)) = range else {
+        let Some((mut start, mut end)) = layout.packed_range(row, *range) else {
             continue;
         };
 
-        // The caller's source boundaries are half-open. Add `length` to map
-        // them into the leaf portion of the flat tree without changing the
-        // inclusive/exclusive meaning of either boundary.
-        start += length;
-        end += length;
+        // `packed_range` has already mapped the caller's source boundaries
+        // into the leaf portion of the flat tree.
         let mut total = if product { 1_i64 } else { 0_i64 };
 
         // Move both boundaries toward their common parent. Whenever a
@@ -2236,18 +2344,22 @@ fn update_u64_segment_ranges(
     nulls: &ArrayView1<'_, bool>,
     output: &mut [u64],
     ranges: &[Option<(usize, usize)>],
+    layout: &PackedSpanLayout<'_>,
     product: bool,
 ) {
-    let length = values.len();
+    let length = layout.length;
 
     // Null leaves begin at the neutral element for the selected operation.
     let mut tree = vec![if product { 1_u64 } else { 0_u64 }; length * 2];
 
     // Copy only values whose mask says they are valid. No null inference is
     // performed from the u64 payload.
-    for position in 0..length {
-        if !nulls[position] {
-            tree[length + position] = values[position];
+    for (cluster, &(span_start, span_end)) in layout.spans.iter().enumerate() {
+        let offset = layout.offsets[cluster];
+        for position in span_start..span_end {
+            if !nulls[position] {
+                tree[length + offset + position - span_start] = values[position];
+            }
         }
     }
 
@@ -2263,14 +2375,13 @@ fn update_u64_segment_ranges(
     // Query every valid half-open range using the same two-boundary walk as
     // the signed implementation, but retain u64 arithmetic throughout.
     for (row, range) in ranges.iter().enumerate() {
-        let Some((mut start, mut end)) = range else {
+        let Some((mut start, mut end)) = layout.packed_range(row, *range) else {
             continue;
         };
 
-        // Translate source positions to leaf positions. The end remains
-        // exclusive, so the query includes exactly `start..end`.
-        start += length;
-        end += length;
+        // `packed_range` has already translated source positions to leaf
+        // positions. The end remains exclusive, so the query includes
+        // exactly `start..end`.
         let mut total = if product { 1_u64 } else { 0_u64 };
         while start < end {
             if start & 1 == 1 {
@@ -2500,9 +2611,10 @@ fn update_extreme_segment_ranges(
     view: &View<'_>,
     output: &mut [i64],
     ranges: &[Option<(usize, usize)>],
+    layout: &PackedSpanLayout<'_>,
     min: bool,
 ) {
-    let length = view.nulls.len();
+    let length = layout.length;
 
     // `-1` means that a block has no valid candidate. `better_extreme` treats
     // it as an empty block and prefers a real position whenever one exists.
@@ -2510,9 +2622,14 @@ fn update_extreme_segment_ranges(
 
     // A valid leaf stores its source position. A masked leaf stays `-1`; the
     // mask, rather than a special numeric value, decides validity.
-    for position in 0..length {
-        if !view.nulls[position] {
-            tree[length + position] = position as i64;
+    for (cluster, &(span_start, span_end)) in layout.spans.iter().enumerate() {
+        let offset = layout.offsets[cluster];
+        for position in span_start..span_end {
+            if !view.nulls[position] {
+                // Keep the original source position in the leaf so min/max
+                // results retain their existing coordinate contract.
+                tree[length + offset + position - span_start] = position as i64;
+            }
         }
     }
 
@@ -2523,14 +2640,12 @@ fn update_extreme_segment_ranges(
         tree[node] = better_extreme(view, tree[node * 2], tree[node * 2 + 1], min);
     }
     for (row, range) in ranges.iter().enumerate() {
-        let Some((mut start, mut end)) = range else {
+        let Some((mut start, mut end)) = layout.packed_range(row, *range) else {
             continue;
         };
 
-        // Move from source coordinates into the leaf half of the flat tree;
-        // `end` remains exclusive throughout the query.
-        start += length;
-        end += length;
+        // `packed_range` has already moved source coordinates into the leaf
+        // half of the flat tree; `end` remains exclusive throughout.
         let mut winner = -1_i64;
         while start < end {
             if start & 1 == 1 {
@@ -2947,7 +3062,11 @@ fn is_greater(view: &View<'_>, a: usize, b: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::kahan_add_f32;
+    use super::{
+        assign_range_clusters, kahan_add_f32, queried_source_spans, update_extreme_segment_ranges,
+        update_signed_segment_ranges, update_u64_segment_ranges, PackedSpanLayout, Values, View,
+    };
+    use numpy::ndarray::Array1;
 
     #[test]
     fn kahan_add_f32_resets_non_finite_compensation() {
@@ -2963,5 +3082,83 @@ mod tests {
         kahan_add_f32(&mut total, &mut compensation, 3.0);
         assert_eq!(total, f32::INFINITY);
         assert_eq!(compensation, 0.0);
+    }
+
+    #[test]
+    fn compact_segment_ranges_match_direct_reductions() {
+        let values = Array1::from_vec(vec![91_i64, 2, 7, 3, 11, 5, 13, 17, 19, 23, 29, 31]);
+        let nulls = Array1::from_vec(vec![
+            false, false, false, false, false, false, true, false, false, false, false, false,
+        ]);
+        let view = View {
+            values: Values::I64(values.view()),
+            nulls: nulls.view(),
+        };
+        let ranges = vec![Some((2, 5)), Some((4, 10)), None];
+        let spans = queried_source_spans(&ranges);
+        assert_eq!(spans, vec![(2, 10)]);
+        let clusters = assign_range_clusters(&ranges, &spans);
+        let layout = PackedSpanLayout::new(&spans, &clusters);
+
+        let mut sums = vec![0_i64; ranges.len()];
+        update_signed_segment_ranges(&view, &mut sums, &ranges, &layout, false);
+        let expected_sums: Vec<_> = ranges
+            .iter()
+            .map(|range| {
+                range.map_or(0, |(start, end)| {
+                    (start..end)
+                        .filter(|&position| !nulls[position])
+                        .map(|position| values[position])
+                        .sum()
+                })
+            })
+            .collect();
+        assert_eq!(sums, expected_sums);
+
+        let mut products = vec![1_i64; ranges.len()];
+        update_signed_segment_ranges(&view, &mut products, &ranges, &layout, true);
+        assert_eq!(products, vec![231, 408_595, 1]);
+
+        let unsigned = Array1::from_vec(vec![91_u64, 2, 7, 3, 11, 5, 13, 17, 19, 23, 29, 31]);
+        let mut unsigned_sums = vec![0_u64; ranges.len()];
+        update_u64_segment_ranges(
+            &unsigned.view(),
+            &nulls.view(),
+            &mut unsigned_sums,
+            &ranges,
+            &layout,
+            false,
+        );
+        assert_eq!(unsigned_sums, vec![21, 75, 0]);
+
+        let mut unsigned_products = vec![1_u64; ranges.len()];
+        update_u64_segment_ranges(
+            &unsigned.view(),
+            &nulls.view(),
+            &mut unsigned_products,
+            &ranges,
+            &layout,
+            true,
+        );
+        assert_eq!(unsigned_products, vec![231, 408_595, 1]);
+
+        let mut minima = vec![-1_i64; ranges.len()];
+        update_extreme_segment_ranges(&view, &mut minima, &ranges, &layout, true);
+        assert_eq!(minima, vec![3, 5, -1]);
+
+        let disjoint_ranges = vec![Some((2, 5)), Some((10, 12)), None];
+        let disjoint_spans = queried_source_spans(&disjoint_ranges);
+        assert_eq!(disjoint_spans, vec![(2, 5), (10, 12)]);
+        let disjoint_clusters = assign_range_clusters(&disjoint_ranges, &disjoint_spans);
+        let disjoint_layout = PackedSpanLayout::new(&disjoint_spans, &disjoint_clusters);
+        let mut disjoint_sums = vec![0_i64; disjoint_ranges.len()];
+        update_signed_segment_ranges(
+            &view,
+            &mut disjoint_sums,
+            &disjoint_ranges,
+            &disjoint_layout,
+            false,
+        );
+        assert_eq!(disjoint_sums, vec![21, 60, 0]);
     }
 }
