@@ -460,6 +460,52 @@ fn equi_compact_group(c: &mut Criterion) {
     });
 }
 
+/// Exercise the packed layout with thousands of separated queried spans.
+fn equi_many_groups(c: &mut Criterion) {
+    Python::initialize();
+    Python::attach(|py| {
+        let left_rows = 2_048_usize;
+        let group_stride = 1_024_i64;
+        let window_width = 512_i64;
+        let right_rows = left_rows * group_stride as usize;
+        let starts_values: Vec<_> = (0..left_rows)
+            .map(|row| row as i64 * group_stride)
+            .collect();
+        let ends_values: Vec<_> = starts_values
+            .iter()
+            .map(|&start| start + window_width)
+            .collect();
+        let left_index = PyArray1::from_vec(py, (0..left_rows as i64).collect());
+        let right_index = PyArray1::from_vec(py, (0..right_rows as i64).collect());
+        let ranges = PyList::empty(py);
+        let residuals = PyList::empty(py);
+        let aggregations = make_large_aggregations(py, right_rows);
+        let mut group = c.benchmark_group("equi_many_groups");
+        group.bench_function("aggregate_starts_ends", |b| {
+            b.iter(|| {
+                let starts = PyArray1::from_vec(py, starts_values.clone());
+                let ends = PyArray1::from_vec(py, ends_values.clone());
+                let result = equi_aggregate_bench(
+                    py,
+                    left_index.readonly(),
+                    right_index.readonly(),
+                    Some(starts.readwrite()),
+                    Some(ends.readwrite()),
+                    &ranges,
+                    &residuals,
+                    &aggregations,
+                    false,
+                    false,
+                    true,
+                )
+                .unwrap();
+                black_box(result);
+            });
+        });
+        group.finish();
+    });
+}
+
 fn bench_equi_starts_ends_only(c: &mut Criterion, name: &str, rows: usize) {
     Python::initialize();
     Python::attach(|py| {
@@ -510,6 +556,7 @@ criterion_group!(
     equi_broad,
     equi_large_group,
     equi_compact_group,
+    equi_many_groups,
     equi_very_large_starts_ends
 );
 criterion_main!(benches);
