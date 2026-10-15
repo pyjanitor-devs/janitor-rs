@@ -464,12 +464,14 @@ fn equi_compact_group(c: &mut Criterion) {
 fn equi_many_groups(c: &mut Criterion) {
     Python::initialize();
     Python::attach(|py| {
-        let left_rows = 2_048_usize;
+        let group_count = 2_048_usize;
+        let queries_per_group = 4_usize;
+        let left_rows = group_count * queries_per_group;
         let group_stride = 1_024_i64;
         let window_width = 512_i64;
-        let right_rows = left_rows * group_stride as usize;
+        let right_rows = group_count * group_stride as usize;
         let starts_values: Vec<_> = (0..left_rows)
-            .map(|row| row as i64 * group_stride)
+            .map(|row| (row / queries_per_group) as i64 * group_stride)
             .collect();
         let ends_values: Vec<_> = starts_values
             .iter()
