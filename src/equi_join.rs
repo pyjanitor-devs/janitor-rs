@@ -1858,10 +1858,40 @@ mod tests {
             )?;
             let residuals = PyList::empty(py);
             let values = PyArray1::from_vec(py, (0_i64..2048).collect());
-            let ones = PyArray1::from_vec(py, vec![1_i64; 2048]);
-            let float_values =
-                PyArray1::from_vec(py, (0..2048).map(|position| position as f64).collect());
-            let float_ones = PyArray1::from_vec(py, vec![1.0_f64; 2048]);
+            let product_values = PyArray1::from_vec(
+                py,
+                (0..2048)
+                    .map(|position| {
+                        if position == 200 || position == 1200 {
+                            2
+                        } else {
+                            1
+                        }
+                    })
+                    .collect(),
+            );
+            let float_values = PyArray1::from_vec(
+                py,
+                (0..2048)
+                    .map(|position| match position % 3 {
+                        0 => 1.0e16,
+                        1 => 1.0,
+                        _ => -1.0e16,
+                    })
+                    .collect(),
+            );
+            let float_product_values = PyArray1::from_vec(
+                py,
+                (0..2048)
+                    .map(|position| {
+                        if position == 200 || position == 1200 {
+                            2.0
+                        } else {
+                            1.0
+                        }
+                    })
+                    .collect(),
+            );
             let nulls = PyArray1::from_vec(
                 py,
                 (0..2048)
@@ -1897,7 +1927,7 @@ mod tests {
                     PyTuple::new(
                         py,
                         [
-                            ones.clone().into_any(),
+                            product_values.clone().into_any(),
                             nulls.clone().into_any(),
                             "product".into_pyobject(py)?.into_any(),
                         ],
@@ -1913,7 +1943,7 @@ mod tests {
                     PyTuple::new(
                         py,
                         [
-                            float_ones.into_any(),
+                            float_product_values.into_any(),
                             nulls.clone().into_any(),
                             "product".into_pyobject(py)?.into_any(),
                         ],
@@ -1993,19 +2023,19 @@ mod tests {
             );
             assert_eq!(
                 outputs.get_item(3)?.extract::<Vec<i64>>()?,
-                vec![1; 12]
+                vec![2; 12]
                     .into_iter()
-                    .chain(vec![1; 12])
+                    .chain(vec![2; 12])
                     .collect::<Vec<_>>()
             );
             assert_eq!(
                 outputs.get_item(4)?.extract::<Vec<f64>>()?,
-                vec![196095.0; 12]
+                vec![0.0; 12]
                     .into_iter()
-                    .chain(vec![718335.0; 12])
+                    .chain(vec![1.0; 12])
                     .collect::<Vec<_>>()
             );
-            assert_eq!(outputs.get_item(5)?.extract::<Vec<f64>>()?, vec![1.0; 24]);
+            assert_eq!(outputs.get_item(5)?.extract::<Vec<f64>>()?, vec![2.0; 24]);
             Ok(())
         })
         .unwrap();

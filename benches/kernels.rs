@@ -322,7 +322,7 @@ fn bench_equi_case(
         let range = make_predicate(py, range_left.as_any(), range_right.as_any(), ">");
         let ranges = PyList::new(py, [range]).unwrap();
         let residuals = PyList::empty(py);
-        let aggregations = make_size_aggregation(py);
+        let aggregations = make_large_aggregations(py, right_len);
 
         let mut group = c.benchmark_group(name);
         group.bench_function("aggregate_starts_ends", |b| {
