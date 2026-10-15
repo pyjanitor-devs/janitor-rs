@@ -39,6 +39,70 @@ fn make_size_aggregation<'py>(py: Python<'py>) -> Bound<'py, PyList> {
     .unwrap()
 }
 
+fn make_large_aggregations<'py>(py: Python<'py>, rows: usize) -> Bound<'py, PyList> {
+    let values = PyArray1::from_vec(py, (0..rows as i64).map(|value| value % 97 + 1).collect());
+    let nulls = PyArray1::from_vec(py, vec![false; rows]);
+    PyList::new(
+        py,
+        [
+            PyTuple::new(
+                py,
+                [
+                    "*".into_pyobject(py).unwrap().into_any(),
+                    "size".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap(),
+            PyTuple::new(
+                py,
+                [
+                    "*".into_pyobject(py).unwrap().into_any(),
+                    nulls.clone().into_any(),
+                    "count".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap(),
+            PyTuple::new(
+                py,
+                [
+                    values.clone().into_any(),
+                    nulls.clone().into_any(),
+                    "sum".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap(),
+            PyTuple::new(
+                py,
+                [
+                    values.clone().into_any(),
+                    nulls.clone().into_any(),
+                    "product".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap(),
+            PyTuple::new(
+                py,
+                [
+                    values.clone().into_any(),
+                    nulls.clone().into_any(),
+                    "min".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap(),
+            PyTuple::new(
+                py,
+                [
+                    values.into_any(),
+                    nulls.into_any(),
+                    "max".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+}
+
 fn selective_second_predicate(c: &mut Criterion) {
     Python::initialize();
     Python::attach(|py| {
@@ -335,7 +399,7 @@ fn bench_equi_starts_ends_only(c: &mut Criterion, name: &str, rows: usize) {
         let right_index = PyArray1::from_vec(py, (0..rows as i64).collect());
         let ranges = PyList::empty(py);
         let residuals = PyList::empty(py);
-        let aggregations = make_size_aggregation(py);
+        let aggregations = make_large_aggregations(py, rows);
         let mut group = c.benchmark_group(name);
         group.bench_function("aggregate_starts_ends", |b| {
             b.iter(|| {
