@@ -31,6 +31,7 @@ use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
     predicates_match_dispatch, NullMetadataView, Predicate, PredicateView,
 };
+use crate::range_join::adaptive_extreme_positions;
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
 #[cfg(test)]
@@ -824,6 +825,37 @@ fn materialize_equi_windows_and_residuals(
                 .map(|view| view.matches(row, right_position))
                 .unwrap_or(true)
     };
+
+    if residual_predicates.is_empty()
+        && additional_range.is_none()
+        && matches!(keep, Keep::First | Keep::Last)
+    {
+        let minimum = keep == Keep::First;
+        let mut rows = Vec::new();
+        let mut ranges = Vec::new();
+        for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
+            if start < 0 || end < 0 {
+                continue;
+            }
+            let (start, end) = validate_start_end(start, end, right_index.len())?;
+            if start == end {
+                continue;
+            }
+            rows.push(row);
+            ranges.push((start, end));
+        }
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        let selected = adaptive_extreme_positions(right_index, &ranges, minimum)?;
+        let mut left_output = Vec::with_capacity(selected.len());
+        let mut right_output = Vec::with_capacity(selected.len());
+        for (row, right_position) in rows.into_iter().zip(selected) {
+            left_output.push(left_index[row]);
+            right_output.push(right_index[right_position]);
+        }
+        return Ok(Some((left_output, right_output)));
+    }
     if keep == Keep::All {
         let mut output_capacity = 0_usize;
         for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
@@ -860,11 +892,15 @@ fn materialize_equi_windows_and_residuals(
     let mut left_output = Vec::with_capacity(left_index.len());
     let mut right_output = Vec::with_capacity(left_index.len());
     for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
-        if start < 0 || end <= start {
+        if start < 0 || end < 0 {
+            continue;
+        }
+        let (start, end) = validate_start_end(start, end, right_index.len())?;
+        if start == end {
             continue;
         }
         let mut selected = None;
-        for right_position in start as usize..end as usize {
+        for right_position in start..end {
             if !matches(row, right_position) {
                 continue;
             }
@@ -2572,6 +2608,57 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(last.1, vec![8]);
+    }
+
+    #[test]
+    fn broad_equi_windows_use_adaptive_extrema() {
+        let left = Array1::from_iter(100_i64..164);
+        let right =
+            Array1::from_iter((0..1_024).map(|position| ((position * 7919) % 1_024) as i64));
+        let starts = Array1::from_iter((0..64).map(|row| (row * 8) as i64));
+        let ends = Array1::from_iter((0..64).map(|row| (row * 8 + 512) as i64));
+
+        let first = materialize_equi_windows(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            Keep::First,
+        )
+        .unwrap()
+        .unwrap();
+        let last = materialize_equi_windows(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            Keep::Last,
+        )
+        .unwrap()
+        .unwrap();
+
+        let expected_first = (0..64)
+            .map(|row| {
+                right.as_slice().unwrap()[row * 8..row * 8 + 512]
+                    .iter()
+                    .copied()
+                    .min()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let expected_last = (0..64)
+            .map(|row| {
+                right.as_slice().unwrap()[row * 8..row * 8 + 512]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first.0, left.to_vec());
+        assert_eq!(first.1, expected_first);
+        assert_eq!(last.0, left.to_vec());
+        assert_eq!(last.1, expected_last);
     }
 
     #[test]
