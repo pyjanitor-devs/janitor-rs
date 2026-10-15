@@ -17,11 +17,9 @@ use numpy::{PyReadonlyArray1, PyReadwriteArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
-use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, HashMap};
 
-use crate::aggregation_common::adaptive::should_use_segment_tree;
 use crate::aggregation_common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
@@ -35,14 +33,9 @@ use crate::predicate::{
 };
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
-const MAX_EQUI_RANK_TREE_WIDTH: usize = 1 << 20;
-thread_local! {
-    static EQUI_RANK_TREE_ENABLED: Cell<bool> = const { Cell::new(true) };
-}
-
 #[cfg(test)]
 thread_local! {
-    static EQUI_RANK_TREE_HITS: Cell<usize> = const { Cell::new(0) };
+    static EQUI_STARTS_ENDS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 type IndexPairs = Option<(Vec<i64>, Vec<i64>)>;
@@ -95,67 +88,6 @@ fn unique_reverse_output_slots(
         }
     }
     (labels, slots)
-}
-
-/// Decide whether equality-window trees can amortize their build cost.
-///
-/// ELI5: a tree must first read every book on each equality shelf, so a few
-/// tiny shelves are cheaper to scan directly. Count each shelf's build width
-/// once and compare it with the total widths requested by the left rows.
-fn should_use_equi_rank_tree(
-    query_starts: ArrayView1<'_, i64>,
-    query_ends: ArrayView1<'_, i64>,
-    equality_starts: ArrayView1<'_, i64>,
-    equality_ends: ArrayView1<'_, i64>,
-) -> bool {
-    let mut row_start = 0;
-    let mut query_count = 0;
-    let mut total_query_width = 0_usize;
-    let mut total_tree_width = 0_usize;
-    while row_start < query_starts.len() {
-        let equality_start = equality_starts[row_start];
-        let equality_end = equality_ends[row_start];
-        let mut row_end = row_start + 1;
-        while row_end < query_starts.len()
-            && equality_starts[row_end] == equality_start
-            && equality_ends[row_end] == equality_end
-        {
-            row_end += 1;
-        }
-        let (Ok(equality_start), Ok(equality_end)) = (
-            usize::try_from(equality_start),
-            usize::try_from(equality_end),
-        ) else {
-            row_start = row_end;
-            continue;
-        };
-        if equality_start >= equality_end {
-            row_start = row_end;
-            continue;
-        }
-        if equality_end - equality_start > MAX_EQUI_RANK_TREE_WIDTH {
-            return false;
-        }
-        total_tree_width = total_tree_width.saturating_add(equality_end - equality_start);
-        for row in row_start..row_end {
-            let (Ok(query_start), Ok(query_end)) = (
-                usize::try_from(query_starts[row]),
-                usize::try_from(query_ends[row]),
-            ) else {
-                continue;
-            };
-            if query_start <= query_end
-                && query_start >= equality_start
-                && query_end <= equality_end
-            {
-                query_count += 1;
-                total_query_width =
-                    total_query_width.saturating_add(query_end.saturating_sub(query_start));
-            }
-        }
-        row_start = row_end;
-    }
-    should_use_segment_tree(query_count, total_query_width, total_tree_width)
 }
 
 pub fn validate_start_end(
@@ -1114,6 +1046,35 @@ pub fn equi_aggregate<'py>(
     return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    equi_aggregate_impl(
+        py,
+        left_index,
+        right_index,
+        starts,
+        ends,
+        range_predicates,
+        residual_predicates,
+        aggregations,
+        return_matched,
+        reverse,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn equi_aggregate_impl<'py>(
+    py: Python<'py>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    starts: Option<PyReadwriteArray1<'py, i64>>,
+    ends: Option<PyReadwriteArray1<'py, i64>>,
+    range_predicates: &Bound<'py, PyList>,
+    residual_predicates: &Bound<'py, PyList>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+    reverse: bool,
+    allow_starts_ends: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let left_index_array = left_index;
     let right_index_array = right_index;
     let left_index = left_index_array.as_array();
@@ -1165,9 +1126,7 @@ pub fn equi_aggregate<'py>(
     let mut ends_owner = ends;
     let mut starts = starts_owner.as_mut().map(|values| values.as_array_mut());
     let mut ends = ends_owner.as_mut().map(|values| values.as_array_mut());
-    let retain_equality_windows = starts.is_some()
-        && (ranges.len() > 1
-            || (!reverse && residual_predicates.is_empty() && set.supports_dual_rank_tree()));
+    let retain_equality_windows = starts.is_some() && ranges.len() > 1;
     let equality_windows = retain_equality_windows.then(|| {
         (
             starts
@@ -1247,41 +1206,21 @@ pub fn equi_aggregate<'py>(
     };
     let demoted_view = demoted_second.map(range_predicate_view);
 
-    if !reverse
-        && residual_predicates.is_empty()
-        && demoted_view.is_none()
-        && set.supports_dual_rank_tree()
-        && EQUI_RANK_TREE_ENABLED.with(Cell::get)
-    {
-        if let (Some(starts), Some(ends), Some((equality_starts, equality_ends))) =
-            (starts.as_ref(), ends.as_ref(), equality_windows.as_ref())
-        {
-            if should_use_equi_rank_tree(
-                starts.view(),
-                ends.view(),
-                equality_starts.view(),
-                equality_ends.view(),
-            ) {
-                #[cfg(test)]
-                EQUI_RANK_TREE_HITS.with(|hits| hits.set(hits.get() + 1));
-                set.aggregate_equi_rank_tree(
-                    starts.view(),
-                    ends.view(),
-                    equality_starts.view(),
-                    equality_ends.view(),
-                    &inputs,
-                );
-                if set.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(make_results_with_positions(
-                    py,
-                    set,
-                    Some(left_index),
-                    output_len,
-                    return_matched,
-                )?));
+    if allow_starts_ends && !reverse && residual_predicates.is_empty() && demoted_view.is_none() {
+        if let (Some(starts), Some(ends)) = (starts.as_ref(), ends.as_ref()) {
+            #[cfg(test)]
+            EQUI_STARTS_ENDS_HITS.with(|hits| hits.set(hits.get() + 1));
+            set.aggregate_starts_ends(starts.view(), ends.view());
+            if set.is_empty() {
+                return Ok(None);
             }
+            return Ok(Some(make_results_with_positions(
+                py,
+                set,
+                Some(left_index),
+                output_len,
+                return_matched,
+            )?));
         }
     }
 
@@ -1374,10 +1313,9 @@ pub fn equi_aggregate_bench<'py>(
     aggregations: &Bound<'py, PyList>,
     return_matched: bool,
     reverse: bool,
-    allow_rank_tree: bool,
+    allow_starts_ends: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
-    let previous = EQUI_RANK_TREE_ENABLED.with(|enabled| enabled.replace(allow_rank_tree));
-    let result = equi_aggregate(
+    equi_aggregate_impl(
         py,
         left_index,
         right_index,
@@ -1388,9 +1326,8 @@ pub fn equi_aggregate_bench<'py>(
         aggregations,
         return_matched,
         reverse,
-    );
-    EQUI_RANK_TREE_ENABLED.with(|enabled| enabled.set(previous));
-    result
+        allow_starts_ends,
+    )
 }
 
 /// Materialize aligned unique-equality rows after residual filtering.
@@ -1801,7 +1738,7 @@ mod tests {
         build_equi_range_indices_core, build_equi_uniq_residual_indices_core,
         build_second_range_envelope, equi_aggregate, materialize_equi_windows,
         materialize_unordered_second_range, narrow_unordered_second_range,
-        should_use_equi_rank_tree, unique_reverse_output_slots, EQUI_RANK_TREE_HITS,
+        unique_reverse_output_slots, EQUI_STARTS_ENDS_HITS,
     };
     use crate::compare_op::CompareOp;
     use crate::join_types::Keep;
@@ -1877,7 +1814,7 @@ mod tests {
     }
 
     #[test]
-    fn equi_aggregate_rank_tree_handles_duplicate_groups_and_nulls() {
+    fn equi_aggregate_starts_ends_handles_duplicate_groups_and_nulls() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
             let left_index = PyArray1::from_vec(py, (100_i64..124).collect());
@@ -1896,15 +1833,6 @@ mod tests {
                     .chain(vec![2048; 12])
                     .collect(),
             );
-            let query_starts =
-                Array1::from_iter(vec![129_i64; 12].into_iter().chain(vec![1153; 12]));
-            let query_ends = Array1::from_iter(vec![640_i64; 12].into_iter().chain(vec![1664; 12]));
-            assert!(should_use_equi_rank_tree(
-                query_starts.view(),
-                query_ends.view(),
-                starts.readonly().as_array(),
-                ends.readonly().as_array(),
-            ));
             let ranges = PyList::new(
                 py,
                 [
@@ -1981,7 +1909,7 @@ mod tests {
                 ],
             )?;
 
-            EQUI_RANK_TREE_HITS.with(|hits| hits.set(0));
+            EQUI_STARTS_ENDS_HITS.with(|hits| hits.set(0));
             let result = equi_aggregate(
                 py,
                 left_index.readonly(),
@@ -1995,7 +1923,7 @@ mod tests {
                 false,
             )?
             .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
-            EQUI_RANK_TREE_HITS.with(|hits| assert!(hits.get() > 0));
+            EQUI_STARTS_ENDS_HITS.with(|hits| assert!(hits.get() > 0));
 
             assert_eq!(result.get_item(1)?.extract::<Vec<bool>>()?, vec![true; 24]);
             let outputs_item = result.get_item(2)?;

@@ -261,7 +261,7 @@ fn bench_equi_case(
         let aggregations = make_size_aggregation(py);
 
         let mut group = c.benchmark_group(name);
-        group.bench_function("rank_tree", |b| {
+        group.bench_function("aggregate_starts_ends", |b| {
             b.iter(|| {
                 let starts = PyArray1::from_vec(py, starts_values.clone());
                 let ends = PyArray1::from_vec(py, ends_values.clone());
@@ -282,7 +282,7 @@ fn bench_equi_case(
                 black_box(result);
             });
         });
-        group.bench_function("candidate_fallback", |b| {
+        group.bench_function("direct", |b| {
             b.iter(|| {
                 let starts = PyArray1::from_vec(py, starts_values.clone());
                 let ends = PyArray1::from_vec(py, ends_values.clone());
@@ -326,7 +326,7 @@ fn equi_large_group(c: &mut Criterion) {
     bench_equi_case(c, "equi_large_group", 16384, vec![8192], 16384);
 }
 
-fn bench_equi_rank_tree_only(c: &mut Criterion, name: &str, rows: usize) {
+fn bench_equi_starts_ends_only(c: &mut Criterion, name: &str, rows: usize) {
     Python::initialize();
     Python::attach(|py| {
         let starts = PyArray1::from_vec(py, vec![0_i64; rows]);
@@ -337,7 +337,7 @@ fn bench_equi_rank_tree_only(c: &mut Criterion, name: &str, rows: usize) {
         let residuals = PyList::empty(py);
         let aggregations = make_size_aggregation(py);
         let mut group = c.benchmark_group(name);
-        group.bench_function("rank_tree", |b| {
+        group.bench_function("aggregate_starts_ends", |b| {
             b.iter(|| {
                 let result = equi_aggregate_bench(
                     py,
@@ -360,10 +360,10 @@ fn bench_equi_rank_tree_only(c: &mut Criterion, name: &str, rows: usize) {
     });
 }
 
-fn equi_very_large_rank_tree(c: &mut Criterion) {
-    bench_equi_rank_tree_only(c, "equi_rank_tree_64k", 65_536);
-    bench_equi_rank_tree_only(c, "equi_rank_tree_256k", 262_144);
-    bench_equi_rank_tree_only(c, "equi_rank_tree_1m", 1_048_576);
+fn equi_very_large_starts_ends(c: &mut Criterion) {
+    bench_equi_starts_ends_only(c, "equi_starts_ends_64k", 65_536);
+    bench_equi_starts_ends_only(c, "equi_starts_ends_256k", 262_144);
+    bench_equi_starts_ends_only(c, "equi_starts_ends_1m", 1_048_576);
 }
 
 criterion_group!(
@@ -375,6 +375,6 @@ criterion_group!(
     equi_random,
     equi_broad,
     equi_large_group,
-    equi_very_large_rank_tree
+    equi_very_large_starts_ends
 );
 criterion_main!(benches);
