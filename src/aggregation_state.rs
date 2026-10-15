@@ -1156,9 +1156,16 @@ impl<'a> AggregationSet<'a> {
             // end. Saturation keeps this advisory cost calculation bounded.
             width = width.saturating_add(end - start);
         }
+        // ELI5: the tree only needs the slice of the source that any query can
+        // touch. Keeping the original positions in the leaves preserves
+        // min/max results while avoiding a full right-side allocation when
+        // all queried rows belong to one small equality group.
+        let queried_span = queried_source_span(&ranges);
         // The tree is useful only for broad, repeated, overlapping ranges;
-        // the adaptive helper also rejects small batches and narrow queries.
-        let use_tree = should_use_segment_tree(ranges.len(), width, self.source_len);
+        // estimate its build cost using the compact span it will actually
+        // materialize, not the full source array.
+        let span_len = queried_span.map_or(0, |(start, end)| end - start);
+        let use_tree = should_use_segment_tree(ranges.len(), width, span_len);
 
         // Dispatch all requested reductions over the same set of ranges. The
         // associative integer and extreme operations may use the tree; float
@@ -1168,13 +1175,18 @@ impl<'a> AggregationSet<'a> {
                 State::CountAll => {}
                 State::CountNonNullMask(nulls, output) => {
                     if use_tree {
-                        let mut prefix = vec![0_i64; self.source_len + 1];
-                        for position in 0..self.source_len {
-                            prefix[position + 1] = prefix[position] + i64::from(!nulls[position]);
+                        let (span_start, span_end) =
+                            queried_span.expect("the tree requires at least one valid query range");
+                        let mut prefix = vec![0_i64; span_end - span_start + 1];
+                        for position in span_start..span_end {
+                            let local_position = position - span_start;
+                            prefix[local_position + 1] =
+                                prefix[local_position] + i64::from(!nulls[position]);
                         }
                         for (row, range) in ranges.iter().enumerate() {
                             if let Some((start, end)) = range {
-                                output[row] = prefix[*end] - prefix[*start];
+                                output[row] =
+                                    prefix[*end - span_start] - prefix[*start - span_start];
                             }
                         }
                     } else {
@@ -1188,15 +1200,19 @@ impl<'a> AggregationSet<'a> {
                     }
                 }
                 State::Sum(view, output) => {
-                    if use_tree {
-                        update_signed_segment_ranges(view, output, &ranges, false);
+                    if let Some((span_start, span_end)) = queried_span {
+                        update_signed_segment_ranges(
+                            view, output, &ranges, false, span_start, span_end,
+                        );
                     } else {
                         update_signed_ranges(view, output, &ranges, false);
                     }
                 }
                 State::SumU64(values, nulls, output) => {
-                    if use_tree {
-                        update_u64_segment_ranges(values, nulls, output, &ranges, false);
+                    if let Some((span_start, span_end)) = queried_span {
+                        update_u64_segment_ranges(
+                            values, nulls, output, &ranges, false, span_start, span_end,
+                        );
                     } else {
                         update_u64_ranges(values, nulls, output, &ranges, false);
                     }
@@ -1208,15 +1224,19 @@ impl<'a> AggregationSet<'a> {
                     update_float_ranges_f32(view, output, compensation, &ranges, false);
                 }
                 State::Product(view, output) => {
-                    if use_tree {
-                        update_signed_segment_ranges(view, output, &ranges, true);
+                    if let Some((span_start, span_end)) = queried_span {
+                        update_signed_segment_ranges(
+                            view, output, &ranges, true, span_start, span_end,
+                        );
                     } else {
                         update_signed_ranges(view, output, &ranges, true);
                     }
                 }
                 State::ProductU64(values, nulls, output) => {
-                    if use_tree {
-                        update_u64_segment_ranges(values, nulls, output, &ranges, true);
+                    if let Some((span_start, span_end)) = queried_span {
+                        update_u64_segment_ranges(
+                            values, nulls, output, &ranges, true, span_start, span_end,
+                        );
                     } else {
                         update_u64_ranges(values, nulls, output, &ranges, true);
                     }
@@ -1228,15 +1248,19 @@ impl<'a> AggregationSet<'a> {
                     update_float_ranges_f32_without_compensation(view, output, &ranges);
                 }
                 State::Min(view, output) => {
-                    if use_tree {
-                        update_extreme_segment_ranges(view, output, &ranges, true);
+                    if let Some((span_start, span_end)) = queried_span {
+                        update_extreme_segment_ranges(
+                            view, output, &ranges, true, span_start, span_end,
+                        );
                     } else {
                         update_extreme_ranges(view, output, &ranges, true, false, false);
                     }
                 }
                 State::Max(view, output) => {
-                    if use_tree {
-                        update_extreme_segment_ranges(view, output, &ranges, false);
+                    if let Some((span_start, span_end)) = queried_span {
+                        update_extreme_segment_ranges(
+                            view, output, &ranges, false, span_start, span_end,
+                        );
                     } else {
                         update_extreme_ranges(view, output, &ranges, false, false, false);
                     }
@@ -2137,6 +2161,21 @@ fn use_running_tables(query_count: usize, total_width: usize, source_len: usize)
         && should_use_running_aggregation(query_count, total_width, source_len)
 }
 
+/// Find the smallest contiguous source span covering all valid requests.
+///
+/// The returned coordinates remain in the original source array. Callers use
+/// them to make a compact tree while keeping extrema leaves as source
+/// positions, so the public result contract does not change.
+fn queried_source_span(ranges: &[Option<(usize, usize)>]) -> Option<(usize, usize)> {
+    let mut span_start = usize::MAX;
+    let mut span_end = 0;
+    for &(start, end) in ranges.iter().flatten() {
+        span_start = span_start.min(start);
+        span_end = span_end.max(end);
+    }
+    (span_start < span_end).then_some((span_start, span_end))
+}
+
 /// Answer arbitrary integer ranges with an iterative segment tree.
 ///
 /// Range-only starts/ends queries cannot use one prefix or suffix table, but
@@ -2153,8 +2192,10 @@ fn update_signed_segment_ranges(
     output: &mut [i64],
     ranges: &[Option<(usize, usize)>],
     product: bool,
+    span_start: usize,
+    span_end: usize,
 ) {
-    let length = view.nulls.len();
+    let length = span_end - span_start;
 
     // Start every leaf with the operation identity. A null value must not
     // change a sum or product, so null leaves are zero for addition and one
@@ -2164,9 +2205,9 @@ fn update_signed_segment_ranges(
     // Install valid source values in the leaf half of the tree. The boolean
     // mask is authoritative; the numeric value is never inspected for
     // sentinel or null-like content.
-    for position in 0..length {
+    for position in span_start..span_end {
         if !view.nulls[position] {
-            tree[length + position] = as_i64(&view.values, position);
+            tree[length + position - span_start] = as_i64(&view.values, position);
         }
     }
 
@@ -2190,8 +2231,8 @@ fn update_signed_segment_ranges(
         // The caller's source boundaries are half-open. Add `length` to map
         // them into the leaf portion of the flat tree without changing the
         // inclusive/exclusive meaning of either boundary.
-        start += length;
-        end += length;
+        start = start - span_start + length;
+        end = end - span_start + length;
         let mut total = if product { 1_i64 } else { 0_i64 };
 
         // Move both boundaries toward their common parent. Whenever a
@@ -2237,17 +2278,19 @@ fn update_u64_segment_ranges(
     output: &mut [u64],
     ranges: &[Option<(usize, usize)>],
     product: bool,
+    span_start: usize,
+    span_end: usize,
 ) {
-    let length = values.len();
+    let length = span_end - span_start;
 
     // Null leaves begin at the neutral element for the selected operation.
     let mut tree = vec![if product { 1_u64 } else { 0_u64 }; length * 2];
 
     // Copy only values whose mask says they are valid. No null inference is
     // performed from the u64 payload.
-    for position in 0..length {
+    for position in span_start..span_end {
         if !nulls[position] {
-            tree[length + position] = values[position];
+            tree[length + position - span_start] = values[position];
         }
     }
 
@@ -2269,8 +2312,8 @@ fn update_u64_segment_ranges(
 
         // Translate source positions to leaf positions. The end remains
         // exclusive, so the query includes exactly `start..end`.
-        start += length;
-        end += length;
+        start = start - span_start + length;
+        end = end - span_start + length;
         let mut total = if product { 1_u64 } else { 0_u64 };
         while start < end {
             if start & 1 == 1 {
@@ -2501,8 +2544,10 @@ fn update_extreme_segment_ranges(
     output: &mut [i64],
     ranges: &[Option<(usize, usize)>],
     min: bool,
+    span_start: usize,
+    span_end: usize,
 ) {
-    let length = view.nulls.len();
+    let length = span_end - span_start;
 
     // `-1` means that a block has no valid candidate. `better_extreme` treats
     // it as an empty block and prefers a real position whenever one exists.
@@ -2510,9 +2555,9 @@ fn update_extreme_segment_ranges(
 
     // A valid leaf stores its source position. A masked leaf stays `-1`; the
     // mask, rather than a special numeric value, decides validity.
-    for position in 0..length {
+    for position in span_start..span_end {
         if !view.nulls[position] {
-            tree[length + position] = position as i64;
+            tree[length + position - span_start] = position as i64;
         }
     }
 
@@ -2529,8 +2574,8 @@ fn update_extreme_segment_ranges(
 
         // Move from source coordinates into the leaf half of the flat tree;
         // `end` remains exclusive throughout the query.
-        start += length;
-        end += length;
+        start = start - span_start + length;
+        end = end - span_start + length;
         let mut winner = -1_i64;
         while start < end {
             if start & 1 == 1 {
@@ -2947,7 +2992,11 @@ fn is_greater(view: &View<'_>, a: usize, b: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::kahan_add_f32;
+    use super::{
+        kahan_add_f32, queried_source_span, update_extreme_segment_ranges,
+        update_signed_segment_ranges, Values, View,
+    };
+    use numpy::ndarray::Array1;
 
     #[test]
     fn kahan_add_f32_resets_non_finite_compensation() {
@@ -2963,5 +3012,35 @@ mod tests {
         kahan_add_f32(&mut total, &mut compensation, 3.0);
         assert_eq!(total, f32::INFINITY);
         assert_eq!(compensation, 0.0);
+    }
+
+    #[test]
+    fn compact_segment_ranges_match_direct_reductions() {
+        let values = Array1::from_vec(vec![91_i64, 2, 7, 3, 11, 5, 13, 17, 19, 23, 29, 31]);
+        let nulls = Array1::from_vec(vec![false; values.len()]);
+        let view = View {
+            values: Values::I64(values.view()),
+            nulls: nulls.view(),
+        };
+        let ranges = vec![Some((2, 5)), Some((4, 10)), None];
+        let span = queried_source_span(&ranges);
+        assert_eq!(span, Some((2, 10)));
+
+        let (span_start, span_end) = span.unwrap();
+        let mut sums = vec![0_i64; ranges.len()];
+        update_signed_segment_ranges(&view, &mut sums, &ranges, false, span_start, span_end);
+        let expected_sums: Vec<_> = ranges
+            .iter()
+            .map(|range| {
+                range.map_or(0, |(start, end)| {
+                    (start..end).map(|position| values[position]).sum()
+                })
+            })
+            .collect();
+        assert_eq!(sums, expected_sums);
+
+        let mut minima = vec![-1_i64; ranges.len()];
+        update_extreme_segment_ranges(&view, &mut minima, &ranges, true, span_start, span_end);
+        assert_eq!(minima, vec![3, 5, -1]);
     }
 }
