@@ -33,6 +33,11 @@ use crate::predicate::{
 };
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
+#[cfg(test)]
+thread_local! {
+    static EQUI_STARTS_ENDS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 type IndexPairs = Option<(Vec<i64>, Vec<i64>)>;
 
 /// Update one row's selected right position and report whether scanning may
@@ -1041,6 +1046,35 @@ pub fn equi_aggregate<'py>(
     return_matched: bool,
     reverse: bool,
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    equi_aggregate_impl(
+        py,
+        left_index,
+        right_index,
+        starts,
+        ends,
+        range_predicates,
+        residual_predicates,
+        aggregations,
+        return_matched,
+        reverse,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn equi_aggregate_impl<'py>(
+    py: Python<'py>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    starts: Option<PyReadwriteArray1<'py, i64>>,
+    ends: Option<PyReadwriteArray1<'py, i64>>,
+    range_predicates: &Bound<'py, PyList>,
+    residual_predicates: &Bound<'py, PyList>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+    reverse: bool,
+    allow_starts_ends: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let left_index_array = left_index;
     let right_index_array = right_index;
     let left_index = left_index_array.as_array();
@@ -1092,6 +1126,20 @@ pub fn equi_aggregate<'py>(
     let mut ends_owner = ends;
     let mut starts = starts_owner.as_mut().map(|values| values.as_array_mut());
     let mut ends = ends_owner.as_mut().map(|values| values.as_array_mut());
+    let retain_equality_windows = starts.is_some() && ranges.len() > 1;
+    let equality_windows = retain_equality_windows.then(|| {
+        (
+            starts
+                .as_ref()
+                .expect("starts and ends are paired")
+                .view()
+                .to_owned(),
+            ends.as_ref()
+                .expect("starts and ends are paired")
+                .view()
+                .to_owned(),
+        )
+    });
     let mut demoted_second = None;
     if let (Some(starts), Some(ends)) = (starts.as_mut(), ends.as_mut()) {
         ensure_equal_lengths_core("left index", left_index.len(), "starts", starts.len())
@@ -1104,7 +1152,6 @@ pub fn equi_aggregate<'py>(
             }
             validate_start_end(start, end, right_index.len()).map_err(PyValueError::new_err)?;
         }
-        let equality_windows = (ranges.len() > 1).then(|| (starts.to_owned(), ends.to_owned()));
         if let Some(first_range) = ranges.first() {
             apply_equi_range_windows(
                 first_range,
@@ -1158,6 +1205,31 @@ pub fn equi_aggregate<'py>(
         Vec::new()
     };
     let demoted_view = demoted_second.map(range_predicate_view);
+
+    // ELI5: after ordered ranges narrow a window, each left row's matches
+    // are one contiguous block of right positions, so starts/ends describe
+    // the complete match set. Reverse joins aggregate onto right rows;
+    // residuals still need pair-by-pair checks; and an unordered second
+    // range filters pairs inside the window, so none of those cases is safe
+    // to answer from the window alone.
+    if allow_starts_ends && !reverse && residual_predicates.is_empty() && demoted_view.is_none() {
+        if let (Some(starts), Some(ends)) = (starts.as_ref(), ends.as_ref()) {
+            #[cfg(test)]
+            EQUI_STARTS_ENDS_HITS.with(|hits| hits.set(hits.get() + 1));
+            set.aggregate_starts_ends(starts.view(), ends.view());
+            if set.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(make_results_with_positions(
+                py,
+                set,
+                Some(left_index),
+                output_len,
+                return_matched,
+            )?));
+        }
+    }
+
     for row in 0..left_index.len() {
         let candidate_start = starts
             .as_ref()
@@ -1231,6 +1303,37 @@ pub fn equi_aggregate<'py>(
         output_len,
         return_matched,
     )?))
+}
+
+/// Benchmark-only entry point that can force the legacy candidate path.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn equi_aggregate_bench<'py>(
+    py: Python<'py>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    starts: Option<PyReadwriteArray1<'py, i64>>,
+    ends: Option<PyReadwriteArray1<'py, i64>>,
+    range_predicates: &Bound<'py, PyList>,
+    residual_predicates: &Bound<'py, PyList>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+    reverse: bool,
+    allow_starts_ends: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    equi_aggregate_impl(
+        py,
+        left_index,
+        right_index,
+        starts,
+        ends,
+        range_predicates,
+        residual_predicates,
+        aggregations,
+        return_matched,
+        reverse,
+        allow_starts_ends,
+    )
 }
 
 /// Materialize aligned unique-equality rows after residual filtering.
@@ -1641,7 +1744,7 @@ mod tests {
         build_equi_range_indices_core, build_equi_uniq_residual_indices_core,
         build_second_range_envelope, equi_aggregate, materialize_equi_windows,
         materialize_unordered_second_range, narrow_unordered_second_range,
-        unique_reverse_output_slots,
+        unique_reverse_output_slots, EQUI_STARTS_ENDS_HITS,
     };
     use crate::compare_op::CompareOp;
     use crate::join_types::Keep;
@@ -1711,6 +1814,234 @@ mod tests {
                 .get_item(0)?
                 .extract::<Vec<i64>>()?;
             assert_eq!(sums, vec![23, 0]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn equi_aggregate_starts_ends_handles_duplicate_groups_and_nulls() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, (100_i64..124).collect());
+            let right_index = PyArray1::from_vec(py, (10_i64..2058).collect());
+            // Each equality group has repeated left rows and a broad window.
+            // Two range bounds make each query an unaligned interior slice,
+            // so the tree must merge both sides of its iterative query.
+            let starts = PyArray1::from_vec(
+                py,
+                vec![0_i64; 12].into_iter().chain(vec![1024; 12]).collect(),
+            );
+            let ends = PyArray1::from_vec(
+                py,
+                vec![1024_i64; 12]
+                    .into_iter()
+                    .chain(vec![2048; 12])
+                    .collect(),
+            );
+            let ranges = PyList::new(
+                py,
+                [
+                    equi_range_tuple(
+                        py,
+                        vec![640_i64; 12]
+                            .into_iter()
+                            .chain(vec![1664; 12])
+                            .collect(),
+                        (0_i64..2048).collect(),
+                        ">",
+                    )?,
+                    equi_range_tuple(
+                        py,
+                        vec![128_i64; 12]
+                            .into_iter()
+                            .chain(vec![1152; 12])
+                            .collect(),
+                        (0_i64..2048).collect(),
+                        "<",
+                    )?,
+                ],
+            )?;
+            let residuals = PyList::empty(py);
+            let values = PyArray1::from_vec(py, (0_i64..2048).collect());
+            let product_values = PyArray1::from_vec(
+                py,
+                (0..2048)
+                    .map(|position| {
+                        if position == 200 || position == 1200 {
+                            2
+                        } else {
+                            1
+                        }
+                    })
+                    .collect(),
+            );
+            let float_values = PyArray1::from_vec(
+                py,
+                (0..2048)
+                    .map(|position| match position % 3 {
+                        0 => 1.0e16,
+                        1 => 1.0,
+                        _ => -1.0e16,
+                    })
+                    .collect(),
+            );
+            let float_product_values = PyArray1::from_vec(
+                py,
+                (0..2048)
+                    .map(|position| {
+                        if position == 200 || position == 1200 {
+                            2.0
+                        } else {
+                            1.0
+                        }
+                    })
+                    .collect(),
+            );
+            let nulls = PyArray1::from_vec(
+                py,
+                (0..2048)
+                    .map(|position| position == 129 || position == 1153)
+                    .collect::<Vec<_>>(),
+            );
+            let aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            "size".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            nulls.clone().into_any(),
+                            "count".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            product_values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "product".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            float_values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            float_product_values.into_any(),
+                            nulls.clone().into_any(),
+                            "product".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "min".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            values.into_any(),
+                            nulls.into_any(),
+                            "max".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+
+            EQUI_STARTS_ENDS_HITS.with(|hits| hits.set(0));
+            let result = equi_aggregate(
+                py,
+                left_index.readonly(),
+                right_index.readonly(),
+                Some(starts.readwrite()),
+                Some(ends.readwrite()),
+                &ranges,
+                &residuals,
+                &aggregations,
+                true,
+                false,
+            )?
+            .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+            EQUI_STARTS_ENDS_HITS.with(|hits| assert!(hits.get() > 0));
+
+            assert_eq!(result.get_item(1)?.extract::<Vec<bool>>()?, vec![true; 24]);
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            assert_eq!(
+                outputs.get_item(0)?.extract::<Vec<i64>>()?,
+                vec![511; 12]
+                    .into_iter()
+                    .chain(vec![511; 12])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(1)?.extract::<Vec<i64>>()?,
+                vec![510; 12]
+                    .into_iter()
+                    .chain(vec![510; 12])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(2)?.extract::<Vec<i64>>()?,
+                vec![196095; 12]
+                    .into_iter()
+                    .chain(vec![718335; 12])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(6)?.extract::<Vec<i64>>()?,
+                vec![130; 12]
+                    .into_iter()
+                    .chain(vec![1154; 12])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(7)?.extract::<Vec<i64>>()?,
+                vec![639; 12]
+                    .into_iter()
+                    .chain(vec![1663; 12])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(3)?.extract::<Vec<i64>>()?,
+                vec![2; 12]
+                    .into_iter()
+                    .chain(vec![2; 12])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(4)?.extract::<Vec<f64>>()?,
+                vec![0.0; 12]
+                    .into_iter()
+                    .chain(vec![1.0; 12])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(outputs.get_item(5)?.extract::<Vec<f64>>()?, vec![2.0; 24]);
             Ok(())
         })
         .unwrap();

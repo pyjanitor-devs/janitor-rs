@@ -1,5 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use janitor_rs::bench_support::{dual_regions_aggregate, dual_regions_and_residual_aggregate};
+use janitor_rs::bench_support::{
+    dual_regions_aggregate, dual_regions_and_residual_aggregate, equi_aggregate_bench,
+};
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
@@ -33,6 +35,70 @@ fn make_size_aggregation<'py>(py: Python<'py>) -> Bound<'py, PyList> {
             ],
         )
         .unwrap()],
+    )
+    .unwrap()
+}
+
+fn make_large_aggregations<'py>(py: Python<'py>, rows: usize) -> Bound<'py, PyList> {
+    let values = PyArray1::from_vec(py, (0..rows as i64).map(|value| value % 97 + 1).collect());
+    let nulls = PyArray1::from_vec(py, vec![false; rows]);
+    PyList::new(
+        py,
+        [
+            PyTuple::new(
+                py,
+                [
+                    "*".into_pyobject(py).unwrap().into_any(),
+                    "size".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap(),
+            PyTuple::new(
+                py,
+                [
+                    "*".into_pyobject(py).unwrap().into_any(),
+                    nulls.clone().into_any(),
+                    "count".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap(),
+            PyTuple::new(
+                py,
+                [
+                    values.clone().into_any(),
+                    nulls.clone().into_any(),
+                    "sum".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap(),
+            PyTuple::new(
+                py,
+                [
+                    values.clone().into_any(),
+                    nulls.clone().into_any(),
+                    "product".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap(),
+            PyTuple::new(
+                py,
+                [
+                    values.clone().into_any(),
+                    nulls.clone().into_any(),
+                    "min".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap(),
+            PyTuple::new(
+                py,
+                [
+                    values.into_any(),
+                    nulls.into_any(),
+                    "max".into_pyobject(py).unwrap().into_any(),
+                ],
+            )
+            .unwrap(),
+        ],
     )
     .unwrap()
 }
@@ -213,10 +279,166 @@ fn staggered_dual_predicate(c: &mut Criterion) {
     );
 }
 
+fn equi_windows(
+    rows: usize,
+    group_widths: &[usize],
+    rows_per_group: usize,
+) -> (Vec<i64>, Vec<i64>, usize) {
+    let mut starts = Vec::with_capacity(rows);
+    let mut ends = Vec::with_capacity(rows);
+    let mut offset = 0_i64;
+    for &width in group_widths {
+        for _ in 0..rows_per_group {
+            starts.push(offset);
+            ends.push(offset + width as i64);
+        }
+        offset += width as i64;
+    }
+    starts.truncate(rows);
+    ends.truncate(rows);
+    (starts, ends, offset as usize)
+}
+
+fn bench_equi_case(
+    c: &mut Criterion,
+    name: &str,
+    rows: usize,
+    group_widths: Vec<usize>,
+    rows_per_group: usize,
+) {
+    Python::initialize();
+    Python::attach(|py| {
+        let (starts_values, ends_values, right_len) =
+            equi_windows(rows, &group_widths, rows_per_group);
+        let left_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+        let right_index = PyArray1::from_vec(py, (0..right_len as i64).collect());
+        let range_left_values = starts_values
+            .iter()
+            .zip(&ends_values)
+            .map(|(&start, &end)| start + (end - start) / 2)
+            .collect::<Vec<_>>();
+        let range_left = PyArray1::from_vec(py, range_left_values);
+        let range_right = PyArray1::from_vec(py, (0..right_len as i64).collect());
+        let range = make_predicate(py, range_left.as_any(), range_right.as_any(), ">");
+        let ranges = PyList::new(py, [range]).unwrap();
+        let residuals = PyList::empty(py);
+        let aggregations = make_large_aggregations(py, right_len);
+
+        let mut group = c.benchmark_group(name);
+        group.bench_function("aggregate_starts_ends", |b| {
+            b.iter(|| {
+                let starts = PyArray1::from_vec(py, starts_values.clone());
+                let ends = PyArray1::from_vec(py, ends_values.clone());
+                let result = equi_aggregate_bench(
+                    py,
+                    left_index.readonly(),
+                    right_index.readonly(),
+                    Some(starts.readwrite()),
+                    Some(ends.readwrite()),
+                    &ranges,
+                    &residuals,
+                    &aggregations,
+                    false,
+                    false,
+                    true,
+                )
+                .unwrap();
+                black_box(result);
+            });
+        });
+        group.bench_function("direct", |b| {
+            b.iter(|| {
+                let starts = PyArray1::from_vec(py, starts_values.clone());
+                let ends = PyArray1::from_vec(py, ends_values.clone());
+                let result = equi_aggregate_bench(
+                    py,
+                    left_index.readonly(),
+                    right_index.readonly(),
+                    Some(starts.readwrite()),
+                    Some(ends.readwrite()),
+                    &ranges,
+                    &residuals,
+                    &aggregations,
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+                black_box(result);
+            });
+        });
+        group.finish();
+    });
+}
+
+fn equi_selective(c: &mut Criterion) {
+    bench_equi_case(c, "equi_selective", 4096, vec![4; 1024], 4);
+}
+
+fn equi_random(c: &mut Criterion) {
+    let widths = (0..64)
+        .map(|index| 16 + ((index * 73 + 11) % 240))
+        .collect();
+    bench_equi_case(c, "equi_random", 4096, widths, 64);
+}
+
+fn equi_broad(c: &mut Criterion) {
+    bench_equi_case(c, "equi_broad", 2048, vec![4096], 2048);
+}
+
+fn equi_large_group(c: &mut Criterion) {
+    bench_equi_case(c, "equi_large_group", 16384, vec![8192], 16384);
+}
+
+fn bench_equi_starts_ends_only(c: &mut Criterion, name: &str, rows: usize) {
+    Python::initialize();
+    Python::attach(|py| {
+        let starts = PyArray1::from_vec(py, vec![0_i64; rows]);
+        let ends = PyArray1::from_vec(py, vec![rows as i64; rows]);
+        let left_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+        let right_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+        let ranges = PyList::empty(py);
+        let residuals = PyList::empty(py);
+        let aggregations = make_large_aggregations(py, rows);
+        let mut group = c.benchmark_group(name);
+        group.bench_function("aggregate_starts_ends", |b| {
+            b.iter(|| {
+                let result = equi_aggregate_bench(
+                    py,
+                    left_index.readonly(),
+                    right_index.readonly(),
+                    Some(starts.readwrite()),
+                    Some(ends.readwrite()),
+                    &ranges,
+                    &residuals,
+                    &aggregations,
+                    false,
+                    false,
+                    true,
+                )
+                .unwrap();
+                black_box(result);
+            });
+        });
+        group.finish();
+    });
+}
+
+fn equi_very_large_starts_ends(c: &mut Criterion) {
+    bench_equi_starts_ends_only(c, "equi_starts_ends_64k", 65_536);
+    bench_equi_starts_ends_only(c, "equi_starts_ends_256k", 262_144);
+    bench_equi_starts_ends_only(c, "equi_starts_ends_1m", 1_048_576);
+}
+
 criterion_group!(
     benches,
     selective_second_predicate,
     broad_dual_predicate,
-    staggered_dual_predicate
+    staggered_dual_predicate,
+    equi_selective,
+    equi_random,
+    equi_broad,
+    equi_large_group,
+    equi_very_large_starts_ends
 );
 criterion_main!(benches);

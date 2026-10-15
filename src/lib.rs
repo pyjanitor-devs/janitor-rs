@@ -18,6 +18,7 @@ mod single_range_predicate;
 /// Narrow Rust-only surface used by criterion benchmarks.
 #[doc(hidden)]
 pub mod bench_support {
+    pub use crate::equi_join::equi_aggregate_bench;
     pub use crate::regions::{dual_regions_aggregate, dual_regions_and_residual_aggregate};
 }
 
