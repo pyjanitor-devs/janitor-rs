@@ -1206,6 +1206,12 @@ fn equi_aggregate_impl<'py>(
     };
     let demoted_view = demoted_second.map(range_predicate_view);
 
+    // ELI5: after ordered ranges narrow a window, each left row's matches
+    // are one contiguous block of right positions, so starts/ends describe
+    // the complete match set. Reverse joins aggregate onto right rows;
+    // residuals still need pair-by-pair checks; and an unordered second
+    // range filters pairs inside the window, so none of those cases is safe
+    // to answer from the window alone.
     if allow_starts_ends && !reverse && residual_predicates.is_empty() && demoted_view.is_none() {
         if let (Some(starts), Some(ends)) = (starts.as_ref(), ends.as_ref()) {
             #[cfg(test)]
