@@ -2221,9 +2221,14 @@ fn assign_range_clusters(
         .iter()
         .map(|range| {
             let (start, end) = (*range)?;
+            // Spans are sorted and disjoint. Find the first span whose end
+            // is beyond this range, then check that the range starts inside
+            // it; this avoids scanning every span for every row.
+            let cluster = spans.partition_point(|&(_, span_end)| span_end <= start);
             spans
-                .iter()
-                .position(|&(span_start, span_end)| start >= span_start && end <= span_end)
+                .get(cluster)
+                .filter(|&&(span_start, span_end)| start >= span_start && end <= span_end)
+                .map(|_| cluster)
         })
         .collect()
 }
