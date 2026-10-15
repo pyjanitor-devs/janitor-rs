@@ -2994,7 +2994,7 @@ fn is_greater(view: &View<'_>, a: usize, b: usize) -> bool {
 mod tests {
     use super::{
         kahan_add_f32, queried_source_span, update_extreme_segment_ranges,
-        update_signed_segment_ranges, Values, View,
+        update_signed_segment_ranges, update_u64_segment_ranges, Values, View,
     };
     use numpy::ndarray::Array1;
 
@@ -3017,7 +3017,9 @@ mod tests {
     #[test]
     fn compact_segment_ranges_match_direct_reductions() {
         let values = Array1::from_vec(vec![91_i64, 2, 7, 3, 11, 5, 13, 17, 19, 23, 29, 31]);
-        let nulls = Array1::from_vec(vec![false; values.len()]);
+        let nulls = Array1::from_vec(vec![
+            false, false, false, false, false, false, true, false, false, false, false, false,
+        ]);
         let view = View {
             values: Values::I64(values.view()),
             nulls: nulls.view(),
@@ -3033,11 +3035,43 @@ mod tests {
             .iter()
             .map(|range| {
                 range.map_or(0, |(start, end)| {
-                    (start..end).map(|position| values[position]).sum()
+                    (start..end)
+                        .filter(|&position| !nulls[position])
+                        .map(|position| values[position])
+                        .sum()
                 })
             })
             .collect();
         assert_eq!(sums, expected_sums);
+
+        let mut products = vec![1_i64; ranges.len()];
+        update_signed_segment_ranges(&view, &mut products, &ranges, true, span_start, span_end);
+        assert_eq!(products, vec![231, 408_595, 1]);
+
+        let unsigned = Array1::from_vec(vec![91_u64, 2, 7, 3, 11, 5, 13, 17, 19, 23, 29, 31]);
+        let mut unsigned_sums = vec![0_u64; ranges.len()];
+        update_u64_segment_ranges(
+            &unsigned.view(),
+            &nulls.view(),
+            &mut unsigned_sums,
+            &ranges,
+            false,
+            span_start,
+            span_end,
+        );
+        assert_eq!(unsigned_sums, vec![21, 75, 0]);
+
+        let mut unsigned_products = vec![1_u64; ranges.len()];
+        update_u64_segment_ranges(
+            &unsigned.view(),
+            &nulls.view(),
+            &mut unsigned_products,
+            &ranges,
+            true,
+            span_start,
+            span_end,
+        );
+        assert_eq!(unsigned_products, vec![231, 408_595, 1]);
 
         let mut minima = vec![-1_i64; ranges.len()];
         update_extreme_segment_ranges(&view, &mut minima, &ranges, true, span_start, span_end);
