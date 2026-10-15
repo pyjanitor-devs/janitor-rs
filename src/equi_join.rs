@@ -807,6 +807,44 @@ pub fn equi_range_indices<'py>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Materialize equality-window matches after range and residual filtering.
+///
+/// `starts` and `ends` describe one half-open right-side candidate window for
+/// each compact left row. The function has three intentionally separate
+/// paths: `Keep::All` emits every surviving pair, `Keep::First`/`Keep::Last`
+/// with residuals scans candidates because each candidate must be checked, and
+/// the no-residual `First`/`Last` case reduces each exact window to one
+/// physical extreme using the adaptive direct-scan/segment-tree helper.
+///
+/// ELI5: when there are extra rules, we must interview every candidate before
+/// choosing one. When there are no extra rules, the first/last answer is just
+/// the smallest/largest physical label on that shelf, so a shared shelf index
+/// can answer many overlapping rows more cheaply.
+///
+/// # Arguments
+///
+/// * `left_index` - Physical labels for compact left rows; output left labels
+///   are read from this array.
+/// * `right_index` - Physical labels for the prepared right layout; output
+///   right labels and extrema comparisons are read from this array.
+/// * `starts` - Inclusive right-window offsets, aligned with `left_index`.
+/// * `ends` - Exclusive right-window offsets, aligned with `left_index`.
+/// * `residual_predicates` - Predicates that must be evaluated for each
+///   candidate after the range windows have been built.
+/// * `null_metadata` - Optional null masks used by residual predicate dispatch.
+/// * `additional_range` - Optional extra range predicate that must be checked
+///   for each candidate; its presence disables the extrema shortcut.
+/// * `keep` - Whether to emit all matches, or one first/last physical label.
+///
+/// # Returns
+///
+/// `None` when no pair survives. Otherwise returns parallel physical left and
+/// right labels in the order required by the selected `keep` policy.
+///
+/// # Errors
+///
+/// Returns an error for invalid signed window bounds, bounds beyond the right
+/// layout, or an internal result/tree allocation overflow.
 fn materialize_equi_windows_and_residuals(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
@@ -830,11 +868,17 @@ fn materialize_equi_windows_and_residuals(
         && additional_range.is_none()
         && matches!(keep, Keep::First | Keep::Last)
     {
+        // With no residual condition, the selected candidate depends only on
+        // the physical right labels. Collect valid windows first so the
+        // adaptive helper can inspect the complete workload and choose its
+        // direct or segment-tree implementation once for all rows.
         let minimum = keep == Keep::First;
         let mut rows = Vec::new();
         let mut ranges = Vec::new();
         for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
             if start < 0 || end < 0 {
+                // A negative window is the existing "no match" sentinel from
+                // the search stage, not a position that can be cast to usize.
                 continue;
             }
             let (start, end) = validate_start_end(start, end, right_index.len())?;
@@ -847,6 +891,8 @@ fn materialize_equi_windows_and_residuals(
         if ranges.is_empty() {
             return Ok(None);
         }
+        // The helper returns offsets into `right_index`; convert those offsets
+        // to the physical labels exposed by this materialization API.
         let selected = adaptive_extreme_positions(right_index, &ranges, minimum)?;
         let mut left_output = Vec::with_capacity(selected.len());
         let mut right_output = Vec::with_capacity(selected.len());
@@ -857,6 +903,9 @@ fn materialize_equi_windows_and_residuals(
         return Ok(Some((left_output, right_output)));
     }
     if keep == Keep::All {
+        // Keep::All cannot use an extrema query because every candidate must
+        // be emitted. The first pass sizes the output exactly, avoiding
+        // repeated reallocations during the second pass.
         let mut output_capacity = 0_usize;
         for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
             if start < 0 || end < 0 {
@@ -893,6 +942,7 @@ fn materialize_equi_windows_and_residuals(
     let mut right_output = Vec::with_capacity(left_index.len());
     for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
         if start < 0 || end < 0 {
+            // Preserve the search-stage no-match sentinel semantics.
             continue;
         }
         let (start, end) = validate_start_end(start, end, right_index.len())?;

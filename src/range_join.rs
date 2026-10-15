@@ -59,15 +59,30 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 static EXTREME_TREE_HITS: AtomicUsize = AtomicUsize::new(0);
 
-/// Select the smallest or largest physical label in each half-open window.
+/// Select the smallest or largest physical label in each half-open window by scanning.
 ///
 /// The returned values are positions into `labels`, not the labels themselves.
 /// This helper searches each exact interior window rather than treating it as
-/// a prefix or suffix of the right-hand layout.
+/// a prefix or suffix of the right-hand layout. It is the simple reference
+/// implementation used for small workloads and for checking the tree path in
+/// tests.
 ///
 /// # Arguments
 ///
-/// The caller has already converted and validated the window boundaries.
+/// * `labels` - Physical right-side labels in the prepared layout.
+/// * `ranges` - Non-empty half-open windows `(start, end)` into `labels`.
+/// * `minimum` - Select the smallest label when `true`; select the largest
+///   label when `false`.
+///
+/// # Returns
+///
+/// One position in `labels` for every input range, preserving input order.
+/// Equal labels keep the first position encountered.
+///
+/// # Panics
+///
+/// The caller must validate that every range is non-empty and in bounds.
+/// Keeping that contract here avoids repeating checks inside the hot loop.
 fn extreme_positions_direct(
     labels: ArrayView1<'_, i64>,
     ranges: &[(usize, usize)],
@@ -96,8 +111,35 @@ fn extreme_positions_direct(
 
 /// Select extrema from arbitrary windows, choosing a direct scan or a tree.
 ///
+/// The adaptive policy compares the estimated work of scanning every queried
+/// element (`total_width`) with building and querying one segment tree over
+/// the union span (`span_len`). Direct scans remain preferable for small or
+/// sparse workloads; a tree is useful when overlapping queries can reuse the
+/// same summaries.
+///
 /// ELI5: a short list of small shelves is faster to inspect by hand, but many
 /// overlapping shelves are cheaper to answer from a shared index of summaries.
+/// The tree stores the winning shelf position for each larger slice, so a
+/// query combines a few stored answers instead of walking every item again.
+///
+/// # Arguments
+///
+/// * `labels` - Physical right-side labels addressed by the query ranges.
+/// * `ranges` - Half-open `(start, end)` windows into `labels`. Every range
+///   must be non-empty and satisfy `end <= labels.len()`.
+/// * `minimum` - Select the smallest label when `true`; select the largest
+///   label when `false`.
+///
+/// # Returns
+///
+/// One selected position in `labels` per input range, in input order. Ties
+/// select the leftmost position because candidates replace one another only
+/// on a strict improvement. An empty `ranges` slice returns an empty vector.
+///
+/// # Errors
+///
+/// Returns an error for an empty, reversed, or out-of-bounds range, or when a
+/// tree allocation cannot be represented by the platform's `usize` capacity.
 pub(crate) fn adaptive_extreme_positions(
     labels: ArrayView1<'_, i64>,
     ranges: &[(usize, usize)],
@@ -110,6 +152,9 @@ pub(crate) fn adaptive_extreme_positions(
         if start >= end || end > labels.len() {
             return Err("range window is empty or out of bounds".to_owned());
         }
+        // ELI5: if the total workload is too large to count exactly, treating
+        // it as "very large" safely favors the tree. This is only a speed
+        // hint; it cannot change which position wins.
         total_width = total_width.saturating_add(end - start);
         span_start = span_start.min(start);
         span_end = span_end.max(end);
@@ -118,6 +163,8 @@ pub(crate) fn adaptive_extreme_positions(
         return Ok(Vec::new());
     }
 
+    // ELI5: cover only the smallest aisle containing every query, not the
+    // entire right table. That keeps unrelated positions out of the index.
     let span_len = span_end - span_start;
     if !should_use_segment_tree(ranges.len(), total_width, span_len) {
         return Ok(extreme_positions_direct(labels, ranges, minimum));
@@ -128,6 +175,7 @@ pub(crate) fn adaptive_extreme_positions(
 
     // ELI5: each tree node remembers the winning original position for its
     // slice, so a query combines a few summaries instead of rescanning rows.
+    // Leaves live at `span_len..2 * span_len`; `usize::MAX` means no candidate.
     let tree_len = span_len
         .checked_mul(2)
         .ok_or("range-extreme tree size exceeds platform capacity")?;
@@ -143,15 +191,19 @@ pub(crate) fn adaptive_extreme_positions(
 
     let mut selected = Vec::with_capacity(ranges.len());
     for &(query_start, query_end) in ranges {
+        // Translate right-layout coordinates into the compact tree's leaf
+        // coordinates while preserving the half-open query convention.
         let mut start = query_start - span_start + span_len;
         let mut end = query_end - span_start + span_len;
         let mut winner = usize::MAX;
         while start < end {
             if start & 1 == 1 {
+                // An odd left boundary is the next complete slice to include.
                 winner = choose_extreme_position(labels, winner, tree[start], minimum);
                 start += 1;
             }
             if end & 1 == 1 {
+                // An odd right boundary is the final complete slice to include.
                 end -= 1;
                 winner = choose_extreme_position(labels, winner, tree[end], minimum);
             }
@@ -163,6 +215,26 @@ pub(crate) fn adaptive_extreme_positions(
     Ok(selected)
 }
 
+/// Choose the better of two candidate positions for an extrema query.
+///
+/// `usize::MAX` is an internal empty-candidate sentinel. It cannot be a real
+/// position because every valid position is smaller than `labels.len()`;
+/// handling it here lets an iterative tree query combine partial slices
+/// without inventing a fake label value. Strict comparison preserves the
+/// leftmost position when labels tie.
+///
+/// # Arguments
+///
+/// * `labels` - Labels used to compare the candidate positions.
+/// * `left` - First candidate, or `usize::MAX` for no candidate.
+/// * `right` - Second candidate, or `usize::MAX` for no candidate.
+/// * `minimum` - Compare for the smallest label when `true`, otherwise the
+///   largest label.
+///
+/// # Returns
+///
+/// The winning real candidate, or the real candidate when the other side is
+/// the empty sentinel.
 fn choose_extreme_position(
     labels: ArrayView1<'_, i64>,
     left: usize,
@@ -187,6 +259,30 @@ fn choose_extreme_position(
     }
 }
 
+/// Select extrema for the public range-window path.
+///
+/// This adapter retains the signed `i64` boundary representation used by the
+/// NumPy-facing API, converts validated boundaries to internal `usize`
+/// offsets, delegates to [`adaptive_extreme_positions`], and converts the
+/// selected offsets back to the public `i64` representation.
+///
+/// # Arguments
+///
+/// * `labels` - Right-side physical labels in prepared layout order.
+/// * `starts` - Inclusive window starts, one per logical left row.
+/// * `ends` - Exclusive window ends, paired with `starts`.
+/// * `minimum` - Select the smallest label when `true`; select the largest
+///   label when `false`.
+///
+/// # Returns
+///
+/// One selected physical offset per valid input window, encoded as `i64` for
+/// the Python-facing contract.
+///
+/// # Errors
+///
+/// Returns an error for mismatched parallel-array lengths, negative bounds,
+/// empty or out-of-bounds windows, or an offset that cannot fit in `i64`.
 fn window_extreme_positions(
     labels: &[i64],
     starts: &[i64],
