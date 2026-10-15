@@ -1858,6 +1858,10 @@ mod tests {
             )?;
             let residuals = PyList::empty(py);
             let values = PyArray1::from_vec(py, (0_i64..2048).collect());
+            let ones = PyArray1::from_vec(py, vec![1_i64; 2048]);
+            let float_values =
+                PyArray1::from_vec(py, (0..2048).map(|position| position as f64).collect());
+            let float_ones = PyArray1::from_vec(py, vec![1.0_f64; 2048]);
             let nulls = PyArray1::from_vec(
                 py,
                 (0..2048)
@@ -1888,6 +1892,30 @@ mod tests {
                             values.clone().into_any(),
                             nulls.clone().into_any(),
                             "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            ones.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "product".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            float_values.clone().into_any(),
+                            nulls.clone().into_any(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            float_ones.into_any(),
+                            nulls.clone().into_any(),
+                            "product".into_pyobject(py)?.into_any(),
                         ],
                     )?,
                     PyTuple::new(
@@ -1950,19 +1978,34 @@ mod tests {
                     .collect::<Vec<_>>()
             );
             assert_eq!(
-                outputs.get_item(3)?.extract::<Vec<i64>>()?,
+                outputs.get_item(6)?.extract::<Vec<i64>>()?,
                 vec![130; 12]
                     .into_iter()
                     .chain(vec![1154; 12])
                     .collect::<Vec<_>>()
             );
             assert_eq!(
-                outputs.get_item(4)?.extract::<Vec<i64>>()?,
+                outputs.get_item(7)?.extract::<Vec<i64>>()?,
                 vec![639; 12]
                     .into_iter()
                     .chain(vec![1663; 12])
                     .collect::<Vec<_>>()
             );
+            assert_eq!(
+                outputs.get_item(3)?.extract::<Vec<i64>>()?,
+                vec![1; 12]
+                    .into_iter()
+                    .chain(vec![1; 12])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                outputs.get_item(4)?.extract::<Vec<f64>>()?,
+                vec![196095.0; 12]
+                    .into_iter()
+                    .chain(vec![718335.0; 12])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(outputs.get_item(5)?.extract::<Vec<f64>>()?, vec![1.0; 24]);
             Ok(())
         })
         .unwrap();

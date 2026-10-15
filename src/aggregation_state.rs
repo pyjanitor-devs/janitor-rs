@@ -615,8 +615,6 @@ impl<'a> AggregationSet<'a> {
         })
     }
 
-    /// Aggregate equality-window queries with one rank tree per equality
-    /// window.
     /// Aggregate starts-only suffixes, selecting the same adaptive strategy
     /// used by the existing single-operation forward kernels.
     ///
