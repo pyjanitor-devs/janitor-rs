@@ -17,6 +17,7 @@ use numpy::{PyReadonlyArray1, PyReadwriteArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, HashMap};
 
@@ -33,6 +34,16 @@ use crate::predicate::{
     predicates_match_dispatch, NullMetadataView, Predicate, PredicateView,
 };
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
+
+const MAX_EQUI_RANK_TREE_WIDTH: usize = 1 << 20;
+thread_local! {
+    static EQUI_RANK_TREE_ENABLED: Cell<bool> = const { Cell::new(true) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static EQUI_RANK_TREE_HITS: Cell<usize> = const { Cell::new(0) };
+}
 
 type IndexPairs = Option<(Vec<i64>, Vec<i64>)>;
 
@@ -121,6 +132,9 @@ fn should_use_equi_rank_tree(
         if equality_start >= equality_end {
             row_start = row_end;
             continue;
+        }
+        if equality_end - equality_start > MAX_EQUI_RANK_TREE_WIDTH {
+            return false;
         }
         total_tree_width = total_tree_width.saturating_add(equality_end - equality_start);
         for row in row_start..row_end {
@@ -1151,9 +1165,16 @@ pub fn equi_aggregate<'py>(
     let mut ends_owner = ends;
     let mut starts = starts_owner.as_mut().map(|values| values.as_array_mut());
     let mut ends = ends_owner.as_mut().map(|values| values.as_array_mut());
-    let equality_windows = starts.as_ref().map(|values| {
+    let retain_equality_windows = starts.is_some()
+        && (ranges.len() > 1
+            || (!reverse && residual_predicates.is_empty() && set.supports_dual_rank_tree()));
+    let equality_windows = retain_equality_windows.then(|| {
         (
-            values.view().to_owned(),
+            starts
+                .as_ref()
+                .expect("starts and ends are paired")
+                .view()
+                .to_owned(),
             ends.as_ref()
                 .expect("starts and ends are paired")
                 .view()
@@ -1230,6 +1251,7 @@ pub fn equi_aggregate<'py>(
         && residual_predicates.is_empty()
         && demoted_view.is_none()
         && set.supports_dual_rank_tree()
+        && EQUI_RANK_TREE_ENABLED.with(Cell::get)
     {
         if let (Some(starts), Some(ends), Some((equality_starts, equality_ends))) =
             (starts.as_ref(), ends.as_ref(), equality_windows.as_ref())
@@ -1240,6 +1262,8 @@ pub fn equi_aggregate<'py>(
                 equality_starts.view(),
                 equality_ends.view(),
             ) {
+                #[cfg(test)]
+                EQUI_RANK_TREE_HITS.with(|hits| hits.set(hits.get() + 1));
                 set.aggregate_equi_rank_tree(
                     starts.view(),
                     ends.view(),
@@ -1334,6 +1358,39 @@ pub fn equi_aggregate<'py>(
         output_len,
         return_matched,
     )?))
+}
+
+/// Benchmark-only entry point that can force the legacy candidate path.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn equi_aggregate_bench<'py>(
+    py: Python<'py>,
+    left_index: PyReadonlyArray1<'py, i64>,
+    right_index: PyReadonlyArray1<'py, i64>,
+    starts: Option<PyReadwriteArray1<'py, i64>>,
+    ends: Option<PyReadwriteArray1<'py, i64>>,
+    range_predicates: &Bound<'py, PyList>,
+    residual_predicates: &Bound<'py, PyList>,
+    aggregations: &Bound<'py, PyList>,
+    return_matched: bool,
+    reverse: bool,
+    allow_rank_tree: bool,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    let previous = EQUI_RANK_TREE_ENABLED.with(|enabled| enabled.replace(allow_rank_tree));
+    let result = equi_aggregate(
+        py,
+        left_index,
+        right_index,
+        starts,
+        ends,
+        range_predicates,
+        residual_predicates,
+        aggregations,
+        return_matched,
+        reverse,
+    );
+    EQUI_RANK_TREE_ENABLED.with(|enabled| enabled.set(previous));
+    result
 }
 
 /// Materialize aligned unique-equality rows after residual filtering.
@@ -1744,7 +1801,7 @@ mod tests {
         build_equi_range_indices_core, build_equi_uniq_residual_indices_core,
         build_second_range_envelope, equi_aggregate, materialize_equi_windows,
         materialize_unordered_second_range, narrow_unordered_second_range,
-        should_use_equi_rank_tree, unique_reverse_output_slots,
+        should_use_equi_rank_tree, unique_reverse_output_slots, EQUI_RANK_TREE_HITS,
     };
     use crate::compare_op::CompareOp;
     use crate::join_types::Keep;
@@ -1823,36 +1880,61 @@ mod tests {
     fn equi_aggregate_rank_tree_handles_duplicate_groups_and_nulls() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
-            let left_index = PyArray1::from_vec(py, (100_i64..117).collect());
-            let right_index = PyArray1::from_vec(py, (10_i64..74).collect());
-            // Each equality group has repeated left rows and a broad
-            // window. The two groups are large enough to cross the adaptive
-            // tree threshold while still making the expected reductions
-            // easy to check.
-            let starts =
-                PyArray1::from_vec(py, vec![0_i64; 9].into_iter().chain(vec![32; 8]).collect());
-            let ends =
-                PyArray1::from_vec(py, vec![32_i64; 9].into_iter().chain(vec![64; 8]).collect());
+            let left_index = PyArray1::from_vec(py, (100_i64..124).collect());
+            let right_index = PyArray1::from_vec(py, (10_i64..2058).collect());
+            // Each equality group has repeated left rows and a broad window.
+            // Two range bounds make each query an unaligned interior slice,
+            // so the tree must merge both sides of its iterative query.
+            let starts = PyArray1::from_vec(
+                py,
+                vec![0_i64; 12].into_iter().chain(vec![1024; 12]).collect(),
+            );
+            let ends = PyArray1::from_vec(
+                py,
+                vec![1024_i64; 12]
+                    .into_iter()
+                    .chain(vec![2048; 12])
+                    .collect(),
+            );
+            let query_starts =
+                Array1::from_iter(vec![129_i64; 12].into_iter().chain(vec![1153; 12]));
+            let query_ends = Array1::from_iter(vec![640_i64; 12].into_iter().chain(vec![1664; 12]));
             assert!(should_use_equi_rank_tree(
-                starts.readonly().as_array(),
-                ends.readonly().as_array(),
+                query_starts.view(),
+                query_ends.view(),
                 starts.readonly().as_array(),
                 ends.readonly().as_array(),
             ));
             let ranges = PyList::new(
                 py,
-                [equi_range_tuple(
-                    py,
-                    vec![32_i64; 9].into_iter().chain(vec![64; 8]).collect(),
-                    (0_i64..64).collect(),
-                    ">",
-                )?],
+                [
+                    equi_range_tuple(
+                        py,
+                        vec![640_i64; 12]
+                            .into_iter()
+                            .chain(vec![1664; 12])
+                            .collect(),
+                        (0_i64..2048).collect(),
+                        ">",
+                    )?,
+                    equi_range_tuple(
+                        py,
+                        vec![128_i64; 12]
+                            .into_iter()
+                            .chain(vec![1152; 12])
+                            .collect(),
+                        (0_i64..2048).collect(),
+                        "<",
+                    )?,
+                ],
             )?;
             let residuals = PyList::empty(py);
-            let values = PyArray1::from_vec(py, (0_i64..64).collect());
+            let values = PyArray1::from_vec(py, (0_i64..2048).collect());
             let nulls = PyArray1::from_vec(
                 py,
-                (0..64).map(|position| position == 33).collect::<Vec<_>>(),
+                (0..2048)
+                    .map(|position| position == 129 || position == 1153)
+                    .collect::<Vec<_>>(),
             );
             let aggregations = PyList::new(
                 py,
@@ -1899,6 +1981,7 @@ mod tests {
                 ],
             )?;
 
+            EQUI_RANK_TREE_HITS.with(|hits| hits.set(0));
             let result = equi_aggregate(
                 py,
                 left_index.readonly(),
@@ -1912,43 +1995,44 @@ mod tests {
                 false,
             )?
             .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+            EQUI_RANK_TREE_HITS.with(|hits| assert!(hits.get() > 0));
 
-            assert_eq!(result.get_item(1)?.extract::<Vec<bool>>()?, vec![true; 17]);
+            assert_eq!(result.get_item(1)?.extract::<Vec<bool>>()?, vec![true; 24]);
             let outputs_item = result.get_item(2)?;
             let outputs = outputs_item.cast::<PyList>()?;
             assert_eq!(
                 outputs.get_item(0)?.extract::<Vec<i64>>()?,
-                vec![32; 9]
+                vec![511; 12]
                     .into_iter()
-                    .chain(vec![32; 8])
+                    .chain(vec![511; 12])
                     .collect::<Vec<_>>()
             );
             assert_eq!(
                 outputs.get_item(1)?.extract::<Vec<i64>>()?,
-                vec![32; 9]
+                vec![510; 12]
                     .into_iter()
-                    .chain(vec![31; 8])
+                    .chain(vec![510; 12])
                     .collect::<Vec<_>>()
             );
             assert_eq!(
                 outputs.get_item(2)?.extract::<Vec<i64>>()?,
-                vec![496; 9]
+                vec![196095; 12]
                     .into_iter()
-                    .chain(vec![1487; 8])
+                    .chain(vec![718335; 12])
                     .collect::<Vec<_>>()
             );
             assert_eq!(
                 outputs.get_item(3)?.extract::<Vec<i64>>()?,
-                vec![0; 9]
+                vec![130; 12]
                     .into_iter()
-                    .chain(vec![32; 8])
+                    .chain(vec![1154; 12])
                     .collect::<Vec<_>>()
             );
             assert_eq!(
                 outputs.get_item(4)?.extract::<Vec<i64>>()?,
-                vec![31; 9]
+                vec![639; 12]
                     .into_iter()
-                    .chain(vec![63; 8])
+                    .chain(vec![1663; 12])
                     .collect::<Vec<_>>()
             );
             Ok(())

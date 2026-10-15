@@ -671,7 +671,13 @@ impl<'a> AggregationSet<'a> {
                 .expect("equality rank tree inputs were validated by the caller");
             for position in group_start_position..group_end_position {
                 tree.update(position, tree_size + position - group_start_position);
-                tree.rebuild_path(tree_size + position - group_start_position);
+            }
+            // ELI5: all books are on their leaves now, so sweep the shelves
+            // once from the bottom up instead of rebuilding the same parent
+            // after every insertion.
+            for node in (1..tree_size).rev() {
+                tree.copy_output_within(node * 2, node);
+                tree.merge_output_within(node * 2 + 1, node);
             }
 
             let mut left_nodes = Vec::new();

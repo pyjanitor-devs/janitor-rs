@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use janitor_rs::bench_support::{
-    dual_regions_aggregate, dual_regions_and_residual_aggregate, equi_aggregate,
+    dual_regions_aggregate, dual_regions_and_residual_aggregate, equi_aggregate_bench,
 };
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
@@ -248,37 +248,35 @@ fn bench_equi_case(
             equi_windows(rows, &group_widths, rows_per_group);
         let left_index = PyArray1::from_vec(py, (0..rows as i64).collect());
         let right_index = PyArray1::from_vec(py, (0..right_len as i64).collect());
-        let starts = PyArray1::from_vec(py, starts_values);
-        let ends = PyArray1::from_vec(py, ends_values);
-        let ranges = PyList::empty(py);
+        let range_left_values = starts_values
+            .iter()
+            .zip(&ends_values)
+            .map(|(&start, &end)| start + (end - start) / 2)
+            .collect::<Vec<_>>();
+        let range_left = PyArray1::from_vec(py, range_left_values);
+        let range_right = PyArray1::from_vec(py, (0..right_len as i64).collect());
+        let range = make_predicate(py, range_left.as_any(), range_right.as_any(), ">");
+        let ranges = PyList::new(py, [range]).unwrap();
+        let residuals = PyList::empty(py);
         let aggregations = make_size_aggregation(py);
-        let residual_left = PyArray1::from_vec(py, vec![1_i64; rows]);
-        let residual_right = PyArray1::from_vec(py, vec![1_i64; right_len]);
-        let residual = PyList::new(
-            py,
-            [make_predicate(
-                py,
-                residual_left.as_any(),
-                residual_right.as_any(),
-                "==",
-            )],
-        )
-        .unwrap();
 
         let mut group = c.benchmark_group(name);
         group.bench_function("rank_tree", |b| {
             b.iter(|| {
-                let result = equi_aggregate(
+                let starts = PyArray1::from_vec(py, starts_values.clone());
+                let ends = PyArray1::from_vec(py, ends_values.clone());
+                let result = equi_aggregate_bench(
                     py,
                     left_index.readonly(),
                     right_index.readonly(),
                     Some(starts.readwrite()),
                     Some(ends.readwrite()),
                     &ranges,
-                    &PyList::empty(py),
+                    &residuals,
                     &aggregations,
                     false,
                     false,
+                    true,
                 )
                 .unwrap();
                 black_box(result);
@@ -286,15 +284,18 @@ fn bench_equi_case(
         });
         group.bench_function("candidate_fallback", |b| {
             b.iter(|| {
-                let result = equi_aggregate(
+                let starts = PyArray1::from_vec(py, starts_values.clone());
+                let ends = PyArray1::from_vec(py, ends_values.clone());
+                let result = equi_aggregate_bench(
                     py,
                     left_index.readonly(),
                     right_index.readonly(),
                     Some(starts.readwrite()),
                     Some(ends.readwrite()),
                     &ranges,
-                    &residual,
+                    &residuals,
                     &aggregations,
+                    false,
                     false,
                     false,
                 )
@@ -338,7 +339,7 @@ fn bench_equi_rank_tree_only(c: &mut Criterion, name: &str, rows: usize) {
         let mut group = c.benchmark_group(name);
         group.bench_function("rank_tree", |b| {
             b.iter(|| {
-                let result = equi_aggregate(
+                let result = equi_aggregate_bench(
                     py,
                     left_index.readonly(),
                     right_index.readonly(),
@@ -349,6 +350,7 @@ fn bench_equi_rank_tree_only(c: &mut Criterion, name: &str, rows: usize) {
                     &aggregations,
                     false,
                     false,
+                    true,
                 )
                 .unwrap();
                 black_box(result);
