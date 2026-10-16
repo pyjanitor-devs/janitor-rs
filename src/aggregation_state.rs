@@ -1140,8 +1140,8 @@ impl<'a> AggregationSet<'a> {
         let use_prefix = should_use_prefix_difference(ranges.len(), width, packed_layout.length);
 
         // Dispatch all requested reductions over the same set of ranges. The
-        // integer sums and mask counts may use prefix differences, products
-        // and extrema a tree; float reductions retain direct source order.
+        // integer sums may use prefix differences, products and extrema a
+        // tree; float reductions retain direct source order.
         for state in &mut self.states {
             match state {
                 State::CountAll => {}
