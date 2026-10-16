@@ -91,12 +91,25 @@ writes each prefix entry once. The new results are recorded as
 `run=register_recheck_*` in the CSV; the pre-fix regression is resolved for
 these Python-level workloads.
 
-The committed harness also supports `--random-nulls`, which uses
-`np.random.default_rng(246)` to place a fixed random 10% null mask. Across 101
-alternating samples, the baseline/proposed ratios were **1.45x signed** and
-**1.15x u64** for unique keys, and **1.36x signed** and **1.08x u64** for
-duplicate keys. All four comparisons matched direct masked NumPy oracles.
-These results are recorded as `run=random_nulls_recheck` in the CSV.
+The committed harness also supports `--random-nulls`. Each fixture gets its
+own reproducible mask from `np.random.default_rng([246, n, repeat])`, so the
+mask does not depend on which other fixtures are selected; the million-query
+oracle derives valid counts from that mask. Across 101 alternating samples, the
+baseline/proposed ratios were **1.45x signed** and **1.15x u64** for unique
+keys, and **1.36x signed** and **1.08x u64** for duplicate keys. All four
+comparisons matched direct masked NumPy oracles. These results are recorded as
+`run=random_nulls_recheck` in the CSV.
+
+To reproduce the recorded focused run (after building the two wheels described
+below), run:
+
+```sh
+pixi run -e py312 python scripts/bench-integer-prefix.py \
+  --library /path/to/base/janitor_rs/janitor_rs.cpython-312-darwin.so \
+  --compare-library /path/to/patched/janitor_rs/janitor_rs.cpython-312-darwin.so \
+  --pyjanitor /path/to/pyjanitor --strategy base --aggregation sum \
+  --repeats 101 --case super_large --endpoint pyo3 --random-nulls
+```
 
 The compact-group signed measurement was unstable in the full run: **0.101 ms
 base / 0.682 ms proposed**. An isolated 101-sample paired recheck measured

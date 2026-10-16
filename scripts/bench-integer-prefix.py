@@ -191,7 +191,6 @@ def main():
         ]
     )
 
-    random_nulls = np.random.default_rng(246) if args.random_nulls else None
     million_starts = (np.arange(1048576, dtype=np.int64) * 7919) % (1048576 - 2000 + 1)
     fixtures.append(
         ("million_queries", 1048576, million_starts, million_starts + 2000, 1, False)
@@ -239,22 +238,24 @@ def main():
         tree = q > 3 and total_width > 5 * packed + 2 * q * (packed - 1).bit_length()
         prefix = q > 3 and total_width > packed + 2 * q
         nulls = (
-            random_nulls.random(n) < 0.1
-            if random_nulls is not None
+            np.random.default_rng([246, n, repeat]).random(n) < 0.1
+            if args.random_nulls
             else np.arange(n) % 10 == 0
         )
         keys = np.arange(n, dtype=np.int64) // repeat
         dtypes = ["int64"] if args.aggregation == "count" else ["int64", "uint64"]
         for dtype in dtypes:
-            # Large positive/negative payloads force wraparound. Every tenth
-            # value is null; the direct NumPy oracle skips masks explicitly.
+            # Large positive/negative payloads force wraparound. The null mask
+            # is either every tenth value or a fixed random mask; the direct
+            # NumPy oracle skips masked positions explicitly.
             bits = np.arange(n, dtype=np.uint64) * np.uint64(0x9E3779B97F4A7C15)
             values = bits.view(np.int64) if dtype == "int64" else bits
             if name == "million_queries":
                 # Constant MAX payloads give an independent closed-form
                 # oracle for every row without a billion-element rescan.
                 values.fill(np.iinfo(dtype).max)
-                valid = ends - starts - ((ends + 9) // 10 - (starts + 9) // 10)
+                valid_prefix = np.concatenate(([0], np.cumsum(~nulls, dtype=np.int64)))
+                valid = valid_prefix[ends] - valid_prefix[starts]
                 expected = (
                     valid.astype(np.uint64) * np.uint64(np.iinfo(dtype).max)
                 ).view(dtype)
