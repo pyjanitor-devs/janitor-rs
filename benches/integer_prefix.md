@@ -124,8 +124,6 @@ tests; production algorithm and dispatch code match the measured proposal.
 - `cargo fmt --check`, Clippy across all targets/features with `-D warnings`, and
   `cargo bench --no-default-features --no-run`: passed.
 - Benchmark script Ruff checks/format and new-document Markdown lint: passed.
-- Full branch matrix and compatibility assessment:
-  [`workflow/VALIDATION.md`](../workflow/VALIDATION.md).
 
 These are single-machine measurements, not statistical guarantees or a promise
 of the standalone reproduction's 14x speedup. Span construction still sorts

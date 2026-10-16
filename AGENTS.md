@@ -431,6 +431,12 @@ work, while one width-eight query makes that regression obvious.
 
 ## Learned Patterns
 
+### [2026-10-16] Keep agent workflow documents out of pull requests
+
+Keep execution plans and standalone validation writeups local unless explicitly
+requested as PR artifacts. Put review and validation evidence in the PR description
+and retain reproducible benchmark results with the benchmarks.
+
 ### [2026-10-16] Wrapping prefix differences work across packed spans
 
 Integer starts/ends sums use wrapping prefix differences over the packed union
