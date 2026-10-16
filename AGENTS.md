@@ -439,6 +439,7 @@ regressed mask counting; retain its conservative cutoff until separate tuning
 has measured benefits. See `benches/integer_prefix.md`. When enlarging an
 integration fixture to exercise an optimized route, retain its original small
 direct-path case and assert the branch-counter delta for both cases.
+Keep instrumentation scoped to the optimization paths changed by the PR.
 
 ### [2026-10-16] Keep agent workflow documents out of pull requests
 

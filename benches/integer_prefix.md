@@ -120,9 +120,9 @@ A sum cutoff cannot assume the same per-element costs for mask counting. Direct
 counting avoids storing a running total for each packed value; the measured
 tradeoff differs from summing numeric payloads. This experiment does not establish
 the compiler-level cause of the difference. **The count change was reverted:**
-mask counts retain their previous conservative cutoff. Tests assert that counts
-remain direct when sums first select prefixes and still use prefixes for broad
-batches. The original 1×2 direct overflow test and 4×5 prefix test remain covered.
+mask counts retain their previous conservative cutoff and have no new branch
+instrumentation. Sum branch counters and the original 1×2 direct overflow test
+alongside the 4×5 prefix test remain covered.
 
 Unlike replacing a sum tree, this count change adds scratch allocation where the
 old path scans: approximately **8 MiB** for the million-row count-only fixtures.
@@ -186,7 +186,7 @@ against the downstream compatibility suite.
 
 ## Verification and limits
 
-- Rust test wrapper (`cargo test --no-default-features`): **107 passed**.
+- Rust test wrapper (`cargo test --no-default-features`): **106 passed**.
 - Proposed wheel against pyjanitor's entire aggregation-kernel test module:
   **138 passed**.
 - `cargo fmt --check`, Clippy across all targets/features with `-D warnings`, and

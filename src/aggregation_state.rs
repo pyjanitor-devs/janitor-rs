@@ -1151,8 +1151,6 @@ impl<'a> AggregationSet<'a> {
                     // the sum cutoff pays for that setup too early for
                     // counts, so retain the existing conservative cutoff.
                     if use_tree {
-                        #[cfg(test)]
-                        PREFIX_COUNT_HITS.with(|hits| hits.set(hits.get() + 1));
                         let mut prefix = vec![0_i64; packed_layout.length + 1];
                         for (cluster, &(span_start, span_end)) in queried_spans.iter().enumerate() {
                             let offset = packed_layout.offsets[cluster];
@@ -2277,7 +2275,6 @@ fn update_u64_prefix_ranges(
 #[cfg(test)]
 thread_local! {
     pub(crate) static PREFIX_SUM_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static PREFIX_COUNT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Answer arbitrary integer products with an iterative segment tree.
