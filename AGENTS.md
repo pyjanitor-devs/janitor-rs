@@ -91,6 +91,20 @@ the bottom of this file.
   verification quality. Do not treat a green test suite or a test name as
   proof that an optimized branch executed; record empirical branch evidence
   and any unverified matrix cells in the review.
+- **Benchmark every PR review independently**: for any PR that changes
+  `src/`, the reviewer runs their own release-mode timing of the base commit
+  against the pinned PR head, rather than relying on the author's numbers or a
+  cost model. Re-run it after each update that changes `src/`. Use detached
+  worktrees at both SHAs with an identical `#[ignore]` timing test (an in-crate
+  child module reaches private types such as `AggregationSet`), run through
+  `./scripts/test-rust.sh --release <name> -- --ignored --nocapture
+  --test-threads=1`, alternate base and head runs, report medians and
+  base/head ratios, and checksum outputs to confirm both versions agree. Cover
+  every adaptive-branch case the change can reach, especially cases where one
+  cutoff fires and another does not, plus tiny inputs and the PR's headline
+  sizes. Benchmark any change the review recommends before presenting it as a
+  win. For PRs that touch no `src/` code, state that the benchmark was skipped
+  and why. See the PR #252 entry in "Learned Patterns".
 
 ### PyJanitor compatibility gate (janitor-rs #225)
 
@@ -416,6 +430,21 @@ work, while one width-eight query makes that regression obvious.
 ---
 
 ## Learned Patterns
+
+### [2026-10-16] Cost-model reasoning is not benchmark evidence
+
+**Context**: A review of PR #252 recommended moving `CountNonNullMask` from
+the segment-tree cutoff to the new prefix-difference cutoff, reasoning from
+element-visit counts alone. The change was applied, and a release-mode
+base/head benchmark then showed counts 7-8x slower whenever the prefix cutoff
+fired but the tree cutoff did not (for example 0.072 ms to 0.58 ms for 1,024
+queries of width 4,096 over 1M rows).
+**Cause**: the direct `filter(!nulls).count()` over a bool slice vectorizes,
+while a prefix build is a serial pass writing eight bytes per position.
+Cutoffs count visits, but per-visit cost differs sharply between operations,
+so a cutoff tuned for integer sums does not transfer to mask counts.
+**Recommendation**: follow the "Benchmark every PR review independently" Core
+Principle, and treat any proposed dispatch change as unproven until timed.
 
 ### [2026-10-15] Distinguish a window hull from its union
 
