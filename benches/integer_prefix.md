@@ -45,7 +45,7 @@ columns are in [`integer_prefix.csv`](integer_prefix.csv), `run=paired`.
 | Tiny: 32 rows, width 8 | 2 | 0.99–1.01x | 0.99–1.01x | 1.00–1.00x |
 | Large: 4,096 rows, width 512 | 128 | 1.22–1.40x | 0.99–1.01x | 0.99–1.01x |
 | Very large: 65,536 rows, width 2,048 | 512 | 1.19–1.44x | 1.00–1.01x | 0.99–1.01x |
-| Super large: 1,048,576 rows, width 2,048 | 4,096 | 1.01–1.21x | 1.00–1.01x | 0.99–1.00x |
+| Super large: 1,048,576 rows, width 2,048 | 4,096 | superseded; see focused recheck below | 1.00–1.01x | 0.99–1.00x |
 | Million-query case: 1,048,576 rows, width 2,000 | 1,048,576 | 1.47–1.52x | — | — |
 | 2,048 separated groups, width 224 | 16,384 | 1.19–1.20x | — | — |
 | Sparse million-row source, width 8 | 4 | 1.00–1.01x | — | — |
@@ -71,10 +71,20 @@ All 12 result comparisons passed their independent oracles.
 
 The focused measurements confirm a repeatable u64 regression for this shape:
 about 4–10% longer runtime with unique keys and 14–19% with duplicate keys.
-Signed sums were near parity; the previously reported 1.26x signed result did
-not reproduce. These focused results are recorded as `run=recheck_*` in the CSV
-and supersede the original 21-sample PyO3 row for this shape. The memory result
-is unchanged: the prefix table is about half the size of the sum tree.
+Signed sums were near parity. A reviewer's Rust-level harness measured 1.26x
+for signed sums across two runs; the Python-to-Rust recheck measured parity,
+which reflects a different measurement method. These focused results are
+recorded as `run=recheck_*` in the CSV and supersede the original 21-sample
+PyO3 row for this shape.
+
+Decision: accept this isolated raw-kernel regression. The duplicate-key u64
+slowdown is about 0.2–0.25 ms, while complete `join_agg` calls take about
+145–228 ms and remain neutral. The prefix table still reduces sum scratch from
+about 16 MiB to 8 MiB for this shape, and other measured shapes are 1.3–3.3x
+faster. Keeping unsigned sums on the tree would avoid this result but give up
+the memory saving and retain the removed sum-tree path; a future fix should
+profile and improve prefix construction rather than add a shape-specific
+cutoff.
 
 The compact-group signed measurement was unstable in the full run: **0.101 ms
 base / 0.682 ms proposed**. An isolated 101-sample paired recheck measured
