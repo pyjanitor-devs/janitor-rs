@@ -50,14 +50,8 @@ fn compare_with_direct(
         }
     }
     let before = PREFIX_SUM_HITS.get();
-    let count_before = PREFIX_COUNT_HITS.get();
     actual.aggregate_starts_ends(starts.view(), ends.view());
     assert_eq!(PREFIX_SUM_HITS.get() - before, prefix_calls, "{windows:?}");
-    assert_eq!(
-        PREFIX_COUNT_HITS.get() - count_before,
-        usize::from(prefix_calls > 0),
-        "mask counts must use the same prefix cutoff as sums: {windows:?}",
-    );
     for (actual, expected) in actual.states.iter().zip(&reference.states) {
         match (actual, expected) {
             (State::Sum(_, a), State::Sum(_, e)) => assert_eq!(a, e),
@@ -254,5 +248,22 @@ fn product_trees_keep_wrapping_zero_even_and_null_semantics() {
             b[row],
             positions.fold(1_u64, |a, i| a.wrapping_mul(unsigned[i]))
         );
+    }
+}
+
+#[test]
+fn mask_counts_keep_conservative_cutoff_independently_of_sums() {
+    let signed = Array1::from_elem(16, 1_i64);
+    let unsigned = Array1::from_elem(16, 1_u64);
+    let nulls = Array1::from_iter((0..16).map(|i| i % 3 == 0));
+    // Sums use prefixes in both cases. Counts keep the cheap direct scan
+    // for the small batch and build a table only for the broad batch.
+    for (windows, count_prefix_calls) in [
+        (vec![(0, 16), (1, 3), (2, 4), (3, 8)], 0),
+        (vec![(0, 16); 128], 1),
+    ] {
+        let count_before = PREFIX_COUNT_HITS.get();
+        compare_with_direct(signed.view(), unsigned.view(), nulls.view(), &windows, 2);
+        assert_eq!(PREFIX_COUNT_HITS.get() - count_before, count_prefix_calls);
     }
 }

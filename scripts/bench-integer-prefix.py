@@ -1,9 +1,9 @@
-"""Compare starts/ends integer sums through PyO3 and downstream join_agg.
+"""Compare starts/ends integer sums and counts through PyO3 and join_agg.
 
 Use explicit release libraries; --compare-library alternates both in one process
 outside the timed intervals to reduce drift between separate runs. Reports
 JSON lines with independent direct NumPy oracle checks, median time, Python/NumPy
-traced peak, and analytical Rust sum-table bytes (not measured RSS). Fixtures,
+traced peak, and analytical Rust table bytes (not measured RSS). Fixtures,
 imports, oracles, and one warmup are outside timing. The same script works on the
 base commit: no new Python endpoint or benchmark-only export is required.
 """
@@ -31,6 +31,21 @@ def main():
         help="Other strategy's library for alternating timings",
     )
     parser.add_argument("--strategy", choices=["base", "prefix"], required=True)
+    parser.add_argument(
+        "--aggregation", choices=["sum", "count", "sum-count"], default="sum"
+    )
+    parser.add_argument(
+        "--baseline-stage",
+        choices=["pre-sum", "pre-count"],
+        default="pre-sum",
+        help="Whether the base library already contains integer prefix sums",
+    )
+    parser.add_argument(
+        "--count-candidate-cutoff",
+        choices=["tree", "prefix"],
+        default="tree",
+        help="Candidate count guard; prefix reproduces the rejected count experiment",
+    )
     parser.add_argument("--repeats", type=int, default=11)
     parser.add_argument("--case", action="append", help="Restrict to named fixtures")
     parser.add_argument(
@@ -81,12 +96,15 @@ def main():
         if endpoint == "pyo3":
             np.testing.assert_array_equal(result[0], left_index)
             np.testing.assert_array_equal(result[1], np.ones(q, dtype=bool))
-            actual = result[2][0]
-            assert actual.dtype == np.dtype(dtype)
+            actual_outputs = result[2]
         else:
-            assert str(result.dtypes.iloc[0]).lower() == dtype
-            actual = result.iloc[:, 0].to_numpy(dtype=dtype)
-        np.testing.assert_array_equal(actual, expected)
+            actual_outputs = [result.iloc[:, i] for i in range(result.shape[1])]
+        assert len(actual_outputs) == len(expected_outputs)
+        for actual, (result_dtype, expected) in zip(actual_outputs, expected_outputs):
+            assert str(actual.dtype).lower() == result_dtype
+            if endpoint != "pyo3":
+                actual = actual.to_numpy(dtype=result_dtype)
+            np.testing.assert_array_equal(actual, expected)
 
     def measure(run):
         times = {strategy: [] for strategy, _ in backends}
@@ -183,6 +201,22 @@ def main():
             )
         )
 
+    if args.aggregation != "sum":
+        # These widths fall between the prefix and tree cutoffs: the count
+        # change should switch direct scans to a packed prefix table.
+        for name, n, q, width in [
+            ("crossover_small", 4096, 128, 64),
+            ("crossover_large", 65536, 512, 512),
+            ("crossover_super", 1048576, 4096, 512),
+        ]:
+            for repeat in [1, 8]:
+                starts = (
+                    (np.arange(q, dtype=np.int64) * 7919) % ((n - width) // repeat + 1)
+                ) * repeat
+                fixtures.append((name, n, starts, starts + width, repeat, True))
+        starts = np.arange(8192) // 4 * 256 + np.arange(8192) % 4 * 4
+        fixtures.append(("crossover_groups", 524288, starts, starts + 32, 1, False))
+
     for name, n, starts, ends, repeat, downstream in fixtures:
         if args.case and name not in args.case:
             continue
@@ -199,7 +233,8 @@ def main():
         prefix = q > 3 and total_width > packed + 2 * q
         nulls = np.arange(n) % 10 == 0
         keys = np.arange(n, dtype=np.int64) // repeat
-        for dtype in ["int64", "uint64"]:
+        dtypes = ["int64"] if args.aggregation == "count" else ["int64", "uint64"]
+        for dtype in dtypes:
             # Large positive/negative payloads force wraparound. Every tenth
             # value is null; the direct NumPy oracle skips masks explicitly.
             bits = np.arange(n, dtype=np.uint64) * np.uint64(0x9E3779B97F4A7C15)
@@ -227,7 +262,25 @@ def main():
                 )
             left_index = np.arange(q, dtype=np.int64)
             right_index = np.arange(n, dtype=np.int64)
-            aggregations = [(values, nulls, "sum")]
+            expected_counts = (
+                np.array(
+                    [np.count_nonzero(~nulls[s:e]) for s, e in zip(starts, ends)],
+                    dtype=np.int64,
+                )
+                if name != "million_queries"
+                else valid.astype(np.int64)
+            )
+            aggregations = []
+            aggfunc = []
+            expected_outputs = []
+            if args.aggregation != "count":
+                aggregations.append((values, nulls, "sum"))
+                aggfunc.append(("v", "sum"))
+                expected_outputs.append((dtype, expected))
+            if args.aggregation != "sum":
+                aggregations.append(("*", nulls, "count"))
+                aggfunc.append(("v", "count"))
+                expected_outputs.append(("int64", expected_counts))
 
             def raw(
                 left_index=left_index,
@@ -248,10 +301,6 @@ def main():
                     False,
                 )
 
-            result = raw()
-            np.testing.assert_array_equal(result[0], left_index)
-            np.testing.assert_array_equal(result[1], np.ones(q, dtype=bool))
-            np.testing.assert_array_equal(result[2][0], expected)
             runs = [("pyo3", raw)]
             if downstream:
                 # Shuffle physical rows so downstream timing includes sorting
@@ -281,48 +330,79 @@ def main():
                     left.index = np.arange(q) // repeat
                     right.index = np.arange(n) // repeat
 
-                def join(left=left, right=right):
+                def join(left=left, right=right, aggfunc=aggfunc):
                     return left.join_agg(
                         right,
                         ("g", "g", "=="),
                         ("lo", "x", "<="),
                         ("hi", "y", ">"),
-                        aggfunc=[("v", "sum")],
+                        aggfunc=aggfunc,
                     )
 
-                result = join()
-                np.testing.assert_array_equal(
-                    result.iloc[:, 0].to_numpy(dtype=dtype), expected
-                )
                 runs.append(("join_agg", join))
 
-                def range_join(left=left, right=right):
+                def range_join(left=left, right=right, aggfunc=aggfunc):
                     return left.join_agg(
                         right,
                         ("lo", "x", "<="),
                         ("hi", "y", ">"),
-                        aggfunc=[("v", "sum")],
+                        aggfunc=aggfunc,
                     )
 
-                result = range_join()
-                np.testing.assert_array_equal(
-                    result.iloc[:, 0].to_numpy(dtype=dtype), expected
-                )
                 runs.append(("range_join_agg", range_join))
             for endpoint, run in runs:
                 if args.endpoint and endpoint not in args.endpoint:
                     continue
                 for strategy, median, peak in measure(run):
-                    table_bytes = (
-                        (8 * (packed + 1) if prefix else 0)
-                        if strategy == "prefix"
-                        else (16 * packed if tree else 0)
+                    sum_prefix = (
+                        prefix
+                        if strategy == "prefix" or args.baseline_stage == "pre-count"
+                        else False
                     )
-                    route = (
-                        ("prefix" if prefix else "direct")
-                        if strategy == "prefix"
-                        else ("tree" if tree else "direct")
+                    sum_tree = (
+                        tree
+                        if strategy == "base" and args.baseline_stage == "pre-sum"
+                        else False
                     )
+                    sum_bytes = (
+                        0
+                        if args.aggregation == "count"
+                        else (
+                            8 * (packed + 1)
+                            if sum_prefix
+                            else 16 * packed
+                            if sum_tree
+                            else 0
+                        )
+                    )
+                    count_prefix = (
+                        prefix
+                        if strategy == "prefix"
+                        and args.count_candidate_cutoff == "prefix"
+                        else tree
+                    )
+                    count_bytes = (
+                        8 * (packed + 1)
+                        if args.aggregation != "sum" and count_prefix
+                        else 0
+                    )
+                    sum_route = (
+                        "absent"
+                        if args.aggregation == "count"
+                        else "prefix"
+                        if sum_prefix
+                        else "tree"
+                        if sum_tree
+                        else "direct"
+                    )
+                    count_route = (
+                        "absent"
+                        if args.aggregation == "sum"
+                        else "prefix"
+                        if count_prefix
+                        else "direct"
+                    )
+                    route = count_route if args.aggregation == "count" else sum_route
                     print(
                         json.dumps(
                             {
@@ -333,11 +413,20 @@ def main():
                                 "rows": n,
                                 "queries": q,
                                 "strategy": strategy,
+                                "aggregation": args.aggregation,
+                                "baseline_stage": args.baseline_stage,
+                                "count_candidate_cutoff": args.count_candidate_cutoff,
+                                "sum_route_model": sum_route,
+                                "count_route_model": count_route,
                                 "packed_len": packed,
                                 "route_model": route,
                                 "median_ms": median,
                                 "python_numpy_peak_bytes": peak,
-                                "rust_sum_table_bytes_model": table_bytes,
+                                "rust_sum_table_bytes_model": sum_bytes,
+                                "rust_count_table_bytes_model": count_bytes,
+                                "rust_table_peak_bytes_model": max(
+                                    sum_bytes, count_bytes
+                                ),
                             }
                         ),
                         flush=True,

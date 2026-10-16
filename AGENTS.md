@@ -431,10 +431,12 @@ work, while one width-eight query makes that regression obvious.
 
 ## Learned Patterns
 
-### [2026-10-16] Review adaptive guards per operation and retain direct cases
+### [2026-10-16] Measure operation-specific guards and retain direct cases
 
-Mask counts use prefix differences and should share the prefix cost guard with
-integer sums, rather than inheriting the segment-tree guard. When enlarging an
+A prefix data structure does not justify sharing the integer-sum cutoff with
+mask counts. Count-only and mixed benchmarks found that the lower sum cutoff
+regressed mask counting; retain its conservative cutoff until separate tuning
+has measured benefits. See `benches/integer_prefix.md`. When enlarging an
 integration fixture to exercise an optimized route, retain its original small
 direct-path case and assert the branch-counter delta for both cases.
 

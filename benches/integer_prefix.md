@@ -85,6 +85,72 @@ For a full 1,048,576-element packed source, sum scratch falls from 16 MiB to
 lower threshold can allocate a prefix where the old implementation scanned:
 `cutoff_5` adds 136 bytes. Sparse/tiny direct paths allocate no sum table.
 
+## Count cutoff experiment: retain the conservative guard
+
+Measured the review suggestion independently: baseline `c554504` already contains
+integer prefix sums but keeps the existing mask-count cutoff; experimental
+`0d2d5bd` changes counts to `use_prefix`. Only that count policy differs in
+production behavior. The baseline has the same production count code as
+`3afe8fe`, immediately before the change. Both are release wheels and use the
+same alternating-library, 21-sample protocol above. These are measurements of
+an experiment, **not an optimization retained in the final proposal**.
+
+All **105 paired comparisons** passed independent result checks: 35 count-only
+and 70 mixed sum/count comparisons. Count-only uses the dtype-independent mask
+request; mixed requests cover signed and unsigned sums. Both distributions repeat
+the earlier unique/duplicate predicate-key and index-label cases. Additional
+fixtures deliberately fall between the sum-prefix and tree cutoffs.
+
+| Source rows / query width | Queries | Count-only PyO3 baseline / experiment | Mixed sum/count PyO3 baseline / experiment |
+| --- | ---: | ---: | ---: |
+| 4,096 / 64 | 128 | 0.68–0.72x | 0.82–0.86x |
+| 65,536 / 512 | 512 | 0.61–0.62x | 0.71–0.76x |
+| 1,048,576 / 512 | 4,096 | 0.16–0.20x | 0.72–0.76x |
+| 2,048 separated groups / 32 | 8,192 | 0.97x | 1.11–1.57x |
+
+Ratios below 1 indicate a regression. Million-row count-only calls changed from
+**0.231 ms to 1.166–1.491 ms**, roughly **5–6.4x slower**. Mixed calls also
+regressed in the three contiguous-source shapes, although the separated-group
+mixed fixture improved. End-to-end calls showed no consistent benefit; the full
+CSV retains their timings, including small regressions. Tiny/sparse controls keep
+direct scanning, and the broad `large` control already uses count prefixes in
+both builds. The three small cutoff fixtures test both sides of the new guard.
+
+A sum cutoff cannot assume the same per-element costs for mask counting. Direct
+counting avoids storing a running total for each packed value; the measured
+tradeoff differs from summing numeric payloads. This experiment does not establish
+the compiler-level cause of the difference. **The count change was reverted:**
+mask counts retain their previous conservative cutoff. Tests assert that counts
+remain direct when sums first select prefixes and still use prefixes for broad
+batches. The original 1×2 direct overflow test and 4×5 prefix test remain covered.
+
+Unlike replacing a sum tree, this count change adds scratch allocation where the
+old path scans: approximately **8 MiB** for the million-row count-only fixtures.
+In mixed requests the sum already allocates a table of that size, so the model's
+peak table budget is unchanged, but another count table is allocated sequentially.
+These are table-size calculations, not measured RSS. Per-endpoint traced
+Python/NumPy peaks and both table models are in
+[`count_prefix.csv`](count_prefix.csv).
+
+To reproduce, build the two commits above and invoke the current harness with
+`--baseline-stage pre-count --count-candidate-cutoff prefix --aggregation count`
+or `--aggregation sum-count` with the same stage/cutoff options. The explicit
+candidate cutoff reproduces the rejected build; the default `tree` setting models
+the final proposal's conservative count policy.
+For the table's targeted cases, add:
+
+```sh
+--case crossover_small --case crossover_large --case crossover_super \
+  --case crossover_groups
+```
+
+Also measured with `--case tiny --case large --case sparse --case cutoff_3
+--case cutoff_4 --case cutoff_5` as controls. The command's `--library` is the
+baseline wheel's extracted extension; `--compare-library` is the experimental
+extension; use `--strategy base --repeats 21` with both. Experimental wheel
+SHA-256: `b890230166840b78304bdd0c8eb9ea3ef38d3df196451e3d912e119a5925e907`.
+The baseline is the earlier proposed wheel (`7a598234…`) listed below.
+
 ## Reproduce
 
 Create a detached worktree at the base commit and build both revisions with the
@@ -113,14 +179,14 @@ Measured wheel SHA-256 values:
 - Base: `ee12a222540137322462846f78b60cb7ecfa79f74c9443e98269badecb953f00`
 - Proposed: `7a598234483e3d786d6a07926f468740448018e3127b11218815252a8dd4bfbb`
 
-The measured sum algorithms and dispatch match the current proposal. A later
-review aligned non-null mask counts with the same prefix cutoff; these benchmarks
-request sums only and do not measure that count optimization. The current wheel
-was separately checked against the downstream compatibility suite.
+The measured sum algorithms and dispatch match the current proposal. Count
+measurements above isolate the subsequently rejected lower count cutoff. The
+final proposal retains the earlier mask-count policy and was separately checked
+against the downstream compatibility suite.
 
 ## Verification and limits
 
-- Rust test wrapper (`cargo test --no-default-features`): **106 passed**.
+- Rust test wrapper (`cargo test --no-default-features`): **107 passed**.
 - Proposed wheel against pyjanitor's entire aggregation-kernel test module:
   **138 passed**.
 - `cargo fmt --check`, Clippy across all targets/features with `-D warnings`, and

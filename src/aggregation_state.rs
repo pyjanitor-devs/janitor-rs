@@ -1146,7 +1146,11 @@ impl<'a> AggregationSet<'a> {
             match state {
                 State::CountAll => {}
                 State::CountNonNullMask(nulls, output) => {
-                    if use_prefix {
+                    // ELI5: a mask-only scan is cheap, while a count prefix
+                    // writes every running total. Measurements show that
+                    // the sum cutoff pays for that setup too early for
+                    // counts, so retain the existing conservative cutoff.
+                    if use_tree {
                         #[cfg(test)]
                         PREFIX_COUNT_HITS.with(|hits| hits.set(hits.get() + 1));
                         let mut prefix = vec![0_i64; packed_layout.length + 1];
