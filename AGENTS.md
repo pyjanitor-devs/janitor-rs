@@ -1505,3 +1505,34 @@ negative indices as invalid input.
 narrowing, preserve negative windows as inactive rows, and skip them in every
 later materialization or aggregation loop. Add or retain regression coverage
 for a mix of active and `-1` windows.
+
+### [2026-10-16] Bound dense region-label tables by occupied positions too
+
+**Context**: Issue #247 replaces hash-based region-label compression with a
+dense label-indexed table. A selective dual-region fixture produced only one
+nonzero right label, but that label was near `left.len()`; sizing solely from
+the producer bound allocated and cleared a large mostly empty table and made
+the existing 100K-row traversal benchmark about 4% slower.
+**Learning**: Region labels are bounded by the number of left rows, but that
+does not imply the label space is dense in a selective right layout. The table
+size must also be proportional to the number of nonzero right positions.
+**Recommendation**: Use the dense compression path only when the maximum label
+is within a small multiple of both `left.len()` and the nonzero right-position
+count. For large inputs, let a bounded nonzero-label probe finish the sparse
+map directly when it reaches the end; this avoids scanning a selective layout
+twice. Preserve the sparse fallback and benchmark a selective high-label case
+as well as the dense headline case.
+
+### [2026-10-17] Choose active-rank storage from visible positions
+
+**Context**: The issue #247 near-unique benchmark strongly favored dense active
+counts when all 10M ranks entered the sweep, but a 10M-rank layout with only
+1,000 visible positions favored `BTreeMap` (25us versus 318us locally, median
+of five release-mode samples).
+**Learning**: Total compressed ranks can greatly exceed the ranks any first-
+predicate window can activate. `RankedRegionPositionLayout::positions.len()`
+is a safe upper bound on distinct active ranks and is a better density signal
+than total right rows.
+**Recommendation**: Use dense counts and bitsets when rank count is within a
+small multiple of visible positions; retain sorted sparse counts otherwise.
+
