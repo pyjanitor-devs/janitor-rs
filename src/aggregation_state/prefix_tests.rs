@@ -176,6 +176,70 @@ fn prefix_packed_disjoint_spans_cancel_earlier_overflow() {
 }
 
 #[test]
+fn prefix_offsets_hold_across_many_disjoint_spans_for_narrow_dtypes() {
+    // ELI5: four separate roads of lengths 3, 1, 6 and 2 share one odometer
+    // log. Each later road starts at the previous roads' combined length, so
+    // an off-by-one offset would shift every reading after the first gap.
+    // The spans are [1, 4), [6, 7), [9, 15) and [18, 20); queries never
+    // touch the gaps, and maxima in the first span force early wraparound.
+    let mut windows = vec![(2, 4), (9, 12), (10, 15), (18, 19)];
+    for _ in 0..5 {
+        windows.extend([(1, 4), (6, 7), (9, 15), (18, 20)]);
+    }
+    let nulls = Array1::from_iter((0..21).map(|i| i % 5 == 2));
+    let unsigned = Array1::from_iter((0..21_u64).map(|i| if i < 4 { u64::MAX } else { i * 37 }));
+    macro_rules! check {
+        ($typ:ty, $variant:ident) => {{
+            let values = Array1::from_iter((0..21).map(|i| {
+                if i < 4 {
+                    <$typ>::MAX
+                } else {
+                    (i * 7 % 11) as $typ
+                }
+            }));
+            let mk = || AggregationSet {
+                states: vec![
+                    State::Sum(
+                        View {
+                            values: Values::$variant(values.view()),
+                            nulls: nulls.view(),
+                        },
+                        vec![0; windows.len()],
+                    ),
+                    State::SumU64(unsigned.view(), nulls.view(), vec![0; windows.len()]),
+                ],
+                output_len: windows.len(),
+                source_len: 21,
+                count_all: None,
+                matched: Some(vec![false; windows.len()]),
+                successful: false,
+            };
+            let (mut actual, mut reference) = (mk(), mk());
+            for (row, &(start, end)) in windows.iter().enumerate() {
+                for position in start..end {
+                    reference.update(position as usize, row);
+                }
+            }
+            let starts = Array1::from_iter(windows.iter().map(|&(s, _)| s));
+            let ends = Array1::from_iter(windows.iter().map(|&(_, e)| e));
+            let before = PREFIX_SUM_HITS.get();
+            actual.aggregate_starts_ends(starts.view(), ends.view());
+            assert_eq!(PREFIX_SUM_HITS.get(), before + 2, stringify!($typ));
+            for (a, e) in actual.states.iter().zip(&reference.states) {
+                match (a, e) {
+                    (State::Sum(_, a), State::Sum(_, e)) => assert_eq!(a, e, stringify!($typ)),
+                    (State::SumU64(_, _, a), State::SumU64(_, _, e)) => assert_eq!(a, e),
+                    _ => unreachable!(),
+                }
+            }
+        }};
+    }
+    check!(i64, I64);
+    check!(i8, I8);
+    check!(u32, U32);
+}
+
+#[test]
 fn prefix_signed_state_widens_every_integer_source_representation() {
     macro_rules! check {
         ($typ:ty, $variant:ident) => {{
