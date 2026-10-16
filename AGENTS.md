@@ -431,15 +431,13 @@ work, while one width-eight query makes that regression obvious.
 
 ## Learned Patterns
 
-### [2026-10-16] Measure operation-specific guards and retain direct cases
+### [2026-10-16] Retain direct cases when enlarging optimized-route fixtures
 
-A prefix data structure does not justify sharing the integer-sum cutoff with
-mask counts. Count-only and mixed benchmarks found that the lower sum cutoff
-regressed mask counting; retain its conservative cutoff until separate tuning
-has measured benefits. See `benches/integer_prefix.md`. When enlarging an
-integration fixture to exercise an optimized route, retain its original small
-direct-path case and assert the branch-counter delta for both cases.
-Keep instrumentation scoped to the optimization paths changed by the PR.
+Mask counts keep the conservative tree cutoff; see "Cost-model reasoning is not
+benchmark evidence" below and `benches/integer_prefix.md` for the measurements.
+When enlarging an integration fixture to exercise an optimized route, retain its
+original small direct-path case and assert the branch-counter delta for both
+cases. Keep instrumentation scoped to the optimization paths changed by the PR.
 
 ### [2026-10-16] Keep agent workflow documents out of pull requests
 
