@@ -251,8 +251,8 @@ def main():
             bits = np.arange(n, dtype=np.uint64) * np.uint64(0x9E3779B97F4A7C15)
             values = bits.view(np.int64) if dtype == "int64" else bits
             if name == "million_queries":
-                # Constant MAX payloads give an independent closed-form
-                # oracle for every row without a billion-element rescan.
+                # Constant MAX payloads plus cumulative valid counts give an
+                # independent oracle without a billion-element rescan.
                 values.fill(np.iinfo(dtype).max)
                 valid_prefix = np.concatenate(([0], np.cumsum(~nulls, dtype=np.int64)))
                 valid = valid_prefix[ends] - valid_prefix[starts]
