@@ -31,6 +31,7 @@ use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
     predicates_match_dispatch, NullMetadataView, Predicate, PredicateView,
 };
+use crate::range_join::adaptive_extreme_positions;
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
 #[cfg(test)]
@@ -806,6 +807,54 @@ pub fn equi_range_indices<'py>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Materialize equality-window matches after range and residual filtering.
+///
+/// `starts` and `ends` describe one half-open right-side candidate window for
+/// each compact left row. The function has three intentionally separate
+/// paths: `Keep::All` emits every surviving pair, `Keep::First`/`Keep::Last`
+/// with residuals scans candidates because each candidate must be checked, and
+/// the no-residual `First`/`Last` case reduces each exact window to one
+/// physical extreme using the adaptive direct-scan/segment-tree helper.
+///
+/// ELI5: when there are extra rules, we must interview every candidate before
+/// choosing one. When there are no extra rules, the first/last answer is just
+/// the smallest/largest physical label on that shelf, so a shared shelf index
+/// can answer many overlapping rows more cheaply.
+///
+/// # Arguments
+///
+/// * `left_index` - Physical labels for compact left rows; output left labels
+///   are read from this array.
+/// * `right_index` - Physical labels for the prepared right layout; output
+///   right labels and extrema comparisons are read from this array.
+/// * `starts` - Inclusive right-window offsets, aligned with `left_index`.
+/// * `ends` - Exclusive right-window offsets, aligned with `left_index`.
+/// * `residual_predicates` - Predicates that must be evaluated for each
+///   candidate after the range windows have been built.
+/// * `null_metadata` - Optional null masks used by residual predicate dispatch.
+/// * `additional_range` - Optional extra range predicate that must be checked
+///   for each candidate; its presence disables the extrema shortcut.
+/// * `keep` - Emit all matches, one first/last physical label, or the first
+///   passing candidate for `Any`.
+///
+/// # Caller contract
+///
+/// The calling core checks parallel-array lengths and input bounds before
+/// range narrowing. Negative prepared bounds mark inactive rows and are
+/// skipped, as are valid empty windows. The `All` path relies on that caller
+/// validation; the other paths share one signed-window check before selecting
+/// or batching candidates. The adaptive helper also checks its native unsigned
+/// window contract before allocating a tree.
+///
+/// # Returns
+///
+/// `None` when no pair survives. Otherwise returns parallel physical left and
+/// right labels in the order required by the selected `keep` policy.
+///
+/// # Errors
+///
+/// Returns an error for invalid signed window bounds, bounds beyond the right
+/// layout, or an internal result/tree allocation overflow.
 fn materialize_equi_windows_and_residuals(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
@@ -824,7 +873,11 @@ fn materialize_equi_windows_and_residuals(
                 .map(|view| view.matches(row, right_position))
                 .unwrap_or(true)
     };
+
     if keep == Keep::All {
+        // Keep::All cannot use an extrema query because every candidate must
+        // be emitted. The first pass sizes the output exactly, avoiding
+        // repeated reallocations during the second pass.
         let mut output_capacity = 0_usize;
         for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
             if start < 0 || end < 0 {
@@ -857,14 +910,36 @@ fn materialize_equi_windows_and_residuals(
         return Ok(Some((left_output, right_output)));
     }
 
+    let use_extrema = residual_predicates.is_empty()
+        && additional_range.is_none()
+        && matches!(keep, Keep::First | Keep::Last);
+    // Reserve once from the known row bound only for the adaptive batch.
+    // Residual/any paths scan immediately and do not allocate these buffers.
+    let batch_capacity = if use_extrema { starts.len() } else { 0 };
+    let mut rows = Vec::with_capacity(batch_capacity);
+    let mut ranges = Vec::with_capacity(batch_capacity);
     let mut left_output = Vec::with_capacity(left_index.len());
     let mut right_output = Vec::with_capacity(left_index.len());
     for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
-        if start < 0 || end <= start {
+        if start < 0 || end < 0 {
+            // ELI5: a negative shelf number means "no shelf for this row".
+            // Skip it before converting to usize, where -1 would look huge.
+            continue;
+        }
+        let (start, end) = validate_start_end(start, end, right_index.len())?;
+        if start == end {
+            continue;
+        }
+        if use_extrema {
+            // ELI5: keep each surviving row beside its shelf coordinates.
+            // Both selection paths share the sentinel/validation loop above;
+            // only a batch with no extra rules can reuse extrema summaries.
+            rows.push(row);
+            ranges.push((start, end));
             continue;
         }
         let mut selected = None;
-        for right_position in start as usize..end as usize {
+        for right_position in start..end {
             if !matches(row, right_position) {
                 continue;
             }
@@ -873,6 +948,13 @@ fn materialize_equi_windows_and_residuals(
             }
         }
         if let Some(right_position) = selected {
+            left_output.push(left_index[row]);
+            right_output.push(right_index[right_position]);
+        }
+    }
+    if use_extrema {
+        let selected = adaptive_extreme_positions(right_index, &ranges, keep == Keep::First)?;
+        for (row, right_position) in rows.into_iter().zip(selected) {
             left_output.push(left_index[row]);
             right_output.push(right_index[right_position]);
         }
@@ -2572,6 +2654,107 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(last.1, vec![8]);
+    }
+
+    #[test]
+    fn extrema_and_scans_preserve_inactive_window_alignment() {
+        use crate::range_join::EXTREME_TREE_HITS;
+        let left = Array1::from_iter(10..16);
+        let right = Array1::from_vec(vec![4, 1, 3, 2]);
+        let starts = Array1::from_vec(vec![-1, 0, 4, 1, 0, 3]);
+        let ends = Array1::from_vec(vec![4, -1, 4, 3, 0, 4]);
+        for (keep, expected) in [
+            (Keep::First, vec![1, 2]),
+            (Keep::Last, vec![3, 2]),
+            (Keep::Any, vec![1, 2]),
+        ] {
+            let before = EXTREME_TREE_HITS.get();
+            assert_eq!(
+                materialize_equi_windows(
+                    left.view(),
+                    right.view(),
+                    starts.view(),
+                    ends.view(),
+                    keep
+                )
+                .unwrap(),
+                Some((vec![13, 15], expected))
+            );
+            assert_eq!(EXTREME_TREE_HITS.get(), before, "small workloads must scan");
+        }
+        for (start, end, message) in [
+            (4, 5, "end exceeds right index length"),
+            (5, 5, "end exceeds right index length"),
+            (3, 2, "start must not exceed end"),
+        ] {
+            for keep in [Keep::First, Keep::Last, Keep::Any] {
+                assert_eq!(
+                    materialize_equi_windows(
+                        left.slice(numpy::ndarray::s![..1]),
+                        right.view(),
+                        numpy::ndarray::ArrayView1::from(&[start]),
+                        numpy::ndarray::ArrayView1::from(&[end]),
+                        keep
+                    ),
+                    Err(message.to_owned())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn broad_equi_windows_use_adaptive_extrema() {
+        use crate::range_join::EXTREME_TREE_HITS;
+        let left = Array1::from_iter(100_i64..164);
+        let right =
+            Array1::from_iter((0..1_024).map(|position| ((position * 7919) % 1_024) as i64));
+        let starts = Array1::from_iter((0..64).map(|row| (row * 8) as i64));
+        let ends = Array1::from_iter((0..64).map(|row| (row * 8 + 512) as i64));
+
+        let before = EXTREME_TREE_HITS.get();
+        let first = materialize_equi_windows(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            Keep::First,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(EXTREME_TREE_HITS.get(), before + 1);
+        let last = materialize_equi_windows(
+            left.view(),
+            right.view(),
+            starts.view(),
+            ends.view(),
+            Keep::Last,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(EXTREME_TREE_HITS.get(), before + 2);
+
+        let expected_first = (0..64)
+            .map(|row| {
+                right.as_slice().unwrap()[row * 8..row * 8 + 512]
+                    .iter()
+                    .copied()
+                    .min()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let expected_last = (0..64)
+            .map(|row| {
+                right.as_slice().unwrap()[row * 8..row * 8 + 512]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first.0, left.to_vec());
+        assert_eq!(first.1, expected_first);
+        assert_eq!(last.0, left.to_vec());
+        assert_eq!(last.1, expected_last);
     }
 
     #[test]

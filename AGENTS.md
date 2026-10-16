@@ -417,6 +417,23 @@ work, while one width-eight query makes that regression obvious.
 
 ## Learned Patterns
 
+### [2026-10-15] Distinguish a window hull from its union
+
+The extrema tree in `range_join.rs` covers the contiguous hull from the
+smallest start to the largest end, including unqueried gaps. Call this a hull,
+not a union or packed span; removing those gaps is separate work in #251.
+
+### [2026-10-15] Isolate adaptive branch evidence and measure performance claims
+
+**Context**: Review of PR #250 found a shared atomic branch counter that could
+be incremented by another parallel test, and an equi test that checked output
+without proving its own tree branch ran.
+**Recommendation**: Use test-only thread-local `Cell` counters, asserting the
+exact delta around each optimized call in every integration path. Pass native
+`usize` windows directly to range helpers instead of converting through signed
+arrays. Include reproducible direct/adaptive timings in performance PRs, and
+verify issue state and commit references before publishing their descriptions.
+
 ### [2026-10-12] Dual-region keep selection uses right-index values
 
 For the standalone dual-region index builder, `keep="first"` and
