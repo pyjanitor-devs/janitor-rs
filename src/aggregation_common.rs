@@ -25,6 +25,19 @@ pub(crate) mod adaptive {
             && total_width > array_len.saturating_mul(RUNNING_WORK_FACTOR)
     }
 
+    /// ELI5: build one running total per packed source value, then read two
+    /// entries per query. Keep tiny batches direct and require saved visits
+    /// to pay for both passes. Saturation makes this cost estimate safe.
+    pub(crate) fn should_use_prefix_difference(
+        query_count: usize,
+        total_width: usize,
+        packed_len: usize,
+    ) -> bool {
+        query_count > MAX_DIRECT_QUERY_COUNT
+            && packed_len > 0
+            && total_width > packed_len.saturating_add(query_count.saturating_mul(2))
+    }
+
     pub(crate) fn should_use_segment_tree(
         query_count: usize,
         total_width: usize,

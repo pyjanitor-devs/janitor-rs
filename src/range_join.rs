@@ -3027,29 +3027,29 @@ mod aggregation_tests {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
             let predicates = PyList::empty(py);
-            let left_index = PyArray1::from_vec(py, vec![100_i64]);
-            let right_index = PyArray1::from_vec(py, vec![10_i64, 20]);
-            // Both anchors select both right rows.  Keeping the right layout
-            // tiny makes the expected wrapping arithmetic obvious.
+            let left_index = PyArray1::from_vec(py, vec![100_i64, 101, 102, 103]);
+            let right_index = PyArray1::from_vec(py, vec![10_i64, 20, 30, 40, 50]);
+            // Both anchors select all five rows. Keeping the right layout
+            // small makes the expected wrapping arithmetic obvious.
             predicates.append(PyTuple::new(
                 py,
                 [
-                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
-                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64; 4]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 3, 4]).into_any(),
                     "<=".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
             predicates.append(PyTuple::new(
                 py,
                 [
-                    PyArray1::from_vec(py, vec![0_i64]).into_any(),
-                    PyArray1::from_vec(py, vec![0_i64, 1]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64; 4]).into_any(),
+                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 3, 4]).into_any(),
                     "<=".into_pyobject(py)?.into_any(),
                 ],
             )?)?;
 
-            let values = PyArray1::from_vec(py, vec![i64::MAX, 2]);
-            let nulls = PyArray1::from_vec(py, vec![false, false]);
+            let values = PyArray1::from_vec(py, vec![i64::MAX, 2, 1, 1, 1]);
+            let nulls = PyArray1::from_vec(py, vec![false; 5]);
             let aggregations = PyList::new(
                 py,
                 [
@@ -3071,6 +3071,7 @@ mod aggregation_tests {
                     )?,
                 ],
             )?;
+            let prefix_before = crate::aggregation_state::PREFIX_SUM_HITS.get();
             let result = call_range_join_aggregate(
                 py,
                 &predicates,
@@ -3080,15 +3081,19 @@ mod aggregation_tests {
                 false,
             )?
             .expect("the overflow fixture has matches");
+            assert_eq!(
+                crate::aggregation_state::PREFIX_SUM_HITS.get(),
+                prefix_before + 1
+            );
             let outputs_item = result.get_item(1)?;
             let outputs = outputs_item.cast::<PyList>()?;
             assert_eq!(
                 outputs.get_item(0)?.extract::<Vec<i64>>()?,
-                vec![i64::MAX.wrapping_add(2)]
+                vec![i64::MAX.wrapping_add(5); 4]
             );
             assert_eq!(
                 outputs.get_item(1)?.extract::<Vec<i64>>()?,
-                vec![i64::MAX.wrapping_mul(2)]
+                vec![i64::MAX.wrapping_mul(2); 4]
             );
             Ok(())
         })
