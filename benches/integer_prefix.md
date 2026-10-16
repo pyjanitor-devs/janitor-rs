@@ -91,13 +91,12 @@ writes each prefix entry once. The new results are recorded as
 `run=register_recheck_*` in the CSV; the pre-fix regression is resolved for
 these Python-level workloads.
 
-The same patched wheel was also checked with a fixed random 10% null mask
-instead of the regular every-tenth mask. Across 101 alternating samples, the
-baseline/proposed ratios were **1.64x signed** and **1.31x u64** for unique
-keys, and **1.57x signed** and **1.22x u64** for duplicate keys. All four
-comparisons matched direct masked NumPy oracles. These results are recorded as
-`run=random_nulls_recheck` in the CSV; the one-off check did not collect
-tracemalloc peaks, so those CSV peak fields are zero.
+The committed harness also supports `--random-nulls`, which uses
+`np.random.default_rng(246)` to place a fixed random 10% null mask. Across 101
+alternating samples, the baseline/proposed ratios were **1.45x signed** and
+**1.15x u64** for unique keys, and **1.36x signed** and **1.08x u64** for
+duplicate keys. All four comparisons matched direct masked NumPy oracles.
+These results are recorded as `run=random_nulls_recheck` in the CSV.
 
 The compact-group signed measurement was unstable in the full run: **0.101 ms
 base / 0.682 ms proposed**. An isolated 101-sample paired recheck measured

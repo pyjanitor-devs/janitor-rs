@@ -49,6 +49,11 @@ def main():
     parser.add_argument("--repeats", type=int, default=11)
     parser.add_argument("--case", action="append", help="Restrict to named fixtures")
     parser.add_argument(
+        "--random-nulls",
+        action="store_true",
+        help="Use a fixed random 10%% null mask (seed 246) instead of every tenth value",
+    )
+    parser.add_argument(
         "--endpoint", action="append", choices=["pyo3", "join_agg", "range_join_agg"]
     )
     args = parser.parse_args()
@@ -185,6 +190,8 @@ def main():
             ),
         ]
     )
+
+    random_nulls = np.random.default_rng(246) if args.random_nulls else None
     million_starts = (np.arange(1048576, dtype=np.int64) * 7919) % (1048576 - 2000 + 1)
     fixtures.append(
         ("million_queries", 1048576, million_starts, million_starts + 2000, 1, False)
@@ -231,7 +238,11 @@ def main():
         total_width = int(np.sum(ends - starts))
         tree = q > 3 and total_width > 5 * packed + 2 * q * (packed - 1).bit_length()
         prefix = q > 3 and total_width > packed + 2 * q
-        nulls = np.arange(n) % 10 == 0
+        nulls = (
+            random_nulls.random(n) < 0.1
+            if random_nulls is not None
+            else np.arange(n) % 10 == 0
+        )
         keys = np.arange(n, dtype=np.int64) // repeat
         dtypes = ["int64"] if args.aggregation == "count" else ["int64", "uint64"]
         for dtype in dtypes:
