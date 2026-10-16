@@ -2055,6 +2055,7 @@ mod tests {
                 ],
             )?;
 
+            let prefix_before = crate::aggregation_state::PREFIX_SUM_HITS.get();
             EQUI_STARTS_ENDS_HITS.with(|hits| hits.set(0));
             let result = equi_aggregate(
                 py,
@@ -2070,6 +2071,10 @@ mod tests {
             )?
             .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
             EQUI_STARTS_ENDS_HITS.with(|hits| assert!(hits.get() > 0));
+            assert_eq!(
+                crate::aggregation_state::PREFIX_SUM_HITS.get(),
+                prefix_before + 1
+            );
 
             assert_eq!(result.get_item(1)?.extract::<Vec<bool>>()?, vec![true; 24]);
             let outputs_item = result.get_item(2)?;

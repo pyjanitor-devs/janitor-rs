@@ -35,7 +35,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::aggregation_common::adaptive::{
-    should_use_running_aggregation, should_use_segment_tree, MAX_DIRECT_QUERY_COUNT,
+    should_use_prefix_difference, should_use_running_aggregation, should_use_segment_tree,
+    MAX_DIRECT_QUERY_COUNT,
 };
 use crate::aggregation_common::ensure_equal_lengths;
 
@@ -1091,46 +1092,15 @@ impl<'a> AggregationSet<'a> {
 
     /// Aggregate explicit half-open ranges supplied by a starts/ends path.
     ///
-    /// Starts-only and ends-only ranges can use one-dimensional suffix or
-    /// prefix tables. An arbitrary starts/ends pair cannot generally share
-    /// either table, so this method deliberately preserves the simple direct
-    /// range walk. That walk is also the numerically correct choice for
-    /// floating-point reductions because it retains source encounter order.
-    ///
-    /// For broad batches, associative integer operations and min/max use one
-    /// iterative segment tree over the disjoint queried spans packed end
-    /// to end. For:
-    ///
-    /// ```text
-    /// right = [2, 3, 4, 5, 1, 6, 7, 8]
-    /// range = [1..6) = [3, 4, 5, 1, 6]
-    /// ```
-    ///
-    /// normal iteration produces sum `19`, product `360`, minimum position
-    /// `4`, and maximum position `5`.
-    ///
-    /// The tree first summarizes blocks:
-    ///
-    /// ```text
-    /// block 0..2: sum 5,  product 6,   min position 0, max position 1
-    /// block 2..4: sum 9,  product 20,  min position 2, max position 3
-    /// block 4..6: sum 7,  product 6,   min position 4, max position 5
-    /// block 6..8: sum 15, product 56,  min position 6, max position 7
-    /// block 0..4: sum 14, product 120, min position 0, max position 3
-    /// block 4..8: sum 22, product 336, min position 4, max position 7
-    /// ```
-    ///
-    /// It answers `[1..6)` by combining complete pieces:
-    ///
-    /// ```text
-    /// [1..6) = [1..2) + [2..4) + [4..6)
-    ///         -> sum 3 + 9 + 7 = 19
-    ///         -> product 3 * 20 * 6 = 360
-    ///         -> min position 4, max position 5
-    /// ```
-    ///
-    /// This is equivalent to normal iteration, but broad overlapping ranges
-    /// reuse the summaries instead of rescanning every source element.
+    /// ELI5: integer sums can subtract two running totals, like finding a
+    /// trip's distance from two odometer readings. Wrapping subtraction still
+    /// works when the odometer rolls over. A prefix table covers only the
+    /// disjoint queried spans packed end to end; each sum takes two lookups.
+    /// For example, `[i64::MAX, 1, 4]` has wrapping prefix totals
+    /// `[0, i64::MAX, i64::MIN, i64::MIN + 4]`. Subtracting totals at
+    /// boundaries 1 and 3 wraps back to `5`, the sum of `[1, 4]`.
+    /// Products and extrema use segment trees for broad batches, while float
+    /// reductions retain direct source order for numerical parity.
     pub(crate) fn aggregate_starts_ends(
         &mut self,
         starts: ArrayView1<'_, i64>,
@@ -1145,10 +1115,9 @@ impl<'a> AggregationSet<'a> {
             ranges.push(range);
         }
         self.mark_ranges(&ranges);
-        // Starts/ends requests may describe arbitrary overlapping intervals.
-        // Unlike starts-only and ends-only requests, they cannot be answered
-        // by one prefix or suffix table. We therefore estimate the total
-        // direct interval width before selecting the segment-tree strategy.
+        // Estimate direct traversal work before choosing reusable summaries.
+        // Integer sums use prefix differences; products and extrema require
+        // trees because their summaries cannot generally be subtracted.
         let mut width = 0_usize;
         for (start, end) in ranges.iter().flatten() {
             // `None` rows are invalid or empty and have no source positions
@@ -1168,14 +1137,19 @@ impl<'a> AggregationSet<'a> {
         // estimate its build cost using the compact span it will actually
         // materialize, not the full source array.
         let use_tree = should_use_segment_tree(ranges.len(), width, packed_layout.length);
+        let use_prefix = should_use_prefix_difference(ranges.len(), width, packed_layout.length);
 
         // Dispatch all requested reductions over the same set of ranges. The
-        // associative integer and extreme operations may use the tree; float
-        // reductions intentionally retain direct source order.
+        // integer sums may use prefix differences, products and extrema a
+        // tree; float reductions retain direct source order.
         for state in &mut self.states {
             match state {
                 State::CountAll => {}
                 State::CountNonNullMask(nulls, output) => {
+                    // ELI5: a mask-only scan is cheap, while a count prefix
+                    // writes every running total. Measurements show that
+                    // the sum cutoff pays for that setup too early for
+                    // counts, so retain the existing conservative cutoff.
                     if use_tree {
                         let mut prefix = vec![0_i64; packed_layout.length + 1];
                         for (cluster, &(span_start, span_end)) in queried_spans.iter().enumerate() {
@@ -1202,22 +1176,15 @@ impl<'a> AggregationSet<'a> {
                     }
                 }
                 State::Sum(view, output) => {
-                    if use_tree {
-                        update_signed_segment_ranges(view, output, &ranges, &packed_layout, false);
+                    if use_prefix {
+                        update_signed_prefix_ranges(view, output, &ranges, &packed_layout);
                     } else {
                         update_signed_ranges(view, output, &ranges, false);
                     }
                 }
                 State::SumU64(values, nulls, output) => {
-                    if use_tree {
-                        update_u64_segment_ranges(
-                            values,
-                            nulls,
-                            output,
-                            &ranges,
-                            &packed_layout,
-                            false,
-                        );
+                    if use_prefix {
+                        update_u64_prefix_ranges(values, nulls, output, &ranges, &packed_layout);
                     } else {
                         update_u64_ranges(values, nulls, output, &ranges, false);
                     }
@@ -1230,20 +1197,19 @@ impl<'a> AggregationSet<'a> {
                 }
                 State::Product(view, output) => {
                     if use_tree {
-                        update_signed_segment_ranges(view, output, &ranges, &packed_layout, true);
+                        update_signed_product_segment_ranges(view, output, &ranges, &packed_layout);
                     } else {
                         update_signed_ranges(view, output, &ranges, true);
                     }
                 }
                 State::ProductU64(values, nulls, output) => {
                     if use_tree {
-                        update_u64_segment_ranges(
+                        update_u64_product_segment_ranges(
                             values,
                             nulls,
                             output,
                             &ranges,
                             &packed_layout,
-                            true,
                         );
                     } else {
                         update_u64_ranges(values, nulls, output, &ranges, true);
@@ -2203,8 +2169,8 @@ fn assign_range_clusters(
         .collect()
 }
 
-/// Coordinates for one segment tree whose leaves are the queried spans laid
-/// end to end, with unqueried gaps omitted.
+/// Coordinates for prefix tables and trees over queried spans laid end to
+/// end, with unqueried gaps omitted.
 struct PackedSpanLayout<'a> {
     spans: &'a [(usize, usize)],
     clusters: &'a [Option<usize>],
@@ -2244,30 +2210,112 @@ impl<'a> PackedSpanLayout<'a> {
     }
 }
 
-/// Answer arbitrary integer ranges with an iterative segment tree.
+/// Answer signed sums with wrapping differences over the packed queried spans.
 ///
-/// Range-only starts/ends queries cannot use one prefix or suffix table, but
-/// broad batches still benefit from sharing work between overlapping ranges.
-/// The tree stores the associative operation (wrapping sum or product) at
-/// each internal node and answers each half-open range in logarithmic time.
-///
-/// The iterative layout is compact and beginner-friendly once its indexing
-/// rule is understood: leaves live at `tree[length + position]`, and each
-/// parent at `tree[node]` combines children `tree[2 * node]` and
-/// `tree[2 * node + 1]`. This avoids a recursive allocation for every node.
-fn update_signed_segment_ranges(
+/// ELI5: pack only the roads actually traveled into one running-distance log.
+/// Earlier spans cancel when two readings from a later span are subtracted,
+/// even if the accumulated total wraps around. Nulls add zero, and ndarray
+/// indexing preserves logical positions for strided sources and masks.
+fn update_signed_prefix_ranges(
     view: &View<'_>,
     output: &mut [i64],
     ranges: &[Option<(usize, usize)>],
     layout: &PackedSpanLayout<'_>,
-    product: bool,
+) {
+    #[cfg(test)]
+    PREFIX_SUM_HITS.with(|hits| hits.set(hits.get() + 1));
+    let mut prefix = vec![0_i64; layout.length + 1];
+    match &view.values {
+        Values::I64(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p]),
+        Values::I32(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p] as i64),
+        Values::I16(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p] as i64),
+        Values::I8(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p] as i64),
+        Values::U32(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p] as i64),
+        Values::U16(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p] as i64),
+        Values::U8(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p] as i64),
+        Values::U64(_) | Values::F64(_) | Values::F32(_) => {
+            unreachable!("signed integer state must contain non-u64 integer values")
+        }
+    }
+    for (row, range) in ranges.iter().enumerate() {
+        if let Some((start, end)) = layout.data_range(row, *range) {
+            output[row] = prefix[end].wrapping_sub(prefix[start]);
+        }
+    }
+}
+
+/// Fill a wrapping signed prefix table with the dtype read hoisted out of the loop.
+///
+/// ELI5: keep the running total in a pocket instead of reading the previous
+/// table entry back for every source value; write each new total once.
+fn fill_signed_prefix(
+    prefix: &mut [i64],
+    nulls: &ArrayView1<'_, bool>,
+    layout: &PackedSpanLayout<'_>,
+    get: impl Fn(usize) -> i64,
+) {
+    let mut running = 0_i64;
+    for (cluster, &(start, end)) in layout.spans.iter().enumerate() {
+        let offset = layout.offsets[cluster];
+        for position in start..end {
+            let value = if nulls[position] { 0 } else { get(position) };
+            running = running.wrapping_add(value);
+            prefix[offset + position - start + 1] = running;
+        }
+    }
+}
+
+/// Preserve the full unsigned width, including values above `i64::MAX`.
+/// ELI5: this uses the same rolling odometer as the signed prefix helper,
+/// but keeps unsigned readings throughout so no high bits are lost.
+fn update_u64_prefix_ranges(
+    values: &ArrayView1<'_, u64>,
+    nulls: &ArrayView1<'_, bool>,
+    output: &mut [u64],
+    ranges: &[Option<(usize, usize)>],
+    layout: &PackedSpanLayout<'_>,
+) {
+    #[cfg(test)]
+    PREFIX_SUM_HITS.with(|hits| hits.set(hits.get() + 1));
+    let mut prefix = vec![0_u64; layout.length + 1];
+    let mut running = 0_u64;
+    for (cluster, &(start, end)) in layout.spans.iter().enumerate() {
+        let offset = layout.offsets[cluster];
+        for position in start..end {
+            let value = if nulls[position] { 0 } else { values[position] };
+            running = running.wrapping_add(value);
+            prefix[offset + position - start + 1] = running;
+        }
+    }
+    for (row, range) in ranges.iter().enumerate() {
+        if let Some((start, end)) = layout.data_range(row, *range) {
+            output[row] = prefix[end].wrapping_sub(prefix[start]);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PREFIX_SUM_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Answer arbitrary integer products with an iterative segment tree.
+///
+/// ELI5: products cannot undo earlier factors by division: a zero erases the
+/// answer, and wrapping multiplication loses information for even factors.
+/// The tree instead combines reusable blocks in logarithmic query time.
+/// Leaves live at `tree[length + position]`; each parent combines its two
+/// children at `tree[2 * node]` and `tree[2 * node + 1]`.
+fn update_signed_product_segment_ranges(
+    view: &View<'_>,
+    output: &mut [i64],
+    ranges: &[Option<(usize, usize)>],
+    layout: &PackedSpanLayout<'_>,
 ) {
     let length = layout.length;
 
-    // Start every leaf with the operation identity. A null value must not
-    // change a sum or product, so null leaves are zero for addition and one
-    // for multiplication.
-    let mut tree = vec![if product { 1_i64 } else { 0_i64 }; length * 2];
+    // A null must not change a product, so null leaves start at one.
+    let mut tree = vec![1_i64; length * 2];
 
     // Install valid source values in the leaf half of the tree. The boolean
     // mask is authoritative; the numeric value is never inspected for
@@ -2284,11 +2332,7 @@ fn update_signed_segment_ranges(
     // Build larger block summaries from the leaves upward. After this pass,
     // each tree node represents one contiguous half-open source block.
     for node in (1..length).rev() {
-        tree[node] = if product {
-            tree[node * 2].wrapping_mul(tree[node * 2 + 1])
-        } else {
-            tree[node * 2].wrapping_add(tree[node * 2 + 1])
-        };
+        tree[node] = tree[node * 2].wrapping_mul(tree[node * 2 + 1]);
     }
 
     // Answer each requested range independently. `None` means that the
@@ -2300,7 +2344,7 @@ fn update_signed_segment_ranges(
 
         // `packed_range` has already mapped the caller's source boundaries
         // into the leaf portion of the flat tree.
-        let mut total = if product { 1_i64 } else { 0_i64 };
+        let mut total = 1_i64;
 
         // Move both boundaries toward their common parent. Whenever a
         // boundary identifies a complete child block, consume that block and
@@ -2308,20 +2352,12 @@ fn update_signed_segment_ranges(
         // element twice.
         while start < end {
             if start & 1 == 1 {
-                total = if product {
-                    total.wrapping_mul(tree[start])
-                } else {
-                    total.wrapping_add(tree[start])
-                };
+                total = total.wrapping_mul(tree[start]);
                 start += 1;
             }
             if end & 1 == 1 {
                 end -= 1;
-                total = if product {
-                    total.wrapping_mul(tree[end])
-                } else {
-                    total.wrapping_add(tree[end])
-                };
+                total = total.wrapping_mul(tree[end]);
             }
             start /= 2;
             end /= 2;
@@ -2333,24 +2369,23 @@ fn update_signed_segment_ranges(
     }
 }
 
-/// Answer arbitrary `u64` ranges with wrapping segment-tree arithmetic.
+/// Answer arbitrary `u64` products with wrapping segment-tree arithmetic.
 ///
 /// This is intentionally separate from the signed implementation. A `u64`
 /// value may be larger than `i64::MAX`, so converting it would violate the
 /// output dtype contract. The tree layout and query algorithm are otherwise
 /// identical.
-fn update_u64_segment_ranges(
+fn update_u64_product_segment_ranges(
     values: &ArrayView1<'_, u64>,
     nulls: &ArrayView1<'_, bool>,
     output: &mut [u64],
     ranges: &[Option<(usize, usize)>],
     layout: &PackedSpanLayout<'_>,
-    product: bool,
 ) {
     let length = layout.length;
 
     // Null leaves begin at the neutral element for the selected operation.
-    let mut tree = vec![if product { 1_u64 } else { 0_u64 }; length * 2];
+    let mut tree = vec![1_u64; length * 2];
 
     // Copy only values whose mask says they are valid. No null inference is
     // performed from the u64 payload.
@@ -2365,11 +2400,7 @@ fn update_u64_segment_ranges(
 
     // Combine neighboring leaf blocks to build the reusable summaries.
     for node in (1..length).rev() {
-        tree[node] = if product {
-            tree[node * 2].wrapping_mul(tree[node * 2 + 1])
-        } else {
-            tree[node * 2].wrapping_add(tree[node * 2 + 1])
-        };
+        tree[node] = tree[node * 2].wrapping_mul(tree[node * 2 + 1]);
     }
 
     // Query every valid half-open range using the same two-boundary walk as
@@ -2382,23 +2413,15 @@ fn update_u64_segment_ranges(
         // `packed_range` has already translated source positions to leaf
         // positions. The end remains exclusive, so the query includes
         // exactly `start..end`.
-        let mut total = if product { 1_u64 } else { 0_u64 };
+        let mut total = 1_u64;
         while start < end {
             if start & 1 == 1 {
-                total = if product {
-                    total.wrapping_mul(tree[start])
-                } else {
-                    total.wrapping_add(tree[start])
-                };
+                total = total.wrapping_mul(tree[start]);
                 start += 1;
             }
             if end & 1 == 1 {
                 end -= 1;
-                total = if product {
-                    total.wrapping_mul(tree[end])
-                } else {
-                    total.wrapping_add(tree[end])
-                };
+                total = total.wrapping_mul(tree[end]);
             }
             start /= 2;
             end /= 2;
@@ -3064,7 +3087,9 @@ fn is_greater(view: &View<'_>, a: usize, b: usize) -> bool {
 mod tests {
     use super::{
         assign_range_clusters, kahan_add_f32, queried_source_spans, update_extreme_segment_ranges,
-        update_signed_segment_ranges, update_u64_segment_ranges, PackedSpanLayout, Values, View,
+        update_signed_prefix_ranges, update_signed_product_segment_ranges,
+        update_u64_prefix_ranges, update_u64_product_segment_ranges, PackedSpanLayout, Values,
+        View,
     };
     use numpy::ndarray::Array1;
 
@@ -3101,7 +3126,7 @@ mod tests {
         let layout = PackedSpanLayout::new(&spans, &clusters);
 
         let mut sums = vec![0_i64; ranges.len()];
-        update_signed_segment_ranges(&view, &mut sums, &ranges, &layout, false);
+        update_signed_prefix_ranges(&view, &mut sums, &ranges, &layout);
         let expected_sums: Vec<_> = ranges
             .iter()
             .map(|range| {
@@ -3116,29 +3141,27 @@ mod tests {
         assert_eq!(sums, expected_sums);
 
         let mut products = vec![1_i64; ranges.len()];
-        update_signed_segment_ranges(&view, &mut products, &ranges, &layout, true);
+        update_signed_product_segment_ranges(&view, &mut products, &ranges, &layout);
         assert_eq!(products, vec![231, 408_595, 1]);
 
         let unsigned = Array1::from_vec(vec![91_u64, 2, 7, 3, 11, 5, 13, 17, 19, 23, 29, 31]);
         let mut unsigned_sums = vec![0_u64; ranges.len()];
-        update_u64_segment_ranges(
+        update_u64_prefix_ranges(
             &unsigned.view(),
             &nulls.view(),
             &mut unsigned_sums,
             &ranges,
             &layout,
-            false,
         );
         assert_eq!(unsigned_sums, vec![21, 75, 0]);
 
         let mut unsigned_products = vec![1_u64; ranges.len()];
-        update_u64_segment_ranges(
+        update_u64_product_segment_ranges(
             &unsigned.view(),
             &nulls.view(),
             &mut unsigned_products,
             &ranges,
             &layout,
-            true,
         );
         assert_eq!(unsigned_products, vec![231, 408_595, 1]);
 
@@ -3152,13 +3175,16 @@ mod tests {
         let disjoint_clusters = assign_range_clusters(&disjoint_ranges, &disjoint_spans);
         let disjoint_layout = PackedSpanLayout::new(&disjoint_spans, &disjoint_clusters);
         let mut disjoint_sums = vec![0_i64; disjoint_ranges.len()];
-        update_signed_segment_ranges(
+        update_signed_prefix_ranges(
             &view,
             &mut disjoint_sums,
             &disjoint_ranges,
             &disjoint_layout,
-            false,
         );
         assert_eq!(disjoint_sums, vec![21, 60, 0]);
     }
 }
+
+#[cfg(test)]
+#[path = "aggregation_state/prefix_tests.rs"]
+mod prefix_tests;

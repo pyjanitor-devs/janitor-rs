@@ -431,6 +431,30 @@ work, while one width-eight query makes that regression obvious.
 
 ## Learned Patterns
 
+### [2026-10-16] Retain direct cases when enlarging optimized-route fixtures
+
+Mask counts keep the conservative tree cutoff; see "Cost-model reasoning is not
+benchmark evidence" below and `benches/integer_prefix.md` for the measurements.
+When enlarging an integration fixture to exercise an optimized route, retain its
+original small direct-path case and assert the branch-counter delta for both
+cases. Keep instrumentation scoped to the optimization paths changed by the PR.
+
+### [2026-10-16] Keep agent workflow documents out of pull requests
+
+Keep execution plans and standalone validation writeups local unless explicitly
+requested as PR artifacts. Put review and validation evidence in the PR description
+and retain reproducible benchmark results with the benchmarks.
+
+### [2026-10-16] Wrapping prefix differences work across packed spans
+
+Integer starts/ends sums use wrapping prefix differences over the packed union
+of queried spans. Do not reset the running sum between disjoint spans: earlier
+totals cancel under wrapping subtraction, and each query lies within one span.
+Cost this route against packed length plus query work; products still require
+trees, and float sums still require encounter-order accumulation. Prefix query
+work is linear in source coverage plus queries, but shared span construction
+still sorts the queries and is not linear overall.
+
 ### [2026-10-16] Cost-model reasoning is not benchmark evidence
 
 **Context**: A review of PR #252 recommended moving `CountNonNullMask` from
