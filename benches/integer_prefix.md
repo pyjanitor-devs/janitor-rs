@@ -95,8 +95,8 @@ The committed harness also supports `--random-nulls`. Each fixture gets its
 own reproducible mask from `np.random.default_rng([246, n, repeat])`, so the
 mask does not depend on which other fixtures are selected; the million-query
 oracle derives valid counts from that mask. Across 101 alternating samples, the
-baseline/proposed ratios were **1.45x signed** and **1.15x u64** for unique
-keys, and **1.36x signed** and **1.08x u64** for duplicate keys. All four
+baseline/proposed ratios were **1.43x signed** and **1.21x u64** for unique
+keys, and **1.37x signed** and **1.08x u64** for duplicate keys. All four
 comparisons matched direct masked NumPy oracles. These results are recorded as
 `run=random_nulls_recheck` in the CSV.
 
