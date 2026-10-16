@@ -2225,19 +2225,42 @@ fn update_signed_prefix_ranges(
     #[cfg(test)]
     PREFIX_SUM_HITS.with(|hits| hits.set(hits.get() + 1));
     let mut prefix = vec![0_i64; layout.length + 1];
-    for (cluster, &(start, end)) in layout.spans.iter().enumerate() {
-        let offset = layout.offsets[cluster];
-        for position in start..end {
-            let packed = offset + position - start;
-            prefix[packed + 1] = prefix[packed];
-            if !view.nulls[position] {
-                prefix[packed + 1] = prefix[packed].wrapping_add(as_i64(&view.values, position));
-            }
+    match &view.values {
+        Values::I64(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p]),
+        Values::I32(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p] as i64),
+        Values::I16(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p] as i64),
+        Values::I8(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p] as i64),
+        Values::U32(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p] as i64),
+        Values::U16(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p] as i64),
+        Values::U8(v) => fill_signed_prefix(&mut prefix, &view.nulls, layout, |p| v[p] as i64),
+        Values::U64(_) | Values::F64(_) | Values::F32(_) => {
+            unreachable!("signed integer state must contain non-u64 integer values")
         }
     }
     for (row, range) in ranges.iter().enumerate() {
         if let Some((start, end)) = layout.data_range(row, *range) {
             output[row] = prefix[end].wrapping_sub(prefix[start]);
+        }
+    }
+}
+
+/// Fill a wrapping signed prefix table with the dtype read hoisted out of the loop.
+///
+/// ELI5: keep the running total in a pocket instead of reading the previous
+/// table entry back for every source value; write each new total once.
+fn fill_signed_prefix(
+    prefix: &mut [i64],
+    nulls: &ArrayView1<'_, bool>,
+    layout: &PackedSpanLayout<'_>,
+    get: impl Fn(usize) -> i64,
+) {
+    let mut running = 0_i64;
+    for (cluster, &(start, end)) in layout.spans.iter().enumerate() {
+        let offset = layout.offsets[cluster];
+        for position in start..end {
+            let value = if nulls[position] { 0 } else { get(position) };
+            running = running.wrapping_add(value);
+            prefix[offset + position - start + 1] = running;
         }
     }
 }
@@ -2255,14 +2278,13 @@ fn update_u64_prefix_ranges(
     #[cfg(test)]
     PREFIX_SUM_HITS.with(|hits| hits.set(hits.get() + 1));
     let mut prefix = vec![0_u64; layout.length + 1];
+    let mut running = 0_u64;
     for (cluster, &(start, end)) in layout.spans.iter().enumerate() {
         let offset = layout.offsets[cluster];
         for position in start..end {
-            let packed = offset + position - start;
-            prefix[packed + 1] = prefix[packed];
-            if !nulls[position] {
-                prefix[packed + 1] = prefix[packed].wrapping_add(values[position]);
-            }
+            let value = if nulls[position] { 0 } else { values[position] };
+            running = running.wrapping_add(value);
+            prefix[offset + position - start + 1] = running;
         }
     }
     for (row, range) in ranges.iter().enumerate() {
