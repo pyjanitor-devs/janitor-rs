@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use janitor_rs::bench_support::{
     adaptive_extreme_positions, dual_regions_aggregate, dual_regions_and_residual_aggregate,
-    equi_aggregate_bench,
+    equi_aggregate_bench, n_region_aggregate,
 };
 use numpy::{ndarray::ArrayView1, PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
@@ -278,6 +278,58 @@ fn staggered_dual_predicate(c: &mut Criterion) {
         (0..rows).map(|v| (v * 2_654_435_761) % rows).collect(),
         (0..rows).map(|v| (v * 40_503) % rows).collect(),
     );
+}
+
+/// Benchmark the multi-region k-d-tree candidate path on a synthetic
+/// five-predicate workload. The region builder and candidate traversal are
+/// included in the measurement, matching the Python-facing execution path.
+fn n_region_kd_tree(c: &mut Criterion) {
+    Python::initialize();
+    Python::attach(|py| {
+        let rows = 2_048_usize;
+        let left_values = PyArray1::from_vec(
+            py,
+            (0..rows as i64)
+                .map(|value| (value * 37) % rows as i64)
+                .collect(),
+        );
+        let right_values = PyArray1::from_vec(py, (0..rows as i64).collect());
+        let left_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+        let right_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+        let first = make_predicate(py, left_values.as_any(), right_values.as_any(), "<=");
+        let mut ranges = Vec::new();
+        let mut aligners = Vec::new();
+        for _ in 0..4 {
+            ranges.push(make_predicate(
+                py,
+                left_values.as_any(),
+                right_values.as_any(),
+                "<=",
+            ));
+            aligners.push(PyArray1::from_vec(py, (0..rows as i64).collect()));
+        }
+        let ranges = PyList::new(py, ranges).unwrap();
+        let aligners = PyList::new(py, aligners).unwrap();
+        let aggregations = make_size_aggregation(py);
+        let mut group = c.benchmark_group("n_region_kd_tree");
+        group.bench_function("five_predicates", |b| {
+            b.iter(|| {
+                let result = n_region_aggregate(
+                    py,
+                    left_index.as_any(),
+                    right_index.as_any(),
+                    &first,
+                    &ranges,
+                    &aligners,
+                    &aggregations,
+                    false,
+                )
+                .unwrap();
+                black_box(result);
+            });
+        });
+        group.finish();
+    });
 }
 
 fn equi_windows(
@@ -670,6 +722,7 @@ criterion_group!(
     selective_second_predicate,
     broad_dual_predicate,
     staggered_dual_predicate,
+    n_region_kd_tree,
     equi_selective,
     equi_random,
     equi_broad,

@@ -1505,3 +1505,13 @@ negative indices as invalid input.
 narrowing, preserve negative windows as inactive rows, and skip them in every
 later materialization or aggregation loop. Add or retain regression coverage
 for a mix of active and `-1` windows.
+
+### [2026-10-17] Issue #234 scope excludes issue #253
+
+**Context**: The multi-predicate k-d-tree rewrite is being developed under
+issue #234.
+
+**Constraint**: Do not expand this work into the parallel build/probe rollout
+tracked by issue #253. Keep issue #234 focused on the single-threaded
+candidate-generation algorithm, correctness, orientation, benchmarks, and
+pyjanitor compatibility.

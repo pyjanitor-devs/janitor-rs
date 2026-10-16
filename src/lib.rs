@@ -12,6 +12,7 @@ mod not_equals_only;
 mod predicate;
 mod range_join;
 mod range_predicate;
+mod region_kd_tree;
 mod regions;
 mod single_range_predicate;
 
@@ -20,7 +21,9 @@ mod single_range_predicate;
 pub mod bench_support {
     pub use crate::equi_join::equi_aggregate_bench;
     pub use crate::range_join::adaptive_extreme_positions;
-    pub use crate::regions::{dual_regions_aggregate, dual_regions_and_residual_aggregate};
+    pub use crate::regions::{
+        dual_regions_aggregate, dual_regions_and_residual_aggregate, n_region_aggregate,
+    };
 }
 
 /// Top-level composition point: each family owns and registers its own

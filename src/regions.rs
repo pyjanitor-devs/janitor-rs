@@ -12,6 +12,7 @@ use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicate_tuple,
     parse_predicates_with_nulls_strings, predicates_match_dispatch, Predicate, PredicateView,
 };
+use crate::region_kd_tree::RegionKdTree;
 use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -983,54 +984,11 @@ fn activate_dual_ranked_positions(
     Ok(())
 }
 
-/// Add the right positions in one newly visible sweep window.
-///
-/// ELI5: each label owns a shelf in `positions`. `active_counts` records how
-/// many items on each shelf are visible for the current left row.
-///
-/// # Arguments
-///
-/// * `layout` - Precomputed rank and flat-position storage.
-/// * `start` / `previous_end` - Newly visible half-open right window.
-/// * `active_counts` - Mutable count prefix for each label rank.
-///
-/// # Errors
-///
-/// Returns an error for non-monotonic windows or count overflow.
-fn activate_ranked_positions(
-    layout: &RankedRegionPositionLayout,
-    start: usize,
-    previous_end: usize,
-    active_counts: &mut BTreeMap<usize, usize>,
-) -> Result<(), String> {
-    if start > previous_end {
-        return Err("starts must be monotonically non-increasing".to_owned());
-    }
-
-    for &rank in &layout.ranks[start..previous_end] {
-        if rank == usize::MAX {
-            continue;
-        }
-        let count = active_counts.entry(rank).or_default();
-        *count = count
-            .checked_add(1)
-            .ok_or("region result size exceeds platform capacity")?;
-    }
-
-    Ok(())
-}
-
 /// Visit n-region candidates in descending first-region order.
 ///
-/// The first two region paths define the search window. The remaining paths
-/// are progressively checked for each candidate, and `.all(...)` stops at the
-/// first failed predicate. `visit` returns `false` when the caller has enough
-/// information for the current left row (for example, `keep="any"`).
-///
-/// The second right-region positions are grouped once by sorted label and in
-/// the same activation order as the search sweep. The sweep only increments
-/// encountered ranks, so candidate traversal does not scan labels that have
-/// not entered the current window.
+/// All region dimensions participate in candidate pruning. `visit` returns
+/// `false` when the caller has enough information for the current left row
+/// (for example, `keep="any"`).
 ///
 /// This function deliberately knows nothing about index materialization or
 /// aggregation. Its callback receives the reordered left position and the
@@ -1040,9 +998,6 @@ fn activate_ranked_positions(
 /// # Arguments
 ///
 /// * `left_regions` / `right_regions` - Equal-length aligned region paths.
-/// * `starts` - One descending-left search start per left row.
-/// * `end` - Exclusive right-side length.
-/// * `right_region_layout` - Ranked layout for the second right region.
 /// * `visit` - Callback receiving search-order left and global-right positions;
 ///   return `false` to stop candidates for the current left row.
 ///
@@ -1052,14 +1007,11 @@ fn activate_ranked_positions(
 ///
 /// # Errors
 ///
-/// Returns an error for path-length mismatches, invalid starts, or result-size
-/// overflow. A callback rejection is normal control flow, not an error.
+/// Returns an error for path-length mismatches or result-size overflow. A
+/// callback rejection is normal control flow, not an error.
 fn visit_n_region_matches<F>(
     left_regions: &[Vec<i64>],
     right_regions: &[Vec<i64>],
-    starts: &[usize],
-    end: usize,
-    right_region_layout: &RankedRegionPositionLayout,
     mut visit: F,
 ) -> Result<usize, String>
 where
@@ -1067,9 +1019,6 @@ where
 {
     if left_regions.len() < 3 || right_regions.len() != left_regions.len() {
         return Err("n-region paths must contain at least three aligned regions".to_owned());
-    }
-    if starts.len() != left_regions[0].len() {
-        return Err("n-region starts must match the left-region length".to_owned());
     }
     for region in left_regions.iter().skip(1) {
         ensure_equal_lengths_core(
@@ -1080,66 +1029,60 @@ where
         )?;
     }
     for region in right_regions {
-        ensure_equal_lengths_core("right region", region.len(), "first right region", end)?;
+        ensure_equal_lengths_core(
+            "right region",
+            region.len(),
+            "first right region",
+            right_regions[0].len(),
+        )?;
     }
 
-    let mut active_counts = BTreeMap::<usize, usize>::new();
-    let mut right_region_maxima = vec![0_i64; right_regions.len()];
-    let mut previous_end = end;
+    // ELI5: the old sweep indexes only the first two dimensions. The tree
+    // indexes every dimension, so a left row can reject a whole right-side
+    // subtree as soon as any predicate is impossible.
+    visit_n_region_matches_kd(left_regions, right_regions, &mut visit)
+}
+
+/// Visit multi-region candidates with a static rank-space k-d tree.
+///
+/// The callback receives the same reordered left position and global right
+/// position as the legacy sweep. Keeping this contract here lets index,
+/// residual, and aggregation callers share one candidate generator.
+fn visit_n_region_matches_kd<F>(
+    left_regions: &[Vec<i64>],
+    right_regions: &[Vec<i64>],
+    visit: &mut F,
+) -> Result<usize, String>
+where
+    F: FnMut(usize, usize) -> bool,
+{
+    let right_tree = RegionKdTree::build(right_regions, 32)?;
+    let left_count = left_regions[0].len();
     let mut total_matches = 0usize;
+    let mut overflowed = false;
 
-    for (left_position, &start) in starts.iter().enumerate() {
-        if start == end {
-            continue;
-        }
-        if start > previous_end {
-            return Err("starts must be monotonically non-increasing".to_owned());
-        }
-
-        for right_position in start..previous_end {
-            for (maximum, region) in right_region_maxima.iter_mut().zip(right_regions) {
-                *maximum = (*maximum).max(region[right_position]);
-            }
-        }
-        activate_ranked_positions(right_region_layout, start, previous_end, &mut active_counts)?;
-        previous_end = start;
-
-        let impossible = left_regions
+    for left_position in 0..left_count {
+        let left_point = left_regions
             .iter()
-            .zip(&right_region_maxima)
-            .any(|(left_region, &right_maximum)| left_region[left_position] > right_maximum);
-        if impossible {
+            .map(|region| region[left_position])
+            .collect::<Vec<_>>();
+        let mut keep_visiting = true;
+        right_tree.visit(&left_point, |right_position| {
+            let Some(next_total) = total_matches.checked_add(1) else {
+                overflowed = true;
+                return false;
+            };
+            total_matches = next_total;
+            keep_visiting = visit(left_position, right_position);
+            keep_visiting
+        });
+        if !keep_visiting {
             continue;
-        }
-
-        let second_left_region = left_regions[1][left_position];
-        let first_rank = right_region_layout
-            .labels
-            .partition_point(|&label| label < second_left_region);
-        'candidate_regions: for (&rank, &region_count) in active_counts.range(first_rank..) {
-            let region_offset = right_region_layout.offsets[rank];
-            for &right_position in
-                &right_region_layout.positions[region_offset..region_offset + region_count]
-            {
-                let matches_remaining = left_regions
-                    .iter()
-                    .skip(2)
-                    .zip(right_regions.iter().skip(2))
-                    .all(|(left_region, right_region)| {
-                        left_region[left_position] <= right_region[right_position]
-                    });
-                if matches_remaining {
-                    total_matches = total_matches
-                        .checked_add(1)
-                        .ok_or("region result size exceeds platform capacity")?;
-                    if !visit(left_position, right_position) {
-                        break 'candidate_regions;
-                    }
-                }
-            }
         }
     }
-
+    if overflowed {
+        return Err("region result size exceeds platform capacity".to_owned());
+    }
     Ok(total_matches)
 }
 
@@ -1964,19 +1907,15 @@ pub fn dual_regions_and_residual_indices<'py>(
     )?))
 }
 
-/// All immutable data needed by the n-region candidate sweep.
+/// All immutable data needed by the multi-region candidate traversal.
 ///
 /// ELI5: this is the prepared map for a treasure hunt. The region vectors say
-/// which rows can match, `starts` says where each search window begins, and
-/// the ranked layout lets the sweep find the second region without rebuilding
-/// a map for every left row.
+/// which rows can match, and `left_order` maps tree-query positions back to
+/// the caller's physical left-row order.
 struct NRegionCandidatePaths {
     left_regions: Vec<Vec<i64>>,
     right_regions: Vec<Vec<i64>>,
-    starts: Vec<usize>,
-    end: usize,
     left_order: Vec<usize>,
-    right_region_layout: RankedRegionPositionLayout,
 }
 
 /// Build the shared candidate state for three or more range predicates.
@@ -2072,25 +2011,20 @@ fn build_n_region_candidate_paths(
         *region = reorder_left_region(region, &left_order);
     }
 
-    // Starts are derived from the first predicate before masking its right
-    // region. That preserves the monotonic input required by partition_point.
-    let Some(starts) = n_region_starts(&left_regions[0], &right_regions[0])? else {
+    // This cheap two-region check preserves the existing early no-match path;
+    // the k-d tree then indexes every region dimension for actual traversal.
+    let Some(_starts) = n_region_starts(&left_regions[0], &right_regions[0])? else {
         return Ok(None);
     };
-    let end = right_regions[0].len();
     mask_zero_regions(&mut right_regions)?;
     if right_regions[0].iter().all(|&region| region == 0) {
         return Ok(None);
     }
 
-    let right_region_layout = build_ranked_region_position_layout(&right_regions[1], &starts, end)?;
     Ok(Some(NRegionCandidatePaths {
         left_regions,
         right_regions,
-        starts,
-        end,
         left_order,
-        right_region_layout,
     }))
 }
 
@@ -2176,10 +2110,7 @@ where
     let NRegionCandidatePaths {
         left_regions: left_range_regions,
         right_regions: right_range_regions,
-        starts,
-        end,
         left_order,
-        right_region_layout,
     } = paths;
 
     if keep != Keep::All {
@@ -2187,9 +2118,6 @@ where
         let _ = visit_n_region_matches(
             &left_range_regions,
             &right_range_regions,
-            &starts,
-            end,
-            &right_region_layout,
             |left_position, right_position| {
                 if !candidate_pass(left_order[left_position], right_position) {
                     return true;
@@ -2253,9 +2181,6 @@ where
     let _ = visit_n_region_matches(
         &left_range_regions,
         &right_range_regions,
-        &starts,
-        end,
-        &right_region_layout,
         |left_position, right_position| {
             if !candidate_pass(left_order[left_position], right_position) {
                 return true;
@@ -2279,9 +2204,6 @@ where
     let _ = visit_n_region_matches(
         &left_range_regions,
         &right_range_regions,
-        &starts,
-        end,
-        &right_region_layout,
         |left_position, right_position| {
             if !candidate_pass(left_order[left_position], right_position) {
                 return true;
@@ -2817,9 +2739,6 @@ where
     visit_n_region_matches(
         &paths.left_regions,
         &paths.right_regions,
-        &paths.starts,
-        paths.end,
-        &paths.right_region_layout,
         |left_position, right_position| {
             if !candidate_pass(paths.left_order[left_position], right_position) {
                 return true;
