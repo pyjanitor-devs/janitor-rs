@@ -3026,75 +3026,80 @@ mod aggregation_tests {
     fn range_aggregation_preserves_integer_overflow_semantics() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
-            let predicates = PyList::empty(py);
-            let left_index = PyArray1::from_vec(py, vec![100_i64, 101, 102, 103]);
-            let right_index = PyArray1::from_vec(py, vec![10_i64, 20, 30, 40, 50]);
-            // Both anchors select all five rows. Keeping the right layout
-            // small makes the expected wrapping arithmetic obvious.
-            predicates.append(PyTuple::new(
-                py,
-                [
-                    PyArray1::from_vec(py, vec![0_i64; 4]).into_any(),
-                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 3, 4]).into_any(),
-                    "<=".into_pyobject(py)?.into_any(),
-                ],
-            )?)?;
-            predicates.append(PyTuple::new(
-                py,
-                [
-                    PyArray1::from_vec(py, vec![0_i64; 4]).into_any(),
-                    PyArray1::from_vec(py, vec![0_i64, 1, 2, 3, 4]).into_any(),
-                    "<=".into_pyobject(py)?.into_any(),
-                ],
-            )?)?;
+            // Keep the original tiny direct case alongside a batch that
+            // exercises prefix sums. Both anchors select every right row.
+            for (left_rows, right_rows, prefix_hits) in [(1, 2, 0), (4, 5, 1)] {
+                let predicates = PyList::empty(py);
+                let left_index = PyArray1::from_vec(py, (100..100 + left_rows as i64).collect());
+                let right_index =
+                    PyArray1::from_vec(py, (1..=right_rows as i64).map(|v| v * 10).collect());
+                predicates.append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![0_i64; left_rows]).into_any(),
+                        PyArray1::from_vec(py, (0..right_rows as i64).collect()).into_any(),
+                        "<=".into_pyobject(py)?.into_any(),
+                    ],
+                )?)?;
+                predicates.append(PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, vec![0_i64; left_rows]).into_any(),
+                        PyArray1::from_vec(py, (0..right_rows as i64).collect()).into_any(),
+                        "<=".into_pyobject(py)?.into_any(),
+                    ],
+                )?)?;
 
-            let values = PyArray1::from_vec(py, vec![i64::MAX, 2, 1, 1, 1]);
-            let nulls = PyArray1::from_vec(py, vec![false; 5]);
-            let aggregations = PyList::new(
-                py,
-                [
-                    PyTuple::new(
-                        py,
-                        [
-                            values.clone().into_any(),
-                            nulls.clone().into_any(),
-                            "sum".into_pyobject(py)?.into_any(),
-                        ],
-                    )?,
-                    PyTuple::new(
-                        py,
-                        [
-                            values.into_any(),
-                            nulls.into_any(),
-                            "prod".into_pyobject(py)?.into_any(),
-                        ],
-                    )?,
-                ],
-            )?;
-            let prefix_before = crate::aggregation_state::PREFIX_SUM_HITS.get();
-            let result = call_range_join_aggregate(
-                py,
-                &predicates,
-                &left_index,
-                &right_index,
-                &aggregations,
-                false,
-            )?
-            .expect("the overflow fixture has matches");
-            assert_eq!(
-                crate::aggregation_state::PREFIX_SUM_HITS.get(),
-                prefix_before + 1
-            );
-            let outputs_item = result.get_item(1)?;
-            let outputs = outputs_item.cast::<PyList>()?;
-            assert_eq!(
-                outputs.get_item(0)?.extract::<Vec<i64>>()?,
-                vec![i64::MAX.wrapping_add(5); 4]
-            );
-            assert_eq!(
-                outputs.get_item(1)?.extract::<Vec<i64>>()?,
-                vec![i64::MAX.wrapping_mul(2); 4]
-            );
+                let mut source = vec![i64::MAX, 2];
+                source.resize(right_rows, 1);
+                let values = PyArray1::from_vec(py, source);
+                let nulls = PyArray1::from_vec(py, vec![false; right_rows]);
+                let aggregations = PyList::new(
+                    py,
+                    [
+                        PyTuple::new(
+                            py,
+                            [
+                                values.clone().into_any(),
+                                nulls.clone().into_any(),
+                                "sum".into_pyobject(py)?.into_any(),
+                            ],
+                        )?,
+                        PyTuple::new(
+                            py,
+                            [
+                                values.into_any(),
+                                nulls.into_any(),
+                                "prod".into_pyobject(py)?.into_any(),
+                            ],
+                        )?,
+                    ],
+                )?;
+                let prefix_before = crate::aggregation_state::PREFIX_SUM_HITS.get();
+                let result = call_range_join_aggregate(
+                    py,
+                    &predicates,
+                    &left_index,
+                    &right_index,
+                    &aggregations,
+                    false,
+                )?
+                .expect("the overflow fixture has matches");
+                assert_eq!(
+                    crate::aggregation_state::PREFIX_SUM_HITS.get(),
+                    prefix_before + prefix_hits
+                );
+                let outputs_item = result.get_item(1)?;
+                let outputs = outputs_item.cast::<PyList>()?;
+                assert_eq!(
+                    outputs.get_item(0)?.extract::<Vec<i64>>()?,
+                    vec![i64::MAX.wrapping_add(right_rows as i64); left_rows]
+                );
+                assert_eq!(
+                    outputs.get_item(1)?.extract::<Vec<i64>>()?,
+                    vec![i64::MAX.wrapping_mul(2); left_rows]
+                );
+            }
             Ok(())
         })
         .unwrap();

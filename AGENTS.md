@@ -431,6 +431,13 @@ work, while one width-eight query makes that regression obvious.
 
 ## Learned Patterns
 
+### [2026-10-16] Review adaptive guards per operation and retain direct cases
+
+Mask counts use prefix differences and should share the prefix cost guard with
+integer sums, rather than inheriting the segment-tree guard. When enlarging an
+integration fixture to exercise an optimized route, retain its original small
+direct-path case and assert the branch-counter delta for both cases.
+
 ### [2026-10-16] Keep agent workflow documents out of pull requests
 
 Keep execution plans and standalone validation writeups local unless explicitly

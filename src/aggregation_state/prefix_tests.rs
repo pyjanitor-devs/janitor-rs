@@ -50,8 +50,14 @@ fn compare_with_direct(
         }
     }
     let before = PREFIX_SUM_HITS.get();
+    let count_before = PREFIX_COUNT_HITS.get();
     actual.aggregate_starts_ends(starts.view(), ends.view());
     assert_eq!(PREFIX_SUM_HITS.get() - before, prefix_calls, "{windows:?}");
+    assert_eq!(
+        PREFIX_COUNT_HITS.get() - count_before,
+        usize::from(prefix_calls > 0),
+        "mask counts must use the same prefix cutoff as sums: {windows:?}",
+    );
     for (actual, expected) in actual.states.iter().zip(&reference.states) {
         match (actual, expected) {
             (State::Sum(_, a), State::Sum(_, e)) => assert_eq!(a, e),

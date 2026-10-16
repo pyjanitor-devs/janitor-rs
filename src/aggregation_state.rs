@@ -1140,13 +1140,15 @@ impl<'a> AggregationSet<'a> {
         let use_prefix = should_use_prefix_difference(ranges.len(), width, packed_layout.length);
 
         // Dispatch all requested reductions over the same set of ranges. The
-        // integer sums may use prefix differences, products and extrema a
-        // tree; float reductions intentionally retain direct source order.
+        // integer sums and mask counts may use prefix differences, products
+        // and extrema a tree; float reductions retain direct source order.
         for state in &mut self.states {
             match state {
                 State::CountAll => {}
                 State::CountNonNullMask(nulls, output) => {
-                    if use_tree {
+                    if use_prefix {
+                        #[cfg(test)]
+                        PREFIX_COUNT_HITS.with(|hits| hits.set(hits.get() + 1));
                         let mut prefix = vec![0_i64; packed_layout.length + 1];
                         for (cluster, &(span_start, span_end)) in queried_spans.iter().enumerate() {
                             let offset = packed_layout.offsets[cluster];
@@ -2271,6 +2273,7 @@ fn update_u64_prefix_ranges(
 #[cfg(test)]
 thread_local! {
     pub(crate) static PREFIX_SUM_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREFIX_COUNT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Answer arbitrary integer products with an iterative segment tree.

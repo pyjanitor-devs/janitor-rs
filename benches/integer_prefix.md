@@ -113,8 +113,10 @@ Measured wheel SHA-256 values:
 - Base: `ee12a222540137322462846f78b60cb7ecfa79f74c9443e98269badecb953f00`
 - Proposed: `7a598234483e3d786d6a07926f468740448018e3127b11218815252a8dd4bfbb`
 
-Rust changes after those wheels were built are limited to comments and regression
-tests; production algorithm and dispatch code match the measured proposal.
+The measured sum algorithms and dispatch match the current proposal. A later
+review aligned non-null mask counts with the same prefix cutoff; these benchmarks
+request sums only and do not measure that count optimization. The current wheel
+was separately checked against the downstream compatibility suite.
 
 ## Verification and limits
 
