@@ -35,7 +35,7 @@ outside timing. Rust tests supply actual branch-execution evidence; benchmark
 
 ## Results
 
-All 62 final paired comparisons passed their independent result checks. The
+All 62 main paired comparisons passed their independent result checks. The
 following ratios are baseline time / proposed time; values above 1 mean faster.
 Ranges span both dtypes and both label distributions. Full timings and memory
 columns are in [`integer_prefix.csv`](integer_prefix.csv), `run=paired`.
@@ -57,6 +57,24 @@ microbenchmark because these calls also validate, pack/sort windows, cross PyO3,
 and materialize outputs. Shuffled pandas preparation dominates complete calls:
 these fixtures show effectively neutral end-to-end performance, including small
 measured slowdowns (largest in the main paired matrix is about 1.5%).
+
+A focused recheck was added after review identified a possible regression in
+the super-large aggregation call. Both commits were rebuilt with the same Rust
+1.98 toolchain, then compared in three independent invocations with 101
+alternating samples per library; one invocation reversed library load order.
+All 12 result comparisons passed their independent oracles.
+
+| Distribution | Signed baseline/proposed | Unsigned baseline/proposed |
+| --- | ---: | ---: |
+| Unique keys | 0.98–1.03x | **0.91–0.96x** |
+| Duplicate keys | 0.98x | **0.84–0.88x** |
+
+The focused measurements confirm a repeatable u64 regression for this shape:
+about 4–10% longer runtime with unique keys and 14–19% with duplicate keys.
+Signed sums were near parity; the previously reported 1.26x signed result did
+not reproduce. These focused results are recorded as `run=recheck_*` in the CSV
+and supersede the original 21-sample PyO3 row for this shape. The memory result
+is unchanged: the prefix table is about half the size of the sum tree.
 
 The compact-group signed measurement was unstable in the full run: **0.101 ms
 base / 0.682 ms proposed**. An isolated 101-sample paired recheck measured
