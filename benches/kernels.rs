@@ -442,7 +442,9 @@ fn equi_unordered_second_range_aggregate_guard(c: &mut Criterion) {
             unordered_second_range_inputs(py);
         let aggregations = make_size_aggregation(py);
         let mut group = c.benchmark_group("equi_unordered_second_range_aggregate_guard");
-        group.bench_function("unchanged_equi_aggregate", |b| {
+        // The equality windows and residual predicate exercise the
+        // predicate-at-a-time window kernel inside equi aggregation.
+        group.bench_function("with_residual_window", |b| {
             b.iter(|| {
                 let starts = PyArray1::from_vec(py, starts_values.clone());
                 let ends = PyArray1::from_vec(py, ends_values.clone());

@@ -37,6 +37,7 @@ use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 #[cfg(test)]
 thread_local! {
     static EQUI_STARTS_ENDS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EQUI_RESIDUAL_WINDOW_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 type IndexPairs = Option<(Vec<i64>, Vec<i64>)>;
@@ -1362,12 +1363,19 @@ fn equi_aggregate_impl<'py>(
     };
     let demoted_view = demoted_second.map(range_predicate_view);
 
+    // ELI5: equality windows give every left row one contiguous shelf of
+    // right candidates. When residuals are present, cross off rejected
+    // candidates once for the whole shelf instead of asking every predicate
+    // about every candidate pair.
+    let use_window_residuals = starts.is_some() && !views.is_empty();
+    let mut residual_mask = Vec::new();
+
     // ELI5: after ordered ranges narrow a window, each left row's matches
     // are one contiguous block of right positions, so starts/ends describe
     // the complete match set. Reverse joins aggregate onto right rows;
-    // residuals still need pair-by-pair checks; and an unordered second
-    // range filters pairs inside the window, so none of those cases is safe
-    // to answer from the window alone.
+    // surviving residual candidates still need pair-by-pair updates; and an
+    // unordered second range filters pairs inside the window, so none of
+    // those cases is safe to answer from the window alone.
     if allow_starts_ends && !reverse && residual_predicates.is_empty() && demoted_view.is_none() {
         if let (Some(starts), Some(ends)) = (starts.as_ref(), ends.as_ref()) {
             #[cfg(test)]
@@ -1407,8 +1415,27 @@ fn equi_aggregate_impl<'py>(
             (candidate_start as usize, candidate_end as usize)
         };
 
+        if use_window_residuals {
+            #[cfg(test)]
+            EQUI_RESIDUAL_WINDOW_HITS.with(|hits| hits.set(hits.get() + 1));
+            residual_mask.resize(candidate_end - candidate_start, 0);
+            predicates_match_window(
+                &views,
+                metadata_views.as_deref(),
+                row,
+                candidate_start,
+                candidate_end,
+                &mut residual_mask,
+            );
+        }
+
         for right_position in candidate_start..candidate_end {
-            if !predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position) {
+            let residual_matches = if use_window_residuals {
+                residual_mask[right_position - candidate_start] != 0
+            } else {
+                predicates_match_dispatch(&views, metadata_views.as_deref(), row, right_position)
+            };
+            if !residual_matches {
                 continue;
             }
             if range_views
@@ -1900,12 +1927,13 @@ mod tests {
         build_equi_range_indices_core, build_equi_uniq_residual_indices_core,
         build_second_range_envelope, equi_aggregate, materialize_equi_windows,
         materialize_equi_windows_and_residuals, materialize_unordered_second_range,
-        narrow_unordered_second_range, unique_reverse_output_slots, EQUI_STARTS_ENDS_HITS,
+        narrow_unordered_second_range, unique_reverse_output_slots, EQUI_RESIDUAL_WINDOW_HITS,
+        EQUI_STARTS_ENDS_HITS,
     };
     use crate::compare_op::CompareOp;
     use crate::join_types::Keep;
     use pyo3::exceptions::PyValueError;
-    use pyo3::types::{PyAnyMethods, PyList, PyListMethods, PyTuple, PyTupleMethods};
+    use pyo3::types::{PyAnyMethods, PyBool, PyList, PyListMethods, PyTuple, PyTupleMethods};
 
     #[test]
     fn reverse_unique_output_slots_collapse_aligned_duplicates() {
@@ -1970,6 +1998,108 @@ mod tests {
                 .get_item(0)?
                 .extract::<Vec<i64>>()?;
             assert_eq!(sums, vec![23, 0]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn equi_aggregate_evaluates_residuals_per_window() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_index = PyArray1::from_vec(py, vec![100_i64]);
+            let right_index = PyArray1::from_vec(py, (10_i64..20).collect());
+            let starts = PyArray1::from_vec(py, vec![0_i64]);
+            let ends = PyArray1::from_vec(py, vec![10_i64]);
+            let ranges = PyList::empty(py);
+            let residual = PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![15_i64]).into_any(),
+                    PyArray1::from_vec(py, (10_i64..20).collect()).into_any(),
+                    ">".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let residuals = PyList::new(py, [residual])?;
+            let aggregations = equi_sum_aggregations(py, (1_i64..11).collect())?;
+
+            EQUI_RESIDUAL_WINDOW_HITS.with(|hits| hits.set(0));
+            let result = equi_aggregate(
+                py,
+                left_index.readonly(),
+                right_index.readonly(),
+                Some(starts.readwrite()),
+                Some(ends.readwrite()),
+                &ranges,
+                &residuals,
+                &aggregations,
+                true,
+                false,
+            )?
+            .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+
+            let (matched, sums) = equi_sum_result(&result)?;
+            assert_eq!(matched, vec![true]);
+            assert_eq!(sums, vec![15]);
+            EQUI_RESIDUAL_WINDOW_HITS.with(|hits| assert_eq!(hits.get(), 1));
+
+            // The reverse layout uses the same window mask but writes into
+            // right-side output slots. Extension-array nulls must reject the
+            // null right value rather than treating it as a passing `!=`.
+            let reverse_left_index = PyArray1::from_vec(py, vec![100_i64]);
+            let reverse_right_index = PyArray1::from_vec(py, (10_i64..20).collect());
+            let reverse_starts = PyArray1::from_vec(py, vec![0_i64]);
+            let reverse_ends = PyArray1::from_vec(py, vec![10_i64]);
+            let reverse_residual = PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![false]).into_any(),
+                    PyArray1::from_vec(py, (1_i64..11).collect()).into_any(),
+                    PyArray1::from_vec(
+                        py,
+                        vec![
+                            false, false, false, false, true, false, false, false, false, false,
+                        ],
+                    )
+                    .into_any(),
+                    PyBool::new(py, true).to_owned().into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let reverse_residuals = PyList::new(py, [reverse_residual])?;
+            let reverse_aggregations = equi_sum_aggregations(py, vec![7])?;
+
+            EQUI_RESIDUAL_WINDOW_HITS.with(|hits| hits.set(0));
+            let reverse_result = equi_aggregate(
+                py,
+                reverse_left_index.readonly(),
+                reverse_right_index.readonly(),
+                Some(reverse_starts.readwrite()),
+                Some(reverse_ends.readwrite()),
+                &ranges,
+                &reverse_residuals,
+                &reverse_aggregations,
+                true,
+                true,
+            )?
+            .ok_or_else(|| PyValueError::new_err("reverse equi aggregation returned None"))?;
+
+            assert_eq!(
+                reverse_result.get_item(0)?.extract::<Vec<i64>>()?,
+                (10_i64..20).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                reverse_result.get_item(1)?.extract::<Vec<bool>>()?,
+                vec![false, true, true, true, false, true, true, true, true, true]
+            );
+            let reverse_sums = reverse_result
+                .get_item(2)?
+                .cast::<PyList>()?
+                .get_item(0)?
+                .extract::<Vec<i64>>()?;
+            assert_eq!(reverse_sums, vec![0, 7, 7, 7, 0, 7, 7, 7, 7, 7]);
+            EQUI_RESIDUAL_WINDOW_HITS.with(|hits| assert_eq!(hits.get(), 1));
             Ok(())
         })
         .unwrap();
