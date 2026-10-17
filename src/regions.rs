@@ -4126,6 +4126,121 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn rank_tree_handles_tied_extrema_with_nulls() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let rows = 100;
+            let left_values: Vec<i64> = (1..=rows as i64).collect();
+            let right_predicate_values = left_values.clone();
+            let right_values: Vec<i64> = (0..rows as i64).map(|value| value % 3).collect();
+            let nulls: Vec<bool> = (0..rows).map(|position| position % 7 == 0).collect();
+            let left_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+            let right_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+            let first = predicate(py, &left_values, &right_predicate_values, "<=")?;
+            let second = predicate(py, &left_values, &right_predicate_values, "<=")?;
+            let aligner = PyArray1::from_vec(py, (0..rows as i64).collect()).readonly();
+            let masked_input = |operation: &str| {
+                PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, right_values.clone()).into_any(),
+                        PyArray1::from_vec(py, nulls.clone()).into_any(),
+                        operation.into_pyobject(py)?.into_any(),
+                    ],
+                )
+            };
+            let aggregations = PyList::new(
+                py,
+                [
+                    masked_input("sum")?,
+                    masked_input("min")?,
+                    masked_input("max")?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            PyArray1::from_vec(py, nulls.clone()).into_any(),
+                            "count".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            "size".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+
+            let tree_hits_before = DUAL_RANK_TREE_HITS.with(Cell::get);
+            let result = dual_regions_aggregate(
+                py,
+                left_index.as_any(),
+                right_index.as_any(),
+                &first,
+                &second,
+                aligner,
+                &aggregations,
+                true,
+            )?
+            .ok_or_else(|| PyValueError::new_err("tied-extrema aggregation returned None"))?;
+            assert!(DUAL_RANK_TREE_HITS.with(Cell::get) > tree_hits_before);
+
+            let matched = result.get_item(1)?.extract::<Vec<bool>>()?;
+            let outputs = result
+                .get_item(2)?
+                .cast::<PyList>()?
+                .iter()
+                .map(|output| output.extract::<Vec<i64>>())
+                .collect::<PyResult<Vec<_>>>()?;
+            let min_values: Vec<Option<i64>> = outputs[1]
+                .iter()
+                .map(|&position| (position >= 0).then(|| right_values[position as usize]))
+                .collect();
+            let max_values: Vec<Option<i64>> = outputs[2]
+                .iter()
+                .map(|&position| (position >= 0).then(|| right_values[position as usize]))
+                .collect();
+
+            let mut expected_sum = vec![0; rows];
+            let mut expected_count = vec![0; rows];
+            let mut expected_size = vec![0; rows];
+            let mut expected_min: Vec<Option<i64>> = vec![None; rows];
+            let mut expected_max: Vec<Option<i64>> = vec![None; rows];
+            for left in 0..rows {
+                for right in left..rows {
+                    expected_size[left] += 1;
+                    if nulls[right] {
+                        continue;
+                    }
+                    let value = right_values[right];
+                    expected_sum[left] += value;
+                    expected_count[left] += 1;
+                    expected_min[left] =
+                        Some(expected_min[left].map_or(value, |current| current.min(value)));
+                    expected_max[left] =
+                        Some(expected_max[left].map_or(value, |current| current.max(value)));
+                }
+            }
+            assert_eq!(
+                matched,
+                expected_size
+                    .iter()
+                    .map(|&size| size != 0)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(outputs[0], expected_sum);
+            assert_eq!(min_values, expected_min);
+            assert_eq!(max_values, expected_max);
+            assert_eq!(outputs[3], expected_count);
+            assert_eq!(outputs[4], expected_size);
+            Ok(())
+        })
+        .unwrap();
+    }
+
     /// One randomized dual-region aggregation result, decoded for comparison.
     ///
     /// Min/max positions are converted to values because tied extrema may
