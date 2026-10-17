@@ -1,6 +1,6 @@
 //! Typed predicate parsing and matching shared by join and aggregation paths.
 
-use numpy::ndarray::ArrayView1;
+use numpy::ndarray::{s, ArrayView1};
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -363,6 +363,185 @@ pub(crate) fn predicates_match_dispatch(
     }
 }
 
+/// Apply every predicate to one contiguous candidate window.
+///
+/// ELI5: instead of asking every judge about every candidate, give each judge
+/// the whole row of candidates once and let it cross rejected candidates off
+/// a shared checklist. The next judge only visits candidates still on the
+/// checklist.
+///
+/// The mask is reset to all matches before evaluation and has one byte for
+/// every position in `start..end`. A byte mask keeps this helper simple and
+/// lets callers reuse the allocation for the exact-size two-pass materializer.
+/// `PredicateView` may contain strided arrays; slicing preserves that layout
+/// and the typed loop below remains the fallback for non-contiguous views.
+pub(crate) fn predicates_match_window(
+    views: &[PredicateView<'_>],
+    metadata: Option<&[NullMetadataView<'_>]>,
+    left: usize,
+    start: usize,
+    end: usize,
+    mask: &mut [u8],
+) {
+    assert_eq!(mask.len(), end - start);
+    mask.fill(1);
+
+    for (position, predicate) in views.iter().enumerate() {
+        let nulls = metadata
+            .and_then(|values| values.get(position))
+            .and_then(|value| match (&value.left, &value.right) {
+                (Some(left_values), Some(right_values)) => {
+                    Some((left_values[left], right_values, value.is_extension_array))
+                }
+                _ => None,
+            });
+
+        match predicate {
+            PredicateView::I64(left_values, right_values, op) => apply_window(
+                &left_values[left],
+                right_values,
+                *op,
+                start,
+                end,
+                mask,
+                nulls,
+            ),
+            PredicateView::I32(left_values, right_values, op) => apply_window(
+                &left_values[left],
+                right_values,
+                *op,
+                start,
+                end,
+                mask,
+                nulls,
+            ),
+            PredicateView::I16(left_values, right_values, op) => apply_window(
+                &left_values[left],
+                right_values,
+                *op,
+                start,
+                end,
+                mask,
+                nulls,
+            ),
+            PredicateView::I8(left_values, right_values, op) => apply_window(
+                &left_values[left],
+                right_values,
+                *op,
+                start,
+                end,
+                mask,
+                nulls,
+            ),
+            PredicateView::U64(left_values, right_values, op) => apply_window(
+                &left_values[left],
+                right_values,
+                *op,
+                start,
+                end,
+                mask,
+                nulls,
+            ),
+            PredicateView::U32(left_values, right_values, op) => apply_window(
+                &left_values[left],
+                right_values,
+                *op,
+                start,
+                end,
+                mask,
+                nulls,
+            ),
+            PredicateView::U16(left_values, right_values, op) => apply_window(
+                &left_values[left],
+                right_values,
+                *op,
+                start,
+                end,
+                mask,
+                nulls,
+            ),
+            PredicateView::U8(left_values, right_values, op) => apply_window(
+                &left_values[left],
+                right_values,
+                *op,
+                start,
+                end,
+                mask,
+                nulls,
+            ),
+            PredicateView::F64(left_values, right_values, op) => apply_window(
+                &left_values[left],
+                right_values,
+                *op,
+                start,
+                end,
+                mask,
+                nulls,
+            ),
+            PredicateView::F32(left_values, right_values, op) => apply_window(
+                &left_values[left],
+                right_values,
+                *op,
+                start,
+                end,
+                mask,
+                nulls,
+            ),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_window<T: PartialOrd>(
+    left: &T,
+    right: &ArrayView1<'_, T>,
+    op: CompareOp,
+    start: usize,
+    end: usize,
+    mask: &mut [u8],
+    nulls: Option<(bool, &ArrayView1<'_, bool>, bool)>,
+) {
+    let right = right.slice(s![start..end]);
+    let right_nulls = nulls.map(|(_, values, _)| values.slice(s![start..end]));
+
+    if let Some((left_null, _, is_extension_array)) = nulls {
+        if left_null {
+            if is_extension_array {
+                mask.fill(0);
+            }
+            return;
+        }
+    }
+
+    macro_rules! apply_comparison {
+        ($operator:tt) => {
+            for (offset, value) in right.iter().enumerate() {
+                if mask[offset] == 0 {
+                    continue;
+                }
+                if let Some(null_values) = &right_nulls {
+                    if null_values[offset] {
+                        if nulls.is_some_and(|(_, _, is_extension_array)| is_extension_array) {
+                            mask[offset] = 0;
+                        }
+                        continue;
+                    }
+                }
+                mask[offset] = (*left $operator *value) as u8;
+            }
+        };
+    }
+
+    match op {
+        CompareOp::Gt => apply_comparison!(>),
+        CompareOp::Ge => apply_comparison!(>=),
+        CompareOp::Lt => apply_comparison!(<),
+        CompareOp::Le => apply_comparison!(<=),
+        CompareOp::Eq => apply_comparison!(==),
+        CompareOp::Ne => apply_comparison!(!=),
+    }
+}
+
 /// Parse string-based comparison tuples for the extended single-join API.
 ///
 /// The parser follows the public single-join contract and accepts readable
@@ -528,7 +707,58 @@ pub(crate) fn parse_predicates_with_nulls_strings_from<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use numpy::ndarray::Array1;
     use numpy::PyArray1;
+
+    #[test]
+    fn window_matches_all_operators_and_reuses_mask() {
+        let left = Array1::from_vec(vec![3_i64]);
+        let right = Array1::from_vec(vec![1_i64, 3, 5, 3]);
+        let operators = [
+            (CompareOp::Gt, vec![1, 0, 0, 0]),
+            (CompareOp::Ge, vec![1, 1, 0, 1]),
+            (CompareOp::Lt, vec![0, 0, 1, 0]),
+            (CompareOp::Le, vec![0, 1, 1, 1]),
+            (CompareOp::Eq, vec![0, 1, 0, 1]),
+            (CompareOp::Ne, vec![1, 0, 1, 0]),
+        ];
+
+        for (op, expected) in operators {
+            let view = PredicateView::I64(left.view(), right.view(), op);
+            let mut mask = vec![9; 4];
+            predicates_match_window(&[view], None, 0, 0, 4, &mut mask);
+            assert_eq!(mask, expected, "operator {op:?}");
+        }
+    }
+
+    #[test]
+    fn window_matches_strided_and_nullable_inputs() {
+        let left = Array1::from_vec(vec![3_i64, 3]);
+        let right = Array1::from_vec(vec![1_i64, 99, 3, 99, 5, 99]);
+        let left_nulls = Array1::from_vec(vec![false, true]);
+        let right_nulls = Array1::from_vec(vec![false, true, false, true, false, true]);
+        let right = right.slice(s![..; 2]);
+        let right_nulls = right_nulls.slice(s![..; 2]);
+        let view = PredicateView::I64(left.view(), right, CompareOp::Ne);
+        let metadata = [NullMetadataView {
+            left: Some(left_nulls.view()),
+            right: Some(right_nulls),
+            is_extension_array: false,
+        }];
+        let mut mask = vec![0; 3];
+
+        predicates_match_window(&[view], Some(&metadata), 0, 0, 3, &mut mask);
+        assert_eq!(mask, vec![1, 0, 1]);
+
+        let view = PredicateView::I64(left.view(), right, CompareOp::Ne);
+        let extension_metadata = [NullMetadataView {
+            left: Some(left_nulls.view()),
+            right: Some(right_nulls),
+            is_extension_array: true,
+        }];
+        predicates_match_window(&[view], Some(&extension_metadata), 1, 0, 3, &mut mask);
+        assert_eq!(mask, vec![0, 0, 0]);
+    }
 
     #[test]
     fn string_null_metadata_requires_a_boolean_extension_flag() {

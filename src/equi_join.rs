@@ -29,7 +29,7 @@ use crate::join_search::partition_point_between;
 use crate::join_types::{result_dict, Keep};
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
-    predicates_match_dispatch, NullMetadataView, Predicate, PredicateView,
+    predicates_match_dispatch, predicates_match_window, NullMetadataView, Predicate, PredicateView,
 };
 use crate::range_join::adaptive_extreme_positions;
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
@@ -866,13 +866,7 @@ fn materialize_equi_windows_and_residuals(
     keep: Keep,
 ) -> Result<IndexPairs, String> {
     let additional_view = additional_range.map(range_predicate_view);
-    let matches = |row: usize, right_position: usize| {
-        predicates_match_dispatch(residual_predicates, null_metadata, row, right_position)
-            && additional_view
-                .as_ref()
-                .map(|view| view.matches(row, right_position))
-                .unwrap_or(true)
-    };
+    let mut mask = Vec::new();
 
     if keep == Keep::All {
         // Keep::All cannot use an extrema query because every candidate must
@@ -883,8 +877,25 @@ fn materialize_equi_windows_and_residuals(
             if start < 0 || end < 0 {
                 continue;
             }
-            for right_position in start as usize..end as usize {
-                if matches(row, right_position) {
+            let start = start as usize;
+            let end = end as usize;
+            mask.resize(end - start, 0);
+            predicates_match_window(
+                residual_predicates,
+                null_metadata,
+                row,
+                start,
+                end,
+                &mut mask,
+            );
+            for (offset, &matches) in mask.iter().enumerate() {
+                let right_position = start + offset;
+                if matches != 0
+                    && additional_view
+                        .as_ref()
+                        .map(|view| view.matches(row, right_position))
+                        .unwrap_or(true)
+                {
                     output_capacity = output_capacity
                         .checked_add(1)
                         .ok_or("equi-join result size exceeds platform capacity")?;
@@ -900,8 +911,25 @@ fn materialize_equi_windows_and_residuals(
             if start < 0 || end < 0 {
                 continue;
             }
-            for right_position in start as usize..end as usize {
-                if matches(row, right_position) {
+            let start = start as usize;
+            let end = end as usize;
+            mask.resize(end - start, 0);
+            predicates_match_window(
+                residual_predicates,
+                null_metadata,
+                row,
+                start,
+                end,
+                &mut mask,
+            );
+            for (offset, &matches) in mask.iter().enumerate() {
+                let right_position = start + offset;
+                if matches != 0
+                    && additional_view
+                        .as_ref()
+                        .map(|view| view.matches(row, right_position))
+                        .unwrap_or(true)
+                {
                     left_output.push(left_index[row]);
                     right_output.push(right_index[right_position]);
                 }
@@ -930,6 +958,15 @@ fn materialize_equi_windows_and_residuals(
         if start == end {
             continue;
         }
+        mask.resize(end - start, 0);
+        predicates_match_window(
+            residual_predicates,
+            null_metadata,
+            row,
+            start,
+            end,
+            &mut mask,
+        );
         if use_extrema {
             // ELI5: keep each surviving row beside its shelf coordinates.
             // Both selection paths share the sentinel/validation loop above;
@@ -939,8 +976,16 @@ fn materialize_equi_windows_and_residuals(
             continue;
         }
         let mut selected = None;
-        for right_position in start..end {
-            if !matches(row, right_position) {
+        for (offset, &matches) in mask.iter().enumerate() {
+            if matches == 0 {
+                continue;
+            }
+            let right_position = start + offset;
+            if !additional_view
+                .as_ref()
+                .map(|view| view.matches(row, right_position))
+                .unwrap_or(true)
+            {
                 continue;
             }
             if !update_keep_selection(&mut selected, right_position, keep, right_index) {
