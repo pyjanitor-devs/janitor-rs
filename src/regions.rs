@@ -2458,9 +2458,6 @@ struct NRegionCandidatePaths {
 /// * `allow_left_tree` - Whether the tree may be built over the left side.
 ///   This is disabled for `keep="any"`, whose early-stop semantics require a
 ///   left-row query to be able to stop traversal.
-/// * `force_sweep` - Bypass dispatch and use the existing sweep. This is used
-///   for `keep="any"`, where a dense match can be found before tree build or
-///   candidate-counting overhead is worthwhile.
 /// * `prefer_sweep_if_early` - For `keep="any"`, probe a small bounded prefix
 ///   for an actual complete match before considering the right-side tree.
 ///
@@ -2485,7 +2482,6 @@ fn build_n_region_candidate_paths(
     right_index: ArrayView1<'_, i64>,
     aligners: &[ArrayView1<'_, i64>],
     allow_left_tree: bool,
-    force_sweep: bool,
     prefer_sweep_if_early: bool,
 ) -> Result<Option<NRegionCandidatePaths>, String> {
     ensure_equal_lengths_core(
@@ -2577,10 +2573,9 @@ fn build_n_region_candidate_paths(
     // once per right row. Probe a few rows first so dense, easy-to-hit joins
     // retain that cheap early exit. Harder joins fall through to the normal
     // C2 decision and may use a right-oriented tree.
-    let force_sweep = force_sweep
-        || (prefer_sweep_if_early
-            && sweep_finds_early_match(&left_regions, &right_regions, &starts));
-    let (use_sweep, sweep_layout) = if force_sweep {
+    let (use_sweep, sweep_layout) = if prefer_sweep_if_early
+        && sweep_finds_early_match(&left_regions, &right_regions, &starts)
+    {
         (true, None)
     } else {
         // C2 is the exact amount of pair work the first two predicates leave
@@ -2825,7 +2820,6 @@ where
         right_index,
         aligners,
         keep != Keep::Any,
-        false,
         keep == Keep::Any,
     )?
     else {
@@ -3464,7 +3458,6 @@ where
         right_index,
         aligners,
         true,
-        false,
         false,
     )
     .map_err(PyValueError::new_err)?
