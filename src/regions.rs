@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{btree_map, BTreeMap, HashMap};
 
 use crate::aggregation_common::adaptive::should_use_segment_tree;
 use crate::aggregation_common::aggregation::{
@@ -24,7 +24,15 @@ use std::cell::Cell;
 #[cfg(test)]
 thread_local! {
     static DUAL_RANK_TREE_HITS: Cell<usize> = const { Cell::new(0) };
+    static DENSE_LABEL_LAYOUT_HITS: Cell<usize> = const { Cell::new(0) };
+    static SPARSE_LABEL_LAYOUT_HITS: Cell<usize> = const { Cell::new(0) };
 }
+
+const DENSE_LABEL_SPARSITY_FACTOR: usize = 4;
+const DENSE_ACTIVE_RANK_SPARSITY_FACTOR: usize = 4;
+const SPARSE_LABEL_PROBE_LIMIT: usize = 1_024;
+const SPARSE_LABEL_PROBE_MIN_LEN: usize = 4_096;
+const BITSET_WORD_BITS: usize = u64::BITS as usize;
 
 /// The second predicate's paths together with the first-predicate starts.
 pub(crate) struct DualRegionPaths {
@@ -46,6 +54,170 @@ pub(crate) struct RankedRegionPositionLayout {
     offsets: Vec<usize>,
     ranks: Vec<usize>,
     positions: Vec<usize>,
+}
+
+/// Dense counts for ranks that have entered the monotonic region sweep.
+///
+/// ELI5: `counts` is one numbered shelf per rank. The first bitset marks
+/// nonempty shelves, and the summary bitset marks nonempty groups of 64
+/// shelves, so a suffix scan can jump over empty groups without a tree map.
+struct DenseActiveRankCounts {
+    counts: Vec<usize>,
+    active_words: Vec<u64>,
+    summary_words: Vec<u64>,
+    active_end: usize,
+}
+
+impl DenseActiveRankCounts {
+    fn new(rank_count: usize) -> Self {
+        let active_word_count = rank_count.div_ceil(BITSET_WORD_BITS);
+        Self {
+            counts: vec![0; rank_count],
+            active_words: vec![0; active_word_count],
+            summary_words: vec![0; active_word_count.div_ceil(BITSET_WORD_BITS)],
+            active_end: 0,
+        }
+    }
+
+    fn activate(&mut self, rank: usize) -> Result<(), String> {
+        let count = self
+            .counts
+            .get_mut(rank)
+            .ok_or("region rank exceeds the dense active-count layout")?;
+        if *count == 0 {
+            let active_word = rank / BITSET_WORD_BITS;
+            let active_bit = rank % BITSET_WORD_BITS;
+            self.active_words[active_word] |= 1_u64 << active_bit;
+
+            let summary_word = active_word / BITSET_WORD_BITS;
+            let summary_bit = active_word % BITSET_WORD_BITS;
+            self.summary_words[summary_word] |= 1_u64 << summary_bit;
+        }
+        *count = count
+            .checked_add(1)
+            .ok_or("region result size exceeds platform capacity")?;
+        self.active_end = self.active_end.max(rank + 1);
+        Ok(())
+    }
+
+    fn iter_from(&self, first_rank: usize) -> DenseActiveRankIter<'_> {
+        DenseActiveRankIter {
+            active: self,
+            next_rank: first_rank.min(self.counts.len()),
+            active_end: self.active_end,
+        }
+    }
+
+    fn next_active_word(&self, start_word: usize) -> Option<usize> {
+        if start_word >= self.active_words.len() {
+            return None;
+        }
+
+        let mut summary_word = start_word / BITSET_WORD_BITS;
+        let first_summary_bit = start_word % BITSET_WORD_BITS;
+        let mut summary_bits = self.summary_words[summary_word] & (u64::MAX << first_summary_bit);
+        loop {
+            if summary_bits != 0 {
+                let active_word =
+                    summary_word * BITSET_WORD_BITS + summary_bits.trailing_zeros() as usize;
+                return (active_word < self.active_words.len()).then_some(active_word);
+            }
+            summary_word += 1;
+            summary_bits = *self.summary_words.get(summary_word)?;
+        }
+    }
+}
+
+struct DenseActiveRankIter<'a> {
+    active: &'a DenseActiveRankCounts,
+    next_rank: usize,
+    active_end: usize,
+}
+
+impl Iterator for DenseActiveRankIter<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_rank >= self.active_end {
+            return None;
+        }
+
+        let mut active_word = self.next_rank / BITSET_WORD_BITS;
+        let first_bit = self.next_rank % BITSET_WORD_BITS;
+        let mut active_bits = self.active.active_words[active_word] & (u64::MAX << first_bit);
+        if active_bits == 0 {
+            active_word = self.active.next_active_word(active_word + 1)?;
+            active_bits = self.active.active_words[active_word];
+        }
+
+        let rank = active_word * BITSET_WORD_BITS + active_bits.trailing_zeros() as usize;
+        self.next_rank = rank + 1;
+        Some((rank, self.active.counts[rank]))
+    }
+}
+
+/// Active rank counts chosen to match the number of ranks the sweep can see.
+///
+/// ELI5: use the numbered shelves when most of them might receive an item, but
+/// keep a sorted notebook when a huge shelf range has only a handful of items.
+enum ActiveRankCounts {
+    Dense(DenseActiveRankCounts),
+    Sparse {
+        rank_count: usize,
+        counts: BTreeMap<usize, usize>,
+    },
+}
+
+impl ActiveRankCounts {
+    fn new(rank_count: usize, visible_position_count: usize) -> Self {
+        if rank_count <= visible_position_count.saturating_mul(DENSE_ACTIVE_RANK_SPARSITY_FACTOR) {
+            Self::Dense(DenseActiveRankCounts::new(rank_count))
+        } else {
+            Self::Sparse {
+                rank_count,
+                counts: BTreeMap::new(),
+            }
+        }
+    }
+
+    fn activate(&mut self, rank: usize) -> Result<(), String> {
+        match self {
+            Self::Dense(counts) => counts.activate(rank),
+            Self::Sparse { rank_count, counts } => {
+                if rank >= *rank_count {
+                    return Err("region rank exceeds the active-count layout".to_owned());
+                }
+                let count = counts.entry(rank).or_default();
+                *count = count
+                    .checked_add(1)
+                    .ok_or("region result size exceeds platform capacity")?;
+                Ok(())
+            }
+        }
+    }
+
+    fn iter_from(&self, first_rank: usize) -> ActiveRankIter<'_> {
+        match self {
+            Self::Dense(counts) => ActiveRankIter::Dense(counts.iter_from(first_rank)),
+            Self::Sparse { counts, .. } => ActiveRankIter::Sparse(counts.range(first_rank..)),
+        }
+    }
+}
+
+enum ActiveRankIter<'a> {
+    Dense(DenseActiveRankIter<'a>),
+    Sparse(btree_map::Range<'a, usize, usize>),
+}
+
+impl Iterator for ActiveRankIter<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense(iter) => iter.next(),
+            Self::Sparse(iter) => iter.next().map(|(&rank, &count)| (rank, count)),
+        }
+    }
 }
 
 /// Point-update/suffix-query tree for the best right index at each rank.
@@ -695,7 +867,10 @@ pub(crate) fn keep_all_first_pass(regions: &DualRegionPaths) -> Result<KeepAllFi
 
     let right_region_layout =
         build_ranked_region_position_layout(&regions.right_region, &regions.starts, regions.end)?;
-    let mut active_counts = BTreeMap::<usize, usize>::new();
+    let mut active_counts = ActiveRankCounts::new(
+        right_region_layout.labels.len(),
+        right_region_layout.positions.len(),
+    );
     let mut left_match_counts = Vec::with_capacity(regions.starts.len());
     let mut total_matches = 0usize;
     let mut previous_end = regions.end;
@@ -710,7 +885,7 @@ pub(crate) fn keep_all_first_pass(regions: &DualRegionPaths) -> Result<KeepAllFi
         if start > previous_end {
             return Err("starts must be monotonically non-increasing".to_owned());
         }
-        activate_dual_ranked_positions(
+        activate_ranked_positions(
             &right_region_layout,
             start,
             previous_end,
@@ -727,8 +902,8 @@ pub(crate) fn keep_all_first_pass(regions: &DualRegionPaths) -> Result<KeepAllFi
             .labels
             .partition_point(|&label| label < left_region);
         let matches = active_counts
-            .range(first_rank..)
-            .map(|(_, &count)| count)
+            .iter_from(first_rank)
+            .map(|(_, count)| count)
             .sum::<usize>();
         left_match_counts.push(matches);
         total_matches = total_matches
@@ -760,7 +935,10 @@ pub(crate) fn keep_all_second_pass(
     }
     debug_assert_eq!(offset, first_pass.total_size);
 
-    let mut active_counts = BTreeMap::<usize, usize>::new();
+    let mut active_counts = ActiveRankCounts::new(
+        first_pass.right_region_layout.labels.len(),
+        first_pass.right_region_layout.positions.len(),
+    );
     let mut positions = vec![0usize; first_pass.total_size];
     let mut left_output = vec![0_i64; first_pass.total_size];
     let mut right_output = vec![0_i64; first_pass.total_size];
@@ -775,7 +953,7 @@ pub(crate) fn keep_all_second_pass(
         if start > previous_end {
             return Err("starts must be monotonically non-increasing".to_owned());
         }
-        activate_dual_ranked_positions(
+        activate_ranked_positions(
             &first_pass.right_region_layout,
             start,
             previous_end,
@@ -795,7 +973,7 @@ pub(crate) fn keep_all_second_pass(
             .right_region_layout
             .labels
             .partition_point(|&label| label < left_region);
-        for (&rank, &count) in active_counts.range(first_rank..) {
+        for (rank, count) in active_counts.iter_from(first_rank) {
             let region_offset = first_pass.right_region_layout.offsets[rank];
             for &right_position in
                 &first_pass.right_region_layout.positions[region_offset..region_offset + count]
@@ -850,32 +1028,7 @@ fn build_ranked_region_position_layout(
     starts: &[usize],
     end: usize,
 ) -> Result<RankedRegionPositionLayout, String> {
-    let mut counts = HashMap::<i64, usize>::new();
-    for &region in second_right_region {
-        if region != 0 {
-            let count = counts.entry(region).or_default();
-            *count = (*count)
-                .checked_add(1)
-                .ok_or("region result size exceeds platform capacity")?;
-        }
-    }
-
-    let mut labels = counts.keys().copied().collect::<Vec<_>>();
-    labels.sort_unstable();
-
-    let mut label_to_rank = HashMap::<i64, usize>::with_capacity(labels.len());
-    for (rank, &label) in labels.iter().enumerate() {
-        label_to_rank.insert(label, rank);
-    }
-
-    let mut ranks = vec![usize::MAX; second_right_region.len()];
-    for (right_position, &region) in second_right_region.iter().enumerate() {
-        if region == 0 {
-            continue;
-        }
-        let rank = label_to_rank[&region];
-        ranks[right_position] = rank;
-    }
+    let (labels, ranks) = compress_region_labels(second_right_region, starts.len())?;
 
     // Count only positions that the sweep can actually see. Some right rows
     // may never enter a first-predicate window, so allocating for every
@@ -949,24 +1102,167 @@ fn build_ranked_region_position_layout(
     })
 }
 
-/// Add dual-region positions to the encountered-rank map.
+/// Compress nonzero region labels into ascending dense ranks.
+///
+/// Region construction normally produces labels in `0..=left.len()`, so a
+/// vector indexed by label avoids hashing and sorting. The sparse fallback
+/// preserves the old behavior for negative or unexpectedly large labels and
+/// prevents malformed internal data from requesting a huge allocation.
+///
+/// ELI5: use numbered cubbies when the label numbers fit near the number of
+/// left rows; otherwise keep the old dictionary so a label like one billion
+/// does not require one billion empty cubbies.
+fn compress_region_labels(
+    regions: &[i64],
+    left_len: usize,
+) -> Result<(Vec<i64>, Vec<usize>), String> {
+    // Large selective layouts are common and should not pay for one complete
+    // density scan followed by another complete HashMap scan. Probe up to a
+    // small number of nonzero positions while building the fallback map; if
+    // the probe reaches the end, that map is already complete.
+    if regions.len() >= SPARSE_LABEL_PROBE_MIN_LEN {
+        let mut counts = HashMap::<i64, usize>::new();
+        let mut nonzero_count = 0usize;
+        let mut probe_complete = true;
+        for &region in regions {
+            if region == 0 {
+                continue;
+            }
+            nonzero_count += 1;
+            if nonzero_count > SPARSE_LABEL_PROBE_LIMIT {
+                probe_complete = false;
+                break;
+            }
+            let count = counts.entry(region).or_default();
+            *count = (*count)
+                .checked_add(1)
+                .ok_or("region result size exceeds platform capacity")?;
+        }
+        if probe_complete {
+            #[cfg(test)]
+            SPARSE_LABEL_LAYOUT_HITS.with(|hits| hits.set(hits.get() + 1));
+            return Ok(finish_sparse_label_compression(regions, counts));
+        }
+    }
+
+    let (max_label, nonzero_count, all_nonnegative) = regions.iter().copied().fold(
+        (0_i64, 0_usize, true),
+        |(maximum, count, nonnegative), label| {
+            (
+                maximum.max(label),
+                count + usize::from(label != 0),
+                nonnegative && label >= 0,
+            )
+        },
+    );
+    // A bounded maximum is not enough by itself: a selective predicate may
+    // produce one nonzero label near `left_len`. Keep the dense table within a
+    // small multiple of both the producer bound and the positions that use it.
+    let dense_limit = left_len
+        .min(nonzero_count)
+        .saturating_mul(DENSE_LABEL_SPARSITY_FACTOR);
+    let dense_table_len = usize::try_from(max_label)
+        .ok()
+        .filter(|&label| label <= dense_limit)
+        .and_then(|label| label.checked_add(1));
+    let use_dense = all_nonnegative && dense_table_len.is_some();
+
+    if use_dense {
+        #[cfg(test)]
+        DENSE_LABEL_LAYOUT_HITS.with(|hits| hits.set(hits.get() + 1));
+
+        let dense_table_len = dense_table_len.expect("dense labels have a bounded table length");
+        // This table starts as counts so present labels can be collected in
+        // ascending order, then those same slots are overwritten with ranks.
+        let mut rank_by_label = vec![0usize; dense_table_len];
+        for &label in regions {
+            if label == 0 {
+                continue;
+            }
+            let count = &mut rank_by_label[label as usize];
+            *count = count
+                .checked_add(1)
+                .ok_or("region result size exceeds platform capacity")?;
+        }
+        let labels = rank_by_label
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(label, &count)| (count != 0).then_some(label as i64))
+            .collect::<Vec<_>>();
+        for (rank, &label) in labels.iter().enumerate() {
+            rank_by_label[label as usize] = rank;
+        }
+        let ranks = regions
+            .iter()
+            .map(|&label| {
+                if label == 0 {
+                    usize::MAX
+                } else {
+                    rank_by_label[label as usize]
+                }
+            })
+            .collect();
+        return Ok((labels, ranks));
+    }
+
+    #[cfg(test)]
+    SPARSE_LABEL_LAYOUT_HITS.with(|hits| hits.set(hits.get() + 1));
+
+    let mut counts = HashMap::<i64, usize>::new();
+    for &region in regions {
+        if region != 0 {
+            let count = counts.entry(region).or_default();
+            *count = (*count)
+                .checked_add(1)
+                .ok_or("region result size exceeds platform capacity")?;
+        }
+    }
+    Ok(finish_sparse_label_compression(regions, counts))
+}
+
+fn finish_sparse_label_compression(
+    regions: &[i64],
+    counts: HashMap<i64, usize>,
+) -> (Vec<i64>, Vec<usize>) {
+    let mut labels = counts.keys().copied().collect::<Vec<_>>();
+    labels.sort_unstable();
+    let label_to_rank = labels
+        .iter()
+        .enumerate()
+        .map(|(rank, &label)| (label, rank))
+        .collect::<HashMap<_, _>>();
+    let ranks = regions
+        .iter()
+        .map(|region| {
+            if *region == 0 {
+                usize::MAX
+            } else {
+                label_to_rank[region]
+            }
+        })
+        .collect();
+    (labels, ranks)
+}
+
+/// Add region positions to the active-rank counts.
 ///
 /// # Arguments
 ///
 /// * `layout` - Precomputed right-label ranks and flat position slices.
 /// * `start` / `previous_end` - The newly visible half-open window.
 /// * `active_counts` - Per-rank counts accumulated while the sweep moves
-///   leftward.
+///   leftward, plus bitsets used to skip inactive ranks.
 ///
 /// # Errors
 ///
 /// Returns an error if the window moves in the wrong direction or a count
 /// overflows platform capacity.
-fn activate_dual_ranked_positions(
+fn activate_ranked_positions(
     layout: &RankedRegionPositionLayout,
     start: usize,
     previous_end: usize,
-    active_counts: &mut BTreeMap<usize, usize>,
+    active_counts: &mut ActiveRankCounts,
 ) -> Result<(), String> {
     if start > previous_end {
         return Err("starts must be monotonically non-increasing".to_owned());
@@ -976,10 +1272,7 @@ fn activate_dual_ranked_positions(
         if rank == usize::MAX {
             continue;
         }
-        let count = active_counts.entry(rank).or_default();
-        *count = count
-            .checked_add(1)
-            .ok_or("region result size exceeds platform capacity")?;
+        active_counts.activate(rank)?;
     }
     Ok(())
 }
@@ -1143,7 +1436,10 @@ where
         Vec::new()
     };
     let mut total_matches = 0usize;
-    let mut active_counts = BTreeMap::<usize, usize>::new();
+    let mut active_counts = ActiveRankCounts::new(
+        right_region_layout.labels.len(),
+        right_region_layout.positions.len(),
+    );
     let mut previous_end = regions.end;
 
     for (left_position, (&start, &left_region)) in
@@ -1155,7 +1451,7 @@ where
         if start > previous_end {
             return Err("starts must be monotonically non-increasing".to_owned());
         }
-        activate_dual_ranked_positions(
+        activate_ranked_positions(
             &right_region_layout,
             start,
             previous_end,
@@ -1170,7 +1466,7 @@ where
         let first_rank = right_region_layout
             .labels
             .partition_point(|&label| label < left_region);
-        'candidates: for (&rank, &region_count) in active_counts.range(first_rank..) {
+        'candidates: for (rank, region_count) in active_counts.iter_from(first_rank) {
             let region_start = right_region_layout.offsets[rank];
             for &right_position in
                 &right_region_layout.positions[region_start..region_start + region_count]
@@ -1248,7 +1544,10 @@ where
         return Ok(None);
     }
 
-    let mut active_counts = BTreeMap::<usize, usize>::new();
+    let mut active_counts = ActiveRankCounts::new(
+        first_pass.right_region_layout.labels.len(),
+        first_pass.right_region_layout.positions.len(),
+    );
     let mut previous_end = regions.end;
     let mut left_output = vec![0_i64; first_pass.total_matches];
     let mut right_output = vec![0_i64; first_pass.total_matches];
@@ -1263,7 +1562,7 @@ where
         if start > previous_end {
             return Err("starts must be monotonically non-increasing".to_owned());
         }
-        activate_dual_ranked_positions(
+        activate_ranked_positions(
             &first_pass.right_region_layout,
             start,
             previous_end,
@@ -1279,7 +1578,7 @@ where
             .right_region_layout
             .labels
             .partition_point(|&label| label < left_region);
-        for (&rank, &region_count) in active_counts.range(first_rank..) {
+        for (rank, region_count) in active_counts.iter_from(first_rank) {
             let region_start = first_pass.right_region_layout.offsets[rank];
             for &right_position in
                 &first_pass.right_region_layout.positions[region_start..region_start + region_count]
@@ -1341,7 +1640,10 @@ where
         }));
     }
 
-    let mut active_counts = BTreeMap::<usize, usize>::new();
+    let mut active_counts = ActiveRankCounts::new(
+        first_pass.right_region_layout.labels.len(),
+        first_pass.right_region_layout.positions.len(),
+    );
     let mut previous_end = regions.end;
     let mut left_output = vec![0_i64; first_pass.total_matches];
     let mut right_output = vec![0_i64; first_pass.total_matches];
@@ -1356,7 +1658,7 @@ where
         if start > previous_end {
             return Err("starts must be monotonically non-increasing".to_owned());
         }
-        activate_dual_ranked_positions(
+        activate_ranked_positions(
             &first_pass.right_region_layout,
             start,
             previous_end,
@@ -1373,7 +1675,7 @@ where
             .right_region_layout
             .labels
             .partition_point(|&label| label < left_region);
-        'candidates: for (&rank, &region_count) in active_counts.range(first_rank..) {
+        'candidates: for (rank, region_count) in active_counts.iter_from(first_rank) {
             let region_start = first_pass.right_region_layout.offsets[rank];
             for &right_position in
                 &first_pass.right_region_layout.positions[region_start..region_start + region_count]
@@ -2641,7 +2943,7 @@ where
         )?));
     }
 
-    let mut active_counts = BTreeMap::<usize, usize>::new();
+    let mut active_counts = ActiveRankCounts::new(layout.labels.len(), layout.positions.len());
     let mut previous_end = regions.end;
     for (left_position, (&start, &left_region)) in
         regions.starts.iter().zip(&regions.left_region).enumerate()
@@ -2649,14 +2951,14 @@ where
         if start == regions.end {
             continue;
         }
-        activate_dual_ranked_positions(&layout, start, previous_end, &mut active_counts)
+        activate_ranked_positions(&layout, start, previous_end, &mut active_counts)
             .map_err(PyValueError::new_err)?;
         previous_end = start;
         if !left_has_match[left_position] || left_region == 0 {
             continue;
         }
         let first_rank = layout.labels.partition_point(|&label| label < left_region);
-        for (&rank, &region_count) in active_counts.range(first_rank..) {
+        for (rank, region_count) in active_counts.iter_from(first_rank) {
             let region_start = layout.offsets[rank];
             for &right_position in &layout.positions[region_start..region_start + region_count] {
                 if !candidate_pass(regions.left_order[left_position], right_position) {
@@ -3302,6 +3604,7 @@ mod tests {
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::exceptions::PyValueError;
     use pyo3::types::{PyDict, PyList};
+    use std::collections::BTreeMap;
 
     fn predicate<'py>(
         py: Python<'py>,
@@ -3371,6 +3674,199 @@ mod tests {
             ">=" => left >= right,
             _ => panic!("unsupported test operator: {operator}"),
         }
+    }
+
+    #[test]
+    fn dense_label_compression_preserves_sorted_ranks_and_masked_zero() {
+        let dense_hits_before = DENSE_LABEL_LAYOUT_HITS.with(Cell::get);
+        let sparse_hits_before = SPARSE_LABEL_LAYOUT_HITS.with(Cell::get);
+        let layout = build_ranked_region_position_layout(&[0, 3, 1, 3, 2], &[5, 0], 5)
+            .expect("dense layout should build");
+
+        assert_eq!(layout.labels, vec![1, 2, 3]);
+        assert_eq!(layout.ranks, vec![usize::MAX, 2, 0, 2, 1]);
+        assert_eq!(layout.offsets, vec![0, 1, 2]);
+        assert_eq!(layout.positions, vec![2, 4, 1, 3]);
+        assert_eq!(
+            DENSE_LABEL_LAYOUT_HITS.with(Cell::get) - dense_hits_before,
+            1
+        );
+        assert_eq!(
+            SPARSE_LABEL_LAYOUT_HITS.with(Cell::get) - sparse_hits_before,
+            0
+        );
+    }
+
+    #[test]
+    fn sparse_label_compression_falls_back_without_changing_labels() {
+        let dense_hits_before = DENSE_LABEL_LAYOUT_HITS.with(Cell::get);
+        let sparse_hits_before = SPARSE_LABEL_LAYOUT_HITS.with(Cell::get);
+        let (labels, ranks) = compress_region_labels(&[0, 1_000_000, 2, 1_000_000], 4)
+            .expect("sparse labels should use the guarded fallback");
+
+        assert_eq!(labels, vec![2, 1_000_000]);
+        assert_eq!(ranks, vec![usize::MAX, 1, 0, 1]);
+        let (negative_labels, negative_ranks) = compress_region_labels(&[0, -2, -2], 3)
+            .expect("negative labels should preserve the guarded fallback");
+        assert_eq!(negative_labels, vec![-2]);
+        assert_eq!(negative_ranks, vec![usize::MAX, 0, 0]);
+        assert_eq!(
+            DENSE_LABEL_LAYOUT_HITS.with(Cell::get) - dense_hits_before,
+            0
+        );
+        assert_eq!(
+            SPARSE_LABEL_LAYOUT_HITS.with(Cell::get) - sparse_hits_before,
+            2
+        );
+    }
+
+    #[test]
+    fn label_compression_dispatches_at_the_dense_limit() {
+        let dense_hits_before = DENSE_LABEL_LAYOUT_HITS.with(Cell::get);
+        let sparse_hits_before = SPARSE_LABEL_LAYOUT_HITS.with(Cell::get);
+
+        let (dense_labels, dense_ranks) = compress_region_labels(&[8, 8], 2)
+            .expect("a label at the dense limit should use the table");
+        assert_eq!(dense_labels, vec![8]);
+        assert_eq!(dense_ranks, vec![0, 0]);
+
+        let (sparse_labels, sparse_ranks) = compress_region_labels(&[9, 9], 2)
+            .expect("a label beyond the dense limit should use the fallback");
+        assert_eq!(sparse_labels, vec![9]);
+        assert_eq!(sparse_ranks, vec![0, 0]);
+
+        assert_eq!(
+            DENSE_LABEL_LAYOUT_HITS.with(Cell::get) - dense_hits_before,
+            1
+        );
+        assert_eq!(
+            SPARSE_LABEL_LAYOUT_HITS.with(Cell::get) - sparse_hits_before,
+            1
+        );
+    }
+
+    #[test]
+    fn large_selective_label_compression_finishes_the_sparse_probe() {
+        let sparse_hits_before = SPARSE_LABEL_LAYOUT_HITS.with(Cell::get);
+        let mut regions = vec![0_i64; SPARSE_LABEL_PROBE_MIN_LEN];
+        regions[17] = 3_999;
+        regions[3_000] = 3_999;
+
+        let (labels, ranks) = compress_region_labels(&regions, regions.len())
+            .expect("the completed sparse probe should preserve ranks");
+        assert_eq!(labels, vec![3_999]);
+        assert_eq!(ranks[17], 0);
+        assert_eq!(ranks[3_000], 0);
+        assert_eq!(
+            ranks.iter().filter(|&&rank| rank == usize::MAX).count(),
+            4_094
+        );
+        assert_eq!(
+            SPARSE_LABEL_LAYOUT_HITS.with(Cell::get) - sparse_hits_before,
+            1
+        );
+    }
+
+    #[test]
+    fn active_rank_counts_scan_across_data_and_summary_word_boundaries() {
+        let mut active = DenseActiveRankCounts::new(4_162);
+        for rank in [0, 63, 64, 4_095, 4_096, 4_161, 64] {
+            active.activate(rank).expect("rank should fit");
+        }
+
+        assert_eq!(
+            active.iter_from(0).collect::<Vec<_>>(),
+            vec![(0, 1), (63, 1), (64, 2), (4_095, 1), (4_096, 1), (4_161, 1)]
+        );
+        assert_eq!(
+            active.iter_from(64).collect::<Vec<_>>(),
+            vec![(64, 2), (4_095, 1), (4_096, 1), (4_161, 1)]
+        );
+        assert_eq!(
+            active.iter_from(65).collect::<Vec<_>>(),
+            vec![(4_095, 1), (4_096, 1), (4_161, 1)]
+        );
+        assert!(active.iter_from(4_162).next().is_none());
+        assert!(DenseActiveRankCounts::new(0).iter_from(0).next().is_none());
+        assert!(DenseActiveRankCounts::new(100)
+            .iter_from(0)
+            .next()
+            .is_none());
+
+        let mut sparse_tail = DenseActiveRankCounts::new(10_000_000);
+        sparse_tail.activate(7).expect("rank should fit");
+        assert_eq!(sparse_tail.iter_from(0).collect::<Vec<_>>(), vec![(7, 1)]);
+        assert!(sparse_tail.iter_from(8).next().is_none());
+
+        let mut empty = DenseActiveRankCounts::new(0);
+        assert_eq!(
+            empty.activate(0),
+            Err("region rank exceeds the dense active-count layout".to_owned())
+        );
+    }
+
+    #[test]
+    fn dense_active_ranks_match_btree_reference_for_random_suffixes() {
+        let rank_count = 5_000;
+        let mut active = DenseActiveRankCounts::new(rank_count);
+        let mut reference = BTreeMap::<usize, usize>::new();
+        let mut seed = 0x517c_c1b7_2722_0a95_u64;
+        for _ in 0..20_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let rank = seed as usize % rank_count;
+            active.activate(rank).expect("rank should fit");
+            *reference.entry(rank).or_default() += 1;
+        }
+
+        for first_rank in [0, 1, 63, 64, 65, 4_095, 4_096, 4_999, 5_000] {
+            let expected = reference
+                .range(first_rank..)
+                .map(|(&rank, &count)| (rank, count))
+                .collect::<Vec<_>>();
+            assert_eq!(active.iter_from(first_rank).collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[test]
+    fn active_rank_counts_use_sparse_storage_for_a_large_mostly_invisible_layout() {
+        let mut sparse = ActiveRankCounts::new(10_000, 100);
+        assert!(matches!(sparse, ActiveRankCounts::Sparse { .. }));
+        for rank in [9_999, 5, 9_999] {
+            sparse.activate(rank).expect("rank should fit");
+        }
+        assert_eq!(
+            sparse.iter_from(5).collect::<Vec<_>>(),
+            vec![(5, 1), (9_999, 2)]
+        );
+        assert_eq!(
+            sparse.activate(10_000),
+            Err("region rank exceeds the active-count layout".to_owned())
+        );
+
+        let dense = ActiveRankCounts::new(400, 100);
+        assert!(matches!(dense, ActiveRankCounts::Dense(_)));
+    }
+
+    #[test]
+    fn ranked_activation_rejects_a_reversed_window_and_skips_masked_ranks() {
+        let layout = RankedRegionPositionLayout {
+            labels: vec![1, 2],
+            offsets: vec![0, 1],
+            ranks: vec![usize::MAX, 1, 0],
+            positions: vec![2, 1],
+        };
+        let mut active = ActiveRankCounts::new(layout.labels.len(), layout.positions.len());
+        activate_ranked_positions(&layout, 0, 3, &mut active).expect("window should activate");
+        assert_eq!(
+            active.iter_from(0).collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1)]
+        );
+        assert_eq!(
+            activate_ranked_positions(&layout, 2, 1, &mut active),
+            Err("starts must be monotonically non-increasing".to_owned())
+        );
     }
 
     #[test]
