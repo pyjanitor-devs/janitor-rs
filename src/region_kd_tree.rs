@@ -81,9 +81,11 @@ impl RegionKdTree {
     ///
     /// # Complexity
     ///
-    /// Construction uses recursive sorting and is approximately `O(n log n)`
-    /// for `n` right rows, with `O(n * d)` point/bounding-box storage for `d`
-    /// dimensions.
+    /// Construction uses a full sort at every recursive level and is therefore
+    /// `O(n log² n)` for `n` right rows in the current implementation. Point
+    /// and bounding-box storage is `O(n * d)` for `d` dimensions. The explicit
+    /// complexity note is intentional: replacing per-node sorting with a
+    /// selection/partition build is a separate optimization opportunity.
     pub(crate) fn build(right_regions: &[Vec<i64>], leaf_size: usize) -> Result<Self, String> {
         if right_regions.len() < 3 {
             return Err("k-d tree requires at least three region dimensions".to_owned());
@@ -211,6 +213,25 @@ impl RegionKdTree {
         self.visit_node(0, left_regions, &mut visit)
     }
 
+    /// Visit every stored point satisfying `point <= query` coordinate-wise.
+    ///
+    /// This is the orientation-reversed form of [`Self::visit`]. It lets the
+    /// caller build the tree over the smaller side of a join while preserving
+    /// the same dominance relation. The callback receives the stored point's
+    /// original position.
+    pub(crate) fn visit_lower<F>(&self, query: &[i64], mut visit: F) -> bool
+    where
+        F: FnMut(usize) -> bool,
+    {
+        if query.len() != self.dimensions || self.nodes.is_empty() {
+            return true;
+        }
+        if query.contains(&0) {
+            return true;
+        }
+        self.visit_node_lower(0, query, &mut visit)
+    }
+
     /// Traverse one node, applying bounding-box pruning and forwarding every
     /// matching point to `visit`.
     ///
@@ -243,9 +264,6 @@ impl RegionKdTree {
             .all(|(&minimum, &left)| minimum >= left)
         {
             for &point_index in &self.order[node.start..node.end] {
-                if self.points[point_index].contains(&0) {
-                    continue;
-                }
                 if !visit(point_index) {
                     return false;
                 }
@@ -281,6 +299,62 @@ impl RegionKdTree {
             true
         }
     }
+
+    /// Traverse one node for the lower-orthant query `point <= query`.
+    fn visit_node_lower<F>(&self, node_index: usize, query: &[i64], visit: &mut F) -> bool
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let node = &self.nodes[node_index];
+        // If one minimum is above the query, every point in this box fails
+        // that dimension. ELI5: the whole box is too far to the right.
+        if node
+            .min
+            .iter()
+            .zip(query)
+            .any(|(&minimum, &value)| minimum > value)
+        {
+            return true;
+        }
+
+        // If every maximum is within the query, the whole box is a match.
+        if node
+            .max
+            .iter()
+            .zip(query)
+            .all(|(&maximum, &value)| maximum <= value)
+        {
+            for &point_index in &self.order[node.start..node.end] {
+                if !visit(point_index) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if let Some(left) = node.left {
+            if !self.visit_node_lower(left, query, visit) {
+                return false;
+            }
+        } else {
+            for &point_index in &self.order[node.start..node.end] {
+                let point = &self.points[point_index];
+                if point.contains(&0)
+                    || !point.iter().zip(query).all(|(&left, &right)| left <= right)
+                {
+                    continue;
+                }
+                if !visit(point_index) {
+                    return false;
+                }
+            }
+        }
+        if let Some(right) = node.right {
+            self.visit_node_lower(right, query, visit)
+        } else {
+            true
+        }
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +384,19 @@ mod tests {
             false
         }));
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn lower_queries_match_points_on_the_other_side() {
+        let regions = vec![vec![1, 2, 3, 4], vec![4, 3, 2, 1], vec![1, 2, 3, 4]];
+        let tree = RegionKdTree::build(&regions, 1).unwrap();
+        let mut actual = Vec::new();
+        assert!(tree.visit_lower(&[3, 3, 3], |position| {
+            actual.push(position);
+            true
+        }));
+        actual.sort_unstable();
+        assert_eq!(actual, vec![1, 2]);
     }
 
     #[test]

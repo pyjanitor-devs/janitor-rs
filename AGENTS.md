@@ -1484,6 +1484,7 @@ maximum checks and must not be changed as part of this work.
 
 **Recommendation**: Apply the cumulative-max filter to dual-region paths
 without modifying the n-region traversal or setup.
+
 ### [2026-10-14] Equality-led range joins use negative windows as no-match sentinels
 
 **Context**: Reviewing the equality-led conditional-join kernels found that
@@ -1515,6 +1516,7 @@ issue #234.
 tracked by issue #253. Keep issue #234 focused on the single-threaded
 candidate-generation algorithm, correctness, orientation, benchmarks, and
 pyjanitor compatibility.
+
 ### [2026-10-16] Bound dense region-label tables by occupied positions too
 
 **Context**: Issue #247 replaces hash-based region-label compression with a
