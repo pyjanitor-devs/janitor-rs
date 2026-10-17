@@ -63,17 +63,17 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use super::join_search::partition_point;
+use super::join_types::{result_dict, Keep};
+use super::predicate::{
+    check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
+    predicates_match_dispatch, NullMetadataView, PredicateView,
+};
 use crate::aggregation_common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
 use crate::aggregation_common::ensure_equal_lengths_core;
 use crate::compare_op::CompareOp;
-use crate::join_search::partition_point;
-use crate::join_types::{result_dict, Keep};
-use crate::predicate::{
-    check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
-    predicates_match_dispatch, NullMetadataView, PredicateView,
-};
 
 /// Validate that non-null and null physical positions form a complete,
 /// disjoint partition of one full input layout.
@@ -377,8 +377,8 @@ fn parse_not_equal_aggregation_residuals<'py>(
     py: Python<'py>,
     predicates: &Bound<'py, PyList>,
 ) -> PyResult<(
-    Vec<crate::predicate::Predicate<'py>>,
-    Option<Vec<crate::predicate::NullMetadata<'py>>>,
+    Vec<super::predicate::Predicate<'py>>,
+    Option<Vec<super::predicate::NullMetadata<'py>>>,
 )> {
     let residuals = PyList::empty(py);
     for item in predicates.iter().skip(1) {

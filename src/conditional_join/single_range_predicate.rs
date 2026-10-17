@@ -44,16 +44,16 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use super::join_aggregation_helpers::{aggregate_range_windows, aggregation_windows};
+use super::join_candidate_materialization::materialize_range_candidates;
+use super::join_search::{range_window, range_window_bounds};
+use super::join_types::{result_dict, Keep, SingleJoinResult};
+use super::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
+use super::range_predicate::parse_any_range_parts;
 use crate::aggregation_common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
 use crate::compare_op::CompareOp;
-use crate::join_aggregation_helpers::{aggregate_range_windows, aggregation_windows};
-use crate::join_candidate_materialization::materialize_range_candidates;
-use crate::join_search::{range_window, range_window_bounds};
-use crate::join_types::{result_dict, Keep, SingleJoinResult};
-use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
-use crate::range_predicate::parse_any_range_parts;
 
 fn prefix_extreme(values: &[i64], minimum: bool) -> Vec<i64> {
     // Prefix extrema are used only when the right physical positions are not
@@ -839,7 +839,7 @@ fn aggregate_range_anchor<'py>(
         &first.get_item(2)?,
     )?;
     let (parsed, metadata) =
-        crate::join_aggregation_helpers::residuals(py, predicates, false, false)?;
+        super::join_aggregation_helpers::residuals(py, predicates, false, false)?;
     let (starts, ends) = anchor.bounds().map_err(PyValueError::new_err)?;
     let windows =
         aggregation_windows(&anchor, starts, ends, true).map_err(PyValueError::new_err)?;

@@ -20,19 +20,19 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, HashMap};
 
+use super::join_search::partition_point_between;
+use super::join_types::{result_dict, Keep};
+use super::predicate::{
+    check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
+    predicates_match_dispatch, predicates_match_window, NullMetadataView, Predicate, PredicateView,
+};
+use super::range_join::adaptive_extreme_positions;
+use super::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 use crate::aggregation_common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
 use crate::aggregation_common::ensure_equal_lengths_core;
 use crate::compare_op::CompareOp;
-use crate::join_search::partition_point_between;
-use crate::join_types::{result_dict, Keep};
-use crate::predicate::{
-    check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
-    predicates_match_dispatch, predicates_match_window, NullMetadataView, Predicate, PredicateView,
-};
-use crate::range_join::adaptive_extreme_positions;
-use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
 #[cfg(test)]
 thread_local! {
@@ -1931,7 +1931,7 @@ mod tests {
         EQUI_STARTS_ENDS_HITS,
     };
     use crate::compare_op::CompareOp;
-    use crate::join_types::Keep;
+    use crate::conditional_join::join_types::Keep;
     use pyo3::exceptions::PyValueError;
     use pyo3::types::{PyAnyMethods, PyBool, PyList, PyListMethods, PyTuple, PyTupleMethods};
 
@@ -2517,8 +2517,8 @@ mod tests {
         })
         .unwrap();
     }
-    use crate::predicate::PredicateView;
-    use crate::range_predicate::{AnyParsedRangePredicate, ParsedRangePredicate};
+    use crate::conditional_join::predicate::PredicateView;
+    use crate::conditional_join::range_predicate::{AnyParsedRangePredicate, ParsedRangePredicate};
 
     #[test]
     fn unordered_second_range_envelope_is_directional() {
@@ -2950,7 +2950,7 @@ mod tests {
 
     #[test]
     fn extrema_and_scans_preserve_inactive_window_alignment() {
-        use crate::range_join::EXTREME_TREE_HITS;
+        use crate::conditional_join::range_join::EXTREME_TREE_HITS;
         let left = Array1::from_iter(10..16);
         let right = Array1::from_vec(vec![4, 1, 3, 2]);
         let starts = Array1::from_vec(vec![-1, 0, 4, 1, 0, 3]);
@@ -2996,7 +2996,7 @@ mod tests {
 
     #[test]
     fn broad_equi_windows_use_adaptive_extrema() {
-        use crate::range_join::EXTREME_TREE_HITS;
+        use crate::conditional_join::range_join::EXTREME_TREE_HITS;
         let left = Array1::from_iter(100_i64..164);
         let right =
             Array1::from_iter((0..1_024).map(|position| ((position * 7919) % 1_024) as i64));

@@ -41,18 +41,18 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use super::join_aggregation_helpers::aggregate_range_windows;
+use super::join_candidate_materialization::materialize_range_candidates;
+#[cfg(test)]
+use super::join_search::range_window;
+use super::join_types::{result_dict, Keep, SingleJoinResult};
+use super::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
+use super::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 use crate::aggregation_common::adaptive::should_use_segment_tree;
 use crate::aggregation_common::ensure_equal_lengths_core;
 #[cfg(test)]
 use crate::compare_op::CompareOp;
-use crate::join_aggregation_helpers::aggregate_range_windows;
-use crate::join_candidate_materialization::materialize_range_candidates;
-#[cfg(test)]
-use crate::join_search::range_window;
-use crate::join_types::{result_dict, Keep, SingleJoinResult};
 use crate::packed_spans::{assign_range_clusters, queried_source_spans, PackedSpanLayout};
-use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
-use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -2117,8 +2117,8 @@ pub(crate) fn aggregate_range_extended<'py>(
     let first = parse_shared_index_range_predicate(first_tuple, left_index, right_index)?;
     let second = parse_shared_index_range_predicate(second_tuple, left_index, right_index)?;
     let (parsed, metadata) =
-        crate::join_aggregation_helpers::residuals(py, predicates, false, true)?;
-    crate::predicate::check_predicate_lengths(&parsed, first.left_len(), first.right_len())?;
+        super::join_aggregation_helpers::residuals(py, predicates, false, true)?;
+    super::predicate::check_predicate_lengths(&parsed, first.left_len(), first.right_len())?;
     let windows = build_any_windows(&first, &second).map_err(PyValueError::new_err)?;
     if windows.left_index.is_empty() {
         return Ok(None);

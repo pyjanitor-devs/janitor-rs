@@ -185,27 +185,14 @@ the `extension-module` PyO3 linker gotcha below).
 janitor-rs/
 ├── src/
 │   ├── lib.rs              # top-level composition point only -- calls each
-│   │                        # family's own `register(m)` (issue #22); no
-│   │                        # per-function add_function calls live here
-│   ├── bin_search/          # binary search kernels (lt, gt, ge, le, ...
-│   │                        # x first/regions variants)
-│   ├── index_builder.rs      # index-building helpers (repeat_index,
-│   │                         # trim_index, build_positional_index, ...)
-│   ├── multi_join_indices/  # fused batch/dual-region/multi-region index
-│   │                        # builders retained from the old `compare/`
-│   │                        # and top-level `non_equi_*` files when the
-│   │                        # per-op comparison-kernel family was removed
-│   │                        # (issue #193)
-│   └── aggs/
-│       ├── sum/ sum_rev/     # forward and reverse sum kernels
-│       ├── min/ min_rev/     # ditto for min
-│       ├── max/ max_rev/     # ditto for max
-│       ├── prod/ prod_rev/   # ditto for prod
-│       ├── size_rev/         # size (count) kernels, reverse-only
-│       └── batch_aggregate.rs, dual_regions.rs, multi_regions.rs, ...
-│                             # fused predicate-driven aggregation, also
-│                             # retained from `compare/`/`non_equi_*`
-│                             # (issue #193)
+│   │                        # family's own `register(m)` (issue #22)
+│   ├── conditional_join/    # conditional-join kernels and helpers
+│   │   ├── mod.rs           # family registration and module ownership
+│   │   ├── equi_join.rs, range_join.rs, ...
+│   │   └── region_kd_tree.rs # multi-predicate range-join tree
+│   ├── aggregation_*.rs     # shared aggregation input/state/common code
+│   ├── compare_op.rs         # shared comparison operators
+│   └── packed_spans.rs       # shared queried-span coordinates
 ├── benches/kernels.rs        # criterion benchmarks for the extracted
 │                             # `*_core` functions (see below)
 ├── clippy.toml                # documents the default Clippy argument policy
@@ -269,32 +256,25 @@ Python export registration is owned by the file/module that defines the
 functions, not by `src/lib.rs`. Three layers, each a `pub(crate) fn
 register(m: &Bound<'_, PyModule>) -> PyResult<()>`:
 
-1. **Leaf file** (e.g. `aggs/sum/sum_starts.rs`, `bin_search/bin_search_lt.rs`,
-   `index_builder.rs`): one `m.add_function(wrap_pyfunction!(..., m)?)?;`
-   per dtype variant it defines, same names/order as before -- just moved
-   out of `lib.rs` into the file that owns the functions.
-2. **Family `mod.rs`** (e.g. `aggs/sum/mod.rs`, `bin_search/mod.rs`,
-   `multi_join_indices/mod.rs`): calls `child::register(m)?;` once per
-   `pub mod` child declared in that file.
-3. **`aggs/mod.rs`**: an extra layer above (2) for the aggregation
-   family specifically, since it has sum/sum_rev/min/min_rev/max/max_rev/
-   prod/prod_rev/size_rev as its own `pub mod` children, each of which is
-   itself a directory following (2), plus the flat fused-aggregation files
-   (`batch_aggregate.rs`, `dual_regions.rs`, `multi_regions.rs`, ...)
-   retained from `compare/`/`non_equi_*` by issue #193.
+1. **Kernel file** (for example, `conditional_join/equi_join.rs`): one
+   `m.add_function(wrap_pyfunction!(..., m)?)?;` per dtype variant it defines,
+   with the same names and order as before.
+2. **Family `mod.rs`** (`conditional_join/mod.rs`): declares the sibling
+   modules and calls each family-kernel `register(m)?;` function once.
+3. **`src/lib.rs`**: calls the family-level register function and retains only
+   narrow public facades such as `bench_support`; it does not know individual
+   dtype-specialized functions.
 
-`src/lib.rs`'s `#[pymodule] fn janitor_rs` only calls the four top-level
-family registers (`bin_search`, `multi_join_indices`, `index_builder`,
-`aggs`) -- it never names an individual dtype-specialized function.
-`index_builder.rs` is a single file (not a directory), so its `register`
-lives directly in that file with no extra layer. (`compare/` and the
-single-file `left_le_right.rs` were removed by issue #193; the fused paths
-they held now live under `multi_join_indices/` and `aggs/`.)
+`src/lib.rs`'s `#[pymodule] fn janitor_rs` calls the top-level
+`conditional_join::register` composition point and never names an individual
+dtype-specialized function. The conditional-join family module owns the five
+kernel registration calls; shared aggregation and span helpers remain outside
+that directory because they can be reused by future kernel families.
 
-When adding a brand-new leaf file (a new kernel shape, not just a new
-dtype instantiation of an existing one), remember to also add its
-`pub mod <name>;` declaration to the parent `mod.rs` and a
-`<name>::register(m)?;` call to that parent's own `register` function --
+When adding a brand-new kernel file (a new kernel shape, not just a new
+dtype instantiation of an existing one), remember to add its module
+declaration to `conditional_join/mod.rs` and its `<name>::register(m)?;` call
+to that module's `register` function --
 a new leaf file with no caller anywhere in this chain compiles fine but
 silently never reaches Python.
 
@@ -1309,7 +1289,8 @@ window coordinates.
 ### [2026-10-02] Keep all-not-equal implementation in `not_equals_only.rs`
 
 **Context**: Defining the all-`!=` Rust implementation contract.
-**Learning**: The all-`!=` anchor path belongs in `src/not_equals_only.rs`;
+**Learning**: The all-`!=` anchor path belongs in
+`src/conditional_join/not_equals_only.rs`;
 the pyjanitor-side preparation is already covered and should not be expanded
 as part of this work.
 
@@ -1396,8 +1377,9 @@ before aggregation and before `keep` selection, so `first` and `last` always
 refer to surviving candidates rather than the unfiltered range window.
 
 **Recommendation**: Treat this entry, not README.md, as the canonical home
-for this contract going forward. If it drifts from `src/single_range_predicate.rs`
-or `src/range_join.rs`, fix the code-comment/doc-comment source first, then
+for this contract going forward. If it drifts from
+`src/conditional_join/single_range_predicate.rs` or
+`src/conditional_join/range_join.rs`, fix the code-comment/doc-comment source first, then
 update this entry to match.
 
 ### [2026-10-05] Benchmarking a change that moves the Python/Rust boundary (relocated from README.md)
@@ -1446,7 +1428,7 @@ full.
 
 ### [2026-10-10] Equi second-range extrema only support range comparisons
 
-The cumulative-envelope fast path in `src/equi_join.rs` is used only for the
+The cumulative-envelope fast path in `src/conditional_join/equi_join.rs` is used only for the
 unordered second range predicate, and it is built from the post-first-range
 windows. Equality and inequality belong to the equi/residual paths and must
 not be added to that classifier.
@@ -1546,3 +1528,17 @@ is a safe upper bound on distinct active ranks and is a better density signal
 than total right rows.
 **Recommendation**: Use dense counts and bitsets when rank count is within a
 small multiple of visible positions; retain sorted sparse counts otherwise.
+
+### [2026-10-17] NaN is outside the pyjanitor range-join contract
+
+**Context**: While assessing issue #256's sort-then-merge region-path
+optimization, float ordering raised a potential `PartialOrd`/NaN concern.
+
+**Constraint**: pyjanitor does not support NaN values for these range-join
+operators. This is a documented input limitation, not a supported ordering
+case that the optimization must define.
+
+**Recommendation**: Keep the limitation explicit in the relevant public/API
+documentation when changing the path builder. Do not silently introduce a
+panic for direct lower-level Rust callers if it is inexpensive to avoid one,
+but do not expand the optimization's contract to define NaN join semantics.

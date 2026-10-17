@@ -10,12 +10,12 @@
 
 use numpy::ndarray::ArrayView1;
 
-use crate::aggregation_common::ensure_equal_lengths_core;
-use crate::join_types::{Keep, SingleJoinResult};
-use crate::predicate::{
+use super::join_types::{Keep, SingleJoinResult};
+use super::predicate::{
     null_metadata_views, predicates_match_dispatch, predicates_match_window, NullMetadata,
     Predicate,
 };
+use crate::aggregation_common::ensure_equal_lengths_core;
 
 /// Filter candidates represented by one half-open right-side window per left row.
 ///
