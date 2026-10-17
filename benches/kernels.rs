@@ -388,12 +388,12 @@ fn equi_unordered_second_range_aggregate_guard(c: &mut Criterion) {
     Python::attach(|py| {
         let (left_index, right_index, starts_values, ends_values, ranges, residuals) =
             unordered_second_range_inputs(py);
-        let starts = PyArray1::from_vec(py, starts_values.clone());
-        let ends = PyArray1::from_vec(py, ends_values.clone());
         let aggregations = make_size_aggregation(py);
         let mut group = c.benchmark_group("equi_unordered_second_range_aggregate_guard");
         group.bench_function("unchanged_equi_aggregate", |b| {
             b.iter(|| {
+                let starts = PyArray1::from_vec(py, starts_values.clone());
+                let ends = PyArray1::from_vec(py, ends_values.clone());
                 let result = equi_aggregate_bench(
                     py,
                     left_index.readonly(),
