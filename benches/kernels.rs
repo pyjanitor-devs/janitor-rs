@@ -804,6 +804,9 @@ fn range_extrema(c: &mut Criterion) {
         ("very_large", 65_536, 512, 8_192),
         ("super_large", 1_048_576, 1_024, 32_768),
         ("sparse_large_column", 1_048_576, 64, 8),
+        ("compact_group", 1_000_000, 128, 1_024),
+        ("scattered_groups", 1_000_000, 128, 1_024),
+        ("dense_overlap", 1_000_000, 1_024, 1_024),
         ("cutoff_below", 64, 8, 51),
         ("cutoff_at", 64, 8, 52),
         ("cutoff_above", 64, 8, 53),
@@ -822,7 +825,12 @@ fn range_extrema(c: &mut Criterion) {
                         },
                     );
                 }
-                let start = row * 7919 % (length - width + 1);
+                let start = match name {
+                    "compact_group" => 496_000 + (row % 8) * 64,
+                    "scattered_groups" => (row / 8) * 50_000 + (row % 8) * 64,
+                    "dense_overlap" => (row / 8) * 1_028 + (row % 8) * 4,
+                    _ => row * 7919 % (length - width + 1),
+                };
                 (start, start + width)
             })
             .collect::<Vec<_>>();
