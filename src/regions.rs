@@ -2640,45 +2640,50 @@ fn build_n_region_candidate_paths(
 /// The probe is capped by scanned positions, not successful C2 candidates:
 /// otherwise a row whose second predicate rejects everything could scan the
 /// entire right side before the cap was reached.
+///
+/// ELI5: the first eight rows are not representative because the shared left
+/// ordering puts the narrowest first-predicate windows there. Look at sixteen
+/// evenly spaced rows instead, and trust the sweep only when at least half of
+/// those rows find a complete match quickly. A single easy row can no longer
+/// force the whole join onto the sweep path.
 fn sweep_finds_early_match(
     left_regions: &[Vec<i64>],
     right_regions: &[Vec<i64>],
     starts: &[usize],
 ) -> bool {
-    const SAMPLE_ROWS: usize = 8;
+    const SAMPLE_ROWS: usize = 16;
     const CANDIDATE_BUDGET: usize = 128;
     let sample_count = starts.len().min(SAMPLE_ROWS);
-    for left_position in 0..sample_count {
+    let end = right_regions[0].len();
+    let mut tried = 0_usize;
+    let mut hits = 0_usize;
+
+    for sample in 0..sample_count {
+        // The left regions are in descending first-region order. Sampling
+        // this reordered vector evenly avoids over-representing its easiest
+        // (narrowest-window) prefix.
+        let left_position = sample * starts.len() / sample_count;
         let start = starts[left_position];
-        let end = right_regions[0].len();
         if start == end {
             continue;
         }
-        let mut scanned = 0;
-        let mut examined = 0;
-        for right_position in start..end {
-            scanned += 1;
-            if right_regions[1][right_position] < left_regions[1][left_position] {
-                if scanned == CANDIDATE_BUDGET {
-                    break;
-                }
-                continue;
-            }
-            examined += 1;
+        tried += 1;
+        for right_position in start..end.min(start + CANDIDATE_BUDGET) {
             if left_regions
                 .iter()
-                .skip(2)
-                .zip(right_regions.iter().skip(2))
+                .zip(right_regions.iter())
+                .skip(1)
                 .all(|(left, right)| left[left_position] <= right[right_position])
             {
-                return true;
-            }
-            if scanned == CANDIDATE_BUDGET || examined == CANDIDATE_BUDGET {
+                hits += 1;
                 break;
             }
         }
     }
-    false
+
+    // Avoid floating-point thresholds: with sixteen samples this is exactly
+    // eight hits, and the same rule scales naturally for smaller inputs.
+    tried > 0 && hits * 2 >= tried
 }
 
 /// Count the candidates the existing two-region sweep would inspect.
@@ -4143,6 +4148,40 @@ mod tests {
         })
         .expect("sweep should visit tied windows");
         assert_eq!(pairs.len(), 8);
+    }
+
+    #[test]
+    fn any_probe_samples_spread_rows_and_requires_half_hits() {
+        let starts = vec![0_usize; 32];
+        let right_regions = vec![vec![1_i64], vec![0], vec![0]];
+
+        // The sixteen sampled positions are 0, 2, ..., 30. Put the hits in
+        // the latter half so a prefix-only probe would see none of them.
+        let left_third = (0..32)
+            .map(|position| {
+                if position >= 16 && position % 2 == 0 {
+                    0
+                } else {
+                    1
+                }
+            })
+            .collect::<Vec<i64>>();
+        let left_regions = vec![vec![1_i64; 32], vec![0; 32], left_third];
+        assert!(sweep_finds_early_match(
+            &left_regions,
+            &right_regions,
+            &starts
+        ));
+
+        // Removing one of those eight sampled hits must fail the 50% rule.
+        let mut left_third = left_regions[2].clone();
+        left_third[30] = 1;
+        let left_regions = vec![vec![1_i64; 32], vec![0; 32], left_third];
+        assert!(!sweep_finds_early_match(
+            &left_regions,
+            &right_regions,
+            &starts
+        ));
     }
 
     fn aggregation_input<'py>(
