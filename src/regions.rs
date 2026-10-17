@@ -4144,7 +4144,7 @@ mod tests {
             let unsigned_wrap_values: Vec<u64> = (0..rows)
                 .map(|position| match position {
                     1 => u64::MAX,
-                    2 => 1,
+                    2 => 2,
                     _ => 0,
                 })
                 .collect();
