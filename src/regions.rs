@@ -4603,6 +4603,151 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn rank_tree_handles_tied_extrema_with_nulls() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let rows = 100;
+            let left_values: Vec<i64> = (1..=rows as i64).collect();
+            let right_predicate_values = left_values.clone();
+            let right_values: Vec<i64> = (0..rows as i64).map(|value| value % 3).collect();
+            let signed_wrap_values: Vec<i64> = (0..rows)
+                .map(|position| match position {
+                    1 => i64::MAX,
+                    2 => 1,
+                    _ => 0,
+                })
+                .collect();
+            let unsigned_wrap_values: Vec<u64> = (0..rows)
+                .map(|position| match position {
+                    1 => u64::MAX,
+                    2 => 2,
+                    _ => 0,
+                })
+                .collect();
+            let nulls: Vec<bool> = (0..rows).map(|position| position % 7 == 0).collect();
+            let left_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+            let right_index = PyArray1::from_vec(py, (0..rows as i64).collect());
+            let first = predicate(py, &left_values, &right_predicate_values, "<=")?;
+            let second = predicate(py, &left_values, &right_predicate_values, "<=")?;
+            let aligner = PyArray1::from_vec(py, (0..rows as i64).collect()).readonly();
+            let masked_input = |values: &[i64], operation: &str| {
+                PyTuple::new(
+                    py,
+                    [
+                        PyArray1::from_vec(py, values.to_vec()).into_any(),
+                        PyArray1::from_vec(py, nulls.clone()).into_any(),
+                        operation.into_pyobject(py)?.into_any(),
+                    ],
+                )
+            };
+            let unsigned_sum = PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, unsigned_wrap_values.clone()).into_any(),
+                    PyArray1::from_vec(py, nulls.clone()).into_any(),
+                    "sum".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let aggregations = PyList::new(
+                py,
+                [
+                    masked_input(&signed_wrap_values, "sum")?,
+                    unsigned_sum,
+                    masked_input(&right_values, "min")?,
+                    masked_input(&right_values, "max")?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            PyArray1::from_vec(py, nulls.clone()).into_any(),
+                            "count".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            "size".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+
+            let tree_hits_before = DUAL_RANK_TREE_HITS.with(Cell::get);
+            let result = dual_regions_aggregate(
+                py,
+                left_index.as_any(),
+                right_index.as_any(),
+                &first,
+                &second,
+                aligner,
+                &aggregations,
+                true,
+            )?
+            .ok_or_else(|| PyValueError::new_err("tied-extrema aggregation returned None"))?;
+            assert_eq!(DUAL_RANK_TREE_HITS.with(Cell::get), tree_hits_before + 1);
+
+            let matched = result.get_item(1)?.extract::<Vec<bool>>()?;
+            let output_value = result.get_item(2)?;
+            let output_list = output_value.cast::<PyList>()?;
+            let signed_sums = output_list.get_item(0)?.extract::<Vec<i64>>()?;
+            let unsigned_sums = output_list.get_item(1)?.extract::<Vec<u64>>()?;
+            let min_positions = output_list.get_item(2)?.extract::<Vec<i64>>()?;
+            let max_positions = output_list.get_item(3)?.extract::<Vec<i64>>()?;
+            let counts = output_list.get_item(4)?.extract::<Vec<i64>>()?;
+            let sizes = output_list.get_item(5)?.extract::<Vec<i64>>()?;
+            let min_values: Vec<Option<i64>> = min_positions
+                .iter()
+                .map(|&position| (position >= 0).then(|| right_values[position as usize]))
+                .collect();
+            let max_values: Vec<Option<i64>> = max_positions
+                .iter()
+                .map(|&position| (position >= 0).then(|| right_values[position as usize]))
+                .collect();
+
+            let mut expected_signed_sums = vec![0_i64; rows];
+            let mut expected_unsigned_sums = vec![0_u64; rows];
+            let mut expected_count = vec![0; rows];
+            let mut expected_size = vec![0; rows];
+            let mut expected_min: Vec<Option<i64>> = vec![None; rows];
+            let mut expected_max: Vec<Option<i64>> = vec![None; rows];
+            for left in 0..rows {
+                for right in left..rows {
+                    expected_size[left] += 1;
+                    if nulls[right] {
+                        continue;
+                    }
+                    let value = right_values[right];
+                    expected_signed_sums[left] =
+                        expected_signed_sums[left].wrapping_add(signed_wrap_values[right]);
+                    expected_unsigned_sums[left] =
+                        expected_unsigned_sums[left].wrapping_add(unsigned_wrap_values[right]);
+                    expected_count[left] += 1;
+                    expected_min[left] =
+                        Some(expected_min[left].map_or(value, |current| current.min(value)));
+                    expected_max[left] =
+                        Some(expected_max[left].map_or(value, |current| current.max(value)));
+                }
+            }
+            assert_eq!(
+                matched,
+                expected_size
+                    .iter()
+                    .map(|&size| size != 0)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(signed_sums, expected_signed_sums);
+            assert_eq!(unsigned_sums, expected_unsigned_sums);
+            assert_eq!(min_values, expected_min);
+            assert_eq!(max_values, expected_max);
+            assert_eq!(counts, expected_count);
+            assert_eq!(sizes, expected_size);
+            Ok(())
+        })
+        .unwrap();
+    }
+
     /// One randomized dual-region aggregation result, decoded for comparison.
     ///
     /// Min/max positions are converted to values because tied extrema may

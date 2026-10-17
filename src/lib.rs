@@ -19,11 +19,13 @@ mod single_range_predicate;
 /// Narrow Rust-only surface used by criterion benchmarks.
 #[doc(hidden)]
 pub mod bench_support {
-    pub use crate::equi_join::equi_aggregate_bench;
+    pub use crate::equi_join::{equi_aggregate_bench, equi_range_and_residual_indices};
     pub use crate::range_join::adaptive_extreme_positions;
-    pub use crate::regions::{
-        dual_regions_aggregate, dual_regions_and_residual_aggregate, n_region_aggregate,
+    pub use crate::range_join::{
+        range_join_extended_aggregate, range_join_extended_aggregate_reverse,
     };
+    pub use crate::regions::n_region_aggregate;
+    pub use crate::regions::{dual_regions_aggregate, dual_regions_and_residual_aggregate};
 }
 
 /// Top-level composition point: each family owns and registers its own

@@ -12,7 +12,10 @@ use numpy::ndarray::ArrayView1;
 
 use crate::aggregation_common::ensure_equal_lengths_core;
 use crate::join_types::{Keep, SingleJoinResult};
-use crate::predicate::{null_metadata_views, predicates_match_dispatch, NullMetadata, Predicate};
+use crate::predicate::{
+    null_metadata_views, predicates_match_dispatch, predicates_match_window, NullMetadata,
+    Predicate,
+};
 
 /// Filter candidates represented by one half-open right-side window per left row.
 ///
@@ -46,6 +49,7 @@ pub(crate) fn materialize_range_candidates(
     let views: Vec<_> = predicates.iter().map(Predicate::view).collect();
     let metadata_views = metadata.map(null_metadata_views);
     let labels = windows.right_index.as_slice();
+    let mut mask = Vec::new();
 
     if keep == Keep::All {
         // Count survivors first so residual predicates do not force us to
@@ -53,13 +57,19 @@ pub(crate) fn materialize_range_candidates(
         let mut output_len = 0_usize;
         for row in 0..windows.left_index.len() {
             let left_position = windows.left_positions[row];
-            for right_position in windows.starts[row]..windows.ends[row] {
-                if predicates_match_dispatch(
-                    &views,
-                    metadata_views.as_deref(),
-                    left_position,
-                    right_position,
-                ) {
+            let start = windows.starts[row];
+            let end = windows.ends[row];
+            mask.resize(end - start, 0);
+            predicates_match_window(
+                &views,
+                metadata_views.as_deref(),
+                left_position,
+                start,
+                end,
+                &mut mask,
+            );
+            for &matches in &mask {
+                if matches != 0 {
                     output_len = output_len
                         .checked_add(1)
                         .ok_or("single extended join result size exceeds platform capacity")?;
@@ -82,14 +92,17 @@ pub(crate) fn materialize_range_candidates(
             let left_position = windows.left_positions[row];
             let start = windows.starts[row];
             let end = windows.ends[row];
-            for (offset, &label) in labels[start..end].iter().enumerate() {
-                let right_position = start + offset;
-                if predicates_match_dispatch(
-                    &views,
-                    metadata_views.as_deref(),
-                    left_position,
-                    right_position,
-                ) {
+            mask.resize(end - start, 0);
+            predicates_match_window(
+                &views,
+                metadata_views.as_deref(),
+                left_position,
+                start,
+                end,
+                &mut mask,
+            );
+            for (&label, &matches) in labels[start..end].iter().zip(mask.iter()) {
+                if matches != 0 {
                     output_left.push(windows.left_index[row]);
                     output_right.push(label);
                 }
@@ -112,17 +125,42 @@ pub(crate) fn materialize_range_candidates(
         let left_position = windows.left_positions[row];
         let start = windows.starts[row];
         let end = windows.ends[row];
+
+        if keep == Keep::Any {
+            let mut selected = None;
+            for right_position in start..end {
+                if predicates_match_dispatch(
+                    &views,
+                    metadata_views.as_deref(),
+                    left_position,
+                    right_position,
+                ) {
+                    selected = Some(right_position);
+                    break;
+                }
+            }
+            if let Some(right_position) = selected {
+                output_left.push(windows.left_index[row]);
+                output_right.push(labels[right_position]);
+            }
+            continue;
+        }
+
+        mask.resize(end - start, 0);
+        predicates_match_window(
+            &views,
+            metadata_views.as_deref(),
+            left_position,
+            start,
+            end,
+            &mut mask,
+        );
         let mut selected = None;
-        for (offset, &label) in labels[start..end].iter().enumerate() {
-            let right_position = start + offset;
-            if !predicates_match_dispatch(
-                &views,
-                metadata_views.as_deref(),
-                left_position,
-                right_position,
-            ) {
+        for (offset, (&label, &matches)) in labels[start..end].iter().zip(mask.iter()).enumerate() {
+            if matches == 0 {
                 continue;
             }
+            let right_position = start + offset;
             match keep {
                 Keep::Any => {
                     selected = Some(right_position);

@@ -459,8 +459,7 @@ impl<'a> AggregationSet<'a> {
                         continue;
                     }
                     let leaf = tree_size + rank;
-                    tree.update(position, leaf);
-                    tree.rebuild_path(leaf);
+                    tree.insert_path(position, leaf);
                 }
                 previous_end = start;
             }
@@ -476,7 +475,11 @@ impl<'a> AggregationSet<'a> {
             left_nodes.clear();
             right_nodes.clear();
             let mut left = tree_size + threshold;
-            let mut right = tree_size + right_labels.len();
+            // ELI5: the unused leaves at the end of the power-of-two tree are
+            // empty identities, so extending to the tree boundary lets the
+            // usual half-open range walk collect the suffix without a special
+            // partial-leaf case.
+            let mut right = tree_output_len;
             while left < right {
                 if left & 1 == 1 {
                     left_nodes.push(left);
@@ -495,28 +498,88 @@ impl<'a> AggregationSet<'a> {
         }
     }
 
-    /// Recompute the rank-tree ancestors after inserting one right position.
-    fn rebuild_path(&mut self, leaf: usize) {
-        let mut node = leaf / 2;
-        while node > 0 {
-            self.copy_output_within(node * 2, node);
-            self.merge_output_within(node * 2 + 1, node);
-            node /= 2;
+    /// Insert one source position into its leaf and every ancestor.
+    ///
+    /// ELI5: instead of rebuilding a parent from both children after every
+    /// insert, carry the new row up the one path it can affect. Counts and
+    /// sums visit the whole path; once a matched flag or an extreme cannot be
+    /// improved, its ancestors cannot be improved either.
+    fn insert_path(&mut self, source_position: usize, leaf: usize) {
+        // The caller validates these coordinates while building the ranked
+        // layout. Keep the guard here as well because this is a shared state
+        // mutation primitive and an invalid leaf must not corrupt buffers.
+        if source_position >= self.source_len || leaf >= self.output_len {
+            return;
         }
-    }
+        self.successful = true;
 
-    fn copy_output_within(&mut self, source: usize, target: usize) {
         if let Some(matched) = &mut self.matched {
-            matched[target] = matched[source];
+            let mut node = leaf;
+            while node > 0 && !matched[node] {
+                matched[node] = true;
+                node /= 2;
+            }
         }
+
         for state in &mut self.states {
             match state {
                 State::CountAll => {}
-                State::CountNonNullMask(_, values)
-                | State::Sum(_, values)
-                | State::Min(_, values)
-                | State::Max(_, values) => values[target] = values[source],
-                State::SumU64(_, _, values) => values[target] = values[source],
+                State::CountNonNullMask(nulls, values) => {
+                    if !nulls[source_position] {
+                        let mut node = leaf;
+                        while node > 0 {
+                            values[node] += 1;
+                            node /= 2;
+                        }
+                    }
+                }
+                State::Sum(view, values) => {
+                    if !view.nulls[source_position] {
+                        let value = as_i64(&view.values, source_position);
+                        let mut node = leaf;
+                        while node > 0 {
+                            values[node] = values[node].wrapping_add(value);
+                            node /= 2;
+                        }
+                    }
+                }
+                State::SumU64(source, nulls, values) => {
+                    if !nulls[source_position] {
+                        let value = source[source_position];
+                        let mut node = leaf;
+                        while node > 0 {
+                            values[node] = values[node].wrapping_add(value);
+                            node /= 2;
+                        }
+                    }
+                }
+                State::Min(view, positions) => {
+                    if !view.nulls[source_position] {
+                        let mut node = leaf;
+                        while node > 0 {
+                            let current = positions[node];
+                            if current >= 0 && !is_less(view, source_position, current as usize) {
+                                break;
+                            }
+                            positions[node] = source_position as i64;
+                            node /= 2;
+                        }
+                    }
+                }
+                State::Max(view, positions) => {
+                    if !view.nulls[source_position] {
+                        let mut node = leaf;
+                        while node > 0 {
+                            let current = positions[node];
+                            if current >= 0 && !is_greater(view, source_position, current as usize)
+                            {
+                                break;
+                            }
+                            positions[node] = source_position as i64;
+                            node /= 2;
+                        }
+                    }
+                }
                 State::SumF32(..)
                 | State::SumF64(..)
                 | State::Product(..)
@@ -527,42 +590,13 @@ impl<'a> AggregationSet<'a> {
                 }
             }
         }
-        if let Some(values) = &mut self.count_all {
-            values[target] = values[source];
-        }
-    }
 
-    fn merge_output_within(&mut self, source: usize, target: usize) {
-        if let Some(matched) = &mut self.matched {
-            matched[target] |= matched[source];
-        }
-        for state in &mut self.states {
-            match state {
-                State::CountAll => {}
-                State::CountNonNullMask(_, values) | State::Sum(_, values) => {
-                    values[target] = values[target].wrapping_add(values[source]);
-                }
-                State::SumU64(_, _, values) => {
-                    values[target] = values[target].wrapping_add(values[source]);
-                }
-                State::Min(view, values) => {
-                    values[target] = better_extreme(view, values[target], values[source], true);
-                }
-                State::Max(view, values) => {
-                    values[target] = better_extreme(view, values[target], values[source], false);
-                }
-                State::SumF32(..)
-                | State::SumF64(..)
-                | State::Product(..)
-                | State::ProductU64(..)
-                | State::ProductF32(..)
-                | State::ProductF64(..) => {
-                    unreachable!("unsupported dual rank tree state")
-                }
-            }
-        }
         if let Some(values) = &mut self.count_all {
-            values[target] = values[target].wrapping_add(values[source]);
+            let mut node = leaf;
+            while node > 0 {
+                values[node] += 1;
+                node /= 2;
+            }
         }
     }
 

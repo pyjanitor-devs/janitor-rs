@@ -15,7 +15,7 @@ use crate::aggregation_common::aggregation::{
 use crate::compare_op::CompareOp;
 use crate::join_types::SingleJoinResult;
 use crate::predicate::{
-    null_metadata_views, parse_predicates_with_nulls_strings, predicates_match_dispatch,
+    null_metadata_views, parse_predicates_with_nulls_strings, predicates_match_window,
     PredicateView,
 };
 use crate::range_predicate::AnyParsedRangePredicate;
@@ -188,15 +188,21 @@ fn aggregate_range(
     reverse: bool,
     physical_position_maps: bool,
 ) {
+    let mut mask = Vec::new();
     for (row, (&start, &end)) in windows.starts.iter().zip(windows.ends.iter()).enumerate() {
         let left_position = windows.left_positions[row];
-        for right_position in start..end {
-            if predicates_match_dispatch(
-                residuals,
-                residual_metadata,
-                left_position,
-                right_position,
-            ) {
+        mask.resize(end - start, 0);
+        predicates_match_window(
+            residuals,
+            residual_metadata,
+            left_position,
+            start,
+            end,
+            &mut mask,
+        );
+        for (offset, &matches) in mask.iter().enumerate() {
+            if matches != 0 {
+                let right_position = start + offset;
                 if physical_position_maps {
                     let physical_left = usize::try_from(windows.left_index[row])
                         .expect("validated physical left position");

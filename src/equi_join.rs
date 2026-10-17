@@ -29,7 +29,7 @@ use crate::join_search::partition_point_between;
 use crate::join_types::{result_dict, Keep};
 use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
-    predicates_match_dispatch, NullMetadataView, Predicate, PredicateView,
+    predicates_match_dispatch, predicates_match_window, NullMetadataView, Predicate, PredicateView,
 };
 use crate::range_join::adaptive_extreme_positions;
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
@@ -866,13 +866,7 @@ fn materialize_equi_windows_and_residuals(
     keep: Keep,
 ) -> Result<IndexPairs, String> {
     let additional_view = additional_range.map(range_predicate_view);
-    let matches = |row: usize, right_position: usize| {
-        predicates_match_dispatch(residual_predicates, null_metadata, row, right_position)
-            && additional_view
-                .as_ref()
-                .map(|view| view.matches(row, right_position))
-                .unwrap_or(true)
-    };
+    let mut mask = Vec::new();
 
     if keep == Keep::All {
         // Keep::All cannot use an extrema query because every candidate must
@@ -883,8 +877,25 @@ fn materialize_equi_windows_and_residuals(
             if start < 0 || end < 0 {
                 continue;
             }
-            for right_position in start as usize..end as usize {
-                if matches(row, right_position) {
+            let start = start as usize;
+            let end = end as usize;
+            mask.resize(end - start, 0);
+            predicates_match_window(
+                residual_predicates,
+                null_metadata,
+                row,
+                start,
+                end,
+                &mut mask,
+            );
+            for (offset, &matches) in mask.iter().enumerate() {
+                let right_position = start + offset;
+                if matches != 0
+                    && additional_view
+                        .as_ref()
+                        .map(|view| view.matches(row, right_position))
+                        .unwrap_or(true)
+                {
                     output_capacity = output_capacity
                         .checked_add(1)
                         .ok_or("equi-join result size exceeds platform capacity")?;
@@ -900,8 +911,25 @@ fn materialize_equi_windows_and_residuals(
             if start < 0 || end < 0 {
                 continue;
             }
-            for right_position in start as usize..end as usize {
-                if matches(row, right_position) {
+            let start = start as usize;
+            let end = end as usize;
+            mask.resize(end - start, 0);
+            predicates_match_window(
+                residual_predicates,
+                null_metadata,
+                row,
+                start,
+                end,
+                &mut mask,
+            );
+            for (offset, &matches) in mask.iter().enumerate() {
+                let right_position = start + offset;
+                if matches != 0
+                    && additional_view
+                        .as_ref()
+                        .map(|view| view.matches(row, right_position))
+                        .unwrap_or(true)
+                {
                     left_output.push(left_index[row]);
                     right_output.push(right_index[right_position]);
                 }
@@ -938,9 +966,55 @@ fn materialize_equi_windows_and_residuals(
             ranges.push((start, end));
             continue;
         }
+
+        if keep == Keep::Any {
+            let mut selected = None;
+            for right_position in start..end {
+                if !predicates_match_dispatch(
+                    residual_predicates,
+                    null_metadata,
+                    row,
+                    right_position,
+                ) {
+                    continue;
+                }
+                if !additional_view
+                    .as_ref()
+                    .map(|view| view.matches(row, right_position))
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+                selected = Some(right_position);
+                break;
+            }
+            if let Some(right_position) = selected {
+                left_output.push(left_index[row]);
+                right_output.push(right_index[right_position]);
+            }
+            continue;
+        }
+
+        mask.resize(end - start, 0);
+        predicates_match_window(
+            residual_predicates,
+            null_metadata,
+            row,
+            start,
+            end,
+            &mut mask,
+        );
         let mut selected = None;
-        for right_position in start..end {
-            if !matches(row, right_position) {
+        for (offset, &matches) in mask.iter().enumerate() {
+            if matches == 0 {
+                continue;
+            }
+            let right_position = start + offset;
+            if !additional_view
+                .as_ref()
+                .map(|view| view.matches(row, right_position))
+                .unwrap_or(true)
+            {
                 continue;
             }
             if !update_keep_selection(&mut selected, right_position, keep, right_index) {
@@ -1825,8 +1899,8 @@ mod tests {
         apply_equi_range_bound, build_equi_ne_indices_core, build_equi_only_indices_core,
         build_equi_range_indices_core, build_equi_uniq_residual_indices_core,
         build_second_range_envelope, equi_aggregate, materialize_equi_windows,
-        materialize_unordered_second_range, narrow_unordered_second_range,
-        unique_reverse_output_slots, EQUI_STARTS_ENDS_HITS,
+        materialize_equi_windows_and_residuals, materialize_unordered_second_range,
+        narrow_unordered_second_range, unique_reverse_output_slots, EQUI_STARTS_ENDS_HITS,
     };
     use crate::compare_op::CompareOp;
     use crate::join_types::Keep;
@@ -2659,6 +2733,38 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(last.1, vec![8]);
+    }
+
+    #[test]
+    fn residual_windows_preserve_keep_any_short_circuit_and_selection() {
+        let left_index = Array1::from_vec(vec![10]);
+        let right_index = Array1::from_vec(vec![9, 8, 7, 6, 5, 4, 3, 2, 1]);
+        let starts = Array1::from_vec(vec![0]);
+        let ends = Array1::from_vec(vec![9]);
+        let residual_left = Array1::from_vec(vec![3]);
+        let residual_right = Array1::from_vec(vec![3, 0, 1, 2, 4, 5, 6, 7, 8]);
+        let residuals = [PredicateView::I64(
+            residual_left.view(),
+            residual_right.view(),
+            CompareOp::Le,
+        )];
+
+        for (keep, expected) in [(Keep::Any, 9), (Keep::First, 1), (Keep::Last, 9)] {
+            let result = materialize_equi_windows_and_residuals(
+                left_index.view(),
+                right_index.view(),
+                starts.view(),
+                ends.view(),
+                &residuals,
+                None,
+                None,
+                keep,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.0, vec![10]);
+            assert_eq!(result.1, vec![expected]);
+        }
     }
 
     #[test]
