@@ -2066,7 +2066,7 @@ fn n_region_indices_core(
 /// position. Range regions are still checked first, so residual predicates
 /// only run for candidates that survived every range predicate.
 ///
-/// ELI5: the range sweep narrows the haystack first; `candidate_pass` checks
+/// ELI5: the range tree narrows the haystack first; `candidate_pass` checks
 /// each remaining needle. A candidate is emitted only when that filter passes.
 ///
 /// # Arguments
@@ -2252,8 +2252,8 @@ where
 /// index materialization; it must not be used to change an aggregate over all
 /// matching candidates.
 ///
-/// Performance note: this sweep is left-driven. It sorts and visits every
-/// left row, and stores one left-region vector per predicate. When the join
+/// Performance note: this tree traversal is left-driven. It visits every
+/// left row and stores one left-region vector per predicate. When the join
 /// direction is otherwise interchangeable, keeping the smaller input on the
 /// left is generally the better heuristic. This is not a correctness
 /// requirement, and broad joins may still be dominated by output size.
@@ -3099,7 +3099,7 @@ pub fn n_region_aggregate_reverse<'py>(
 
 /// Aggregate n-region candidates after applying residual predicates.
 ///
-/// Range predicates are checked by the n-region sweep first. Residual
+/// Range predicates are checked by the n-region tree first. Residual
 /// predicates run only for candidates that pass every range path, and only
 /// those candidates update the right-source/left-output aggregation state.
 ///
@@ -3191,7 +3191,7 @@ pub fn n_region_and_residual_aggregate_reverse<'py>(
     )
 }
 
-/// Parse the n-region Python lists and run the shared aggregation sweep.
+/// Parse the n-region Python lists and run the shared aggregation traversal.
 #[allow(clippy::too_many_arguments)]
 fn n_region_aggregate_entry<'py>(
     py: Python<'py>,
