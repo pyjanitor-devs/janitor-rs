@@ -56,6 +56,47 @@ pub(crate) struct RankedRegionPositionLayout {
     positions: Vec<usize>,
 }
 
+/// Point-update/prefix-sum index used while choosing a candidate generator.
+/// It answers a suffix cardinality in `O(log n)` even when most ranks are
+/// populated, avoiding a scan of every active rank for each left row.
+struct FenwickCounts {
+    values: Vec<usize>,
+}
+
+impl FenwickCounts {
+    fn new(length: usize) -> Self {
+        Self {
+            values: vec![0; length + 1],
+        }
+    }
+
+    fn add(&mut self, rank: usize) -> Result<(), String> {
+        let mut index = rank
+            .checked_add(1)
+            .ok_or("region rank exceeds the Fenwick layout")?;
+        while index < self.values.len() {
+            self.values[index] = self.values[index]
+                .checked_add(1)
+                .ok_or("region result size exceeds platform capacity")?;
+            index += index.isolate_lowest_one();
+        }
+        Ok(())
+    }
+
+    fn prefix_sum(&self, mut length: usize) -> usize {
+        let mut total = 0;
+        while length != 0 {
+            total += self.values[length];
+            length &= length - 1;
+        }
+        total
+    }
+
+    fn suffix_sum(&self, first_rank: usize) -> usize {
+        self.prefix_sum(self.values.len() - 1) - self.prefix_sum(first_rank)
+    }
+}
+
 /// Dense counts for ranks that have entered the monotonic region sweep.
 ///
 /// ELI5: `counts` is one numbered shelf per rank. The first bitset marks
@@ -2415,6 +2456,8 @@ struct NRegionCandidatePaths {
 /// * `force_sweep` - Bypass dispatch and use the existing sweep. This is used
 ///   for `keep="any"`, where a dense match can be found before tree build or
 ///   candidate-counting overhead is worthwhile.
+/// * `prefer_sweep_if_early` - For `keep="any"`, probe a small bounded prefix
+///   for an actual complete match before considering the right-side tree.
 ///
 /// # Returns
 ///
@@ -2429,6 +2472,7 @@ struct NRegionCandidatePaths {
 /// sorting performed by upstream region construction and, for tree paths, the
 /// `O(n log n)` tree build; memory is `O(n * d)` for `n` rows and `d`
 /// predicates, plus the selected generator's layout.
+#[allow(clippy::too_many_arguments)]
 fn build_n_region_candidate_paths(
     first_predicate: &Predicate<'_>,
     range_predicates: &[Predicate<'_>],
@@ -2437,6 +2481,7 @@ fn build_n_region_candidate_paths(
     aligners: &[ArrayView1<'_, i64>],
     allow_left_tree: bool,
     force_sweep: bool,
+    prefer_sweep_if_early: bool,
 ) -> Result<Option<NRegionCandidatePaths>, String> {
     ensure_equal_lengths_core(
         "first left predicate",
@@ -2522,6 +2567,9 @@ fn build_n_region_candidate_paths(
         return Ok(None);
     }
 
+    let force_sweep = force_sweep
+        || (prefer_sweep_if_early
+            && sweep_finds_early_match(&left_regions, &right_regions, &starts));
     let (use_sweep, sweep_layout) = if force_sweep {
         (true, None)
     } else {
@@ -2571,13 +2619,61 @@ fn build_n_region_candidate_paths(
     }))
 }
 
+/// Return whether a bounded sweep probe finds a complete match quickly.
+///
+/// This protects `keep="any"` workloads where the sweep can stop almost
+/// immediately, such as dense dominance joins. If the sampled rows do not
+/// find a match within the small probe budget, the normal C2 dispatcher may
+/// select the right-oriented tree. The left-oriented tree remains forbidden
+/// for this keep mode because it cannot stop its right-driven traversal.
+fn sweep_finds_early_match(
+    left_regions: &[Vec<i64>],
+    right_regions: &[Vec<i64>],
+    starts: &[usize],
+) -> bool {
+    const SAMPLE_ROWS: usize = 8;
+    const CANDIDATE_BUDGET: usize = 128;
+    let sample_count = starts.len().min(SAMPLE_ROWS);
+    for left_position in 0..sample_count {
+        let start = starts[left_position];
+        let end = right_regions[0].len();
+        if start == end {
+            continue;
+        }
+        let mut scanned = 0;
+        let mut examined = 0;
+        for right_position in start..end {
+            scanned += 1;
+            if right_regions[1][right_position] < left_regions[1][left_position] {
+                if scanned == CANDIDATE_BUDGET {
+                    break;
+                }
+                continue;
+            }
+            examined += 1;
+            if left_regions
+                .iter()
+                .skip(2)
+                .zip(right_regions.iter().skip(2))
+                .all(|(left, right)| left[left_position] <= right[right_position])
+            {
+                return true;
+            }
+            if scanned == CANDIDATE_BUDGET || examined == CANDIDATE_BUDGET {
+                break;
+            }
+        }
+    }
+    false
+}
+
 /// Count the candidates the existing two-region sweep would inspect.
 ///
 /// The count is exact for the first two predicates and stops as soon as it
-/// exceeds `limit`. A Fenwick tree is unnecessary here: the already-built
-/// ranked layout and active-rank counts provide the same suffix cardinality
-/// without enumerating each candidate pair. Returning the layout when the
-/// count stays within the limit lets the sweep reuse this dispatch work.
+/// exceeds `limit`. Fenwick suffix sums keep each left-row count logarithmic
+/// in the number of distinct second-predicate labels. Returning the layout
+/// when the count stays within the limit lets the sweep reuse this dispatch
+/// work.
 ///
 /// ELI5: count the work the old conveyor belt would do. If that work is small,
 /// keep the conveyor belt; if it is large, pay for the multidimensional tree.
@@ -2589,7 +2685,7 @@ fn sweep_candidate_count_exceeds(
     limit: u128,
 ) -> Result<(bool, Option<RankedRegionPositionLayout>), String> {
     let layout = build_ranked_region_position_layout(second_right_region, starts, end)?;
-    let mut active_counts = ActiveRankCounts::new(layout.labels.len(), layout.positions.len());
+    let mut active_counts = FenwickCounts::new(layout.labels.len());
     let mut previous_end = end;
     let mut total = 0_u128;
 
@@ -2600,7 +2696,11 @@ fn sweep_candidate_count_exceeds(
         if start > previous_end {
             return Err("starts must be monotonically non-increasing".to_owned());
         }
-        activate_ranked_positions(&layout, start, previous_end, &mut active_counts)?;
+        for &rank in &layout.ranks[start..previous_end] {
+            if rank != usize::MAX {
+                active_counts.add(rank)?;
+            }
+        }
         previous_end = start;
 
         let left_region = left_regions[1][left_position];
@@ -2608,14 +2708,7 @@ fn sweep_candidate_count_exceeds(
             continue;
         }
         let first_rank = layout.labels.partition_point(|&label| label < left_region);
-        let row_count =
-            active_counts
-                .iter_from(first_rank)
-                .try_fold(0_u128, |count, (_, positions)| {
-                    count
-                        .checked_add(positions as u128)
-                        .ok_or("region result size exceeds platform capacity")
-                })?;
+        let row_count = active_counts.suffix_sum(first_rank) as u128;
         total = total
             .checked_add(row_count)
             .ok_or("region result size exceeds platform capacity")?;
@@ -2711,6 +2804,7 @@ where
         right_index,
         aligners,
         keep != Keep::Any,
+        false,
         keep == Keep::Any,
     )?
     else {
@@ -3349,6 +3443,7 @@ where
         right_index,
         aligners,
         true,
+        false,
         false,
     )
     .map_err(PyValueError::new_err)?
@@ -4249,6 +4344,19 @@ mod tests {
 
         let dense = ActiveRankCounts::new(400, 100);
         assert!(matches!(dense, ActiveRankCounts::Dense(_)));
+    }
+
+    #[test]
+    fn fenwick_counts_return_suffix_cardinalities() {
+        let mut counts = FenwickCounts::new(5);
+        for rank in [0, 2, 2, 4] {
+            counts.add(rank).expect("rank should fit");
+        }
+        assert_eq!(counts.suffix_sum(0), 4);
+        assert_eq!(counts.suffix_sum(1), 3);
+        assert_eq!(counts.suffix_sum(2), 3);
+        assert_eq!(counts.suffix_sum(3), 1);
+        assert_eq!(counts.suffix_sum(5), 0);
     }
 
     #[test]
