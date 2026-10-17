@@ -1406,9 +1406,8 @@ matters is the end-to-end call from Python.
    #1673 for the format), so a reviewer can see the kernel-level and
    end-to-end pictures without having to reproduce either locally.
 
-Benchmark rebaselining itself was intentionally out of scope for issue #206's
-aggregation-migration audit (see `AGGREGATION_MIGRATION_MATRIX.md`); that
-audit records observable correctness and endpoint coverage, not a
+Benchmark rebaselining itself was intentionally out of scope for issue #206;
+the audit recorded observable correctness and endpoint coverage, not a
 release-profile or performance claim.
 
 ### [2026-10-05] `too_many_arguments` is an intentional, scoped clippy allow (relocated from README.md)
