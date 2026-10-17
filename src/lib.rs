@@ -12,6 +12,7 @@ mod not_equals_only;
 mod predicate;
 mod range_join;
 mod range_predicate;
+mod region_kd_tree;
 mod regions;
 mod single_range_predicate;
 
@@ -23,6 +24,7 @@ pub mod bench_support {
     pub use crate::range_join::{
         range_join_extended_aggregate, range_join_extended_aggregate_reverse,
     };
+    pub use crate::regions::n_region_aggregate;
     pub use crate::regions::{dual_regions_aggregate, dual_regions_and_residual_aggregate};
 }
 

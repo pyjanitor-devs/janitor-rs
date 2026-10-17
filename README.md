@@ -63,3 +63,10 @@ is the canonical reference for implementation-level
 detail that doesn't belong in a contributor quickstart: the range-first
 Python/Rust ABI contract, the cross-boundary benchmarking methodology, and
 other non-obvious conventions and gotchas.
+
+The multi-predicate range-join rewrite is inspired by Reif and Neumann,
+[*A Scalable and Generic Approach to Range Joins*](https://db.in.tum.de/~reif/papers/p2535-reif.pdf),
+which describes a generic kd-tree-based multidimensional range join. The
+paper is useful context for the candidate-generation design and for future
+parallel build/probe work; this implementation adapts the idea to janitor-rs'
+rank-region representation and Python-facing aggregation contracts.

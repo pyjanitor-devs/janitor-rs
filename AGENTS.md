@@ -1484,6 +1484,7 @@ maximum checks and must not be changed as part of this work.
 
 **Recommendation**: Apply the cumulative-max filter to dual-region paths
 without modifying the n-region traversal or setup.
+
 ### [2026-10-14] Equality-led range joins use negative windows as no-match sentinels
 
 **Context**: Reviewing the equality-led conditional-join kernels found that
@@ -1505,6 +1506,16 @@ negative indices as invalid input.
 narrowing, preserve negative windows as inactive rows, and skip them in every
 later materialization or aggregation loop. Add or retain regression coverage
 for a mix of active and `-1` windows.
+
+### [2026-10-17] Issue #234 scope excludes issue #253
+
+**Context**: The multi-predicate k-d-tree rewrite is being developed under
+issue #234.
+
+**Constraint**: Do not expand this work into the parallel build/probe rollout
+tracked by issue #253. Keep issue #234 focused on the single-threaded
+candidate-generation algorithm, correctness, orientation, benchmarks, and
+pyjanitor compatibility.
 
 ### [2026-10-16] Bound dense region-label tables by occupied positions too
 
@@ -1535,4 +1546,3 @@ is a safe upper bound on distinct active ranks and is a better density signal
 than total right rows.
 **Recommendation**: Use dense counts and bitsets when rank count is within a
 small multiple of visible positions; retain sorted sparse counts otherwise.
-

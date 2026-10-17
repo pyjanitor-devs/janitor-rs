@@ -12,6 +12,7 @@ use crate::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicate_tuple,
     parse_predicates_with_nulls_strings, predicates_match_dispatch, Predicate, PredicateView,
 };
+use crate::region_kd_tree::RegionKdTree;
 use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -32,6 +33,8 @@ const DENSE_ACTIVE_RANK_SPARSITY_FACTOR: usize = 4;
 const SPARSE_LABEL_PROBE_LIMIT: usize = 1_024;
 const SPARSE_LABEL_PROBE_MIN_LEN: usize = 4_096;
 const BITSET_WORD_BITS: usize = u64::BITS as usize;
+const KEEP_ANY_PROBE_SAMPLE_ROWS: usize = 16;
+const KEEP_ANY_PROBE_CANDIDATE_BUDGET: usize = 128;
 
 /// The second predicate's paths together with the first-predicate starts.
 pub(crate) struct DualRegionPaths {
@@ -53,6 +56,52 @@ pub(crate) struct RankedRegionPositionLayout {
     offsets: Vec<usize>,
     ranks: Vec<usize>,
     positions: Vec<usize>,
+}
+
+/// Point-update/prefix-sum index used while choosing a candidate generator.
+/// It answers a suffix cardinality in `O(log n)` even when most ranks are
+/// populated, avoiding a scan of every active rank for each left row.
+///
+/// This is deliberately separate from `ActiveRankCounts`: the actual sweep
+/// must enumerate active rank groups to emit candidates, while dispatch only
+/// needs cardinalities. Reusing the emission-oriented structure made a broad
+/// join spend too much time walking ranks before selecting the tree.
+struct FenwickCounts {
+    values: Vec<usize>,
+}
+
+impl FenwickCounts {
+    fn new(length: usize) -> Self {
+        Self {
+            values: vec![0; length + 1],
+        }
+    }
+
+    fn add(&mut self, rank: usize) -> Result<(), String> {
+        let mut index = rank
+            .checked_add(1)
+            .ok_or("region rank exceeds the Fenwick layout")?;
+        while index < self.values.len() {
+            self.values[index] = self.values[index]
+                .checked_add(1)
+                .ok_or("region result size exceeds platform capacity")?;
+            index += index.isolate_lowest_one();
+        }
+        Ok(())
+    }
+
+    fn prefix_sum(&self, mut length: usize) -> usize {
+        let mut total = 0;
+        while length != 0 {
+            total += self.values[length];
+            length &= length - 1;
+        }
+        total
+    }
+
+    fn suffix_sum(&self, first_rank: usize) -> usize {
+        self.prefix_sum(self.values.len() - 1) - self.prefix_sum(first_rank)
+    }
 }
 
 /// Dense counts for ranks that have entered the monotonic region sweep.
@@ -1276,17 +1325,15 @@ fn activate_ranked_positions(
     Ok(())
 }
 
-/// Visit n-region candidates in descending first-region order.
+/// Visit n-region candidates using the generator selected during preparation.
 ///
-/// The first two region paths define the search window. The remaining paths
-/// are progressively checked for each candidate, and `.all(...)` stops at the
-/// first failed predicate. `visit` returns `false` when the caller has enough
-/// information for the current left row (for example, `keep="any"`).
-///
-/// The second right-region positions are grouped once by sorted label and in
-/// the same activation order as the search sweep. The sweep only increments
-/// encountered ranks, so candidate traversal does not scan labels that have
-/// not entered the current window.
+/// All region dimensions participate in k-d-tree pruning. For selective
+/// two-region windows, the original sweep remains available because it can be
+/// cheaper than building and querying a tree. `visit` returns `false` when the
+/// caller has enough information for the current left row (for example,
+/// `keep="any"`). The orientation-reversed tree may continue probing after
+/// that signal because its natural traversal is right-driven; selection
+/// callers remain correct because they store at most one result per left row.
 ///
 /// This function deliberately knows nothing about index materialization or
 /// aggregation. Its callback receives the reordered left position and the
@@ -1295,12 +1342,14 @@ fn activate_ranked_positions(
 ///
 /// # Arguments
 ///
-/// * `left_regions` / `right_regions` - Equal-length aligned region paths.
-/// * `starts` - One descending-left search start per left row.
-/// * `end` - Exclusive right-side length.
-/// * `right_region_layout` - Ranked layout for the second right region.
+/// * `paths` - Prepared, equal-length aligned region paths and their selected
+///   sweep/tree generator. Dimension `d` uses `paths.left_regions[d][i]` and
+///   `paths.right_regions[d][j]` for the same predicate. Left position `i` is
+///   search order, not necessarily the caller's physical order.
 /// * `visit` - Callback receiving search-order left and global-right positions;
-///   return `false` to stop candidates for the current left row.
+///   return `false` to stop candidates for the current left row. The callback
+///   must not assume a particular right traversal order unless the caller's
+///   selection policy explicitly defines one.
 ///
 /// # Returns
 ///
@@ -1308,97 +1357,205 @@ fn activate_ranked_positions(
 ///
 /// # Errors
 ///
-/// Returns an error for path-length mismatches, invalid starts, or result-size
-/// overflow. A callback rejection is normal control flow, not an error.
-fn visit_n_region_matches<F>(
-    left_regions: &[Vec<i64>],
-    right_regions: &[Vec<i64>],
-    starts: &[usize],
-    end: usize,
-    right_region_layout: &RankedRegionPositionLayout,
-    mut visit: F,
-) -> Result<usize, String>
+/// Returns an error for path-length mismatches or result-size overflow. A
+/// callback rejection is normal control flow, not an error. The count is the
+/// number of callback invocations accepted before any early stop.
+fn visit_n_region_matches<F>(paths: &NRegionCandidatePaths, mut visit: F) -> Result<usize, String>
 where
     F: FnMut(usize, usize) -> bool,
 {
-    if left_regions.len() < 3 || right_regions.len() != left_regions.len() {
+    if paths.left_regions.len() < 3 || paths.right_regions.len() != paths.left_regions.len() {
         return Err("n-region paths must contain at least three aligned regions".to_owned());
     }
-    if starts.len() != left_regions[0].len() {
-        return Err("n-region starts must match the left-region length".to_owned());
-    }
-    for region in left_regions.iter().skip(1) {
+    for region in paths.left_regions.iter().skip(1) {
         ensure_equal_lengths_core(
             "left region",
             region.len(),
             "first left region",
-            left_regions[0].len(),
+            paths.left_regions[0].len(),
         )?;
     }
-    for region in right_regions {
-        ensure_equal_lengths_core("right region", region.len(), "first right region", end)?;
+    for region in &paths.right_regions {
+        ensure_equal_lengths_core(
+            "right region",
+            region.len(),
+            "first right region",
+            paths.right_regions[0].len(),
+        )?;
     }
 
+    match &paths.generator {
+        NRegionCandidateGenerator::Sweep { starts, layout } => {
+            visit_n_region_matches_sweep(paths, starts, layout, &mut visit)
+        }
+        NRegionCandidateGenerator::Kd { tree, orientation } => {
+            // ELI5: the old sweep indexes only the first two dimensions. The
+            // tree indexes every dimension, so a left row can reject a whole
+            // right-side subtree as soon as any predicate is impossible.
+            visit_n_region_matches_kd(paths, tree, *orientation, &mut visit)
+        }
+    }
+}
+
+/// The side whose points are stored in the k-d tree.
+#[derive(Clone, Copy, Debug)]
+enum NRegionTreeOrientation {
+    Right,
+    Left,
+}
+
+/// Candidate generator selected for one prepared n-region join.
+enum NRegionCandidateGenerator {
+    /// The exact first-two candidate count stayed below the dispatch limit,
+    /// so the existing sweep is expected to beat tree construction and
+    /// multidimensional probing.
+    Sweep {
+        starts: Vec<usize>,
+        layout: RankedRegionPositionLayout,
+    },
+    /// A static tree, stored once so keep-all's two passes can reuse it.
+    Kd {
+        tree: RegionKdTree,
+        orientation: NRegionTreeOrientation,
+    },
+}
+
+/// Visit candidates using the existing first-two-region sweep.
+fn visit_n_region_matches_sweep<F>(
+    paths: &NRegionCandidatePaths,
+    starts: &[usize],
+    right_region_layout: &RankedRegionPositionLayout,
+    visit: &mut F,
+) -> Result<usize, String>
+where
+    F: FnMut(usize, usize) -> bool,
+{
     let mut active_counts = ActiveRankCounts::new(
         right_region_layout.labels.len(),
         right_region_layout.positions.len(),
     );
-    let mut right_region_maxima = vec![0_i64; right_regions.len()];
-    let mut previous_end = end;
+    let mut right_region_maxima = vec![0_i64; paths.right_regions.len()];
+    let mut previous_end = paths.right_regions[0].len();
     let mut total_matches = 0usize;
 
     for (left_position, &start) in starts.iter().enumerate() {
-        if start == end {
+        // A zero left region is represented by the terminal start and is an
+        // inactive row, not a window that must preserve sweep monotonicity.
+        if start == paths.right_regions[0].len() {
             continue;
         }
         if start > previous_end {
             return Err("starts must be monotonically non-increasing".to_owned());
         }
-
         for right_position in start..previous_end {
-            for (maximum, region) in right_region_maxima.iter_mut().zip(right_regions) {
+            for (maximum, region) in right_region_maxima.iter_mut().zip(&paths.right_regions) {
                 *maximum = (*maximum).max(region[right_position]);
             }
         }
         activate_ranked_positions(right_region_layout, start, previous_end, &mut active_counts)?;
         previous_end = start;
 
-        let impossible = left_regions
+        if paths
+            .left_regions
             .iter()
             .zip(&right_region_maxima)
-            .any(|(left_region, &right_maximum)| left_region[left_position] > right_maximum);
-        if impossible {
+            .any(|(left_region, &right_maximum)| left_region[left_position] > right_maximum)
+        {
             continue;
         }
 
-        let second_left_region = left_regions[1][left_position];
         let first_rank = right_region_layout
             .labels
-            .partition_point(|&label| label < second_left_region);
+            .partition_point(|&label| label < paths.left_regions[1][left_position]);
         'candidate_regions: for (rank, region_count) in active_counts.iter_from(first_rank) {
             let region_offset = right_region_layout.offsets[rank];
             for &right_position in
                 &right_region_layout.positions[region_offset..region_offset + region_count]
             {
-                let matches_remaining = left_regions
+                if !paths
+                    .left_regions
                     .iter()
                     .skip(2)
-                    .zip(right_regions.iter().skip(2))
+                    .zip(paths.right_regions.iter().skip(2))
                     .all(|(left_region, right_region)| {
                         left_region[left_position] <= right_region[right_position]
-                    });
-                if matches_remaining {
-                    total_matches = total_matches
-                        .checked_add(1)
-                        .ok_or("region result size exceeds platform capacity")?;
-                    if !visit(left_position, right_position) {
-                        break 'candidate_regions;
-                    }
+                    })
+                {
+                    continue;
+                }
+                total_matches = total_matches
+                    .checked_add(1)
+                    .ok_or("region result size exceeds platform capacity")?;
+                if !visit(left_position, right_position) {
+                    break 'candidate_regions;
                 }
             }
         }
     }
+    Ok(total_matches)
+}
 
+/// Visit multi-region candidates with a static rank-space k-d tree.
+///
+/// The callback receives the same reordered left position and global right
+/// position as the legacy sweep. Keeping this contract here lets index,
+/// residual, and aggregation callers share one candidate generator.
+fn visit_n_region_matches_kd<F>(
+    paths: &NRegionCandidatePaths,
+    right_tree: &RegionKdTree,
+    orientation: NRegionTreeOrientation,
+    visit: &mut F,
+) -> Result<usize, String>
+where
+    F: FnMut(usize, usize) -> bool,
+{
+    let mut total_matches = 0usize;
+    let mut overflowed = false;
+
+    match orientation {
+        NRegionTreeOrientation::Right => {
+            for left_position in 0..paths.left_regions[0].len() {
+                let left_point = paths
+                    .left_regions
+                    .iter()
+                    .map(|region| region[left_position])
+                    .collect::<Vec<_>>();
+                right_tree.visit(&left_point, |right_position| {
+                    let Some(next_total) = total_matches.checked_add(1) else {
+                        overflowed = true;
+                        return false;
+                    };
+                    total_matches = next_total;
+                    visit(left_position, right_position)
+                });
+            }
+        }
+        NRegionTreeOrientation::Left => {
+            for right_position in 0..paths.right_regions[0].len() {
+                let right_point = paths
+                    .right_regions
+                    .iter()
+                    .map(|region| region[right_position])
+                    .collect::<Vec<_>>();
+                right_tree.visit_lower(&right_point, |left_position| {
+                    let Some(next_total) = total_matches.checked_add(1) else {
+                        overflowed = true;
+                        return false;
+                    };
+                    total_matches = next_total;
+                    // The left-oriented traversal is right-driven. A false
+                    // callback means “this left row already has enough,” but
+                    // cannot stop probing this right row without losing other
+                    // left rows that may still match.
+                    let _ = visit(left_position, right_position);
+                    true
+                });
+            }
+        }
+    }
+    if overflowed {
+        return Err("region result size exceeds platform capacity".to_owned());
+    }
     Ok(total_matches)
 }
 
@@ -2232,19 +2389,32 @@ pub fn dual_regions_and_residual_indices<'py>(
     )?))
 }
 
-/// All immutable data needed by the n-region candidate sweep.
+/// All immutable data needed by the multi-region candidate traversal.
+///
+/// Every inner vector is indexed by predicate dimension. Within a dimension,
+/// the left and right vectors are aligned by row position, so the candidate
+/// test is `left_regions[d][i] <= right_regions[d][j]` for every `d`.
+/// Region value zero is reserved as the existing “cannot match” sentinel and
+/// is removed before the tree is queried.
+///
+/// `left_regions` is reordered into descending first-region order because
+/// that is the search order used by the old two-region implementation and it
+/// keeps output grouping stable. `left_order[i]` maps that search position
+/// back to the original physical left position. Right positions are not
+/// reordered from the caller's global first-predicate layout.
 ///
 /// ELI5: this is the prepared map for a treasure hunt. The region vectors say
-/// which rows can match, `starts` says where each search window begins, and
-/// the ranked layout lets the sweep find the second region without rebuilding
-/// a map for every left row.
+/// which rows can match, and `left_order` tells us which original left row a
+/// tree-query row came from.
 struct NRegionCandidatePaths {
+    /// Region labels for left rows in search order, one vector per predicate.
     left_regions: Vec<Vec<i64>>,
+    /// Region labels for right rows in global right-position order.
     right_regions: Vec<Vec<i64>>,
-    starts: Vec<usize>,
-    end: usize,
+    /// Search-position to original physical-left-position permutation.
     left_order: Vec<usize>,
-    right_region_layout: RankedRegionPositionLayout,
+    /// Reusable candidate generator, built once for all passes.
+    generator: NRegionCandidateGenerator,
 }
 
 /// Build the shared candidate state for three or more range predicates.
@@ -2253,13 +2423,45 @@ struct NRegionCandidatePaths {
 /// Both consumers must see the same masked, reordered, and aligned candidates
 /// or their results could disagree on which pairs are valid.
 ///
+/// Each predicate is represented as `(left_values, right_values, operator)`.
+/// The first predicate establishes the global right order. For each additional
+/// predicate, its aligner maps a global right position to the position in that
+/// predicate's independently sorted right array. This is why the tree can
+/// compare all dimensions at once even though each source range was sorted
+/// differently.
+///
+/// The helper performs the following preparation steps:
+///
+/// 1. Validate that every predicate, index array, and aligner has compatible
+///    lengths.
+/// 2. Build one region-label vector per predicate and align right labels into
+///    the global right layout.
+/// 3. Mask zero labels, reorder all left dimensions together, and preserve the
+///    existing cheap first-dimension no-match check.
+/// 4. Count the exact first-two-region candidate work up to a bounded limit.
+///    Use the existing sweep for selective windows; otherwise build one
+///    reusable k-d tree, choosing the smaller input side as its stored-point
+///    orientation when the caller permits it.
+/// 5. Return the immutable paths shared by index and aggregation consumers.
+///
+/// No `keep` selection, residual filtering, callback invocation, or aggregate
+/// update happens here. Keeping preparation separate ensures every public
+/// n-region operation uses exactly the same candidate semantics.
+///
 /// # Arguments
 ///
-/// * `first_predicate` - Global first range anchor.
-/// * `range_predicates` - At least two additional anchors.
-/// * `left_index` / `right_index` - Shared physical maps.
+/// * `first_predicate` - Global first range anchor; its right values define
+///   `right_index` order.
+/// * `range_predicates` - At least two additional range anchors.
+/// * `left_index` / `right_index` - Physical maps whose lengths must match
+///   every corresponding predicate side.
 /// * `aligners` - One global-to-source-right permutation per additional
-///   predicate.
+///   predicate, paired by position with `range_predicates`.
+/// * `allow_left_tree` - Whether the tree may be built over the left side.
+///   This is disabled for `keep="any"`, whose early-stop semantics require a
+///   left-row query to be able to stop traversal.
+/// * `prefer_sweep_if_early` - For `keep="any"`, probe a small bounded prefix
+///   for an actual complete match before considering the right-side tree.
 ///
 /// # Returns
 ///
@@ -2269,13 +2471,20 @@ struct NRegionCandidatePaths {
 /// # Errors
 ///
 /// Returns an error for mismatched predicate/index/aligner lengths, invalid
-/// alignments, unsupported operators, or invalid search invariants.
+/// alignments, unsupported operators, or invalid search invariants. Building
+/// the paths is linear in the number of predicate values apart from the
+/// sorting performed by upstream region construction and, for tree paths, the
+/// `O(n log n)` tree build; memory is `O(n * d)` for `n` rows and `d`
+/// predicates, plus the selected generator's layout.
+#[allow(clippy::too_many_arguments)]
 fn build_n_region_candidate_paths(
     first_predicate: &Predicate<'_>,
     range_predicates: &[Predicate<'_>],
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     aligners: &[ArrayView1<'_, i64>],
+    allow_left_tree: bool,
+    prefer_sweep_if_early: bool,
 ) -> Result<Option<NRegionCandidatePaths>, String> {
     ensure_equal_lengths_core(
         "first left predicate",
@@ -2321,6 +2530,11 @@ fn build_n_region_candidate_paths(
 
     for (predicate, aligner) in range_predicates.iter().zip(aligners) {
         ensure_equal_lengths_core("aligner", aligner.len(), "right_index", right_index.len())?;
+        // Region construction sorts each predicate's right values in the
+        // direction required by its operator. The aligner puts the resulting
+        // labels back into the first predicate's global right layout, so the
+        // tree's point `j` always means the same physical right row in every
+        // dimension.
         let Some((left_region, right_region)) =
             build_region_paths(predicate, Some(aligner), None, None)?
         else {
@@ -2330,36 +2544,200 @@ fn build_n_region_candidate_paths(
         right_regions.push(right_region);
     }
 
+    // A zero region means “this row cannot match” rather than a real rank.
+    // Masking it before reordering keeps the sentinel from becoming a valid
+    // point in any later dimension.
     mask_zero_regions(&mut left_regions)?;
     if left_regions[0].iter().all(|&region| region == 0) {
         return Ok(None);
     }
 
+    // Reorder every dimension with one shared permutation. Reordering each
+    // vector independently would silently pair labels from different left
+    // rows and produce plausible-looking but incorrect candidates.
     let left_order = descending_left_order(&left_regions[0]);
     for region in &mut left_regions {
         *region = reorder_left_region(region, &left_order);
     }
 
-    // Starts are derived from the first predicate before masking its right
-    // region. That preserves the monotonic input required by partition_point.
+    // This cheap first-region check preserves the existing early no-match
+    // path; the selected generator then handles the complete traversal.
     let Some(starts) = n_region_starts(&left_regions[0], &right_regions[0])? else {
         return Ok(None);
     };
-    let end = right_regions[0].len();
     mask_zero_regions(&mut right_regions)?;
     if right_regions[0].iter().all(|&region| region == 0) {
         return Ok(None);
     }
 
-    let right_region_layout = build_ranked_region_position_layout(&right_regions[1], &starts, end)?;
+    // `keep="any"` is unusual: a sweep can stop after its first complete
+    // match, but a left-oriented tree cannot stop because it visits the tree
+    // once per right row. Probe a few rows first so dense, easy-to-hit joins
+    // retain that cheap early exit. Harder joins fall through to the normal
+    // C2 decision and may use a right-oriented tree.
+    let (use_sweep, sweep_layout) = if prefer_sweep_if_early
+        && sweep_finds_early_match(&left_regions, &right_regions, &starts)
+    {
+        (true, None)
+    } else {
+        // C2 is the exact amount of pair work the first two predicates leave
+        // for the sweep. The 64x budget is intentionally conservative: later
+        // predicates can reduce that work, but the sweep still pays to test
+        // every C2 candidate. Once the budget is exceeded, discard the count
+        // layout and pay for the multidimensional tree instead.
+        let limit = 64_u128.saturating_mul(
+            (left_regions[0].len() as u128).saturating_add(right_regions[0].len() as u128),
+        );
+        let (exceeded, layout) = sweep_candidate_count_exceeds(
+            &left_regions,
+            &right_regions[1],
+            &starts,
+            right_regions[0].len(),
+            limit,
+        )?;
+        (!exceeded, layout)
+    };
+    let generator = if use_sweep {
+        let layout = match sweep_layout {
+            Some(layout) => layout,
+            None => build_ranked_region_position_layout(
+                &right_regions[1],
+                &starts,
+                right_regions[0].len(),
+            )?,
+        };
+        NRegionCandidateGenerator::Sweep { starts, layout }
+    } else {
+        let orientation = if allow_left_tree && left_regions[0].len() < right_regions[0].len() {
+            NRegionTreeOrientation::Left
+        } else {
+            NRegionTreeOrientation::Right
+        };
+        let tree_regions = match orientation {
+            NRegionTreeOrientation::Right => &right_regions,
+            NRegionTreeOrientation::Left => &left_regions,
+        };
+        NRegionCandidateGenerator::Kd {
+            tree: RegionKdTree::build(tree_regions, 32)?,
+            orientation,
+        }
+    };
+
     Ok(Some(NRegionCandidatePaths {
         left_regions,
         right_regions,
-        starts,
-        end,
         left_order,
-        right_region_layout,
+        generator,
     }))
+}
+
+/// Return whether a bounded sweep probe finds a complete match quickly.
+///
+/// This protects `keep="any"` workloads where the sweep can stop almost
+/// immediately, such as dense dominance joins. If the sampled rows do not
+/// find a match within the small probe budget, the normal C2 dispatcher may
+/// select the right-oriented tree. The left-oriented tree remains forbidden
+/// for this keep mode because it cannot stop its right-driven traversal.
+///
+/// The probe is capped by scanned positions, not successful C2 candidates:
+/// otherwise a row whose second predicate rejects everything could scan the
+/// entire right side before the cap was reached.
+///
+/// ELI5: the first eight rows are not representative because the shared left
+/// ordering puts the narrowest first-predicate windows there. Look at sixteen
+/// evenly spaced rows instead, and trust the sweep only when at least half of
+/// those rows find a complete match quickly. A single easy row can no longer
+/// force the whole join onto the sweep path.
+fn sweep_finds_early_match(
+    left_regions: &[Vec<i64>],
+    right_regions: &[Vec<i64>],
+    starts: &[usize],
+) -> bool {
+    let sample_count = starts.len().min(KEEP_ANY_PROBE_SAMPLE_ROWS);
+    let end = right_regions[0].len();
+    let mut tried = 0_usize;
+    let mut hits = 0_usize;
+
+    for sample in 0..sample_count {
+        // The left regions are in descending first-region order. Sampling
+        // this reordered vector evenly avoids over-representing its easiest
+        // (narrowest-window) prefix.
+        let left_position = sample * starts.len() / sample_count;
+        let start = starts[left_position];
+        if start == end {
+            continue;
+        }
+        tried += 1;
+        for right_position in start..end.min(start + KEEP_ANY_PROBE_CANDIDATE_BUDGET) {
+            if left_regions
+                .iter()
+                .zip(right_regions.iter())
+                .skip(1)
+                .all(|(left, right)| left[left_position] <= right[right_position])
+            {
+                hits += 1;
+                break;
+            }
+        }
+    }
+
+    // Avoid floating-point thresholds: with sixteen samples this is exactly
+    // eight hits, and the same rule scales naturally for smaller inputs.
+    tried > 0 && hits * 2 >= tried
+}
+
+/// Count the candidates the existing two-region sweep would inspect.
+///
+/// The count is exact for the first two predicates and stops as soon as it
+/// exceeds `limit`. Fenwick suffix sums keep each left-row count logarithmic
+/// in the number of distinct second-predicate labels. Returning the layout
+/// when the count stays within the limit lets the sweep reuse this dispatch
+/// work. If the limit is exceeded, the layout is intentionally discarded:
+/// building the tree needs a different flat storage layout, and retaining
+/// both would increase peak memory on the largest joins.
+///
+/// ELI5: count the work the old conveyor belt would do. If that work is small,
+/// keep the conveyor belt; if it is large, pay for the multidimensional tree.
+fn sweep_candidate_count_exceeds(
+    left_regions: &[Vec<i64>],
+    second_right_region: &[i64],
+    starts: &[usize],
+    end: usize,
+    limit: u128,
+) -> Result<(bool, Option<RankedRegionPositionLayout>), String> {
+    let layout = build_ranked_region_position_layout(second_right_region, starts, end)?;
+    let mut active_counts = FenwickCounts::new(layout.labels.len());
+    let mut previous_end = end;
+    let mut total = 0_u128;
+
+    for (left_position, &start) in starts.iter().enumerate() {
+        if start == end {
+            continue;
+        }
+        if start > previous_end {
+            return Err("starts must be monotonically non-increasing".to_owned());
+        }
+        for &rank in &layout.ranks[start..previous_end] {
+            if rank != usize::MAX {
+                active_counts.add(rank)?;
+            }
+        }
+        previous_end = start;
+
+        let left_region = left_regions[1][left_position];
+        if left_region == 0 {
+            continue;
+        }
+        let first_rank = layout.labels.partition_point(|&label| label < left_region);
+        let row_count = active_counts.suffix_sum(first_rank) as u128;
+        total = total
+            .checked_add(row_count)
+            .ok_or("region result size exceeds platform capacity")?;
+        if total > limit {
+            return Ok((true, None));
+        }
+    }
+    Ok((false, Some(layout)))
 }
 
 /// Build index pairs for three or more range predicates after Python-side
@@ -2400,15 +2778,24 @@ fn n_region_indices_core(
 /// position. Range regions are still checked first, so residual predicates
 /// only run for candidates that survived every range predicate.
 ///
-/// ELI5: the range sweep narrows the haystack first; `candidate_pass` checks
+/// ELI5: the range tree narrows the haystack first; `candidate_pass` checks
 /// each remaining needle. A candidate is emitted only when that filter passes.
 ///
 /// # Arguments
 ///
-/// The predicate, index, range, aligner, and `keep` arguments define the
-/// prepared n-region search. `candidate_pass` receives original left and
-/// global right positions and is evaluated only after all range predicates
-/// pass.
+/// * `first_predicate` / `range_predicates` - The complete range join. The
+///   first predicate is the global right anchor; the remaining predicates are
+///   aligned through `aligners`.
+/// * `left_index` / `right_index` - Physical labels used in the returned
+///   arrays. `right_index` is in global first-predicate order.
+/// * `aligners` - Global-to-source-right permutations for the additional
+///   predicates.
+/// * `keep` - Index selection policy. `All` performs two full traversals for
+///   exact output sizing; the other modes keep at most one right position per
+///   left row.
+/// * `candidate_pass` - Residual filter receiving original physical left and
+///   global right positions. It is called only after every range dimension
+///   passes, so it can never widen the range candidate set.
 ///
 /// # Returns
 ///
@@ -2437,58 +2824,47 @@ where
         left_index,
         right_index,
         aligners,
+        keep != Keep::Any,
+        keep == Keep::Any,
     )?
     else {
         return Ok(None);
     };
-    let NRegionCandidatePaths {
-        left_regions: left_range_regions,
-        right_regions: right_range_regions,
-        starts,
-        end,
-        left_order,
-        right_region_layout,
-    } = paths;
+    let left_range_regions = &paths.left_regions;
+    let left_order = &paths.left_order;
 
     if keep != Keep::All {
         let mut selected_right_positions = vec![None; left_range_regions[0].len()];
-        let _ = visit_n_region_matches(
-            &left_range_regions,
-            &right_range_regions,
-            &starts,
-            end,
-            &right_region_layout,
-            |left_position, right_position| {
-                if !candidate_pass(left_order[left_position], right_position) {
-                    return true;
+        let _ = visit_n_region_matches(&paths, |left_position, right_position| {
+            if !candidate_pass(left_order[left_position], right_position) {
+                return true;
+            }
+            match keep {
+                Keep::Any => {
+                    selected_right_positions[left_position] = Some(right_position);
+                    false
                 }
-                match keep {
-                    Keep::Any => {
-                        selected_right_positions[left_position] = Some(right_position);
-                        false
+                Keep::First => {
+                    let selected = &mut selected_right_positions[left_position];
+                    if selected
+                        .is_none_or(|position| right_index[right_position] < right_index[position])
+                    {
+                        *selected = Some(right_position);
                     }
-                    Keep::First => {
-                        let selected = &mut selected_right_positions[left_position];
-                        if selected.is_none_or(|position| {
-                            right_index[right_position] < right_index[position]
-                        }) {
-                            *selected = Some(right_position);
-                        }
-                        true
-                    }
-                    Keep::Last => {
-                        let selected = &mut selected_right_positions[left_position];
-                        if selected.is_none_or(|position| {
-                            right_index[right_position] > right_index[position]
-                        }) {
-                            *selected = Some(right_position);
-                        }
-                        true
-                    }
-                    Keep::All => unreachable!("keep='all' uses the two-pass path"),
+                    true
                 }
-            },
-        )?;
+                Keep::Last => {
+                    let selected = &mut selected_right_positions[left_position];
+                    if selected
+                        .is_none_or(|position| right_index[right_position] > right_index[position])
+                    {
+                        *selected = Some(right_position);
+                    }
+                    true
+                }
+                Keep::All => unreachable!("keep='all' uses the two-pass path"),
+            }
+        })?;
 
         let selected_count = selected_right_positions
             .iter()
@@ -2518,20 +2894,13 @@ where
     // counts size the exact index output and can be reused for count(*),
     // matched-row masks, and early no-match decisions by aggregate callers.
     let mut left_match_counts = vec![0usize; left_range_regions[0].len()];
-    let _ = visit_n_region_matches(
-        &left_range_regions,
-        &right_range_regions,
-        &starts,
-        end,
-        &right_region_layout,
-        |left_position, right_position| {
-            if !candidate_pass(left_order[left_position], right_position) {
-                return true;
-            }
-            left_match_counts[left_position] += 1;
-            true
-        },
-    )?;
+    let _ = visit_n_region_matches(&paths, |left_position, right_position| {
+        if !candidate_pass(left_order[left_position], right_position) {
+            return true;
+        }
+        left_match_counts[left_position] += 1;
+        true
+    })?;
     let total_matches = left_match_counts.iter().try_fold(0usize, |total, &count| {
         total
             .checked_add(count)
@@ -2544,22 +2913,15 @@ where
     let mut left_output = Vec::with_capacity(total_matches);
     let mut right_output = Vec::with_capacity(total_matches);
     let mut second_left_match_counts = vec![0usize; left_range_regions[0].len()];
-    let _ = visit_n_region_matches(
-        &left_range_regions,
-        &right_range_regions,
-        &starts,
-        end,
-        &right_region_layout,
-        |left_position, right_position| {
-            if !candidate_pass(left_order[left_position], right_position) {
-                return true;
-            }
-            second_left_match_counts[left_position] += 1;
-            left_output.push(left_index[left_order[left_position]]);
-            right_output.push(right_index[right_position]);
-            true
-        },
-    )?;
+    let _ = visit_n_region_matches(&paths, |left_position, right_position| {
+        if !candidate_pass(left_order[left_position], right_position) {
+            return true;
+        }
+        second_left_match_counts[left_position] += 1;
+        left_output.push(left_index[left_order[left_position]]);
+        right_output.push(right_index[right_position]);
+        true
+    })?;
     let second_pass_matches = left_output.len();
 
     if second_left_match_counts != left_match_counts
@@ -2598,8 +2960,8 @@ where
 /// index materialization; it must not be used to change an aggregate over all
 /// matching candidates.
 ///
-/// Performance note: this sweep is left-driven. It sorts and visits every
-/// left row, and stores one left-region vector per predicate. When the join
+/// Performance note: this tree traversal is left-driven. It visits every
+/// left row and stores one left-region vector per predicate. When the join
 /// direction is otherwise interchangeable, keeping the smaller input on the
 /// left is generally the better heuristic. This is not a correctness
 /// requirement, and broad joins may still be dominated by output size.
@@ -2607,7 +2969,8 @@ where
 /// # Arguments
 ///
 /// * `py` - Active Python interpreter used to create the result dictionary.
-/// * `left_index` - Physical labels for the prepared left rows.
+/// * `left_index` - Physical labels for the prepared left rows; returned in
+///   the same left-row identity space, not in tree search order.
 /// * `right_index` - Physical labels in the first predicate's global right
 ///   order.
 /// * `first_predicate` - First, global-order range predicate.
@@ -2615,7 +2978,9 @@ where
 /// * `aligners` - One right-position permutation for each additional
 ///   predicate. `aligners[i][global_position]` is the source position in the
 ///   corresponding predicate's right values.
-/// * `keep` - One of `"all"`, `"any"`, `"first"`, or `"last"`.
+/// * `keep` - One of `"all"`, `"any"`, `"first"`, or `"last"`. `"all"`
+///   preserves every candidate; the other modes select at most one candidate
+///   per left row.
 ///
 /// # Returns
 ///
@@ -3034,11 +3399,32 @@ where
 /// stop traversal: aggregation requires every passing pair, unlike `keep`-
 /// based index selection.
 ///
+/// Forward mode updates one output slot per left row from right-side source
+/// values. Reverse mode updates one output slot per right row from left-side
+/// source values. In both modes, `candidate_pass` sees original physical
+/// positions, while the tree itself uses reordered left search positions and
+/// global right positions.
+///
+/// ELI5: index joins write down matching pairs. Aggregation joins instead
+/// visit every matching pair and drop each right (or left, in reverse mode)
+/// value into the matching row's running bucket. Nothing may be skipped just
+/// because one value has already been seen.
+///
 /// # Arguments
 ///
-/// The predicate, index, range, aligner, aggregation, and direction arguments
-/// define the prepared n-region join. `candidate_pass` applies residual
-/// predicates using original physical positions.
+/// * `py` - Python interpreter used to build the result tuple.
+/// * `left_index` / `right_index` - Physical output labels for the prepared
+///   left side and global first-predicate right side.
+/// * `first` / `ranges` - The complete range predicate set. The first anchor
+///   establishes global right order; `ranges` contains the additional paths.
+/// * `aligners` - Global-to-source-right permutations paired with `ranges`.
+/// * `aggregations` - Non-empty aggregation requests. In forward mode their
+///   source arrays are right-aligned; in reverse mode they are left-aligned.
+/// * `return_matched` - Whether to include the output-side matched mask.
+/// * `reverse` - Select right-output/left-source aggregation when `true`.
+/// * `candidate_pass` - Residual filter on original physical positions. It
+///   must be pure with respect to traversal and return `true` for candidates
+///   that should update aggregate state.
 ///
 /// # Returns
 ///
@@ -3070,9 +3456,16 @@ where
             "at least one aggregation is required",
         ));
     }
-    let Some(paths) =
-        build_n_region_candidate_paths(&first, ranges, left_index, right_index, aligners)
-            .map_err(PyValueError::new_err)?
+    let Some(paths) = build_n_region_candidate_paths(
+        &first,
+        ranges,
+        left_index,
+        right_index,
+        aligners,
+        true,
+        false,
+    )
+    .map_err(PyValueError::new_err)?
     else {
         return Ok(None);
     };
@@ -3082,24 +3475,17 @@ where
         (Some(left_index), left_index.len(), right_index.len())
     };
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
-    visit_n_region_matches(
-        &paths.left_regions,
-        &paths.right_regions,
-        &paths.starts,
-        paths.end,
-        &paths.right_region_layout,
-        |left_position, right_position| {
-            if !candidate_pass(paths.left_order[left_position], right_position) {
-                return true;
-            }
-            if reverse {
-                set.update(paths.left_order[left_position], right_position);
-            } else {
-                set.update(right_position, paths.left_order[left_position]);
-            }
-            true
-        },
-    )
+    visit_n_region_matches(&paths, |left_position, right_position| {
+        if !candidate_pass(paths.left_order[left_position], right_position) {
+            return true;
+        }
+        if reverse {
+            set.update(paths.left_order[left_position], right_position);
+        } else {
+            set.update(right_position, paths.left_order[left_position]);
+        }
+        true
+    })
     .map_err(PyValueError::new_err)?;
     if set.is_empty() {
         return Ok(None);
@@ -3356,6 +3742,16 @@ pub fn dual_regions_and_residual_aggregate_reverse<'py>(
 /// `range_predicates` is paired by position with an aligner, and all range
 /// paths must pass before a source value is aggregated.
 ///
+/// Aggregation visits every passing pair; there is deliberately no `keep`
+/// argument. The k-d tree changes how candidates are found, not which pairs
+/// contribute to a bucket. Traversal order is an implementation detail, so
+/// aggregators must be associative in the same way as the existing join
+/// aggregation API.
+///
+/// ELI5: for each left row, the tree finds all right rows that fit every
+/// ruler. The aggregation then adds every matching right value to that left
+/// row's bucket.
+///
 /// # Arguments
 ///
 /// * `py` - Python interpreter token used to construct the result tuple.
@@ -3405,6 +3801,9 @@ pub fn n_region_aggregate<'py>(
 ///
 /// This uses the same n-region candidate set as [`n_region_aggregate`], but
 /// reads left-side source arrays and writes right-side output slots.
+/// Every complete range candidate contributes exactly once to the appropriate
+/// right output slot; this is the direction-reversed counterpart of
+/// [`n_region_aggregate`], not a different candidate-generation algorithm.
 ///
 /// # Arguments
 ///
@@ -3448,9 +3847,11 @@ pub fn n_region_aggregate_reverse<'py>(
 
 /// Aggregate n-region candidates after applying residual predicates.
 ///
-/// Range predicates are checked by the n-region sweep first. Residual
+/// Range predicates are checked by the n-region tree first. Residual
 /// predicates run only for candidates that pass every range path, and only
 /// those candidates update the right-source/left-output aggregation state.
+/// No range candidate is aggregated before the residual callback returns
+/// `true`, and residuals are evaluated using original physical positions.
 ///
 /// # Arguments
 ///
@@ -3498,6 +3899,8 @@ pub fn n_region_and_residual_aggregate<'py>(
 /// This is the reverse counterpart of
 /// [`n_region_and_residual_aggregate`]. Passing left-source values update
 /// right-side output slots after all range and residual predicates pass.
+/// The residual stage still runs on original left/right positions; only the
+/// source and destination of the aggregate state are reversed.
 ///
 /// # Arguments
 ///
@@ -3540,7 +3943,19 @@ pub fn n_region_and_residual_aggregate_reverse<'py>(
     )
 }
 
-/// Parse the n-region Python lists and run the shared aggregation sweep.
+/// Parse n-region Python inputs and run the shared aggregation traversal.
+///
+/// This is the single adapter behind the four public aggregation entry
+/// points. It owns Python-shape validation and residual parsing, then hands
+/// aligned Rust views to [`aggregate_n_region_core`]. Keeping this plumbing in
+/// one place prevents forward/reverse and residual/non-residual variants from
+/// drifting apart.
+///
+/// `range_predicates` contains the additional predicates after `first_predicate`;
+/// consequently it must contain at least two items for a true n-region join.
+/// `aligners` has one item for each of those predicates. In reverse mode the
+/// same candidate paths are used, but aggregation arrays must be left-aligned
+/// and output slots are right-aligned.
 #[allow(clippy::too_many_arguments)]
 fn n_region_aggregate_entry<'py>(
     py: Python<'py>,
@@ -3679,6 +4094,94 @@ mod tests {
             .ok_or_else(|| PyValueError::new_err("result has no right_index"))?
             .extract::<Vec<i64>>()?;
         Ok(left.into_iter().zip(right).collect())
+    }
+
+    #[test]
+    fn left_oriented_n_region_tree_visits_all_dominance_matches() {
+        let left_regions = vec![vec![2_i64, 1], vec![2, 1], vec![2, 1]];
+        let right_values = (1_i64..=2_048).collect::<Vec<_>>();
+        let right_regions = vec![
+            right_values.clone(),
+            right_values.clone(),
+            right_values.clone(),
+        ];
+        let paths = NRegionCandidatePaths {
+            left_regions,
+            right_regions: right_regions.clone(),
+            left_order: vec![0, 1],
+            generator: NRegionCandidateGenerator::Kd {
+                tree: RegionKdTree::build(&[vec![2_i64, 1], vec![2, 1], vec![2, 1]], 32)
+                    .expect("left tree should build"),
+                orientation: NRegionTreeOrientation::Left,
+            },
+        };
+        let mut counts = [0_usize; 2];
+        visit_n_region_matches(&paths, |left_position, _| {
+            counts[left_position] += 1;
+            true
+        })
+        .expect("left-oriented traversal should succeed");
+        assert_eq!(counts, [2_047, 2_048]);
+    }
+
+    #[test]
+    fn sweep_keeps_tied_left_windows() {
+        let left_regions = vec![vec![1_i64, 1], vec![1, 1], vec![1, 1]];
+        let right_regions = vec![vec![1_i64, 2, 3, 4], vec![1, 2, 3, 4], vec![1, 2, 3, 4]];
+        let starts = n_region_starts(&left_regions[0], &right_regions[0])
+            .expect("starts should be valid")
+            .expect("both rows should have matches");
+        let layout =
+            build_ranked_region_position_layout(&right_regions[1], &starts, right_regions[0].len())
+                .expect("ranked layout should build");
+        let paths = NRegionCandidatePaths {
+            left_regions,
+            right_regions,
+            left_order: vec![0, 1],
+            generator: NRegionCandidateGenerator::Sweep { starts, layout },
+        };
+
+        let mut pairs = Vec::new();
+        visit_n_region_matches(&paths, |left, right| {
+            pairs.push((left, right));
+            true
+        })
+        .expect("sweep should visit tied windows");
+        assert_eq!(pairs.len(), 8);
+    }
+
+    #[test]
+    fn any_probe_samples_spread_rows_and_requires_half_hits() {
+        let starts = vec![0_usize; 32];
+        let right_regions = vec![vec![1_i64], vec![1], vec![1]];
+
+        // The sixteen sampled positions are 0, 2, ..., 30. Put the hits in
+        // the latter half so a prefix-only probe would see none of them.
+        let left_third = (0..32)
+            .map(|position| {
+                if position >= 16 && position % 2 == 0 {
+                    1
+                } else {
+                    2
+                }
+            })
+            .collect::<Vec<i64>>();
+        let left_regions = vec![vec![1_i64; 32], vec![1; 32], left_third];
+        assert!(sweep_finds_early_match(
+            &left_regions,
+            &right_regions,
+            &starts
+        ));
+
+        // Removing one of those eight sampled hits must fail the 50% rule.
+        let mut left_third = left_regions[2].clone();
+        left_third[30] = 2;
+        let left_regions = vec![vec![1_i64; 32], vec![1; 32], left_third];
+        assert!(!sweep_finds_early_match(
+            &left_regions,
+            &right_regions,
+            &starts
+        ));
     }
 
     fn aggregation_input<'py>(
@@ -3894,6 +4397,19 @@ mod tests {
 
         let dense = ActiveRankCounts::new(400, 100);
         assert!(matches!(dense, ActiveRankCounts::Dense(_)));
+    }
+
+    #[test]
+    fn fenwick_counts_return_suffix_cardinalities() {
+        let mut counts = FenwickCounts::new(5);
+        for rank in [0, 2, 2, 4] {
+            counts.add(rank).expect("rank should fit");
+        }
+        assert_eq!(counts.suffix_sum(0), 4);
+        assert_eq!(counts.suffix_sum(1), 3);
+        assert_eq!(counts.suffix_sum(2), 3);
+        assert_eq!(counts.suffix_sum(3), 1);
+        assert_eq!(counts.suffix_sum(5), 0);
     }
 
     #[test]
