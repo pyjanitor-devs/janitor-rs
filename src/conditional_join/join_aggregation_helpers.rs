@@ -15,7 +15,7 @@ use super::predicate::{
     PredicateView,
 };
 use super::range_predicate::AnyParsedRangePredicate;
-use crate::aggregation_common::aggregation::{
+use crate::aggregation::common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
 use crate::compare_op::CompareOp;

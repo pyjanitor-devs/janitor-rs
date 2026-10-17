@@ -48,8 +48,8 @@ use super::join_search::range_window;
 use super::join_types::{result_dict, Keep, SingleJoinResult};
 use super::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
 use super::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
-use crate::aggregation_common::adaptive::should_use_segment_tree;
-use crate::aggregation_common::ensure_equal_lengths_core;
+use crate::aggregation::common::adaptive::should_use_segment_tree;
+use crate::aggregation::common::ensure_equal_lengths_core;
 #[cfg(test)]
 use crate::compare_op::CompareOp;
 use crate::packed_spans::{assign_range_clusters, queried_source_spans, PackedSpanLayout};
@@ -3194,7 +3194,7 @@ mod aggregation_tests {
                         )?,
                     ],
                 )?;
-                let prefix_before = crate::aggregation_state::PREFIX_SUM_HITS.get();
+                let prefix_before = crate::aggregation::state::PREFIX_SUM_HITS.get();
                 let result = call_range_join_aggregate(
                     py,
                     &predicates,
@@ -3205,7 +3205,7 @@ mod aggregation_tests {
                 )?
                 .expect("the overflow fixture has matches");
                 assert_eq!(
-                    crate::aggregation_state::PREFIX_SUM_HITS.get(),
+                    crate::aggregation::state::PREFIX_SUM_HITS.get(),
                     prefix_before + prefix_hits
                 );
                 let outputs_item = result.get_item(1)?;

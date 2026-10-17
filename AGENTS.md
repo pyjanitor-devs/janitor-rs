@@ -190,7 +190,8 @@ janitor-rs/
 │   │   ├── mod.rs           # family registration and module ownership
 │   │   ├── equi_join.rs, range_join.rs, ...
 │   │   └── region_kd_tree.rs # multi-predicate range-join tree
-│   ├── aggregation_*.rs     # shared aggregation input/state/common code
+│   ├── aggregation/          # shared aggregation input/state/common code
+│   │   ├── mod.rs, common.rs, input.rs, state.rs
 │   ├── compare_op.rs         # shared comparison operators
 │   └── packed_spans.rs       # shared queried-span coordinates
 ├── benches/kernels.rs        # criterion benchmarks for the extracted
@@ -268,8 +269,9 @@ register(m: &Bound<'_, PyModule>) -> PyResult<()>`:
 `src/lib.rs`'s `#[pymodule] fn janitor_rs` calls the top-level
 `conditional_join::register` composition point and never names an individual
 dtype-specialized function. The conditional-join family module owns the five
-kernel registration calls; shared aggregation and span helpers remain outside
-that directory because they can be reused by future kernel families.
+kernel registration calls; the shared aggregation family has its own sibling
+directory, while packed-span coordinates remain top-level because both
+aggregation state and range joins use them.
 
 When adding a brand-new kernel file (a new kernel shape, not just a new
 dtype instantiation of an existing one), remember to add its module

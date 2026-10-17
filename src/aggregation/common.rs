@@ -1,7 +1,7 @@
 //! Shared aggregation boundary used by the surviving join kernels.
 //!
 //! The former aggregation tree has been collapsed into
-//! [`crate::aggregation_input`] and [`crate::aggregation_state`]. This small
+//! [`crate::aggregation::input`] and [`crate::aggregation::state`]. This small
 //! module keeps the validation and result-shape
 //! helpers in one place without recreating the deleted per-operation kernel
 //! hierarchy.
@@ -54,8 +54,8 @@ pub(crate) mod adaptive {
 }
 
 pub(crate) mod aggregation {
-    pub(crate) use crate::aggregation_input::parse_inputs;
-    pub(crate) use crate::aggregation_state::AggregationSet;
+    pub(crate) use super::super::input::parse_inputs;
+    pub(crate) use super::super::state::AggregationSet;
 
     use super::*;
 

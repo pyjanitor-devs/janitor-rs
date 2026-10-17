@@ -28,10 +28,10 @@ use super::predicate::{
 };
 use super::range_join::adaptive_extreme_positions;
 use super::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
-use crate::aggregation_common::aggregation::{
+use crate::aggregation::common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
-use crate::aggregation_common::ensure_equal_lengths_core;
+use crate::aggregation::common::ensure_equal_lengths_core;
 use crate::compare_op::CompareOp;
 
 #[cfg(test)]
@@ -2310,7 +2310,7 @@ mod tests {
                 ],
             )?;
 
-            let prefix_before = crate::aggregation_state::PREFIX_SUM_HITS.get();
+            let prefix_before = crate::aggregation::state::PREFIX_SUM_HITS.get();
             EQUI_STARTS_ENDS_HITS.with(|hits| hits.set(0));
             let result = equi_aggregate(
                 py,
@@ -2327,7 +2327,7 @@ mod tests {
             .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
             EQUI_STARTS_ENDS_HITS.with(|hits| assert!(hits.get() > 0));
             assert_eq!(
-                crate::aggregation_state::PREFIX_SUM_HITS.get(),
+                crate::aggregation::state::PREFIX_SUM_HITS.get(),
                 prefix_before + 1
             );
 

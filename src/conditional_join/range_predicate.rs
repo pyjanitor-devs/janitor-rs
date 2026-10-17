@@ -29,7 +29,7 @@
 
 use super::join_search::{range_window, range_window_bounds};
 use super::join_types::SingleJoinResult;
-use crate::aggregation_common::ensure_equal_lengths_core;
+use crate::aggregation::common::ensure_equal_lengths_core;
 use crate::compare_op::CompareOp;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;

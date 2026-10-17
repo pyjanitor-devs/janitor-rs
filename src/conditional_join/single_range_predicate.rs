@@ -50,7 +50,7 @@ use super::join_search::{range_window, range_window_bounds};
 use super::join_types::{result_dict, Keep, SingleJoinResult};
 use super::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
 use super::range_predicate::parse_any_range_parts;
-use crate::aggregation_common::aggregation::{
+use crate::aggregation::common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
 use crate::compare_op::CompareOp;

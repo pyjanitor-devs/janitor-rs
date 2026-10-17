@@ -1,7 +1,5 @@
 use pyo3::prelude::*;
-mod aggregation_common;
-mod aggregation_input;
-mod aggregation_state;
+mod aggregation;
 mod compare_op;
 mod conditional_join;
 mod packed_spans;

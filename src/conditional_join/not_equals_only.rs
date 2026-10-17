@@ -69,10 +69,10 @@ use super::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicates_with_nulls_strings,
     predicates_match_dispatch, NullMetadataView, PredicateView,
 };
-use crate::aggregation_common::aggregation::{
+use crate::aggregation::common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
-use crate::aggregation_common::ensure_equal_lengths_core;
+use crate::aggregation::common::ensure_equal_lengths_core;
 use crate::compare_op::CompareOp;
 
 /// Validate that non-null and null physical positions form a complete,

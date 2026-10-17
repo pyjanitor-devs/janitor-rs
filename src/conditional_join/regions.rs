@@ -7,11 +7,11 @@ use super::predicate::{
     parse_predicates_with_nulls_strings, predicates_match_dispatch, Predicate, PredicateView,
 };
 use super::region_kd_tree::RegionKdTree;
-use crate::aggregation_common::adaptive::should_use_segment_tree;
-use crate::aggregation_common::aggregation::{
+use crate::aggregation::common::adaptive::should_use_segment_tree;
+use crate::aggregation::common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
-use crate::aggregation_common::ensure_equal_lengths_core;
+use crate::aggregation::common::ensure_equal_lengths_core;
 use crate::compare_op::CompareOp;
 use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
 use pyo3::exceptions::{PyTypeError, PyValueError};
