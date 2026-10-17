@@ -192,7 +192,7 @@ janitor-rs/
 │   │   └── region_kd_tree.rs # multi-predicate range-join tree
 │   ├── aggregation/          # shared aggregation input/state/common code
 │   │   ├── mod.rs, common.rs, input.rs, state.rs
-│   ├── compare_op.rs         # shared comparison operators
+│   │   └── compare_op.rs     # conditional-join comparison operators
 │   └── packed_spans.rs       # shared queried-span coordinates
 ├── benches/kernels.rs        # criterion benchmarks for the extracted
 │                             # `*_core` functions (see below)

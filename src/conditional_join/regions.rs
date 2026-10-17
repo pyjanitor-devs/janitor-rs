@@ -1,5 +1,6 @@
 use std::collections::{btree_map, BTreeMap, HashMap};
 
+use super::compare_op::CompareOp;
 use super::join_search::partition_point;
 use super::join_types::{result_dict, Keep};
 use super::predicate::{
@@ -12,7 +13,6 @@ use crate::aggregation::common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
 use crate::aggregation::common::ensure_equal_lengths_core;
-use crate::compare_op::CompareOp;
 use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;

@@ -44,6 +44,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use super::compare_op::CompareOp;
 use super::join_aggregation_helpers::{aggregate_range_windows, aggregation_windows};
 use super::join_candidate_materialization::materialize_range_candidates;
 use super::join_search::{range_window, range_window_bounds};
@@ -53,7 +54,6 @@ use super::range_predicate::parse_any_range_parts;
 use crate::aggregation::common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
-use crate::compare_op::CompareOp;
 
 fn prefix_extreme(values: &[i64], minimum: bool) -> Vec<i64> {
     // Prefix extrema are used only when the right physical positions are not

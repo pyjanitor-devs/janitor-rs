@@ -9,6 +9,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
+use super::compare_op::CompareOp;
 use super::join_types::SingleJoinResult;
 use super::predicate::{
     null_metadata_views, parse_predicates_with_nulls_strings, predicates_match_window,
@@ -18,7 +19,6 @@ use super::range_predicate::AnyParsedRangePredicate;
 use crate::aggregation::common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
-use crate::compare_op::CompareOp;
 
 /// Package precomputed range bounds as dense aggregation windows.
 ///

@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+mod compare_op;
 mod equi_join;
 mod join_aggregation_helpers;
 mod join_candidate_materialization;

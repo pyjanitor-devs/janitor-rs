@@ -2,7 +2,7 @@
 
 use numpy::ndarray::ArrayView1;
 
-use crate::compare_op::CompareOp;
+use super::compare_op::CompareOp;
 
 /// Return the first offset at which `predicate` is false.
 ///

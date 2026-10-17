@@ -41,6 +41,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+#[cfg(test)]
+use super::compare_op::CompareOp;
 use super::join_aggregation_helpers::aggregate_range_windows;
 use super::join_candidate_materialization::materialize_range_candidates;
 #[cfg(test)]
@@ -50,8 +52,6 @@ use super::predicate::{check_predicate_lengths, parse_predicates_with_nulls_stri
 use super::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 use crate::aggregation::common::adaptive::should_use_segment_tree;
 use crate::aggregation::common::ensure_equal_lengths_core;
-#[cfg(test)]
-use crate::compare_op::CompareOp;
 use crate::packed_spans::{assign_range_clusters, queried_source_spans, PackedSpanLayout};
 
 #[cfg(test)]

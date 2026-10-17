@@ -1,6 +1,5 @@
 use pyo3::prelude::*;
 mod aggregation;
-mod compare_op;
 mod conditional_join;
 mod packed_spans;
 

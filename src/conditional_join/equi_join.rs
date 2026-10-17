@@ -20,6 +20,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, HashMap};
 
+use super::compare_op::CompareOp;
 use super::join_search::partition_point_between;
 use super::join_types::{result_dict, Keep};
 use super::predicate::{
@@ -32,7 +33,6 @@ use crate::aggregation::common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
 use crate::aggregation::common::ensure_equal_lengths_core;
-use crate::compare_op::CompareOp;
 
 #[cfg(test)]
 thread_local! {
@@ -1930,7 +1930,7 @@ mod tests {
         narrow_unordered_second_range, unique_reverse_output_slots, EQUI_RESIDUAL_WINDOW_HITS,
         EQUI_STARTS_ENDS_HITS,
     };
-    use crate::compare_op::CompareOp;
+    use crate::conditional_join::compare_op::CompareOp;
     use crate::conditional_join::join_types::Keep;
     use pyo3::exceptions::PyValueError;
     use pyo3::types::{PyAnyMethods, PyBool, PyList, PyListMethods, PyTuple, PyTupleMethods};
