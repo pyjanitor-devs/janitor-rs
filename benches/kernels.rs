@@ -339,7 +339,7 @@ fn range_extended_residual_aggregation(c: &mut Criterion) {
     });
 }
 
-fn equi_unordered_second_range(c: &mut Criterion) {
+fn equi_unordered_second_range_with_residual(c: &mut Criterion) {
     Python::initialize();
     Python::attach(|py| {
         let left_rows = 2_048_usize;
@@ -352,13 +352,24 @@ fn equi_unordered_second_range(c: &mut Criterion) {
         let first_right = PyArray1::from_vec(py, (0..right_rows as i64).collect());
         let second_left = PyArray1::from_vec(py, vec![7_500_i64; left_rows]);
         let second_right = PyArray1::from_vec(py, (0..right_rows as i64).rev().collect());
+        let residual_left = PyArray1::from_vec(py, vec![5_000_i64; left_rows]);
+        let residual_right = PyArray1::from_vec(py, (0..right_rows as i64).collect());
         let first = make_predicate(py, first_left.as_any(), first_right.as_any(), "<");
         let second = make_predicate(py, second_left.as_any(), second_right.as_any(), ">");
         let ranges = PyList::new(py, [first, second]).unwrap();
-        let residuals = PyList::empty(py);
+        let residuals = PyList::new(
+            py,
+            [make_predicate(
+                py,
+                residual_left.as_any(),
+                residual_right.as_any(),
+                ">=",
+            )],
+        )
+        .unwrap();
         let aggregations = make_size_aggregation(py);
         let mut group = c.benchmark_group("equi_unordered_second_range");
-        group.bench_function("aggregate_starts_ends", |b| {
+        group.bench_function("aggregate_starts_ends_with_residual", |b| {
             b.iter(|| {
                 let starts = PyArray1::from_vec(py, starts_values.clone());
                 let ends = PyArray1::from_vec(py, ends_values.clone());
@@ -774,7 +785,7 @@ criterion_group!(
     broad_dual_predicate,
     staggered_dual_predicate,
     range_extended_residual_aggregation,
-    equi_unordered_second_range,
+    equi_unordered_second_range_with_residual,
     equi_selective,
     equi_random,
     equi_broad,
