@@ -1291,8 +1291,13 @@ fn activate_ranked_positions(
 /// # Arguments
 ///
 /// * `left_regions` / `right_regions` - Equal-length aligned region paths.
+///   Dimension `d` uses `left_regions[d][i]` and `right_regions[d][j]` for
+///   the same predicate. Left position `i` is search order, not necessarily
+///   the caller's physical order.
 /// * `visit` - Callback receiving search-order left and global-right positions;
-///   return `false` to stop candidates for the current left row.
+///   return `false` to stop candidates for the current left row. The callback
+///   must not assume a particular right traversal order unless the caller's
+///   selection policy explicitly defines one.
 ///
 /// # Returns
 ///
@@ -1301,7 +1306,8 @@ fn activate_ranked_positions(
 /// # Errors
 ///
 /// Returns an error for path-length mismatches or result-size overflow. A
-/// callback rejection is normal control flow, not an error.
+/// callback rejection is normal control flow, not an error. The count is the
+/// number of callback invocations accepted before any early stop.
 fn visit_n_region_matches<F>(
     left_regions: &[Vec<i64>],
     right_regions: &[Vec<i64>],
@@ -1349,6 +1355,9 @@ fn visit_n_region_matches_kd<F>(
 where
     F: FnMut(usize, usize) -> bool,
 {
+    // The tree is rebuilt once per shared traversal. Every left row then
+    // reuses the same right-side index, which is the important distinction
+    // from rebuilding a search structure for each query point.
     let right_tree = RegionKdTree::build(right_regions, 32)?;
     let left_count = left_regions[0].len();
     let mut total_matches = 0usize;
@@ -1360,6 +1369,9 @@ where
             .map(|region| region[left_position])
             .collect::<Vec<_>>();
         let mut keep_visiting = true;
+        // `left_position` remains in reordered search space here. Consumers
+        // translate it through `left_order` only when they need physical
+        // indices or residual-predicate coordinates.
         right_tree.visit(&left_point, |right_position| {
             let Some(next_total) = total_matches.checked_add(1) else {
                 overflowed = true;
@@ -2211,12 +2223,27 @@ pub fn dual_regions_and_residual_indices<'py>(
 
 /// All immutable data needed by the multi-region candidate traversal.
 ///
+/// Every inner vector is indexed by predicate dimension. Within a dimension,
+/// the left and right vectors are aligned by row position, so the candidate
+/// test is `left_regions[d][i] <= right_regions[d][j]` for every `d`.
+/// Region value zero is reserved as the existing “cannot match” sentinel and
+/// is removed before the tree is queried.
+///
+/// `left_regions` is reordered into descending first-region order because
+/// that is the search order used by the old two-region implementation and it
+/// keeps output grouping stable. `left_order[i]` maps that search position
+/// back to the original physical left position. Right positions are not
+/// reordered from the caller's global first-predicate layout.
+///
 /// ELI5: this is the prepared map for a treasure hunt. The region vectors say
-/// which rows can match, and `left_order` maps tree-query positions back to
-/// the caller's physical left-row order.
+/// which rows can match, and `left_order` tells us which original left row a
+/// tree-query row came from.
 struct NRegionCandidatePaths {
+    /// Region labels for left rows in search order, one vector per predicate.
     left_regions: Vec<Vec<i64>>,
+    /// Region labels for right rows in global right-position order.
     right_regions: Vec<Vec<i64>>,
+    /// Search-position to original physical-left-position permutation.
     left_order: Vec<usize>,
 }
 
@@ -2226,13 +2253,36 @@ struct NRegionCandidatePaths {
 /// Both consumers must see the same masked, reordered, and aligned candidates
 /// or their results could disagree on which pairs are valid.
 ///
+/// Each predicate is represented as `(left_values, right_values, operator)`.
+/// The first predicate establishes the global right order. For each additional
+/// predicate, its aligner maps a global right position to the position in that
+/// predicate's independently sorted right array. This is why the tree can
+/// compare all dimensions at once even though each source range was sorted
+/// differently.
+///
+/// The helper performs the following preparation steps:
+///
+/// 1. Validate that every predicate, index array, and aligner has compatible
+///    lengths.
+/// 2. Build one region-label vector per predicate and align right labels into
+///    the global right layout.
+/// 3. Mask zero labels, reorder all left dimensions together, and preserve the
+///    existing cheap first-dimension no-match check.
+/// 4. Return the immutable paths shared by index and aggregation consumers.
+///
+/// No `keep` selection, residual filtering, callback invocation, or aggregate
+/// update happens here. Keeping preparation separate ensures every public
+/// n-region operation uses exactly the same candidate semantics.
+///
 /// # Arguments
 ///
-/// * `first_predicate` - Global first range anchor.
-/// * `range_predicates` - At least two additional anchors.
-/// * `left_index` / `right_index` - Shared physical maps.
+/// * `first_predicate` - Global first range anchor; its right values define
+///   `right_index` order.
+/// * `range_predicates` - At least two additional range anchors.
+/// * `left_index` / `right_index` - Physical maps whose lengths must match
+///   every corresponding predicate side.
 /// * `aligners` - One global-to-source-right permutation per additional
-///   predicate.
+///   predicate, paired by position with `range_predicates`.
 ///
 /// # Returns
 ///
@@ -2242,7 +2292,10 @@ struct NRegionCandidatePaths {
 /// # Errors
 ///
 /// Returns an error for mismatched predicate/index/aligner lengths, invalid
-/// alignments, unsupported operators, or invalid search invariants.
+/// alignments, unsupported operators, or invalid search invariants. Building
+/// the paths is linear in the number of predicate values apart from the
+/// sorting performed by upstream region construction; memory is `O(n * d)`
+/// for `n` rows and `d` predicates.
 fn build_n_region_candidate_paths(
     first_predicate: &Predicate<'_>,
     range_predicates: &[Predicate<'_>],
@@ -2294,6 +2347,11 @@ fn build_n_region_candidate_paths(
 
     for (predicate, aligner) in range_predicates.iter().zip(aligners) {
         ensure_equal_lengths_core("aligner", aligner.len(), "right_index", right_index.len())?;
+        // Region construction sorts each predicate's right values in the
+        // direction required by its operator. The aligner puts the resulting
+        // labels back into the first predicate's global right layout, so the
+        // tree's point `j` always means the same physical right row in every
+        // dimension.
         let Some((left_region, right_region)) =
             build_region_paths(predicate, Some(aligner), None, None)?
         else {
@@ -2303,11 +2361,17 @@ fn build_n_region_candidate_paths(
         right_regions.push(right_region);
     }
 
+    // A zero region means “this row cannot match” rather than a real rank.
+    // Masking it before reordering keeps the sentinel from becoming a valid
+    // point in any later dimension.
     mask_zero_regions(&mut left_regions)?;
     if left_regions[0].iter().all(|&region| region == 0) {
         return Ok(None);
     }
 
+    // Reorder every dimension with one shared permutation. Reordering each
+    // vector independently would silently pair labels from different left
+    // rows and produce plausible-looking but incorrect candidates.
     let left_order = descending_left_order(&left_regions[0]);
     for region in &mut left_regions {
         *region = reorder_left_region(region, &left_order);
@@ -2373,10 +2437,19 @@ fn n_region_indices_core(
 ///
 /// # Arguments
 ///
-/// The predicate, index, range, aligner, and `keep` arguments define the
-/// prepared n-region search. `candidate_pass` receives original left and
-/// global right positions and is evaluated only after all range predicates
-/// pass.
+/// * `first_predicate` / `range_predicates` - The complete range join. The
+///   first predicate is the global right anchor; the remaining predicates are
+///   aligned through `aligners`.
+/// * `left_index` / `right_index` - Physical labels used in the returned
+///   arrays. `right_index` is in global first-predicate order.
+/// * `aligners` - Global-to-source-right permutations for the additional
+///   predicates.
+/// * `keep` - Index selection policy. `All` performs two full traversals for
+///   exact output sizing; the other modes keep at most one right position per
+///   left row.
+/// * `candidate_pass` - Residual filter receiving original physical left and
+///   global right positions. It is called only after every range dimension
+///   passes, so it can never widen the range candidate set.
 ///
 /// # Returns
 ///
@@ -2563,7 +2636,8 @@ where
 /// # Arguments
 ///
 /// * `py` - Active Python interpreter used to create the result dictionary.
-/// * `left_index` - Physical labels for the prepared left rows.
+/// * `left_index` - Physical labels for the prepared left rows; returned in
+///   the same left-row identity space, not in tree search order.
 /// * `right_index` - Physical labels in the first predicate's global right
 ///   order.
 /// * `first_predicate` - First, global-order range predicate.
@@ -2571,7 +2645,9 @@ where
 /// * `aligners` - One right-position permutation for each additional
 ///   predicate. `aligners[i][global_position]` is the source position in the
 ///   corresponding predicate's right values.
-/// * `keep` - One of `"all"`, `"any"`, `"first"`, or `"last"`.
+/// * `keep` - One of `"all"`, `"any"`, `"first"`, or `"last"`. `"all"`
+///   preserves every candidate; the other modes select at most one candidate
+///   per left row.
 ///
 /// # Returns
 ///
@@ -2990,11 +3066,32 @@ where
 /// stop traversal: aggregation requires every passing pair, unlike `keep`-
 /// based index selection.
 ///
+/// Forward mode updates one output slot per left row from right-side source
+/// values. Reverse mode updates one output slot per right row from left-side
+/// source values. In both modes, `candidate_pass` sees original physical
+/// positions, while the tree itself uses reordered left search positions and
+/// global right positions.
+///
+/// ELI5: index joins write down matching pairs. Aggregation joins instead
+/// visit every matching pair and drop each right (or left, in reverse mode)
+/// value into the matching row's running bucket. Nothing may be skipped just
+/// because one value has already been seen.
+///
 /// # Arguments
 ///
-/// The predicate, index, range, aligner, aggregation, and direction arguments
-/// define the prepared n-region join. `candidate_pass` applies residual
-/// predicates using original physical positions.
+/// * `py` - Python interpreter used to build the result tuple.
+/// * `left_index` / `right_index` - Physical output labels for the prepared
+///   left side and global first-predicate right side.
+/// * `first` / `ranges` - The complete range predicate set. The first anchor
+///   establishes global right order; `ranges` contains the additional paths.
+/// * `aligners` - Global-to-source-right permutations paired with `ranges`.
+/// * `aggregations` - Non-empty aggregation requests. In forward mode their
+///   source arrays are right-aligned; in reverse mode they are left-aligned.
+/// * `return_matched` - Whether to include the output-side matched mask.
+/// * `reverse` - Select right-output/left-source aggregation when `true`.
+/// * `candidate_pass` - Residual filter on original physical positions. It
+///   must be pure with respect to traversal and return `true` for candidates
+///   that should update aggregate state.
 ///
 /// # Returns
 ///
@@ -3309,6 +3406,16 @@ pub fn dual_regions_and_residual_aggregate_reverse<'py>(
 /// `range_predicates` is paired by position with an aligner, and all range
 /// paths must pass before a source value is aggregated.
 ///
+/// Aggregation visits every passing pair; there is deliberately no `keep`
+/// argument. The k-d tree changes how candidates are found, not which pairs
+/// contribute to a bucket. Traversal order is an implementation detail, so
+/// aggregators must be associative in the same way as the existing join
+/// aggregation API.
+///
+/// ELI5: for each left row, the tree finds all right rows that fit every
+/// ruler. The aggregation then adds every matching right value to that left
+/// row's bucket.
+///
 /// # Arguments
 ///
 /// * `py` - Python interpreter token used to construct the result tuple.
@@ -3358,6 +3465,9 @@ pub fn n_region_aggregate<'py>(
 ///
 /// This uses the same n-region candidate set as [`n_region_aggregate`], but
 /// reads left-side source arrays and writes right-side output slots.
+/// Every complete range candidate contributes exactly once to the appropriate
+/// right output slot; this is the direction-reversed counterpart of
+/// [`n_region_aggregate`], not a different candidate-generation algorithm.
 ///
 /// # Arguments
 ///
@@ -3404,6 +3514,8 @@ pub fn n_region_aggregate_reverse<'py>(
 /// Range predicates are checked by the n-region tree first. Residual
 /// predicates run only for candidates that pass every range path, and only
 /// those candidates update the right-source/left-output aggregation state.
+/// No range candidate is aggregated before the residual callback returns
+/// `true`, and residuals are evaluated using original physical positions.
 ///
 /// # Arguments
 ///
@@ -3451,6 +3563,8 @@ pub fn n_region_and_residual_aggregate<'py>(
 /// This is the reverse counterpart of
 /// [`n_region_and_residual_aggregate`]. Passing left-source values update
 /// right-side output slots after all range and residual predicates pass.
+/// The residual stage still runs on original left/right positions; only the
+/// source and destination of the aggregate state are reversed.
 ///
 /// # Arguments
 ///
@@ -3493,7 +3607,19 @@ pub fn n_region_and_residual_aggregate_reverse<'py>(
     )
 }
 
-/// Parse the n-region Python lists and run the shared aggregation traversal.
+/// Parse n-region Python inputs and run the shared aggregation traversal.
+///
+/// This is the single adapter behind the four public aggregation entry
+/// points. It owns Python-shape validation and residual parsing, then hands
+/// aligned Rust views to [`aggregate_n_region_core`]. Keeping this plumbing in
+/// one place prevents forward/reverse and residual/non-residual variants from
+/// drifting apart.
+///
+/// `range_predicates` contains the additional predicates after `first_predicate`;
+/// consequently it must contain at least two items for a true n-region join.
+/// `aligners` has one item for each of those predicates. In reverse mode the
+/// same candidate paths are used, but aggregation arrays must be left-aligned
+/// and output slots are right-aligned.
 #[allow(clippy::too_many_arguments)]
 fn n_region_aggregate_entry<'py>(
     py: Python<'py>,

@@ -7,29 +7,83 @@
 //! Design inspiration: Reif and Neumann, "A Scalable and Generic Approach to
 //! Range Joins" (PVLDB 15(11), 2022),
 //! <https://db.in.tum.de/~reif/papers/p2535-reif.pdf>.
+//!
+//! The rest of the region-join implementation represents one range predicate
+//! as one integer *region label*.  After the labels have been aligned, a
+//! candidate is valid exactly when every left label is less than or equal to
+//! the corresponding right label.  In other words, a query is a point in
+//! `d`-dimensional space and the matching right points are the points in its
+//! upper-right orthant.
+//!
+//! This module owns only that geometric lookup.  It does not know about
+//! Python objects, index labels, residual predicates, `keep` modes, or
+//! aggregation.  Keeping those concerns outside the tree makes the same
+//! traversal usable by index materialization and aggregation callers.
 
 /// A node in the implicit k-d tree.
 #[derive(Debug)]
 struct Node {
+    /// Half-open range into [`RegionKdTree::order`].
     start: usize,
+    /// Exclusive end of the point range represented by this node.
     end: usize,
+    /// Inclusive lower bound of the node in each region dimension.
     min: Vec<i64>,
+    /// Inclusive upper bound of the node in each region dimension.
     max: Vec<i64>,
+    /// Index of the left child in the tree's flat node arena.
     left: Option<usize>,
+    /// Index of the right child in the tree's flat node arena.
     right: Option<usize>,
 }
 
 /// A static tree over right-side region points.
+///
+/// `points` stores right rows in their global right-position order.  `order`
+/// is the mutable permutation used to lay those points out in tree nodes;
+/// callbacks therefore receive the original right position, never a tree
+/// slot.  Nodes keep bounding boxes so a query can reject or accept a whole
+/// subtree without examining every point in it.
+///
+/// The tree is intentionally static: all region labels must be known before
+/// construction, and queries do not mutate it.  That makes it safe to reuse
+/// for every left row in one join and keeps the query path allocation-free
+/// apart from the caller's left-point slice.
 pub(crate) struct RegionKdTree {
+    /// Number of aligned region predicates (the k in k-d tree).
     dimensions: usize,
+    /// Right-side points, indexed by their global right position.
     points: Vec<Vec<i64>>,
+    /// Tree order: each node owns a contiguous slice of this permutation.
     order: Vec<usize>,
+    /// Flat node arena; child fields refer back into this vector.
     nodes: Vec<Node>,
+    /// Maximum number of points kept in a leaf.
     leaf_size: usize,
 }
 
 impl RegionKdTree {
-    /// Build a deterministic tree over the right-side region vectors.
+    /// Build a deterministic tree over columnar right-side region vectors.
+    ///
+    /// # Arguments
+    ///
+    /// * `right_regions` - One aligned region-label array per predicate. All
+    ///   arrays must have the same length; position `j` describes right row
+    ///   `j` in the global right layout.
+    /// * `leaf_size` - Target maximum number of points scanned directly in a
+    ///   leaf. Values below one are treated as one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fewer than three dimensions are supplied or if the
+    /// region arrays have different lengths. An empty right side is valid and
+    /// produces an empty tree that simply answers no queries.
+    ///
+    /// # Complexity
+    ///
+    /// Construction uses recursive sorting and is approximately `O(n log n)`
+    /// for `n` right rows, with `O(n * d)` point/bounding-box storage for `d`
+    /// dimensions.
     pub(crate) fn build(right_regions: &[Vec<i64>], leaf_size: usize) -> Result<Self, String> {
         if right_regions.len() < 3 {
             return Err("k-d tree requires at least three region dimensions".to_owned());
@@ -63,6 +117,14 @@ impl RegionKdTree {
         Ok(tree)
     }
 
+    /// Recursively add the half-open `order[start..end]` range to the node
+    /// arena and return its arena index.
+    ///
+    /// Each node first computes a bounding box. If it is larger than the leaf
+    /// target, the widest dimension becomes the split axis and the point
+    /// order is divided at its midpoint. The node is inserted before its
+    /// children so child indices remain stable even while recursion appends
+    /// more nodes.
     fn build_node(&mut self, start: usize, end: usize) -> Result<usize, String> {
         let mut min = vec![i64::MAX; self.dimensions];
         let mut max = vec![i64::MIN; self.dimensions];
@@ -73,6 +135,9 @@ impl RegionKdTree {
             }
         }
 
+        // ELI5: put nearby points in the same box, then split the widest box
+        // in half. A later query can throw away a whole box when its limits
+        // prove that none of its points could possibly match.
         let split_dimension = if end - start > self.leaf_size {
             Some(
                 (0..self.dimensions)
@@ -96,6 +161,8 @@ impl RegionKdTree {
 
         if let Some(split_dimension) = split_dimension {
             let midpoint = start + (end - start) / 2;
+            // The point index is a tie-breaker so equal labels produce the
+            // same tree and callback order on every build.
             self.order[start..end].sort_unstable_by_key(|&point_index| {
                 (self.points[point_index][split_dimension], point_index)
             });
@@ -109,9 +176,28 @@ impl RegionKdTree {
 
     /// Visit every right position satisfying all `left_regions <= right_regions`.
     ///
-    /// The callback returns `false` to stop this left-row query early.  Zero
+    /// The callback returns `false` to stop this left-row query early. Zero
     /// region labels are excluded because they are the existing no-match
     /// sentinel, not ordinary rank values.
+    ///
+    /// # Arguments
+    ///
+    /// * `left_regions` - One query label per dimension, in exactly the same
+    ///   predicate order used to build the tree.
+    /// * `visit` - Called with each matching global right position. Returning
+    ///   `false` stops this query and is reported back to the caller.
+    ///
+    /// # Returns
+    ///
+    /// `true` means traversal completed. `false` means the callback requested
+    /// an early stop. Invalid dimensionality, an empty tree, or a zero query
+    /// label are treated as a completed query with no matches.
+    ///
+    /// # Complexity
+    ///
+    /// The traversal is output-sensitive when bounding boxes are selective;
+    /// its worst case is `O(n)` for `n` right rows. It uses no per-query heap
+    /// allocation and does not change the tree.
     pub(crate) fn visit<F>(&self, left_regions: &[i64], mut visit: F) -> bool
     where
         F: FnMut(usize) -> bool,
@@ -125,11 +211,19 @@ impl RegionKdTree {
         self.visit_node(0, left_regions, &mut visit)
     }
 
+    /// Traverse one node, applying bounding-box pruning and forwarding every
+    /// matching point to `visit`.
+    ///
+    /// Returning `false` from the callback propagates all the way up the
+    /// recursion so a caller can implement `keep="any"` without scanning the
+    /// rest of the right side for that left row.
     fn visit_node<F>(&self, node_index: usize, left_regions: &[i64], visit: &mut F) -> bool
     where
         F: FnMut(usize) -> bool,
     {
         let node = &self.nodes[node_index];
+        // If one maximum is below the query label, every point in this box
+        // fails that dimension. ELI5: the whole box is too far to the left.
         if node
             .max
             .iter()
@@ -139,6 +233,9 @@ impl RegionKdTree {
             return true;
         }
 
+        // If every minimum reaches the query, every point in the box passes
+        // every dimension. ELI5: the whole box is safely in the answer area,
+        // so we can report its points without rechecking each coordinate.
         if node
             .min
             .iter()
@@ -161,6 +258,8 @@ impl RegionKdTree {
                 return false;
             }
         } else {
+            // A leaf is the only place where individual points need the full
+            // coordinate-by-coordinate dominance check.
             for &point_index in &self.order[node.start..node.end] {
                 let point = &self.points[point_index];
                 if point.contains(&0)
