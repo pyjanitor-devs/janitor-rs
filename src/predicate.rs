@@ -746,7 +746,7 @@ mod tests {
     fn window_matches_strided_and_nullable_inputs() {
         let left = Array1::from_vec(vec![3_i64, 3]);
         let right = Array1::from_vec(vec![
-            1_i64, 99, 3, 99, 5, 99, 7, 99, 9, 99, 11, 99, 13, 99, 15, 99,
+            3_i64, 99, 3, 99, 5, 99, 7, 99, 9, 99, 11, 99, 13, 99, 15, 99,
         ]);
         let left_nulls = Array1::from_vec(vec![false, true]);
         let right_nulls = Array1::from_vec(vec![
