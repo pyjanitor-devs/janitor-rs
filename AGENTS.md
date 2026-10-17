@@ -193,7 +193,7 @@ janitor-rs/
 │   ├── aggregation/          # shared aggregation input/state/common code
 │   │   ├── mod.rs, common.rs, input.rs, state.rs
 │   │   └── compare_op.rs     # conditional-join comparison operators
-│   └── packed_spans.rs       # shared queried-span coordinates
+│   │   └── packed_spans.rs    # queried-span coordinates
 ├── benches/kernels.rs        # criterion benchmarks for the extracted
 │                             # `*_core` functions (see below)
 ├── clippy.toml                # documents the default Clippy argument policy
@@ -270,8 +270,8 @@ register(m: &Bound<'_, PyModule>) -> PyResult<()>`:
 `conditional_join::register` composition point and never names an individual
 dtype-specialized function. The conditional-join family module owns the five
 kernel registration calls; the shared aggregation family has its own sibling
-directory, while packed-span coordinates remain top-level because both
-aggregation state and range joins use them.
+directory, including the packed-span coordinates used by range joins and
+aggregation state.
 
 When adding a brand-new kernel file (a new kernel shape, not just a new
 dtype instantiation of an existing one), remember to add its module

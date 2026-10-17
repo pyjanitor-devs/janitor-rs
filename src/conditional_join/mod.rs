@@ -7,6 +7,7 @@ mod join_candidate_materialization;
 mod join_search;
 mod join_types;
 mod not_equals_only;
+pub(crate) mod packed_spans;
 mod predicate;
 mod range_join;
 mod range_predicate;

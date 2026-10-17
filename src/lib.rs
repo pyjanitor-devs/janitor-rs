@@ -1,7 +1,6 @@
 use pyo3::prelude::*;
 mod aggregation;
 mod conditional_join;
-mod packed_spans;
 
 /// Narrow Rust-only surface used by criterion benchmarks.
 #[doc(hidden)]
