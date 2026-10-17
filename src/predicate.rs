@@ -724,20 +724,20 @@ mod tests {
     #[test]
     fn window_matches_all_operators_and_reuses_mask() {
         let left = Array1::from_vec(vec![3_i64]);
-        let right = Array1::from_vec(vec![1_i64, 3, 5, 3]);
+        let right = Array1::from_vec(vec![1_i64, 3, 5, 3, 1, 3, 5, 3]);
         let operators = [
-            (CompareOp::Gt, vec![1, 0, 0, 0]),
-            (CompareOp::Ge, vec![1, 1, 0, 1]),
-            (CompareOp::Lt, vec![0, 0, 1, 0]),
-            (CompareOp::Le, vec![0, 1, 1, 1]),
-            (CompareOp::Eq, vec![0, 1, 0, 1]),
-            (CompareOp::Ne, vec![1, 0, 1, 0]),
+            (CompareOp::Gt, vec![1, 0, 0, 0, 1, 0, 0, 0]),
+            (CompareOp::Ge, vec![1, 1, 0, 1, 1, 1, 0, 1]),
+            (CompareOp::Lt, vec![0, 0, 1, 0, 0, 0, 1, 0]),
+            (CompareOp::Le, vec![0, 1, 1, 1, 0, 1, 1, 1]),
+            (CompareOp::Eq, vec![0, 1, 0, 1, 0, 1, 0, 1]),
+            (CompareOp::Ne, vec![1, 0, 1, 0, 1, 0, 1, 0]),
         ];
 
         for (op, expected) in operators {
             let view = PredicateView::I64(left.view(), right.view(), op);
-            let mut mask = vec![9; 4];
-            predicates_match_window(&[view], None, 0, 0, 4, &mut mask);
+            let mut mask = vec![9; 8];
+            predicates_match_window(&[view], None, 0, 0, 8, &mut mask);
             assert_eq!(mask, expected, "operator {op:?}");
         }
     }
@@ -745,9 +745,14 @@ mod tests {
     #[test]
     fn window_matches_strided_and_nullable_inputs() {
         let left = Array1::from_vec(vec![3_i64, 3]);
-        let right = Array1::from_vec(vec![1_i64, 99, 3, 99, 5, 99]);
+        let right = Array1::from_vec(vec![
+            1_i64, 99, 3, 99, 5, 99, 7, 99, 9, 99, 11, 99, 13, 99, 15, 99,
+        ]);
         let left_nulls = Array1::from_vec(vec![false, true]);
-        let right_nulls = Array1::from_vec(vec![true, false, false, true, false, true]);
+        let right_nulls = Array1::from_vec(vec![
+            true, false, false, false, false, false, false, false, false, false, false, false,
+            false, false, false, false,
+        ]);
         let right = right.slice(s![..; 2]);
         let right_nulls = right_nulls.slice(s![..; 2]);
         let view = PredicateView::I64(left.view(), right, CompareOp::Ne);
@@ -756,10 +761,10 @@ mod tests {
             right: Some(right_nulls),
             is_extension_array: false,
         }];
-        let mut mask = vec![0; 3];
+        let mut mask = vec![0; 8];
 
-        predicates_match_window(&[view], Some(&metadata), 0, 0, 3, &mut mask);
-        assert_eq!(mask, vec![1, 0, 1]);
+        predicates_match_window(&[view], Some(&metadata), 0, 0, 8, &mut mask);
+        assert_eq!(mask, vec![1, 0, 1, 1, 1, 1, 1, 1]);
 
         let extension_metadata = [NullMetadataView {
             left: Some(left_nulls.view()),
@@ -767,12 +772,12 @@ mod tests {
             is_extension_array: true,
         }];
         let view = PredicateView::I64(left.view(), right, CompareOp::Ne);
-        predicates_match_window(&[view], Some(&extension_metadata), 0, 0, 3, &mut mask);
-        assert_eq!(mask, vec![0, 0, 1]);
+        predicates_match_window(&[view], Some(&extension_metadata), 0, 0, 8, &mut mask);
+        assert_eq!(mask, vec![0, 0, 1, 1, 1, 1, 1, 1]);
 
         let view = PredicateView::I64(left.view(), right, CompareOp::Ne);
-        predicates_match_window(&[view], Some(&extension_metadata), 1, 0, 3, &mut mask);
-        assert_eq!(mask, vec![0, 0, 0]);
+        predicates_match_window(&[view], Some(&extension_metadata), 1, 0, 8, &mut mask);
+        assert_eq!(mask, vec![0, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
