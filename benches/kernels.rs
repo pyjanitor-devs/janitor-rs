@@ -401,7 +401,7 @@ type UnorderedSecondRangeInputs<'py> = (
     Bound<'py, PyList>,
 );
 
-fn unordered_second_range_inputs<'py>(py: Python<'py>) -> UnorderedSecondRangeInputs<'py> {
+fn second_range_inputs<'py>(py: Python<'py>, unordered: bool) -> UnorderedSecondRangeInputs<'py> {
     let left_rows = 2_048_usize;
     let right_rows = 10_000_usize;
     let left_index = PyArray1::from_vec(py, (0..left_rows as i64).collect());
@@ -409,7 +409,12 @@ fn unordered_second_range_inputs<'py>(py: Python<'py>) -> UnorderedSecondRangeIn
     let first_left = PyArray1::from_vec(py, vec![2_500_i64; left_rows]);
     let first_right = PyArray1::from_vec(py, (0..right_rows as i64).collect());
     let second_left = PyArray1::from_vec(py, vec![7_500_i64; left_rows]);
-    let second_right = PyArray1::from_vec(py, (0..right_rows as i64).rev().collect());
+    let second_right_values = if unordered {
+        (0..right_rows as i64).rev().collect()
+    } else {
+        (0..right_rows as i64).collect()
+    };
+    let second_right = PyArray1::from_vec(py, second_right_values);
     let residual_left = PyArray1::from_vec(py, vec![5_000_i64; left_rows]);
     let residual_right = PyArray1::from_vec(py, (0..right_rows as i64).collect());
     let first = make_predicate(py, first_left.as_any(), first_right.as_any(), "<");
@@ -439,11 +444,45 @@ fn equi_unordered_second_range_aggregate_guard(c: &mut Criterion) {
     Python::initialize();
     Python::attach(|py| {
         let (left_index, right_index, starts_values, ends_values, ranges, residuals) =
-            unordered_second_range_inputs(py);
+            second_range_inputs(py, true);
         let aggregations = make_size_aggregation(py);
         let mut group = c.benchmark_group("equi_unordered_second_range_aggregate_guard");
         // The equality windows and residual predicate exercise the
         // predicate-at-a-time window kernel inside equi aggregation.
+        // Keep this Criterion ID stable so saved base measurements remain
+        // directly comparable with the pre-optimization benchmark.
+        group.bench_function("unchanged_equi_aggregate", |b| {
+            b.iter(|| {
+                let starts = PyArray1::from_vec(py, starts_values.clone());
+                let ends = PyArray1::from_vec(py, ends_values.clone());
+                let result = equi_aggregate_bench(
+                    py,
+                    left_index.readonly(),
+                    right_index.readonly(),
+                    Some(starts.readwrite()),
+                    Some(ends.readwrite()),
+                    &ranges,
+                    &residuals,
+                    &aggregations,
+                    false,
+                    false,
+                    true,
+                )
+                .unwrap();
+                black_box(result);
+            });
+        });
+        group.finish();
+    });
+}
+
+fn equi_ordered_second_range_aggregate_guard(c: &mut Criterion) {
+    Python::initialize();
+    Python::attach(|py| {
+        let (left_index, right_index, starts_values, ends_values, ranges, residuals) =
+            second_range_inputs(py, false);
+        let aggregations = make_size_aggregation(py);
+        let mut group = c.benchmark_group("equi_ordered_second_range_aggregate_guard");
         group.bench_function("with_residual_window", |b| {
             b.iter(|| {
                 let starts = PyArray1::from_vec(py, starts_values.clone());
@@ -473,7 +512,7 @@ fn equi_unordered_second_range_materialize(c: &mut Criterion) {
     Python::initialize();
     Python::attach(|py| {
         let (left_index, right_index, starts_values, ends_values, ranges, residuals) =
-            unordered_second_range_inputs(py);
+            second_range_inputs(py, true);
         let mut group = c.benchmark_group("equi_unordered_second_range_materialize");
         group.bench_function("with_residual", |b| {
             b.iter(|| {
@@ -898,6 +937,7 @@ criterion_group!(
     n_region_kd_tree,
     range_extended_residual_aggregation,
     equi_unordered_second_range_aggregate_guard,
+    equi_ordered_second_range_aggregate_guard,
     equi_unordered_second_range_materialize,
     equi_selective,
     equi_random,

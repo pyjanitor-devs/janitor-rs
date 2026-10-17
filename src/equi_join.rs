@@ -2015,12 +2015,29 @@ mod tests {
             let residual = PyTuple::new(
                 py,
                 [
-                    PyArray1::from_vec(py, vec![15_i64]).into_any(),
-                    PyArray1::from_vec(py, (10_i64..20).collect()).into_any(),
-                    ">".into_pyobject(py)?.into_any(),
+                    PyArray1::from_vec(py, vec![1_i64]).into_any(),
+                    PyArray1::from_vec(py, vec![false]).into_any(),
+                    PyArray1::from_vec(py, (1_i64..11).collect()).into_any(),
+                    PyArray1::from_vec(
+                        py,
+                        vec![
+                            false, false, false, false, true, false, false, false, false, false,
+                        ],
+                    )
+                    .into_any(),
+                    PyBool::new(py, false).to_owned().into_any(),
+                    "!=".into_pyobject(py)?.into_any(),
                 ],
             )?;
-            let residuals = PyList::new(py, [residual])?;
+            let residual_second = PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![10_i64]).into_any(),
+                    PyArray1::from_vec(py, (1_i64..11).collect()).into_any(),
+                    ">=".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let residuals = PyList::new(py, [residual, residual_second])?;
             let aggregations = equi_sum_aggregations(py, (1_i64..11).collect())?;
 
             EQUI_RESIDUAL_WINDOW_HITS.with(|hits| hits.set(0));
@@ -2040,7 +2057,41 @@ mod tests {
 
             let (matched, sums) = equi_sum_result(&result)?;
             assert_eq!(matched, vec![true]);
-            assert_eq!(sums, vec![15]);
+            assert_eq!(sums, vec![54]);
+            EQUI_RESIDUAL_WINDOW_HITS.with(|hits| assert_eq!(hits.get(), 1));
+
+            // Windows shorter than eight still use the helper's scalar
+            // fallback, while retaining the same caller-level result.
+            let small_right_index = PyArray1::from_vec(py, (10_i64..14).collect());
+            let small_starts = PyArray1::from_vec(py, vec![0_i64]);
+            let small_ends = PyArray1::from_vec(py, vec![4_i64]);
+            let small_residual = PyTuple::new(
+                py,
+                [
+                    PyArray1::from_vec(py, vec![15_i64]).into_any(),
+                    PyArray1::from_vec(py, (10_i64..14).collect()).into_any(),
+                    ">".into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            let small_residuals = PyList::new(py, [small_residual])?;
+            let small_aggregations = equi_sum_aggregations(py, (1_i64..5).collect())?;
+            EQUI_RESIDUAL_WINDOW_HITS.with(|hits| hits.set(0));
+            let small_result = equi_aggregate(
+                py,
+                left_index.readonly(),
+                small_right_index.readonly(),
+                Some(small_starts.readwrite()),
+                Some(small_ends.readwrite()),
+                &ranges,
+                &small_residuals,
+                &small_aggregations,
+                true,
+                false,
+            )?
+            .ok_or_else(|| PyValueError::new_err("small-window aggregation returned None"))?;
+            let (small_matched, small_sums) = equi_sum_result(&small_result)?;
+            assert_eq!(small_matched, vec![true]);
+            assert_eq!(small_sums, vec![10]);
             EQUI_RESIDUAL_WINDOW_HITS.with(|hits| assert_eq!(hits.get(), 1));
 
             // The reverse layout uses the same window mask but writes into
