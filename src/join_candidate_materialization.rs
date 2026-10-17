@@ -125,6 +125,27 @@ pub(crate) fn materialize_range_candidates(
         let left_position = windows.left_positions[row];
         let start = windows.starts[row];
         let end = windows.ends[row];
+
+        if keep == Keep::Any {
+            let mut selected = None;
+            for right_position in start..end {
+                if predicates_match_dispatch(
+                    &views,
+                    metadata_views.as_deref(),
+                    left_position,
+                    right_position,
+                ) {
+                    selected = Some(right_position);
+                    break;
+                }
+            }
+            if let Some(right_position) = selected {
+                output_left.push(windows.left_index[row]);
+                output_right.push(labels[right_position]);
+            }
+            continue;
+        }
+
         mask.resize(end - start, 0);
         predicates_match_window(
             &views,

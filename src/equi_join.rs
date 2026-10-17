@@ -958,6 +958,43 @@ fn materialize_equi_windows_and_residuals(
         if start == end {
             continue;
         }
+        if use_extrema {
+            // ELI5: keep each surviving row beside its shelf coordinates.
+            // Both selection paths share the sentinel/validation loop above;
+            // only a batch with no extra rules can reuse extrema summaries.
+            rows.push(row);
+            ranges.push((start, end));
+            continue;
+        }
+
+        if keep == Keep::Any {
+            let mut selected = None;
+            for right_position in start..end {
+                if !predicates_match_dispatch(
+                    residual_predicates,
+                    null_metadata,
+                    row,
+                    right_position,
+                ) {
+                    continue;
+                }
+                if !additional_view
+                    .as_ref()
+                    .map(|view| view.matches(row, right_position))
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+                selected = Some(right_position);
+                break;
+            }
+            if let Some(right_position) = selected {
+                left_output.push(left_index[row]);
+                right_output.push(right_index[right_position]);
+            }
+            continue;
+        }
+
         mask.resize(end - start, 0);
         predicates_match_window(
             residual_predicates,
@@ -967,14 +1004,6 @@ fn materialize_equi_windows_and_residuals(
             end,
             &mut mask,
         );
-        if use_extrema {
-            // ELI5: keep each surviving row beside its shelf coordinates.
-            // Both selection paths share the sentinel/validation loop above;
-            // only a batch with no extra rules can reuse extrema summaries.
-            rows.push(row);
-            ranges.push((start, end));
-            continue;
-        }
         let mut selected = None;
         for (offset, &matches) in mask.iter().enumerate() {
             if matches == 0 {
@@ -1870,8 +1899,8 @@ mod tests {
         apply_equi_range_bound, build_equi_ne_indices_core, build_equi_only_indices_core,
         build_equi_range_indices_core, build_equi_uniq_residual_indices_core,
         build_second_range_envelope, equi_aggregate, materialize_equi_windows,
-        materialize_unordered_second_range, narrow_unordered_second_range,
-        unique_reverse_output_slots, EQUI_STARTS_ENDS_HITS,
+        materialize_equi_windows_and_residuals, materialize_unordered_second_range,
+        narrow_unordered_second_range, unique_reverse_output_slots, EQUI_STARTS_ENDS_HITS,
     };
     use crate::compare_op::CompareOp;
     use crate::join_types::Keep;
@@ -2704,6 +2733,38 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(last.1, vec![8]);
+    }
+
+    #[test]
+    fn residual_windows_preserve_keep_any_short_circuit_and_selection() {
+        let left_index = Array1::from_vec(vec![10]);
+        let right_index = Array1::from_vec(vec![9, 8, 7, 6, 5, 4, 3, 2, 1]);
+        let starts = Array1::from_vec(vec![0]);
+        let ends = Array1::from_vec(vec![9]);
+        let residual_left = Array1::from_vec(vec![3]);
+        let residual_right = Array1::from_vec(vec![3, 0, 1, 2, 4, 5, 6, 7, 8]);
+        let residuals = [PredicateView::I64(
+            residual_left.view(),
+            residual_right.view(),
+            CompareOp::Le,
+        )];
+
+        for (keep, expected) in [(Keep::Any, 9), (Keep::First, 1), (Keep::Last, 9)] {
+            let result = materialize_equi_windows_and_residuals(
+                left_index.view(),
+                right_index.view(),
+                starts.view(),
+                ends.view(),
+                &residuals,
+                None,
+                None,
+                keep,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.0, vec![10]);
+            assert_eq!(result.1, vec![expected]);
+        }
     }
 
     #[test]

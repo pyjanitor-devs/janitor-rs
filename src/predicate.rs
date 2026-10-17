@@ -384,17 +384,28 @@ pub(crate) fn predicates_match_window(
     mask: &mut [u8],
 ) {
     assert_eq!(mask.len(), end - start);
+
+    // ELI5: for a tiny shelf, checking each item directly is cheaper than
+    // laying out a checklist and walking it again. This also preserves the
+    // caller's pairwise short-circuit behavior for narrow windows.
+    if end - start < 8 {
+        for right in start..end {
+            mask[right - start] = predicates_match_dispatch(views, metadata, left, right) as u8;
+        }
+        return;
+    }
+
     mask.fill(1);
 
     for (position, predicate) in views.iter().enumerate() {
-        let nulls = metadata
-            .and_then(|values| values.get(position))
-            .and_then(|value| match (&value.left, &value.right) {
+        let nulls = metadata.map(|values| &values[position]).and_then(|value| {
+            match (&value.left, &value.right) {
                 (Some(left_values), Some(right_values)) => {
                     Some((left_values[left], right_values, value.is_extension_array))
                 }
                 _ => None,
-            });
+            }
+        });
 
         match predicate {
             PredicateView::I64(left_values, right_values, op) => apply_window(
@@ -736,7 +747,7 @@ mod tests {
         let left = Array1::from_vec(vec![3_i64, 3]);
         let right = Array1::from_vec(vec![1_i64, 99, 3, 99, 5, 99]);
         let left_nulls = Array1::from_vec(vec![false, true]);
-        let right_nulls = Array1::from_vec(vec![false, true, false, true, false, true]);
+        let right_nulls = Array1::from_vec(vec![true, false, false, true, false, true]);
         let right = right.slice(s![..; 2]);
         let right_nulls = right_nulls.slice(s![..; 2]);
         let view = PredicateView::I64(left.view(), right, CompareOp::Ne);
@@ -750,12 +761,16 @@ mod tests {
         predicates_match_window(&[view], Some(&metadata), 0, 0, 3, &mut mask);
         assert_eq!(mask, vec![1, 0, 1]);
 
-        let view = PredicateView::I64(left.view(), right, CompareOp::Ne);
         let extension_metadata = [NullMetadataView {
             left: Some(left_nulls.view()),
             right: Some(right_nulls),
             is_extension_array: true,
         }];
+        let view = PredicateView::I64(left.view(), right, CompareOp::Ne);
+        predicates_match_window(&[view], Some(&extension_metadata), 0, 0, 3, &mut mask);
+        assert_eq!(mask, vec![0, 0, 1]);
+
+        let view = PredicateView::I64(left.view(), right, CompareOp::Ne);
         predicates_match_window(&[view], Some(&extension_metadata), 1, 0, 3, &mut mask);
         assert_eq!(mask, vec![0, 0, 0]);
     }
