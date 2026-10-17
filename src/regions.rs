@@ -59,6 +59,11 @@ pub(crate) struct RankedRegionPositionLayout {
 /// Point-update/prefix-sum index used while choosing a candidate generator.
 /// It answers a suffix cardinality in `O(log n)` even when most ranks are
 /// populated, avoiding a scan of every active rank for each left row.
+///
+/// This is deliberately separate from `ActiveRankCounts`: the actual sweep
+/// must enumerate active rank groups to emit candidates, while dispatch only
+/// needs cardinalities. Reusing the emission-oriented structure made a broad
+/// join spend too much time walking ranks before selecting the tree.
 struct FenwickCounts {
     values: Vec<usize>,
 }
@@ -2567,12 +2572,22 @@ fn build_n_region_candidate_paths(
         return Ok(None);
     }
 
+    // `keep="any"` is unusual: a sweep can stop after its first complete
+    // match, but a left-oriented tree cannot stop because it visits the tree
+    // once per right row. Probe a few rows first so dense, easy-to-hit joins
+    // retain that cheap early exit. Harder joins fall through to the normal
+    // C2 decision and may use a right-oriented tree.
     let force_sweep = force_sweep
         || (prefer_sweep_if_early
             && sweep_finds_early_match(&left_regions, &right_regions, &starts));
     let (use_sweep, sweep_layout) = if force_sweep {
         (true, None)
     } else {
+        // C2 is the exact amount of pair work the first two predicates leave
+        // for the sweep. The 64x budget is intentionally conservative: later
+        // predicates can reduce that work, but the sweep still pays to test
+        // every C2 candidate. Once the budget is exceeded, discard the count
+        // layout and pay for the multidimensional tree instead.
         let limit = 64_u128.saturating_mul(
             (left_regions[0].len() as u128).saturating_add(right_regions[0].len() as u128),
         );
@@ -2626,6 +2641,10 @@ fn build_n_region_candidate_paths(
 /// find a match within the small probe budget, the normal C2 dispatcher may
 /// select the right-oriented tree. The left-oriented tree remains forbidden
 /// for this keep mode because it cannot stop its right-driven traversal.
+///
+/// The probe is capped by scanned positions, not successful C2 candidates:
+/// otherwise a row whose second predicate rejects everything could scan the
+/// entire right side before the cap was reached.
 fn sweep_finds_early_match(
     left_regions: &[Vec<i64>],
     right_regions: &[Vec<i64>],
@@ -2673,7 +2692,9 @@ fn sweep_finds_early_match(
 /// exceeds `limit`. Fenwick suffix sums keep each left-row count logarithmic
 /// in the number of distinct second-predicate labels. Returning the layout
 /// when the count stays within the limit lets the sweep reuse this dispatch
-/// work.
+/// work. If the limit is exceeded, the layout is intentionally discarded:
+/// building the tree needs a different flat storage layout, and retaining
+/// both would increase peak memory on the largest joins.
 ///
 /// ELI5: count the work the old conveyor belt would do. If that work is small,
 /// keep the conveyor belt; if it is large, pay for the multidimensional tree.
