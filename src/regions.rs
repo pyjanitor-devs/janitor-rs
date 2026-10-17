@@ -33,6 +33,8 @@ const DENSE_ACTIVE_RANK_SPARSITY_FACTOR: usize = 4;
 const SPARSE_LABEL_PROBE_LIMIT: usize = 1_024;
 const SPARSE_LABEL_PROBE_MIN_LEN: usize = 4_096;
 const BITSET_WORD_BITS: usize = u64::BITS as usize;
+const KEEP_ANY_PROBE_SAMPLE_ROWS: usize = 16;
+const KEEP_ANY_PROBE_CANDIDATE_BUDGET: usize = 128;
 
 /// The second predicate's paths together with the first-predicate starts.
 pub(crate) struct DualRegionPaths {
@@ -2651,9 +2653,7 @@ fn sweep_finds_early_match(
     right_regions: &[Vec<i64>],
     starts: &[usize],
 ) -> bool {
-    const SAMPLE_ROWS: usize = 16;
-    const CANDIDATE_BUDGET: usize = 128;
-    let sample_count = starts.len().min(SAMPLE_ROWS);
+    let sample_count = starts.len().min(KEEP_ANY_PROBE_SAMPLE_ROWS);
     let end = right_regions[0].len();
     let mut tried = 0_usize;
     let mut hits = 0_usize;
@@ -2668,7 +2668,7 @@ fn sweep_finds_early_match(
             continue;
         }
         tried += 1;
-        for right_position in start..end.min(start + CANDIDATE_BUDGET) {
+        for right_position in start..end.min(start + KEEP_ANY_PROBE_CANDIDATE_BUDGET) {
             if left_regions
                 .iter()
                 .zip(right_regions.iter())
