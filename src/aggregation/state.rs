@@ -28,18 +28,20 @@
 //! input `f32` or `f64` width through materialization. Position, length, and
 //! allocation arithmetic remains checked and must not wrap.
 
-use super::aggregation_input::{AggregationInput, AggregationOp};
+use super::input::{AggregationInput, AggregationOp};
 use numpy::ndarray::{Array1, ArrayView1};
 use numpy::IntoPyArray;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use crate::aggregation_common::adaptive::{
+use super::common::adaptive::{
     should_use_prefix_difference, should_use_running_aggregation, should_use_segment_tree,
     MAX_DIRECT_QUERY_COUNT,
 };
-use crate::aggregation_common::ensure_equal_lengths;
-use crate::packed_spans::{assign_range_clusters, queried_source_spans, PackedSpanLayout};
+use super::common::ensure_equal_lengths;
+use crate::aggregation::packed_spans::{
+    assign_range_clusters, queried_source_spans, PackedSpanLayout,
+};
 
 /// A borrowed view of one supported NumPy dtype.
 ///
@@ -3046,7 +3048,9 @@ mod tests {
         update_signed_product_segment_ranges, update_u64_prefix_ranges,
         update_u64_product_segment_ranges, Values, View,
     };
-    use crate::packed_spans::{assign_range_clusters, queried_source_spans, PackedSpanLayout};
+    use crate::aggregation::packed_spans::{
+        assign_range_clusters, queried_source_spans, PackedSpanLayout,
+    };
     use numpy::ndarray::Array1;
 
     #[test]
@@ -3142,5 +3146,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "aggregation_state/prefix_tests.rs"]
+#[path = "state/prefix_tests.rs"]
 mod prefix_tests;

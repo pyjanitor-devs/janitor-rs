@@ -9,16 +9,16 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
-use crate::aggregation_common::aggregation::{
-    make_results_with_positions, parse_inputs, AggregationSet,
-};
-use crate::compare_op::CompareOp;
-use crate::join_types::SingleJoinResult;
-use crate::predicate::{
+use super::compare_op::CompareOp;
+use super::join_types::SingleJoinResult;
+use super::predicate::{
     null_metadata_views, parse_predicates_with_nulls_strings, predicates_match_window,
     PredicateView,
 };
-use crate::range_predicate::AnyParsedRangePredicate;
+use super::range_predicate::AnyParsedRangePredicate;
+use crate::aggregation::common::aggregation::{
+    make_results_with_positions, parse_inputs, AggregationSet,
+};
 
 /// Package precomputed range bounds as dense aggregation windows.
 ///
@@ -114,8 +114,8 @@ pub(crate) fn residuals<'py>(
     require_not_equal: bool,
     skip_second_range: bool,
 ) -> PyResult<(
-    Vec<crate::predicate::Predicate<'py>>,
-    Option<Vec<crate::predicate::NullMetadata<'py>>>,
+    Vec<super::predicate::Predicate<'py>>,
+    Option<Vec<super::predicate::NullMetadata<'py>>>,
 )> {
     let values = PyList::empty(py);
     let start = if skip_second_range { 2 } else { 1 };
@@ -183,7 +183,7 @@ pub(crate) fn residuals<'py>(
 fn aggregate_range(
     windows: &SingleJoinResult,
     residuals: &[PredicateView<'_>],
-    residual_metadata: Option<&[crate::predicate::NullMetadataView<'_>]>,
+    residual_metadata: Option<&[super::predicate::NullMetadataView<'_>]>,
     set: &mut AggregationSet<'_>,
     reverse: bool,
     physical_position_maps: bool,
@@ -272,8 +272,8 @@ fn aggregate_range(
 pub(crate) fn aggregate_range_windows<'py>(
     py: Python<'py>,
     windows: SingleJoinResult,
-    parsed: &[crate::predicate::Predicate<'_>],
-    metadata: Option<&[crate::predicate::NullMetadata<'_>]>,
+    parsed: &[super::predicate::Predicate<'_>],
+    metadata: Option<&[super::predicate::NullMetadata<'_>]>,
     aggregations: &Bound<'py, PyList>,
     output_positions: Option<ArrayView1<'_, i64>>,
     output_len: usize,

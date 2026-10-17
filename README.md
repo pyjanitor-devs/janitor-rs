@@ -32,9 +32,6 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-The per-endpoint test and operation coverage is tracked in
-[`AGGREGATION_MIGRATION_MATRIX.md`](https://github.com/pyjanitor-devs/janitor-rs/blob/main/AGGREGATION_MIGRATION_MATRIX.md).
-
 ## Building
 
 Build a wheel locally with [maturin](https://www.maturin.rs/):
