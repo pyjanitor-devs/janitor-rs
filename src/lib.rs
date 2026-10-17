@@ -20,6 +20,9 @@ mod single_range_predicate;
 pub mod bench_support {
     pub use crate::equi_join::equi_aggregate_bench;
     pub use crate::range_join::adaptive_extreme_positions;
+    pub use crate::range_join::{
+        range_join_extended_aggregate, range_join_extended_aggregate_reverse,
+    };
     pub use crate::regions::{dual_regions_aggregate, dual_regions_and_residual_aggregate};
 }
 
