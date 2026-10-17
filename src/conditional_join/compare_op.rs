@@ -3,9 +3,9 @@ use pyo3::PyResult;
 
 /// One clear name for each of the six ways two values can be compared.
 ///
-/// This is shared by the multi-predicate and single-predicate join kernels.
-/// Keeping the enum at the crate root avoids coupling the comparator to one
-/// particular join implementation.
+/// This is shared by the multi-predicate and single-predicate conditional-join
+/// kernels. Keeping it in the family module gives all join implementations one
+/// comparison contract without exposing it as a crate-wide concept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
     Gt,

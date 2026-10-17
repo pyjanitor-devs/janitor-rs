@@ -1,18 +1,18 @@
 use std::collections::{btree_map, BTreeMap, HashMap};
 
-use crate::aggregation_common::adaptive::should_use_segment_tree;
-use crate::aggregation_common::aggregation::{
-    make_results_with_positions, parse_inputs, AggregationSet,
-};
-use crate::aggregation_common::ensure_equal_lengths_core;
-use crate::compare_op::CompareOp;
-use crate::join_search::partition_point;
-use crate::join_types::{result_dict, Keep};
-use crate::predicate::{
+use super::compare_op::CompareOp;
+use super::join_search::partition_point;
+use super::join_types::{result_dict, Keep};
+use super::predicate::{
     check_predicate_lengths, null_metadata_views, parse_predicate_tuple,
     parse_predicates_with_nulls_strings, predicates_match_dispatch, Predicate, PredicateView,
 };
-use crate::region_kd_tree::RegionKdTree;
+use super::region_kd_tree::RegionKdTree;
+use crate::aggregation::common::adaptive::should_use_segment_tree;
+use crate::aggregation::common::aggregation::{
+    make_results_with_positions, parse_inputs, AggregationSet,
+};
+use crate::aggregation::common::ensure_equal_lengths_core;
 use numpy::{ndarray::ArrayView1, PyReadonlyArray1};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
