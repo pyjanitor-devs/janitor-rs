@@ -50,6 +50,7 @@ use crate::join_candidate_materialization::materialize_range_candidates;
 #[cfg(test)]
 use crate::join_search::range_window;
 use crate::join_types::{result_dict, Keep, SingleJoinResult};
+use crate::packed_spans::{assign_range_clusters, queried_source_spans, PackedSpanLayout};
 use crate::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
 use crate::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 
@@ -61,6 +62,8 @@ thread_local! {
     // ELI5: each test thread keeps its own tally, so a neighboring test cannot
     // accidentally supply the branch evidence that this test is missing.
     pub(crate) static EXTREME_TREE_HITS: Cell<usize> = const { Cell::new(0) };
+    pub(crate) static EXTREME_HULL_TREE_HITS: Cell<usize> = const { Cell::new(0) };
+    pub(crate) static PACKING_PRECHECK_DIRECT_HITS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Select the smallest or largest physical label in each half-open window by scanning.
@@ -113,14 +116,13 @@ fn extreme_positions_direct(
     selected
 }
 
-/// Select extrema from arbitrary windows, choosing a direct scan or a tree.
+/// Select extrema from arbitrary windows, choosing a direct scan or a packed tree.
 ///
 /// The adaptive policy compares the estimated work of scanning every queried
 /// element (`total_width`) with building and querying one segment tree over
-/// the hull (`span_len`): the contiguous interval from the smallest start to
-/// the largest end, including any gaps between queried windows. Direct scans
-/// remain preferable for small or sparse workloads; a tree is useful when
-/// overlapping queries can reuse the same summaries.
+/// the packed queried spans. Unqueried gaps are omitted, while every leaf
+/// retains its original source position so callers receive the same result
+/// coordinates as the direct scan.
 ///
 /// ELI5: a short list of small shelves is faster to inspect by hand, but many
 /// overlapping shelves are cheaper to answer from a shared index of summaries.
@@ -151,6 +153,7 @@ pub fn adaptive_extreme_positions(
     minimum: bool,
 ) -> Result<Vec<usize>, String> {
     let mut total_width = 0_usize;
+    let mut max_width = 0_usize;
     let mut span_start = labels.len();
     let mut span_end = 0_usize;
     for &(start, end) in ranges {
@@ -160,47 +163,93 @@ pub fn adaptive_extreme_positions(
         // ELI5: if the total workload is too large to count exactly, treating
         // it as "very large" safely favors the tree. This is only a speed
         // hint; it cannot change which position wins.
-        total_width = total_width.saturating_add(end - start);
+        let width = end - start;
+        total_width = total_width.saturating_add(width);
+        max_width = max_width.max(width);
         span_start = span_start.min(start);
         span_end = span_end.max(end);
     }
     if ranges.is_empty() {
         return Ok(Vec::new());
     }
+    // The shared cutoff never selects a tree for three or fewer queries. Keep
+    // those tiny batches on the direct path before paying for span sorting and
+    // cluster mapping.
+    if ranges.len() <= 3 {
+        return Ok(extreme_positions_direct(labels, ranges, minimum));
+    }
+    // Keep the established adaptive cutoff exact for small batches; the
+    // packing estimate is primarily needed for larger sparse batches where
+    // sorting the query list can dominate the direct scan.
+    if ranges.len() > PACKING_ESTIMATE_QUERY_THRESHOLD
+        && !should_consider_packed_tree(ranges.len(), total_width, max_width)
+    {
+        #[cfg(test)]
+        PACKING_PRECHECK_DIRECT_HITS.with(|hits| hits.set(hits.get() + 1));
+        return Ok(extreme_positions_direct(labels, ranges, minimum));
+    }
 
-    // ELI5: the aisle runs from the first queried shelf to the last, including
-    // all shelves in between even when no query visits them. This hull trims
-    // positions outside those endpoints but does not pack away internal gaps.
-    let span_len = span_end - span_start;
-    if !should_use_segment_tree(ranges.len(), total_width, span_len) {
+    // ELI5: sort the shelves once, then lay only the shelves that at least one
+    // query visits end to end. Empty aisles between groups disappear from the
+    // tree, but each query still maps back to its original source positions.
+    // Hull-first gate: if removing every possible gap cannot repay sorting,
+    // retain one hull span and avoid the packed metadata allocations.
+    let hull_len = span_end - span_start;
+    let packing_query_height =
+        (usize::BITS - (ranges.len().saturating_sub(1)).leading_zeros()) as usize;
+    let packing_cost = ranges.len().saturating_mul(packing_query_height + 1);
+    let use_hull = hull_len.saturating_sub(max_width).saturating_mul(5) <= packing_cost;
+    let (spans, clusters) = if use_hull {
+        (
+            vec![(span_start, span_end)],
+            vec![Some(0_usize); ranges.len()],
+        )
+    } else {
+        let packed_ranges: Vec<_> = ranges.iter().copied().map(Some).collect();
+        let spans = queried_source_spans(&packed_ranges);
+        let clusters = assign_range_clusters(&packed_ranges, &spans);
+        (spans, clusters)
+    };
+    let layout = PackedSpanLayout::new(&spans, &clusters);
+    if !should_use_segment_tree(ranges.len(), total_width, layout.length) {
         return Ok(extreme_positions_direct(labels, ranges, minimum));
     }
 
     #[cfg(test)]
     EXTREME_TREE_HITS.with(|hits| hits.set(hits.get() + 1));
+    #[cfg(test)]
+    if use_hull {
+        EXTREME_HULL_TREE_HITS.with(|hits| hits.set(hits.get() + 1));
+    }
 
     // ELI5: each tree node remembers the winning original position for its
     // slice, so a query combines a few summaries instead of rescanning rows.
-    // Leaves live at `span_len..2 * span_len`; `usize::MAX` means no candidate.
-    let tree_len = span_len
+    // Leaves live at `layout.length..2 * layout.length`; `usize::MAX` means no
+    // candidate.
+    let tree_len = layout
+        .length
         .checked_mul(2)
         .ok_or("range-extreme tree size exceeds platform capacity")?;
     let mut tree = vec![usize::MAX; tree_len];
-    for position in span_start..span_end {
-        tree[span_len + position - span_start] = position;
+    for (cluster, &(span_start, span_end)) in layout.spans.iter().enumerate() {
+        let offset = layout.offsets[cluster];
+        for position in span_start..span_end {
+            tree[layout.length + offset + position - span_start] = position;
+        }
     }
-    for node in (1..span_len).rev() {
+    for node in (1..layout.length).rev() {
         let left = tree[node * 2];
         let right = tree[node * 2 + 1];
         tree[node] = choose_extreme_position(labels, left, right, minimum);
     }
 
     let mut selected = Vec::with_capacity(ranges.len());
-    for &(query_start, query_end) in ranges {
+    for (row, &(query_start, query_end)) in ranges.iter().enumerate() {
         // Translate right-layout coordinates into the compact tree's leaf
         // coordinates while preserving the half-open query convention.
-        let mut start = query_start - span_start + span_len;
-        let mut end = query_end - span_start + span_len;
+        let (mut start, mut end) = layout
+            .packed_range(row, Some((query_start, query_end)))
+            .expect("validated range must belong to a packed span");
         let mut winner = usize::MAX;
         while start < end {
             if start & 1 == 1 {
@@ -219,6 +268,26 @@ pub fn adaptive_extreme_positions(
         selected.push(winner);
     }
     Ok(selected)
+}
+
+// Below this size, retaining the established cutoff is cheaper and keeps its
+// exact boundary behavior; larger batches are where metadata sorting matters.
+const PACKING_ESTIMATE_QUERY_THRESHOLD: usize = 16;
+
+/// Decide whether it is worth constructing packed-span metadata at all.
+///
+/// `max_width` is a lower bound on the eventual packed length. If even a tree
+/// over that smallest possible layout is unlikely to repay its build/query
+/// work and a rough sort-and-map cost, scanning directly avoids paying for
+/// packing only to choose the direct path afterward.
+fn should_consider_packed_tree(query_count: usize, total_width: usize, max_width: usize) -> bool {
+    let query_height = (usize::BITS - (query_count.saturating_sub(1)).leading_zeros()) as usize;
+    let span_height = (usize::BITS - (max_width.saturating_sub(1)).leading_zeros()) as usize;
+    let packing = query_count.saturating_mul(query_height.saturating_add(1));
+    let smallest_tree = max_width
+        .saturating_mul(5)
+        .saturating_add(query_count.saturating_mul(span_height).saturating_mul(2));
+    total_width > smallest_tree.saturating_add(packing)
 }
 
 /// Choose the better of two candidate positions for an extrema query.
@@ -1334,14 +1403,64 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_extrema_packs_far_apart_query_groups() {
+        let labels = Array1::from_iter(
+            (0..1_000_000_usize).map(|position| ((position.wrapping_mul(7919)) % 1_000_000) as i64),
+        );
+        let mut ranges = Vec::new();
+        for group in 0..16 {
+            let group_start = group * 50_000;
+            for query in 0..8 {
+                let start = group_start + query * 64;
+                ranges.push((start, start + 1_024));
+            }
+        }
+
+        // The packed length is small enough for the tree cutoff, while the
+        // hull between the first and last groups is large enough that the old
+        // hull-based guard would have selected the direct scan.
+        let before = EXTREME_TREE_HITS.get();
+        let hull_before = EXTREME_HULL_TREE_HITS.get();
+        for minimum in [true, false] {
+            let actual = adaptive_extreme_positions(labels.view(), &ranges, minimum).unwrap();
+            let expected = extreme_positions_direct(labels.view(), &ranges, minimum);
+            assert_eq!(
+                actual.iter().map(|&p| labels[p]).collect::<Vec<_>>(),
+                expected.iter().map(|&p| labels[p]).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(EXTREME_TREE_HITS.get(), before + 2);
+        assert_eq!(EXTREME_HULL_TREE_HITS.get(), hull_before);
+    }
+
+    #[test]
+    fn adaptive_extrema_precheck_keeps_sparse_batch_direct() {
+        let labels = Array1::from_iter((0..10_000).map(|position| position as i64));
+        let ranges = (0..64)
+            .map(|row| (row * 100, row * 100 + 8))
+            .collect::<Vec<_>>();
+        let tree_before = EXTREME_TREE_HITS.get();
+        let direct_before = PACKING_PRECHECK_DIRECT_HITS.get();
+
+        let actual = adaptive_extreme_positions(labels.view(), &ranges, true).unwrap();
+        let expected = extreme_positions_direct(labels.view(), &ranges, true);
+
+        assert_eq!(actual, expected);
+        assert_eq!(EXTREME_TREE_HITS.get(), tree_before);
+        assert_eq!(PACKING_PRECHECK_DIRECT_HITS.get(), direct_before + 1);
+    }
+
+    #[test]
     fn adaptive_extrema_counter_is_thread_local() {
         let before = EXTREME_TREE_HITS.get();
         std::thread::spawn(|| {
             let labels = Array1::from_iter(0..64);
             let ranges = vec![(0, 64); 16];
             assert_eq!(EXTREME_TREE_HITS.get(), 0);
+            assert_eq!(EXTREME_HULL_TREE_HITS.get(), 0);
             adaptive_extreme_positions(labels.view(), &ranges, true).unwrap();
             assert_eq!(EXTREME_TREE_HITS.get(), 1);
+            assert_eq!(EXTREME_HULL_TREE_HITS.get(), 1);
         })
         .join()
         .unwrap();
