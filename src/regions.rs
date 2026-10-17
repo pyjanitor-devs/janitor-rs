@@ -1358,8 +1358,9 @@ enum NRegionTreeOrientation {
 
 /// Candidate generator selected for one prepared n-region join.
 enum NRegionCandidateGenerator {
-    /// The first two paths are selective enough that the existing sweep is
-    /// expected to beat tree construction and multidimensional probing.
+    /// The exact first-two candidate count stayed below the dispatch limit,
+    /// so the existing sweep is expected to beat tree construction and
+    /// multidimensional probing.
     Sweep {
         starts: Vec<usize>,
         layout: RankedRegionPositionLayout,
@@ -1392,7 +1393,7 @@ where
     for (left_position, &start) in starts.iter().enumerate() {
         // A zero left region is represented by the terminal start and is an
         // inactive row, not a window that must preserve sweep monotonicity.
-        if start == paths.right_regions[0].len() || start == previous_end {
+        if start == paths.right_regions[0].len() {
             continue;
         }
         if start > previous_end {
@@ -2389,9 +2390,10 @@ struct NRegionCandidatePaths {
 ///    the global right layout.
 /// 3. Mask zero labels, reorder all left dimensions together, and preserve the
 ///    existing cheap first-dimension no-match check.
-/// 4. Estimate the first-two-region candidate width. Use the existing sweep
-///    for selective windows; otherwise build one reusable k-d tree, choosing
-///    the smaller input side as its stored-point orientation.
+/// 4. Count the exact first-two-region candidate work up to a bounded limit.
+///    Use the existing sweep for selective windows; otherwise build one
+///    reusable k-d tree, choosing the smaller input side as its stored-point
+///    orientation when the caller permits it.
 /// 5. Return the immutable paths shared by index and aggregation consumers.
 ///
 /// No `keep` selection, residual filtering, callback invocation, or aggregate
@@ -2407,6 +2409,12 @@ struct NRegionCandidatePaths {
 ///   every corresponding predicate side.
 /// * `aligners` - One global-to-source-right permutation per additional
 ///   predicate, paired by position with `range_predicates`.
+/// * `allow_left_tree` - Whether the tree may be built over the left side.
+///   This is disabled for `keep="any"`, whose early-stop semantics require a
+///   left-row query to be able to stop traversal.
+/// * `force_sweep` - Bypass dispatch and use the existing sweep. This is used
+///   for `keep="any"`, where a dense match can be found before tree build or
+///   candidate-counting overhead is worthwhile.
 ///
 /// # Returns
 ///
@@ -2419,7 +2427,7 @@ struct NRegionCandidatePaths {
 /// alignments, unsupported operators, or invalid search invariants. Building
 /// the paths is linear in the number of predicate values apart from the
 /// sorting performed by upstream region construction and, for tree paths, the
-/// current `O(n log² n)` tree build; memory is `O(n * d)` for `n` rows and `d`
+/// `O(n log n)` tree build; memory is `O(n * d)` for `n` rows and `d`
 /// predicates, plus the selected generator's layout.
 fn build_n_region_candidate_paths(
     first_predicate: &Predicate<'_>,
@@ -2427,6 +2435,8 @@ fn build_n_region_candidate_paths(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
     aligners: &[ArrayView1<'_, i64>],
+    allow_left_tree: bool,
+    force_sweep: bool,
 ) -> Result<Option<NRegionCandidatePaths>, String> {
     ensure_equal_lengths_core(
         "first left predicate",
@@ -2512,16 +2522,33 @@ fn build_n_region_candidate_paths(
         return Ok(None);
     }
 
-    let use_sweep = first_two_regions_are_selective(&left_regions, &right_regions);
-    let generator = if use_sweep {
-        let layout = build_ranked_region_position_layout(
+    let (use_sweep, sweep_layout) = if force_sweep {
+        (true, None)
+    } else {
+        let limit = 64_u128.saturating_mul(
+            (left_regions[0].len() as u128).saturating_add(right_regions[0].len() as u128),
+        );
+        let (exceeded, layout) = sweep_candidate_count_exceeds(
+            &left_regions,
             &right_regions[1],
             &starts,
             right_regions[0].len(),
+            limit,
         )?;
+        (!exceeded, layout)
+    };
+    let generator = if use_sweep {
+        let layout = match sweep_layout {
+            Some(layout) => layout,
+            None => build_ranked_region_position_layout(
+                &right_regions[1],
+                &starts,
+                right_regions[0].len(),
+            )?,
+        };
         NRegionCandidateGenerator::Sweep { starts, layout }
     } else {
-        let orientation = if left_regions[0].len() < right_regions[0].len() {
+        let orientation = if allow_left_tree && left_regions[0].len() < right_regions[0].len() {
             NRegionTreeOrientation::Left
         } else {
             NRegionTreeOrientation::Right
@@ -2544,49 +2571,59 @@ fn build_n_region_candidate_paths(
     }))
 }
 
-/// Decide whether the old two-region sweep is likely cheaper than a tree.
+/// Count the candidates the existing two-region sweep would inspect.
 ///
-/// The estimate samples at most eight reordered left rows. Each sample
-/// counts only the first-two-region suffix, stopping once it exceeds the
-/// cutoff. This keeps the dispatch inexpensive for broad joins while still
-/// recognizing narrow bands without enumerating their complete candidate
-/// sets. The later region dimensions can only reduce the sweep's candidates,
-/// so the choice is intentionally conservative rather than an exact runtime
-/// model.
+/// The count is exact for the first two predicates and stops as soon as it
+/// exceeds `limit`. A Fenwick tree is unnecessary here: the already-built
+/// ranked layout and active-rank counts provide the same suffix cardinality
+/// without enumerating each candidate pair. Returning the layout when the
+/// count stays within the limit lets the sweep reuse this dispatch work.
 ///
-/// ELI5: if the first two rulers already leave only a small handful of right
-/// rows to inspect, keep the old shortcut instead of paying to build a map for
-/// every dimension.
-fn first_two_regions_are_selective(left_regions: &[Vec<i64>], right_regions: &[Vec<i64>]) -> bool {
-    const SAMPLE_COUNT: usize = 8;
-    const CANDIDATE_CUTOFF: usize = 1_024;
-    let left_count = left_regions[0].len();
-    let right_count = right_regions[0].len();
-    if left_count == 0 || right_count == 0 {
-        return true;
-    }
+/// ELI5: count the work the old conveyor belt would do. If that work is small,
+/// keep the conveyor belt; if it is large, pay for the multidimensional tree.
+fn sweep_candidate_count_exceeds(
+    left_regions: &[Vec<i64>],
+    second_right_region: &[i64],
+    starts: &[usize],
+    end: usize,
+    limit: u128,
+) -> Result<(bool, Option<RankedRegionPositionLayout>), String> {
+    let layout = build_ranked_region_position_layout(second_right_region, starts, end)?;
+    let mut active_counts = ActiveRankCounts::new(layout.labels.len(), layout.positions.len());
+    let mut previous_end = end;
+    let mut total = 0_u128;
 
-    let sample_count = left_count.min(SAMPLE_COUNT);
-    let mut total = 0usize;
-    for sample in 0..sample_count {
-        let left_position = sample * left_count / sample_count;
-        let first_start = right_regions[0]
-            .partition_point(|&right_region| right_region < left_regions[0][left_position]);
-        let mut count = 0usize;
-        for &right_region in right_regions[1].iter().skip(first_start) {
-            if left_regions[1][left_position] <= right_region && right_region != 0 {
-                count += 1;
-                if count > CANDIDATE_CUTOFF {
-                    break;
-                }
-            }
+    for (left_position, &start) in starts.iter().enumerate() {
+        if start == end {
+            continue;
         }
-        total = total.saturating_add(count);
-        if total > CANDIDATE_CUTOFF * sample_count {
-            return false;
+        if start > previous_end {
+            return Err("starts must be monotonically non-increasing".to_owned());
+        }
+        activate_ranked_positions(&layout, start, previous_end, &mut active_counts)?;
+        previous_end = start;
+
+        let left_region = left_regions[1][left_position];
+        if left_region == 0 {
+            continue;
+        }
+        let first_rank = layout.labels.partition_point(|&label| label < left_region);
+        let row_count =
+            active_counts
+                .iter_from(first_rank)
+                .try_fold(0_u128, |count, (_, positions)| {
+                    count
+                        .checked_add(positions as u128)
+                        .ok_or("region result size exceeds platform capacity")
+                })?;
+        total = total
+            .checked_add(row_count)
+            .ok_or("region result size exceeds platform capacity")?;
+        if total > limit {
+            return Ok((true, None));
         }
     }
-    total / sample_count <= CANDIDATE_CUTOFF
+    Ok((false, Some(layout)))
 }
 
 /// Build index pairs for three or more range predicates after Python-side
@@ -2673,6 +2710,8 @@ where
         left_index,
         right_index,
         aligners,
+        keep != Keep::Any,
+        keep == Keep::Any,
     )?
     else {
         return Ok(None);
@@ -3303,9 +3342,16 @@ where
             "at least one aggregation is required",
         ));
     }
-    let Some(paths) =
-        build_n_region_candidate_paths(&first, ranges, left_index, right_index, aligners)
-            .map_err(PyValueError::new_err)?
+    let Some(paths) = build_n_region_candidate_paths(
+        &first,
+        ranges,
+        left_index,
+        right_index,
+        aligners,
+        true,
+        false,
+    )
+    .map_err(PyValueError::new_err)?
     else {
         return Ok(None);
     };
@@ -3962,6 +4008,32 @@ mod tests {
         })
         .expect("left-oriented traversal should succeed");
         assert_eq!(counts, [2_047, 2_048]);
+    }
+
+    #[test]
+    fn sweep_keeps_tied_left_windows() {
+        let left_regions = vec![vec![1_i64, 1], vec![1, 1], vec![1, 1]];
+        let right_regions = vec![vec![1_i64, 2, 3, 4], vec![1, 2, 3, 4], vec![1, 2, 3, 4]];
+        let starts = n_region_starts(&left_regions[0], &right_regions[0])
+            .expect("starts should be valid")
+            .expect("both rows should have matches");
+        let layout =
+            build_ranked_region_position_layout(&right_regions[1], &starts, right_regions[0].len())
+                .expect("ranked layout should build");
+        let paths = NRegionCandidatePaths {
+            left_regions,
+            right_regions,
+            left_order: vec![0, 1],
+            generator: NRegionCandidateGenerator::Sweep { starts, layout },
+        };
+
+        let mut pairs = Vec::new();
+        visit_n_region_matches(&paths, |left, right| {
+            pairs.push((left, right));
+            true
+        })
+        .expect("sweep should visit tied windows");
+        assert_eq!(pairs.len(), 8);
     }
 
     fn aggregation_input<'py>(

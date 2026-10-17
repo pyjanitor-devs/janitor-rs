@@ -352,6 +352,12 @@ impl RegionKdTree {
             .all(|(&maximum, &value)| maximum <= value)
         {
             for &point_index in &self.order[start..end] {
+                // Zero is the region-building sentinel for a left row that
+                // cannot match. Whole-node acceptance skips point checks, so
+                // filter it here just as the leaf path does.
+                if self.point(point_index).contains(&0) {
+                    continue;
+                }
                 if !visit(point_index) {
                     return false;
                 }
@@ -430,6 +436,18 @@ mod tests {
         }));
         actual.sort_unstable();
         assert_eq!(actual, vec![1, 2]);
+    }
+
+    #[test]
+    fn lower_whole_node_queries_skip_masked_points() {
+        let regions = vec![vec![0, 1], vec![0, 1], vec![0, 1]];
+        let tree = RegionKdTree::build(&regions, 32).unwrap();
+        let mut actual = Vec::new();
+        assert!(tree.visit_lower(&[10, 10, 10], |position| {
+            actual.push(position);
+            true
+        }));
+        assert_eq!(actual, vec![1]);
     }
 
     #[test]
