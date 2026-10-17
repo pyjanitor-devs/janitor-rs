@@ -4153,20 +4153,20 @@ mod tests {
     #[test]
     fn any_probe_samples_spread_rows_and_requires_half_hits() {
         let starts = vec![0_usize; 32];
-        let right_regions = vec![vec![1_i64], vec![0], vec![0]];
+        let right_regions = vec![vec![1_i64], vec![1], vec![1]];
 
         // The sixteen sampled positions are 0, 2, ..., 30. Put the hits in
         // the latter half so a prefix-only probe would see none of them.
         let left_third = (0..32)
             .map(|position| {
                 if position >= 16 && position % 2 == 0 {
-                    0
-                } else {
                     1
+                } else {
+                    2
                 }
             })
             .collect::<Vec<i64>>();
-        let left_regions = vec![vec![1_i64; 32], vec![0; 32], left_third];
+        let left_regions = vec![vec![1_i64; 32], vec![1; 32], left_third];
         assert!(sweep_finds_early_match(
             &left_regions,
             &right_regions,
@@ -4175,8 +4175,8 @@ mod tests {
 
         // Removing one of those eight sampled hits must fail the 50% rule.
         let mut left_third = left_regions[2].clone();
-        left_third[30] = 1;
-        let left_regions = vec![vec![1_i64; 32], vec![0; 32], left_third];
+        left_third[30] = 2;
+        let left_regions = vec![vec![1_i64; 32], vec![1; 32], left_third];
         assert!(!sweep_finds_early_match(
             &left_regions,
             &right_regions,
