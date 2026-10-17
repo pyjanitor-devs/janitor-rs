@@ -39,7 +39,7 @@ use super::common::adaptive::{
     MAX_DIRECT_QUERY_COUNT,
 };
 use super::common::ensure_equal_lengths;
-use crate::conditional_join::packed_spans::{
+use crate::aggregation::packed_spans::{
     assign_range_clusters, queried_source_spans, PackedSpanLayout,
 };
 
@@ -3048,7 +3048,7 @@ mod tests {
         update_signed_product_segment_ranges, update_u64_prefix_ranges,
         update_u64_product_segment_ranges, Values, View,
     };
-    use crate::conditional_join::packed_spans::{
+    use crate::aggregation::packed_spans::{
         assign_range_clusters, queried_source_spans, PackedSpanLayout,
     };
     use numpy::ndarray::Array1;

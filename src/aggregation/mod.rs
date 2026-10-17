@@ -5,4 +5,5 @@
 
 pub(crate) mod common;
 pub(crate) mod input;
+pub(crate) mod packed_spans;
 pub(crate) mod state;

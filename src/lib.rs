@@ -5,20 +5,16 @@ mod conditional_join;
 /// Narrow Rust-only surface used by criterion benchmarks.
 #[doc(hidden)]
 pub mod bench_support {
-    pub use crate::conditional_join::adaptive_extreme_positions;
-    pub use crate::conditional_join::n_region_aggregate;
     pub use crate::conditional_join::{
-        dual_regions_aggregate, dual_regions_and_residual_aggregate,
-    };
-    pub use crate::conditional_join::{equi_aggregate_bench, equi_range_and_residual_indices};
-    pub use crate::conditional_join::{
+        adaptive_extreme_positions, dual_regions_aggregate, dual_regions_and_residual_aggregate,
+        equi_aggregate_bench, equi_range_and_residual_indices, n_region_aggregate,
         range_join_extended_aggregate, range_join_extended_aggregate_reverse,
     };
 }
 
 /// Top-level composition point: each family owns and registers its own
-/// exports, so this function only has to know the surviving family names, not
-/// the ~900 individual dtype-specialized functions they expose.
+/// exports, so this function only has to know the conditional-join family, not
+/// the individual dtype-specialized functions it exposes.
 ///
 /// ELI5: instead of one giant guest list at the front door, each
 /// department (equality, inequality, range, or region joins)

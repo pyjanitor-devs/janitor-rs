@@ -48,11 +48,13 @@ use super::join_candidate_materialization::materialize_range_candidates;
 #[cfg(test)]
 use super::join_search::range_window;
 use super::join_types::{result_dict, Keep, SingleJoinResult};
-use super::packed_spans::{assign_range_clusters, queried_source_spans, PackedSpanLayout};
 use super::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
 use super::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
 use crate::aggregation::common::adaptive::should_use_segment_tree;
 use crate::aggregation::common::ensure_equal_lengths_core;
+use crate::aggregation::packed_spans::{
+    assign_range_clusters, queried_source_spans, PackedSpanLayout,
+};
 
 #[cfg(test)]
 use std::cell::Cell;

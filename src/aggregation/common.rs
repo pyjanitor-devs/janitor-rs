@@ -54,8 +54,8 @@ pub(crate) mod adaptive {
 }
 
 pub(crate) mod aggregation {
-    pub(crate) use super::super::input::parse_inputs;
-    pub(crate) use super::super::state::AggregationSet;
+    pub(crate) use crate::aggregation::input::parse_inputs;
+    pub(crate) use crate::aggregation::state::AggregationSet;
 
     use super::*;
 
