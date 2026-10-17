@@ -27,10 +27,8 @@ struct Node {
     start: usize,
     /// Exclusive end of the point range represented by this node.
     end: usize,
-    /// Inclusive lower bound of the node in each region dimension.
-    min: Vec<i64>,
-    /// Inclusive upper bound of the node in each region dimension.
-    max: Vec<i64>,
+    /// Offset of the inclusive lower bound in the tree's flat bound arrays.
+    bounds_offset: usize,
     /// Index of the left child in the tree's flat node arena.
     left: Option<usize>,
     /// Index of the right child in the tree's flat node arena.
@@ -52,8 +50,13 @@ struct Node {
 pub(crate) struct RegionKdTree {
     /// Number of aligned region predicates (the k in k-d tree).
     dimensions: usize,
-    /// Right-side points, indexed by their global right position.
-    points: Vec<Vec<i64>>,
+    /// Right-side points in row-major flat storage, indexed by position times
+    /// `dimensions`. Flat storage avoids one heap allocation per point.
+    points: Vec<i64>,
+    /// Inclusive lower and upper bounds for every node, stored as contiguous
+    /// `node_count * dimensions` arrays rather than one vector per node.
+    lower_bounds: Vec<i64>,
+    upper_bounds: Vec<i64>,
     /// Tree order: each node owns a contiguous slice of this permutation.
     order: Vec<usize>,
     /// Flat node arena; child fields refer back into this vector.
@@ -81,11 +84,9 @@ impl RegionKdTree {
     ///
     /// # Complexity
     ///
-    /// Construction uses a full sort at every recursive level and is therefore
-    /// `O(n log² n)` for `n` right rows in the current implementation. Point
-    /// and bounding-box storage is `O(n * d)` for `d` dimensions. The explicit
-    /// complexity note is intentional: replacing per-node sorting with a
-    /// selection/partition build is a separate optimization opportunity.
+    /// Construction uses median selection at each recursive level and is
+    /// approximately `O(n log n)` for `n` right rows. Point and bounding-box
+    /// storage is `O(n * d)` for `d` dimensions.
     pub(crate) fn build(right_regions: &[Vec<i64>], leaf_size: usize) -> Result<Self, String> {
         if right_regions.len() < 3 {
             return Err("k-d tree requires at least three region dimensions".to_owned());
@@ -98,17 +99,17 @@ impl RegionKdTree {
             }
         }
 
-        let points = (0..point_count)
-            .map(|position| {
-                right_regions
-                    .iter()
-                    .map(|region| region[position])
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let mut points = Vec::with_capacity(point_count.saturating_mul(dimensions));
+        for position in 0..point_count {
+            for region in right_regions {
+                points.push(region[position]);
+            }
+        }
         let mut tree = Self {
             dimensions,
             points,
+            lower_bounds: Vec::new(),
+            upper_bounds: Vec::new(),
             order: (0..point_count).collect(),
             nodes: Vec::new(),
             leaf_size: leaf_size.max(1),
@@ -132,8 +133,9 @@ impl RegionKdTree {
         let mut max = vec![i64::MIN; self.dimensions];
         for &point_index in &self.order[start..end] {
             for dimension in 0..self.dimensions {
-                min[dimension] = min[dimension].min(self.points[point_index][dimension]);
-                max[dimension] = max[dimension].max(self.points[point_index][dimension]);
+                let value = self.points[point_index * self.dimensions + dimension];
+                min[dimension] = min[dimension].min(value);
+                max[dimension] = max[dimension].max(value);
             }
         }
 
@@ -152,21 +154,28 @@ impl RegionKdTree {
             None
         };
         let node_index = self.nodes.len();
+        let bounds_offset = self.lower_bounds.len();
+        self.lower_bounds.extend_from_slice(&min);
+        self.upper_bounds.extend_from_slice(&max);
         self.nodes.push(Node {
             start,
             end,
-            min,
-            max,
+            bounds_offset,
             left: None,
             right: None,
         });
 
         if let Some(split_dimension) = split_dimension {
             let midpoint = start + (end - start) / 2;
-            // The point index is a tie-breaker so equal labels produce the
-            // same tree and callback order on every build.
-            self.order[start..end].sort_unstable_by_key(|&point_index| {
-                (self.points[point_index][split_dimension], point_index)
+            // Partition around the median instead of fully sorting every
+            // subtree. Repeating a linear partition at each depth gives the
+            // expected O(n log n) build cost. The point index tie-breaker
+            // keeps equal labels deterministic.
+            self.order[start..end].select_nth_unstable_by_key(midpoint - start, |&point_index| {
+                (
+                    self.points[point_index * self.dimensions + split_dimension],
+                    point_index,
+                )
             });
             let left = self.build_node(start, midpoint)?;
             let right = self.build_node(midpoint, end)?;
@@ -242,11 +251,21 @@ impl RegionKdTree {
     where
         F: FnMut(usize) -> bool,
     {
-        let node = &self.nodes[node_index];
+        let (start, end, bounds_offset, left_child, right_child) = {
+            let node = &self.nodes[node_index];
+            (
+                node.start,
+                node.end,
+                node.bounds_offset,
+                node.left,
+                node.right,
+            )
+        };
+        let min = &self.lower_bounds[bounds_offset..bounds_offset + self.dimensions];
+        let max = &self.upper_bounds[bounds_offset..bounds_offset + self.dimensions];
         // If one maximum is below the query label, every point in this box
         // fails that dimension. ELI5: the whole box is too far to the left.
-        if node
-            .max
+        if max
             .iter()
             .zip(left_regions)
             .any(|(&maximum, &left)| maximum < left)
@@ -257,13 +276,12 @@ impl RegionKdTree {
         // If every minimum reaches the query, every point in the box passes
         // every dimension. ELI5: the whole box is safely in the answer area,
         // so we can report its points without rechecking each coordinate.
-        if node
-            .min
+        if min
             .iter()
             .zip(left_regions)
             .all(|(&minimum, &left)| minimum >= left)
         {
-            for &point_index in &self.order[node.start..node.end] {
+            for &point_index in &self.order[start..end] {
                 if !visit(point_index) {
                     return false;
                 }
@@ -271,15 +289,15 @@ impl RegionKdTree {
             return true;
         }
 
-        if let Some(left) = node.left {
+        if let Some(left) = left_child {
             if !self.visit_node(left, left_regions, visit) {
                 return false;
             }
         } else {
             // A leaf is the only place where individual points need the full
             // coordinate-by-coordinate dominance check.
-            for &point_index in &self.order[node.start..node.end] {
-                let point = &self.points[point_index];
+            for &point_index in &self.order[start..end] {
+                let point = self.point(point_index);
                 if point.contains(&0)
                     || !left_regions
                         .iter()
@@ -293,7 +311,7 @@ impl RegionKdTree {
                 }
             }
         }
-        if let Some(right) = node.right {
+        if let Some(right) = right_child {
             self.visit_node(right, left_regions, visit)
         } else {
             true
@@ -305,11 +323,21 @@ impl RegionKdTree {
     where
         F: FnMut(usize) -> bool,
     {
-        let node = &self.nodes[node_index];
+        let (start, end, bounds_offset, left_child, right_child) = {
+            let node = &self.nodes[node_index];
+            (
+                node.start,
+                node.end,
+                node.bounds_offset,
+                node.left,
+                node.right,
+            )
+        };
+        let min = &self.lower_bounds[bounds_offset..bounds_offset + self.dimensions];
+        let max = &self.upper_bounds[bounds_offset..bounds_offset + self.dimensions];
         // If one minimum is above the query, every point in this box fails
         // that dimension. ELI5: the whole box is too far to the right.
-        if node
-            .min
+        if min
             .iter()
             .zip(query)
             .any(|(&minimum, &value)| minimum > value)
@@ -318,13 +346,12 @@ impl RegionKdTree {
         }
 
         // If every maximum is within the query, the whole box is a match.
-        if node
-            .max
+        if max
             .iter()
             .zip(query)
             .all(|(&maximum, &value)| maximum <= value)
         {
-            for &point_index in &self.order[node.start..node.end] {
+            for &point_index in &self.order[start..end] {
                 if !visit(point_index) {
                     return false;
                 }
@@ -332,13 +359,13 @@ impl RegionKdTree {
             return true;
         }
 
-        if let Some(left) = node.left {
+        if let Some(left) = left_child {
             if !self.visit_node_lower(left, query, visit) {
                 return false;
             }
         } else {
-            for &point_index in &self.order[node.start..node.end] {
-                let point = &self.points[point_index];
+            for &point_index in &self.order[start..end] {
+                let point = self.point(point_index);
                 if point.contains(&0)
                     || !point.iter().zip(query).all(|(&left, &right)| left <= right)
                 {
@@ -349,11 +376,17 @@ impl RegionKdTree {
                 }
             }
         }
-        if let Some(right) = node.right {
+        if let Some(right) = right_child {
             self.visit_node_lower(right, query, visit)
         } else {
             true
         }
+    }
+
+    /// Return one row from the flat point buffer.
+    fn point(&self, point_index: usize) -> &[i64] {
+        let start = point_index * self.dimensions;
+        &self.points[start..start + self.dimensions]
     }
 }
 
