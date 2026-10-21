@@ -4,6 +4,10 @@ All notable changes to janitor-rs are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- update PyO3 and rust-numpy; Python argument and array-mismatch error text may differ, with some argument names now exposed through exception notes
+
 ## [0.6.5](https://github.com/pyjanitor-devs/janitor-rs/compare/v0.6.4...v0.6.5) - 2026-10-18
 
 ### Fixed

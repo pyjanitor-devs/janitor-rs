@@ -31,4 +31,4 @@ fi
 
 PYTHONPATH="$site_packages${PYTHONPATH:+:$PYTHONPATH}" \
     PYO3_PYTHON="$python_bin" \
-    cargo test --no-default-features "$@"
+    cargo test "$@"
