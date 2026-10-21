@@ -15,6 +15,7 @@ use super::predicate::{
     null_metadata_views, predicates_match_dispatch, predicates_match_window, NullMetadata,
     Predicate,
 };
+use super::range_skip_scan::WindowResidualScan;
 use crate::aggregation::common::ensure_equal_lengths_core;
 
 /// Filter candidates represented by one half-open right-side window per left row.
@@ -46,6 +47,9 @@ pub(crate) fn materialize_range_candidates(
     metadata: Option<&[NullMetadata<'_>]>,
     keep: Keep,
 ) -> Result<(Vec<i64>, Vec<i64>), String> {
+    if let Some(scan) = WindowResidualScan::plan(predicates, metadata, windows) {
+        return materialize_range_candidates_skipping(windows, &scan, keep);
+    }
     let views: Vec<_> = predicates.iter().map(Predicate::view).collect();
     let metadata_views = metadata.map(null_metadata_views);
     let labels = windows.right_index.as_slice();
@@ -179,6 +183,99 @@ pub(crate) fn materialize_range_candidates(
                 Keep::All => unreachable!(),
             }
         }
+        if let Some(right_position) = selected {
+            output_left.push(windows.left_index[row]);
+            output_right.push(labels[right_position]);
+        }
+    }
+    Ok((output_left, output_right))
+}
+
+/// [`materialize_range_candidates`] when one range residual drives a skip
+/// scan.
+///
+/// The scan reports the same surviving positions, in the same ascending
+/// order, as the residual checklist, so every `keep` mode selects the same
+/// pairs; it just never reads the blocks that cannot hold a match.
+// Kept out of line: inlined, this loop changed the code generated for the
+// residual-mask loop beside it, and dense reverse aggregations that never
+// take the skip path ran about 7% slower (Arun 200K reverse size).
+#[inline(never)]
+fn materialize_range_candidates_skipping(
+    windows: &SingleJoinResult,
+    scan: &WindowResidualScan<'_>,
+    keep: Keep,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    let labels = windows.right_index.as_slice();
+    let rows = windows.left_index.len();
+    let window = |row: usize| {
+        (
+            windows.left_positions[row],
+            windows.starts[row],
+            windows.ends[row],
+        )
+    };
+
+    if keep == Keep::All {
+        let mut output_len = 0_usize;
+        for row in 0..rows {
+            let (left_position, start, end) = window(row);
+            output_len = output_len
+                .checked_add(scan.count_matches(left_position, start, end))
+                .ok_or("single extended join result size exceeds platform capacity")?;
+        }
+        if output_len == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut output_left = Vec::new();
+        output_left
+            .try_reserve_exact(output_len)
+            .map_err(|_| "single extended join result allocation failed")?;
+        let mut output_right = Vec::new();
+        output_right
+            .try_reserve_exact(output_len)
+            .map_err(|_| "single extended join result allocation failed")?;
+        for row in 0..rows {
+            let (left_position, start, end) = window(row);
+            scan.for_each_match(left_position, start, end, |right_position| {
+                output_left.push(windows.left_index[row]);
+                output_right.push(labels[right_position]);
+                true
+            });
+        }
+        return Ok((output_left, output_right));
+    }
+
+    let mut output_left = Vec::new();
+    output_left
+        .try_reserve_exact(rows)
+        .map_err(|_| "single extended join result allocation failed")?;
+    let mut output_right = Vec::new();
+    output_right
+        .try_reserve_exact(rows)
+        .map_err(|_| "single extended join result allocation failed")?;
+    for row in 0..rows {
+        let (left_position, start, end) = window(row);
+        let mut selected: Option<usize> = None;
+        scan.for_each_match(left_position, start, end, |right_position| {
+            let replace = match keep {
+                Keep::Any => {
+                    selected = Some(right_position);
+                    return false;
+                }
+                Keep::First => {
+                    selected.is_none_or(|current| labels[right_position] < labels[current])
+                }
+                Keep::Last => {
+                    selected.is_none_or(|current| labels[right_position] > labels[current])
+                }
+                Keep::All => unreachable!(),
+            };
+            if replace {
+                selected = Some(right_position);
+            }
+            true
+        });
         if let Some(right_position) = selected {
             output_left.push(windows.left_index[row]);
             output_right.push(labels[right_position]);

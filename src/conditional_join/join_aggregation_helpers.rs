@@ -16,6 +16,7 @@ use super::predicate::{
     PredicateView,
 };
 use super::range_predicate::AnyParsedRangePredicate;
+use super::range_skip_scan::WindowResidualScan;
 use crate::aggregation::common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
@@ -223,6 +224,45 @@ fn aggregate_range(
     }
 }
 
+/// [`aggregate_range`] when one range residual drives a skip scan.
+///
+/// The scan reports the same pairs in the same order as the residual
+/// checklist, so every output slot receives its updates in the same sequence
+/// (float sums keep their Kahan summation order).
+// Kept out of line: inlined, this loop changed the code generated for the
+// residual-mask loop beside it, and dense reverse aggregations that never
+// take the skip path ran about 7% slower (Arun 200K reverse size).
+#[inline(never)]
+fn aggregate_range_skipping(
+    windows: &SingleJoinResult,
+    scan: &WindowResidualScan<'_>,
+    set: &mut AggregationSet<'_>,
+    reverse: bool,
+    physical_position_maps: bool,
+) {
+    for (row, (&start, &end)) in windows.starts.iter().zip(windows.ends.iter()).enumerate() {
+        let left_position = windows.left_positions[row];
+        scan.for_each_match(left_position, start, end, |right_position| {
+            if physical_position_maps {
+                let physical_left = usize::try_from(windows.left_index[row])
+                    .expect("validated physical left position");
+                let physical_right = usize::try_from(windows.right_index[right_position])
+                    .expect("validated physical right position");
+                if reverse {
+                    set.update(physical_left, physical_right);
+                } else {
+                    set.update(physical_right, physical_left);
+                }
+            } else if reverse {
+                set.update(left_position, right_position);
+            } else {
+                set.update(right_position, left_position);
+            }
+            true
+        });
+    }
+}
+
 /// Finish aggregation after a range window has been constructed.
 ///
 /// This helper contains the shared state setup and result materialization for
@@ -338,6 +378,19 @@ pub(crate) fn aggregate_range_windows<'py>(
         )?));
     }
 
+    if let Some(scan) = WindowResidualScan::plan(parsed, metadata, &windows) {
+        aggregate_range_skipping(&windows, &scan, &mut set, reverse, physical_position_maps);
+        if set.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(make_results_with_positions(
+            py,
+            set,
+            output_positions,
+            output_len,
+            return_matched,
+        )?));
+    }
     let views: Vec<_> = parsed.iter().map(|predicate| predicate.view()).collect();
     let metadata_views = metadata.map(null_metadata_views);
     aggregate_range(

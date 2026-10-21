@@ -1560,3 +1560,21 @@ for nothing. Size `keep="all"` output with the callback-free
 pass about 14% slower than the old plain loop. With residuals, keep the
 whole-window residual mask when the gate does not fire. Benchmark dense,
 gate-firing cases as well as the overscan headline.
+
+### [2026-10-21] Default range path: residual overscan behind a cumulative envelope
+**Context**: pyjanitor's default dual-range preparation replaces a
+non-monotonic second range with its cumulative envelope and keeps the
+original predicate as a residual (`range_join_extended_*`). The window loops
+then checked every candidate. On AIList ex-anno x chainRn4 the windows held
+15.1 billion candidates for 2.8 million matches, so every `keep` mode took
+12-48 s while the same join flipped took 0.15 s.
+**Learning**: This is the same overscan as the equi path's second range, one
+layer down: the envelope only trims window ends. `WindowResidualScan`
+(`range_skip_scan.rs`) promotes the first unmasked range residual to a
+`SecondRangeSkipScan` and checks the remaining residuals on the candidates
+it reports. Positions arrive in ascending order, so `keep` selection and
+aggregation update order (including Kahan float sums) are unchanged.
+**Recommendation**: Keep the 2x-right-length width gate shared with the
+equi path, and fall back to the whole-window residual mask below it. Only
+range residuals without null masks are eligible (masks exist only for `!=`
+today).

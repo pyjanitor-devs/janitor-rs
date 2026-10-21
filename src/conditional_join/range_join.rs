@@ -3306,3 +3306,428 @@ mod aggregation_tests {
         .unwrap();
     }
 }
+
+/// The default range path's envelope residual answered by a skip scan.
+///
+/// These fixtures mimic pyjanitor's default dual-range preparation for an
+/// interval overlap: the right rows are sorted by the first anchor, the
+/// second range is replaced by its cumulative envelope, and the original
+/// second range follows as a residual. A few very long intervals keep the
+/// envelope low, so the windows are wide and the skip scan engages.
+#[cfg(test)]
+mod default_skip_scan_tests {
+    use super::*;
+    use crate::conditional_join::range_skip_scan::{
+        SECOND_RANGE_SUPER_SKIPS, WINDOW_RESIDUAL_SKIP_DENSE, WINDOW_RESIDUAL_SKIP_PLANS,
+    };
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::IntoPyObject;
+    use std::collections::BTreeMap;
+
+    struct Overlap {
+        left_start: Vec<i64>,
+        left_end: Vec<i64>,
+        left_tag: Vec<i64>,
+        left_tag_mask: Vec<bool>,
+        right_start: Vec<i64>,
+        right_end: Vec<i64>,
+        right_tag: Vec<i64>,
+        right_tag_mask: Vec<bool>,
+        right_value: Vec<i64>,
+        /// Physical labels of the right rows after sorting by `right_end`.
+        right_index: Vec<i64>,
+        left_index: Vec<i64>,
+    }
+
+    fn next(seed: &mut u64) -> u64 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    /// Short intervals plus a few long ones, right side sorted by end.
+    fn overlap_fixture(left_rows: usize, right_rows: usize, seed: u64) -> Overlap {
+        let mut seed = seed;
+        let intervals = |rows: usize, long_every: u64, seed: &mut u64| {
+            (0..rows)
+                .map(|_| {
+                    let start = (next(seed) % 100_000) as i64;
+                    let length = if next(seed).is_multiple_of(long_every) {
+                        (next(seed) % 100_000) as i64
+                    } else {
+                        (next(seed) % 40) as i64
+                    };
+                    (start, start + length)
+                })
+                .collect::<Vec<_>>()
+        };
+        let left = intervals(left_rows, 1_000, &mut seed);
+        let mut right = intervals(right_rows, 300, &mut seed);
+        let mut labels: Vec<i64> = (0..right_rows as i64)
+            .map(|label| label * 7 % 10_007)
+            .collect();
+        let mut order: Vec<usize> = (0..right_rows).collect();
+        order.sort_by_key(|&position| right[position].1);
+        right = order.iter().map(|&position| right[position]).collect();
+        labels = order.iter().map(|&position| labels[position]).collect();
+        let right_tag: Vec<i64> = (0..right_rows)
+            .map(|_| (next(&mut seed) % 5) as i64)
+            .collect();
+        Overlap {
+            left_start: left.iter().map(|interval| interval.0).collect(),
+            left_end: left.iter().map(|interval| interval.1).collect(),
+            left_tag: (0..left_rows)
+                .map(|_| (next(&mut seed) % 5) as i64)
+                .collect(),
+            left_tag_mask: (0..left_rows)
+                .map(|_| next(&mut seed).is_multiple_of(11))
+                .collect(),
+            right_tag_mask: (0..right_rows)
+                .map(|_| next(&mut seed).is_multiple_of(13))
+                .collect(),
+            right_value: (0..right_rows)
+                .map(|_| (next(&mut seed) % 1_000) as i64)
+                .collect(),
+            right_start: right.iter().map(|interval| interval.0).collect(),
+            right_end: right.iter().map(|interval| interval.1).collect(),
+            right_tag,
+            right_index: labels,
+            left_index: (0..left_rows as i64).map(|label| 1_000 + label).collect(),
+        }
+    }
+
+    impl Overlap {
+        /// `left.start <= right.end`, `left.end >= envelope`,
+        /// `left.end >= right.start`, and optionally a masked
+        /// `left.tag != right.tag`.
+        fn predicates<'py>(
+            &self,
+            py: Python<'py>,
+            as_float: bool,
+            with_tag: bool,
+        ) -> PyResult<Bound<'py, PyList>> {
+            let array = |values: &[i64]| -> Bound<'py, PyAny> {
+                if as_float {
+                    PyArray1::from_vec(py, values.iter().map(|&value| value as f64).collect())
+                        .into_any()
+                } else {
+                    PyArray1::from_vec(py, values.to_vec()).into_any()
+                }
+            };
+            let mut envelope = self.right_start.clone();
+            for position in (0..envelope.len().saturating_sub(1)).rev() {
+                envelope[position] = envelope[position].min(envelope[position + 1]);
+            }
+            let predicates = PyList::empty(py);
+            for (left, right, op) in [
+                (&self.left_start, &self.right_end, "<="),
+                (&self.left_end, &envelope, ">="),
+                (&self.left_end, &self.right_start, ">="),
+            ] {
+                predicates.append(PyTuple::new(
+                    py,
+                    [array(left), array(right), op.into_pyobject(py)?.into_any()],
+                )?)?;
+            }
+            if with_tag {
+                predicates.append(PyTuple::new(
+                    py,
+                    [
+                        array(&self.left_tag),
+                        PyArray1::from_vec(py, self.left_tag_mask.clone()).into_any(),
+                        array(&self.right_tag),
+                        PyArray1::from_vec(py, self.right_tag_mask.clone()).into_any(),
+                        false.into_pyobject(py)?.to_owned().into_any(),
+                        "!=".into_pyobject(py)?.into_any(),
+                    ],
+                )?)?;
+            }
+            Ok(predicates)
+        }
+
+        /// Matching right positions for every left row, ascending.
+        fn reference(&self, with_tag: bool) -> Vec<Vec<usize>> {
+            (0..self.left_start.len())
+                .map(|row| {
+                    (0..self.right_start.len())
+                        .filter(|&position| {
+                            self.left_start[row] <= self.right_end[position]
+                                && self.left_end[row] >= self.right_start[position]
+                                // NumPy-null semantics: a masked side
+                                // passes `!=`.
+                                && (!with_tag
+                                    || self.left_tag_mask[row]
+                                    || self.right_tag_mask[position]
+                                    || self.left_tag[row] != self.right_tag[position])
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    fn plans() -> usize {
+        WINDOW_RESIDUAL_SKIP_PLANS.with(|plans| plans.get())
+    }
+
+    #[test]
+    fn envelope_residual_skip_scan_matches_bruteforce_for_every_keep() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let data = overlap_fixture(500, 5_000, 17);
+            let super_skips_before = SECOND_RANGE_SUPER_SKIPS.with(|skips| skips.get());
+            for as_float in [false, true] {
+                for with_tag in [false, true] {
+                    let reference = data.reference(with_tag);
+                    assert!(reference.iter().map(Vec::len).sum::<usize>() > 500);
+                    for keep in ["all", "any", "first", "last"] {
+                        let predicates = data.predicates(py, as_float, with_tag)?;
+                        let plans_before = plans();
+                        let result = range_join_extended_indices(
+                            py,
+                            &predicates,
+                            PyArray1::from_vec(py, data.left_index.clone()).into_any(),
+                            PyArray1::from_vec(py, data.right_index.clone()).into_any(),
+                            keep,
+                        )?
+                        .expect("the overlap has matches");
+                        assert!(plans() > plans_before, "skip scan did not run for {keep}");
+                        let read = |name: &str| -> PyResult<Vec<i64>> {
+                            Ok(result
+                                .get_item(name)?
+                                .expect("index output")
+                                .cast::<PyArray1<i64>>()?
+                                .readonly()
+                                .as_array()
+                                .to_vec())
+                        };
+                        let observed: Vec<(i64, i64)> = read("left_index")?
+                            .into_iter()
+                            .zip(read("right_index")?)
+                            .collect();
+                        let mut expected = Vec::new();
+                        for (row, positions) in reference.iter().enumerate() {
+                            let labels =
+                                positions.iter().map(|&position| data.right_index[position]);
+                            let selected: Vec<i64> = match keep {
+                                "all" => labels.collect(),
+                                "any" => labels.take(1).collect(),
+                                "first" => labels.min().into_iter().collect(),
+                                _ => labels.max().into_iter().collect(),
+                            };
+                            expected.extend(
+                                selected
+                                    .into_iter()
+                                    .map(|label| (data.left_index[row], label)),
+                            );
+                        }
+                        assert_eq!(
+                            observed, expected,
+                            "keep={keep} float={as_float} tag={with_tag}"
+                        );
+                    }
+                }
+            }
+            assert!(SECOND_RANGE_SUPER_SKIPS.with(|skips| skips.get()) > super_skips_before);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn envelope_residual_skip_scan_matches_bruteforce_aggregation() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let data = overlap_fixture(500, 5_000, 29);
+            for with_tag in [false, true] {
+                let reference = data.reference(with_tag);
+                for reverse in [false, true] {
+                    // Integer-valued floats keep the float sum exact, so the
+                    // brute-force total is directly comparable.
+                    let (values, output_index) = if reverse {
+                        (
+                            (0..data.left_start.len())
+                                .map(|row| (row % 17) as f64)
+                                .collect::<Vec<_>>(),
+                            &data.right_index,
+                        )
+                    } else {
+                        (
+                            data.right_value.iter().map(|&value| value as f64).collect(),
+                            &data.left_index,
+                        )
+                    };
+                    let mut expected_size: BTreeMap<i64, i64> = BTreeMap::new();
+                    let mut expected_sum: BTreeMap<i64, f64> = BTreeMap::new();
+                    for (row, positions) in reference.iter().enumerate() {
+                        for &position in positions {
+                            let (slot, source) = if reverse {
+                                (position, row)
+                            } else {
+                                (row, position)
+                            };
+                            *expected_size.entry(output_index[slot]).or_default() += 1;
+                            *expected_sum.entry(output_index[slot]).or_default() += values[source];
+                        }
+                    }
+                    let aggregations = PyList::empty(py);
+                    for name in ["size", "sum"] {
+                        aggregations.append(PyTuple::new(
+                            py,
+                            [
+                                PyArray1::from_vec(py, values.clone()).into_any(),
+                                PyArray1::from_vec(py, vec![false; values.len()]).into_any(),
+                                name.into_pyobject(py)?.into_any(),
+                            ],
+                        )?)?;
+                    }
+                    let predicates = data.predicates(py, false, with_tag)?;
+                    let left_index = PyArray1::from_vec(py, data.left_index.clone()).into_any();
+                    let right_index = PyArray1::from_vec(py, data.right_index.clone()).into_any();
+                    let plans_before = plans();
+                    let result = if reverse {
+                        range_join_extended_aggregate_reverse(
+                            py,
+                            &predicates,
+                            &left_index,
+                            &right_index,
+                            &aggregations,
+                            true,
+                        )?
+                    } else {
+                        range_join_extended_aggregate(
+                            py,
+                            &predicates,
+                            &left_index,
+                            &right_index,
+                            &aggregations,
+                            true,
+                        )?
+                    }
+                    .expect("the overlap has matches");
+                    assert!(
+                        plans() > plans_before,
+                        "skip scan did not run (reverse={reverse})"
+                    );
+                    let positions = result.get_item(0)?.extract::<Vec<i64>>()?;
+                    let matched = result.get_item(1)?.extract::<Vec<bool>>()?;
+                    let outputs_item = result.get_item(2)?;
+                    let outputs = outputs_item.cast::<PyList>()?;
+                    let sizes = outputs.get_item(0)?.extract::<Vec<i64>>()?;
+                    let sums = outputs.get_item(1)?.extract::<Vec<f64>>()?;
+                    let mut observed_size = BTreeMap::new();
+                    let mut observed_sum = BTreeMap::new();
+                    for (slot, &label) in positions.iter().enumerate() {
+                        if matched[slot] {
+                            observed_size.insert(label, sizes[slot]);
+                            observed_sum.insert(label, sums[slot]);
+                        }
+                    }
+                    assert_eq!(
+                        observed_size, expected_size,
+                        "reverse={reverse} tag={with_tag}"
+                    );
+                    assert_eq!(
+                        observed_sum, expected_sum,
+                        "reverse={reverse} tag={with_tag}"
+                    );
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn dense_wide_windows_keep_the_residual_checklist() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // Every right interval starts near zero: the windows are wide and
+            // almost every candidate matches, so the summaries cannot skip
+            // anything and the plan must decline after sampling.
+            let mut data = overlap_fixture(300, 5_000, 53);
+            for position in 0..data.right_start.len() {
+                data.right_start[position] = (position % 3) as i64;
+            }
+            let reference = data.reference(true);
+            for keep in ["all", "first"] {
+                let predicates = data.predicates(py, false, true)?;
+                let (plans_before, dense_before) = (
+                    plans(),
+                    WINDOW_RESIDUAL_SKIP_DENSE.with(|dense| dense.get()),
+                );
+                let result = range_join_extended_indices(
+                    py,
+                    &predicates,
+                    PyArray1::from_vec(py, data.left_index.clone()).into_any(),
+                    PyArray1::from_vec(py, data.right_index.clone()).into_any(),
+                    keep,
+                )?
+                .expect("dense join has matches");
+                assert_eq!(
+                    plans(),
+                    plans_before,
+                    "dense windows must not use the skip scan"
+                );
+                assert!(WINDOW_RESIDUAL_SKIP_DENSE.with(|dense| dense.get()) > dense_before);
+                let observed = result
+                    .get_item("right_index")?
+                    .expect("index output")
+                    .len()?;
+                let expected: usize = if keep == "all" {
+                    reference.iter().map(Vec::len).sum()
+                } else {
+                    reference
+                        .iter()
+                        .filter(|positions| !positions.is_empty())
+                        .count()
+                };
+                assert_eq!(observed, expected, "keep={keep}");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn narrow_windows_keep_the_residual_checklist() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // Without long right intervals the envelope is tight and the
+            // windows hold fewer candidates than twice the right rows.
+            let mut data = overlap_fixture(50, 5_000, 41);
+            for position in 0..data.right_start.len() {
+                data.right_start[position] =
+                    data.right_start[position].max(data.right_end[position] - 39);
+            }
+            let reference = data.reference(false);
+            let predicates = data.predicates(py, false, false)?;
+            let plans_before = plans();
+            let result = range_join_extended_indices(
+                py,
+                &predicates,
+                PyArray1::from_vec(py, data.left_index.clone()).into_any(),
+                PyArray1::from_vec(py, data.right_index.clone()).into_any(),
+                "all",
+            )?;
+            assert_eq!(
+                plans(),
+                plans_before,
+                "narrow windows must not build summaries"
+            );
+            let expected: usize = reference.iter().map(Vec::len).sum();
+            let observed = result.map_or(0, |result| {
+                result
+                    .get_item("left_index")
+                    .unwrap()
+                    .unwrap()
+                    .len()
+                    .unwrap()
+            });
+            assert_eq!(observed, expected);
+            Ok(())
+        })
+        .unwrap();
+    }
+}
