@@ -41,7 +41,6 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
-#[cfg(test)]
 use super::compare_op::CompareOp;
 use super::join_aggregation_helpers::aggregate_range_windows;
 use super::join_candidate_materialization::materialize_range_candidates;
@@ -49,7 +48,7 @@ use super::join_candidate_materialization::materialize_range_candidates;
 use super::join_search::range_window;
 use super::join_types::{result_dict, Keep, SingleJoinResult};
 use super::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
-use super::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
+use super::range_predicate::{parse_any_range_parts, AnchorSearch, AnyParsedRangePredicate};
 use crate::aggregation::common::adaptive::should_use_segment_tree;
 use crate::aggregation::common::ensure_equal_lengths_core;
 use crate::aggregation::packed_spans::{
@@ -507,6 +506,7 @@ pub(crate) fn build_windows<T: PartialOrd + Copy>(
 /// Returns an error when the window arrays or physical maps have incompatible
 /// lengths, or when a window boundary is outside the corresponding right
 /// layout.
+#[cfg(test)]
 pub(crate) fn intersect_windows(
     first: SingleJoinResult,
     second: SingleJoinResult,
@@ -570,6 +570,70 @@ pub(crate) fn intersect_windows(
     Ok(result)
 }
 
+/// Left rows whose windows are computed per batch by [`for_each_window`].
+const WINDOW_CHUNK: usize = 4_096;
+
+/// Evenly spaced row blocks, of [`SWEEP_WIDTH_SAMPLE_ROWS`] rows each, that
+/// [`FirstAnchorSweep::new`] searches to estimate the candidate width.
+const SWEEP_WIDTH_SAMPLE_BLOCKS: usize = 32;
+const SWEEP_WIDTH_SAMPLE_ROWS: usize = 256;
+
+/// Call `visit(row, (start, end))` for every left row's window, in row
+/// order.
+///
+/// ELI5: work through the rows a few thousand at a time and measure each
+/// batch in one tight typed loop, so the CPU can overlap neighbouring
+/// rows' binary searches. Only one batch of windows is ever held; storing
+/// every row's window first cost four `usize` per left row per anchor.
+fn for_each_window(
+    search: &AnchorSearch<'_>,
+    left_len: usize,
+    mut visit: impl FnMut(usize, (usize, usize)),
+) {
+    let chunk = WINDOW_CHUNK.min(left_len);
+    let (mut starts, mut ends) = (vec![0_usize; chunk], vec![0_usize; chunk]);
+    for chunk_start in (0..left_len).step_by(WINDOW_CHUNK) {
+        let rows = WINDOW_CHUNK.min(left_len - chunk_start);
+        search.windows_into(chunk_start, &mut starts[..rows], &mut ends[..rows]);
+        for offset in 0..rows {
+            visit(chunk_start + offset, (starts[offset], ends[offset]));
+        }
+    }
+}
+
+/// [`for_each_window`] over two aligned anchors at once, for the left rows
+/// in `rows`: `visit(row, first_window, second_window)`.
+fn for_each_window_pair(
+    first: &AnchorSearch<'_>,
+    second: &AnchorSearch<'_>,
+    rows: std::ops::Range<usize>,
+    mut visit: impl FnMut(usize, (usize, usize), (usize, usize)),
+) {
+    let chunk = WINDOW_CHUNK.min(rows.len());
+    let (mut first_starts, mut first_ends) = (vec![0_usize; chunk], vec![0_usize; chunk]);
+    let (mut second_starts, mut second_ends) = (vec![0_usize; chunk], vec![0_usize; chunk]);
+    for chunk_start in rows.clone().step_by(WINDOW_CHUNK) {
+        let rows = WINDOW_CHUNK.min(rows.end - chunk_start);
+        first.windows_into(
+            chunk_start,
+            &mut first_starts[..rows],
+            &mut first_ends[..rows],
+        );
+        second.windows_into(
+            chunk_start,
+            &mut second_starts[..rows],
+            &mut second_ends[..rows],
+        );
+        for offset in 0..rows {
+            visit(
+                chunk_start + offset,
+                (first_starts[offset], first_ends[offset]),
+                (second_starts[offset], second_ends[offset]),
+            );
+        }
+    }
+}
+
 /// Build dual-range windows while dispatching each anchor independently.
 ///
 /// The two anchors may use different NumPy dtypes. Each is binary-searched in
@@ -593,7 +657,90 @@ pub(crate) fn build_any_windows(
     first: &AnyParsedRangePredicate<'_>,
     second: &AnyParsedRangePredicate<'_>,
 ) -> Result<SingleJoinResult, String> {
-    intersect_windows(first.windows(true)?, second.windows(false)?)
+    // ELI5: measure both rulers for one row at a time and write down only
+    // the overlap. Building each anchor's windows for every left row first
+    // held eight left-length vectors at once (4 GiB for Arun's 40M rows)
+    // just to keep the rows where they overlap.
+    let left_len = first.left_len();
+    let right_len = first.right_len();
+    let (left_labels, right_labels) = first.labels();
+    let (second_left_labels, second_right_labels) = second.labels();
+    ensure_equal_lengths_core("left", left_len, "left_index", left_labels.len())?;
+    ensure_equal_lengths_core("right", right_len, "right_index", right_labels.len())?;
+    ensure_equal_lengths_core(
+        "left",
+        second.left_len(),
+        "left_index",
+        second_left_labels.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "right",
+        second.right_len(),
+        "right_index",
+        second_right_labels.len(),
+    )?;
+    let (first_search, second_search) = (first.search(), second.search());
+    for op in [first_search.op(), second_search.op()] {
+        if !matches!(
+            op,
+            CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+        ) {
+            return Err("single join range core requires a range comparator".to_owned());
+        }
+    }
+    if second.left_len() != left_len {
+        return Err(
+            "dual range predicates must use aligned left rows and right positions".to_owned(),
+        );
+    }
+    let mut result = SingleJoinResult {
+        left_positions: Vec::new(),
+        left_index: Vec::new(),
+        right_index: right_labels.to_vec(),
+        starts: Vec::new(),
+        ends: Vec::new(),
+    };
+    if left_len == 0 || right_len == 0 || second.right_len() == 0 {
+        return Ok(result);
+    }
+    // ELI5: reserve room for every row once instead of letting the vectors
+    // double as they fill. Doubling copies the data and can leave up to
+    // twice the needed capacity; a reservation the rows never reach is
+    // address space the operating system does not back with memory until
+    // it is written.
+    result.left_positions.reserve_exact(left_len);
+    result.left_index.reserve_exact(left_len);
+    result.starts.reserve_exact(left_len);
+    result.ends.reserve_exact(left_len);
+    // ELI5: work through the rows a few thousand at a time. For each batch,
+    // measure all its rows against the first ruler, then all against the
+    // second, then keep the overlaps. Each ruler's measurements run in their
+    // own tight loop (as when every row was measured up front), but only one
+    // batch of measurements is ever held.
+    let mut misaligned = false;
+    for_each_window_pair(
+        &first_search,
+        &second_search,
+        0..left_len,
+        |row, first, second| {
+            // The second anchor's labels are deliberately not compared:
+            // PyJanitor aligns both right value arrays to one physical layout.
+            // Its windows must still stay inside the first anchor's layout.
+            misaligned |= second.1 > right_len;
+            let start = first.0.max(second.0);
+            let end = first.1.min(second.1);
+            if start < end {
+                result.left_positions.push(row);
+                result.left_index.push(left_labels[row]);
+                result.starts.push(start);
+                result.ends.push(end);
+            }
+        },
+    );
+    if misaligned {
+        return Err("dual range predicates must use aligned right positions".to_owned());
+    }
+    Ok(result)
 }
 
 /// Select one label from each arbitrary dual-range window.
@@ -877,34 +1024,22 @@ fn extended_join<'py>(
     )
     .map_err(PyValueError::new_err)?;
     check_predicate_lengths(&parsed, first.left_len(), first.right_len())?;
-    let first_windows = first.windows(true).map_err(PyValueError::new_err)?;
     // ELI5: `first`/`last` only need the smallest or largest label among a
     // row's matches. When the second anchor is just the residual's envelope,
     // a running scoreboard answers that without walking every match.
-    let sweepable =
-        matches!(keep, Keep::First | Keep::Last) && metadata.is_none() && parsed.len() == 1;
-    let first_bounds = sweepable.then(|| FirstAnchorWindows {
-        starts: first_windows.starts.clone(),
-        ends: first_windows.ends.clone(),
-        left_positions: first_windows.left_positions.clone(),
-    });
-    let windows = intersect_windows(
-        first_windows,
-        second.windows(false).map_err(PyValueError::new_err)?,
-    )
-    .map_err(PyValueError::new_err)?;
-    if windows.left_index.is_empty() {
-        return Ok(None);
-    }
-    if let Some(first_bounds) = &first_bounds {
+    if matches!(keep, Keep::First | Keep::Last) && metadata.is_none() && parsed.len() == 1 {
         if let Some((out_left, out_right)) =
-            select_envelope_rank_sweep(&second, &parsed[0], first_bounds, &windows, keep)
+            select_envelope_rank_sweep(&first, &second, &parsed[0], keep)
         {
             if out_left.is_empty() {
                 return Ok(None);
             }
             return Ok(Some(result_dict(py, out_left, out_right, None, None)?));
         }
+    }
+    let windows = build_any_windows(&first, &second).map_err(PyValueError::new_err)?;
+    if windows.left_index.is_empty() {
+        return Ok(None);
     }
     let (out_left, out_right) =
         materialize_range_candidates(&windows, &parsed, metadata.as_deref(), keep)
@@ -2148,18 +2283,6 @@ pub(crate) fn aggregate_range_extended<'py>(
     let (parsed, metadata) =
         super::join_aggregation_helpers::residuals(py, predicates, false, true)?;
     super::predicate::check_predicate_lengths(&parsed, first.left_len(), first.right_len())?;
-    let first_windows = first.windows(true).map_err(PyValueError::new_err)?;
-    let first_bounds = FirstAnchorWindows {
-        starts: first_windows.starts.clone(),
-        ends: first_windows.ends.clone(),
-        left_positions: first_windows.left_positions.clone(),
-    };
-    let second_windows = second.windows(false).map_err(PyValueError::new_err)?;
-    let windows =
-        intersect_windows(first_windows, second_windows).map_err(PyValueError::new_err)?;
-    if windows.left_index.is_empty() {
-        return Ok(None);
-    }
 
     let left_index = left_index.extract::<PyReadonlyArray1<'py, i64>>()?;
     let right_index = right_index.extract::<PyReadonlyArray1<'py, i64>>()?;
@@ -2181,10 +2304,9 @@ pub(crate) fn aggregate_range_extended<'py>(
     if !reverse && metadata.is_none() && parsed.len() == 1 {
         if let Some(result) = aggregate_envelope_rank_sweep(
             py,
+            &first,
             &second,
             &parsed[0],
-            &first_bounds,
-            &windows,
             aggregations,
             output_positions,
             output_len,
@@ -2193,6 +2315,10 @@ pub(crate) fn aggregate_range_extended<'py>(
         )? {
             return Ok(result);
         }
+    }
+    let windows = build_any_windows(&first, &second).map_err(PyValueError::new_err)?;
+    if windows.left_index.is_empty() {
+        return Ok(None);
     }
     aggregate_range_windows(
         py,
@@ -2209,14 +2335,136 @@ pub(crate) fn aggregate_range_extended<'py>(
     )
 }
 
-/// The first anchor's own windows, kept before intersection.
+/// What the envelope sweeps need from the first anchor, without storing
+/// its windows.
 ///
-/// Every left row is retained (empty windows included), and
-/// `left_positions[row]` is the compact left slot that row aggregates into.
-struct FirstAnchorWindows {
-    starts: Vec<usize>,
-    ends: Vec<usize>,
-    left_positions: Vec<usize>,
+/// A `<`/`<=` first anchor gives every left row a suffix of the right
+/// layout and a `>`/`>=` anchor a prefix, so the sweep only needs each row's
+/// window boundary, which it searches when it builds its queries. Storing
+/// the first anchor's windows for every left row cost three vectors of
+/// left length (about 1 GB for Arun's 40M rows).
+struct FirstAnchorSweep<'a> {
+    search: AnchorSearch<'a>,
+    /// Every window is a suffix (`<`/`<=`); otherwise every one is a prefix.
+    suffix: bool,
+    left_len: usize,
+    right_len: usize,
+    /// Total size of the two anchors' intersected windows: the work the
+    /// residual traversal would do, which the sweep's cost gate compares.
+    candidate_width: usize,
+}
+
+impl<'a> FirstAnchorSweep<'a> {
+    /// Search both anchors row by row and total the intersected widths.
+    ///
+    /// Returns `None` when the second anchor's windows reach beyond the
+    /// first anchor's right layout; the caller's window builder reports
+    /// that misalignment.
+    fn new(
+        first: &'a AnyParsedRangePredicate<'_>,
+        second: &AnyParsedRangePredicate<'_>,
+    ) -> Option<Self> {
+        let search = first.search();
+        let second_search = second.search();
+        let (left_len, right_len) = (first.left_len(), first.right_len());
+        // Rows, positions and thresholds are stored as `u32` below.
+        if second.left_len() != left_len
+            || u32::try_from(left_len).is_err()
+            || u32::try_from(right_len).is_err()
+        {
+            return None;
+        }
+        // ELI5: the width only feeds a cost guess, so estimate it from a
+        // few evenly spaced batches of rows instead of searching every row.
+        // An exact pass searched both anchors for every left row, then the
+        // fallback searched them all again whenever the sweep declined;
+        // sparse joins ran up to 1.5x slower. Misaligned anchors cannot
+        // reach the sweep: the envelope proof requires equal right lengths,
+        // and the fallback window builder checks every row.
+        let sampled = SWEEP_WIDTH_SAMPLE_BLOCKS * SWEEP_WIDTH_SAMPLE_ROWS;
+        let mut candidate_width = 0_usize;
+        let mut count_width = |_: usize, first: (usize, usize), second: (usize, usize)| {
+            candidate_width = candidate_width
+                .saturating_add(first.1.min(second.1).saturating_sub(first.0.max(second.0)));
+        };
+        if left_len <= sampled {
+            for_each_window_pair(&search, &second_search, 0..left_len, &mut count_width);
+        } else {
+            let stride = left_len / SWEEP_WIDTH_SAMPLE_BLOCKS;
+            for block in 0..SWEEP_WIDTH_SAMPLE_BLOCKS {
+                let start = block * stride;
+                let rows = start..start + SWEEP_WIDTH_SAMPLE_ROWS;
+                for_each_window_pair(&search, &second_search, rows, &mut count_width);
+            }
+            candidate_width = (candidate_width as f64 * left_len as f64 / sampled as f64) as usize;
+        }
+        let suffix = matches!(search.op(), CompareOp::Lt | CompareOp::Le);
+        Some(Self {
+            search,
+            suffix,
+            left_len,
+            right_len,
+            candidate_width,
+        })
+    }
+
+    /// Right positions visible to a row whose first-anchor window is
+    /// `(start, end)`, counted in insertion order: from the end for a suffix
+    /// window, from the start for a prefix.
+    #[inline]
+    fn visible(&self, (start, end): (usize, usize)) -> usize {
+        if self.suffix {
+            self.right_len.saturating_sub(start)
+        } else {
+            end
+        }
+    }
+
+    /// Left rows that can match, bucketed by visible count.
+    ///
+    /// Returns `(queries, bin_ends)`: every query packs `row` in its low 32
+    /// bits and the row's threshold in the high 32, and the queries for
+    /// visible count `v` are `queries[bin_ends[v - 1]..bin_ends[v]]`.
+    ///
+    /// ELI5: sort the left rows into numbered bins, one per visible count,
+    /// then read the bins in order. A visible count is at most the right
+    /// length, so this counting sort is O(left + right). Packing the
+    /// threshold next to the row keeps the sweep reading one array in order
+    /// (8 bytes per row) instead of hopping between per-row arrays; sorting
+    /// `(visible, threshold, row)` tuples held 24 bytes per row (1.5 GiB of
+    /// capacity for 40M rows).
+    fn bucket_queries(&self, thresholds: &[u32], rank_count: usize) -> (Vec<u64>, Vec<usize>) {
+        let mut visible = Vec::with_capacity(self.left_len);
+        let mut bin_ends = vec![0_usize; self.right_len + 1];
+        for_each_window(&self.search, self.left_len, |row, window| {
+            let count = if (thresholds[row] as usize) < rank_count {
+                self.visible(window)
+            } else {
+                0
+            };
+            visible.push(count as u32);
+            bin_ends[count] += 1;
+        });
+        // Bin 0 holds rows that cannot match; it stays out of the queries.
+        bin_ends[0] = 0;
+        for bin in 1..bin_ends.len() {
+            bin_ends[bin] += bin_ends[bin - 1];
+        }
+        // `cursor[v]` is where bin `v` starts: the previous bin's end.
+        let mut cursor: Vec<usize> = std::iter::once(0)
+            .chain(bin_ends.iter().copied())
+            .take(bin_ends.len())
+            .collect();
+        let mut queries = vec![0_u64; bin_ends[self.right_len]];
+        for (row, &count) in visible.iter().enumerate() {
+            if count > 0 {
+                let slot = &mut cursor[count as usize];
+                queries[*slot] = row as u64 | (u64::from(thresholds[row]) << 32);
+                *slot += 1;
+            }
+        }
+        (queries, bin_ends)
+    }
 }
 
 /// Rank thresholds for a residual range predicate over one right layout.
@@ -2234,7 +2482,7 @@ fn residual_rank_thresholds<T: PartialOrd + Copy>(
     left: ArrayView1<'_, T>,
     right: ArrayView1<'_, T>,
     op: super::compare_op::CompareOp,
-) -> (Vec<usize>, usize, Vec<usize>) {
+) -> (Vec<usize>, usize, Vec<u32>) {
     use super::compare_op::CompareOp;
     use std::cmp::Ordering;
     let mut distinct: Vec<T> = right.iter().copied().collect();
@@ -2265,6 +2513,9 @@ fn residual_rank_thresholds<T: PartialOrd + Copy>(
             CompareOp::Ge => count - distinct.partition_point(|candidate| *candidate <= value),
             CompareOp::Eq | CompareOp::Ne => unreachable!("caller checks range operators"),
         })
+        // The caller declines right layouts longer than `u32::MAX`, so a
+        // threshold (at most the distinct count) always fits.
+        .map(|threshold| threshold as u32)
         .collect();
     (ranks, count, thresholds)
 }
@@ -2521,7 +2772,7 @@ fn residual_density_sample_dispatch(
 fn envelope_residual_ranks(
     second: &AnyParsedRangePredicate<'_>,
     residual: &super::predicate::Predicate<'_>,
-) -> Option<(Vec<usize>, usize, Vec<usize>)> {
+) -> Option<(Vec<usize>, usize, Vec<u32>)> {
     use super::compare_op::CompareOp;
     use super::predicate::PredicateView;
 
@@ -2590,31 +2841,14 @@ fn envelope_residual_ranks(
 /// too small to repay the tree, so the caller keeps the residual scan.
 /// Otherwise the pairs are emitted in left-row order, as the scan does.
 fn select_envelope_rank_sweep(
+    first: &AnyParsedRangePredicate<'_>,
     second: &AnyParsedRangePredicate<'_>,
     residual: &super::predicate::Predicate<'_>,
-    first_bounds: &FirstAnchorWindows,
-    windows: &SingleJoinResult,
     keep: Keep,
 ) -> Option<(Vec<i64>, Vec<i64>)> {
-    let FirstAnchorWindows {
-        starts: first_starts,
-        ends: first_ends,
-        left_positions,
-    } = first_bounds;
-    let right_len = windows.right_index.len();
-    let candidate_width = windows
-        .starts
-        .iter()
-        .zip(&windows.ends)
-        .fold(0_usize, |total, (start, end)| {
-            total.saturating_add(end.saturating_sub(*start))
-        });
-    if !should_use_rank_sweep(first_starts.len(), candidate_width, right_len, right_len) {
-        return None;
-    }
-    let suffix = first_ends.iter().all(|&end| end == right_len);
-    let prefix = first_starts.iter().all(|&start| start == 0);
-    if !(suffix || prefix) {
+    let sweep = FirstAnchorSweep::new(first, second)?;
+    let (left_len, right_len, suffix) = (sweep.left_len, sweep.right_len, sweep.suffix);
+    if !should_use_segment_tree(left_len, sweep.candidate_width, right_len) {
         return None;
     }
     let (sampled, surviving) =
@@ -2633,75 +2867,65 @@ fn select_envelope_rank_sweep(
 
     #[cfg(test)]
     ENVELOPE_KEEP_SWEEP_HITS.with(|hits| hits.set(hits.get() + 1));
-    let labels = &windows.right_index;
+    let (left_labels, labels) = first.labels();
     let better = |candidate: i64, current: i64| match keep {
         Keep::First => candidate < current,
         _ => candidate > current,
     };
-    // `(visible, query prefix length, row)`: the row's window holds the
-    // first `visible` inserted positions, and positions with rank at or
-    // above its threshold sit in reversed-rank slots `0..rank_count -
-    // threshold`.
-    let mut queries: Vec<(usize, usize, usize)> = (0..first_starts.len())
-        .filter_map(|row| {
-            let threshold = *thresholds.get(left_positions[row])?;
-            let visible = if suffix {
-                right_len.saturating_sub(first_starts[row])
-            } else {
-                first_ends[row]
-            };
-            (threshold < rank_count && visible > 0).then_some((
-                visible,
-                rank_count - threshold,
-                row,
-            ))
-        })
-        .collect();
-    queries.sort_unstable_by_key(|&(visible, _, _)| visible);
+    // A row's window holds the first `visible` inserted positions, and
+    // positions with rank at or above its threshold sit in reversed-rank
+    // slots `1..=rank_count - threshold`.
+    let (queries, bin_ends) = sweep.bucket_queries(&thresholds, rank_count);
+    drop(thresholds);
 
-    let mut tree: Vec<Option<i64>> = vec![None; rank_count + 1];
-    // Indexed by compact left position, which is how the intersected
-    // windows name their rows.
-    let mut selected: Vec<Option<i64>> = vec![None; thresholds.len()];
-    let mut inserted = 0_usize;
-    for (visible, prefix_len, row) in queries {
-        while inserted < visible {
-            let position = if suffix {
-                right_len - 1 - inserted
-            } else {
-                inserted
-            };
-            let label = labels[position];
-            let mut slot = rank_count - ranks[position];
-            while slot <= rank_count {
-                if tree[slot].is_none_or(|current| better(label, current)) {
-                    tree[slot] = Some(label);
-                }
-                slot += slot.isolate_lowest_one();
+    // Tree nodes and selections hold right positions (`NONE` when empty)
+    // rather than `Option<i64>` labels: 4 bytes per left row instead of 16.
+    const NONE: u32 = u32::MAX;
+    let wins = |candidate: u32, current: u32| {
+        current == NONE || better(labels[candidate as usize], labels[current as usize])
+    };
+    let mut tree = vec![NONE; rank_count + 1];
+    let mut selected = vec![NONE; left_len];
+    for visible in 1..bin_ends.len() {
+        // Insert the one position that becomes visible at this count.
+        let inserted = visible - 1;
+        let position = if suffix {
+            right_len - 1 - inserted
+        } else {
+            inserted
+        };
+        let mut slot = rank_count - ranks[position];
+        while slot <= rank_count {
+            if wins(position as u32, tree[slot]) {
+                tree[slot] = position as u32;
             }
-            inserted += 1;
+            slot += slot.isolate_lowest_one();
         }
-        let mut best = None;
-        let mut slot = prefix_len;
-        while slot > 0 {
-            if let Some(label) = tree[slot] {
-                if best.is_none_or(|current| better(label, current)) {
-                    best = Some(label);
+        for &query in &queries[bin_ends[visible - 1]..bin_ends[visible]] {
+            let (row, threshold) = ((query as u32) as usize, (query >> 32) as usize);
+            let mut best = NONE;
+            let mut slot = rank_count - threshold;
+            while slot > 0 {
+                if tree[slot] != NONE && wins(tree[slot], best) {
+                    best = tree[slot];
                 }
+                slot -= slot.isolate_lowest_one();
             }
-            slot -= slot.isolate_lowest_one();
+            selected[row] = best;
         }
-        selected[left_positions[row]] = best;
     }
 
-    // ELI5: a left row whose intersected window is empty has no match, so
-    // walk the intersected rows; they also carry the left labels.
-    let mut out_left = Vec::with_capacity(windows.left_index.len());
-    let mut out_right = Vec::with_capacity(windows.left_index.len());
-    for (window_row, &left_position) in windows.left_positions.iter().enumerate() {
-        if let Some(label) = selected[left_position] {
-            out_left.push(windows.left_index[window_row]);
-            out_right.push(label);
+    // Pairs in left-row order, as the residual scan emits them.
+    let matched = selected
+        .iter()
+        .filter(|&&position| position != NONE)
+        .count();
+    let mut out_left = Vec::with_capacity(matched);
+    let mut out_right = Vec::with_capacity(matched);
+    for (row, position) in selected.into_iter().enumerate() {
+        if position != NONE {
+            out_left.push(left_labels[row]);
+            out_right.push(labels[position as usize]);
         }
     }
     Some((out_left, out_right))
@@ -2730,10 +2954,9 @@ fn select_envelope_rank_sweep(
 #[allow(clippy::too_many_arguments)]
 fn aggregate_envelope_rank_sweep<'py>(
     py: Python<'py>,
+    first: &AnyParsedRangePredicate<'_>,
     second: &AnyParsedRangePredicate<'_>,
     residual: &super::predicate::Predicate<'_>,
-    first_bounds: &FirstAnchorWindows,
-    windows: &SingleJoinResult,
     aggregations: &Bound<'py, PyList>,
     output_positions: Option<ArrayView1<'_, i64>>,
     output_len: usize,
@@ -2744,33 +2967,13 @@ fn aggregate_envelope_rank_sweep<'py>(
         make_results_with_positions, parse_inputs, AggregationSet,
     };
 
-    let FirstAnchorWindows {
-        starts: first_starts,
-        ends: first_ends,
-        left_positions,
-    } = first_bounds;
-    let inputs = parse_inputs(aggregations)?;
-    if inputs.is_empty() {
-        return Err(PyValueError::new_err(
-            "at least one aggregation is required",
-        ));
-    }
-    let Some(state_bytes) = rank_sweep_state_bytes(&inputs) else {
+    let Some(sweep) = FirstAnchorSweep::new(first, second) else {
         return Ok(None);
     };
-    let candidate_width = windows
-        .starts
-        .iter()
-        .zip(&windows.ends)
-        .fold(0_usize, |total, (start, end)| {
-            total.saturating_add(end.saturating_sub(*start))
-        });
-    if !should_use_rank_sweep(first_starts.len(), candidate_width, source_len, source_len) {
-        return Ok(None);
-    }
-    let suffix = first_ends.iter().all(|&end| end == source_len);
-    let prefix = first_starts.iter().all(|&start| start == 0);
-    if !(suffix || prefix) {
+    let suffix = sweep.suffix;
+    // The sweep replaces a traversal of the intersected windows; only take
+    // it when that traversal is large next to building and querying a tree.
+    if !should_use_segment_tree(sweep.left_len, sweep.candidate_width, source_len) {
         return Ok(None);
     }
     let inputs = parse_inputs(aggregations)?;
@@ -2811,24 +3014,18 @@ fn aggregate_envelope_rank_sweep<'py>(
     } else {
         (0..source_len).collect()
     };
-    let mut queries: Vec<(usize, usize, usize)> = (0..first_starts.len())
-        .filter_map(|row| {
-            let left_position = left_positions[row];
-            let threshold = *thresholds.get(left_position)?;
-            if threshold >= rank_count {
-                return None;
-            }
-            let visible = if suffix {
-                source_len.saturating_sub(first_starts[row])
-            } else {
-                first_ends[row]
-            };
-            Some((visible, threshold, left_position))
-        })
-        .filter(|&(visible, _, _)| visible > 0)
-        .collect();
-    queries.sort_unstable_by_key(|&(visible, _, _)| visible);
-    set.aggregate_rank_threshold_sweep(&insertion_order, &ranks, rank_count, &queries, &inputs);
+    let (queries, bin_ends) = sweep.bucket_queries(&thresholds, rank_count);
+    drop(thresholds);
+    // Every left row is its own compact output slot here, so the packed
+    // `(row, threshold)` queries are already `(slot, threshold)`.
+    set.aggregate_rank_threshold_sweep(
+        &insertion_order,
+        &ranks,
+        rank_count,
+        &queries,
+        &bin_ends,
+        &inputs,
+    );
     if set.is_empty() {
         return Ok(Some(None));
     }
@@ -5290,6 +5487,33 @@ mod envelope_keep_sweep_tests {
     }
 
     #[test]
+    fn envelope_keep_sweep_estimates_width_on_large_left() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // More left rows than the width sample covers, so the gate runs
+            // on the sampled estimate rather than an exact pass.
+            let mut rng = XorShift(0x1A26_E5A3);
+            let fixture = fixture(&mut rng, 12_000, 300);
+            let (first_op, second_op) = (CompareOp::Le, CompareOp::Gt);
+            let anchor = envelope(&fixture.right_second, second_op);
+            for keep in ["first", "last"] {
+                let before = keep_hits();
+                let observed = run(
+                    py, &fixture, first_op, &anchor, second_op, false, false, keep,
+                )?;
+                assert!(keep_hits() > before, "sweep did not run for keep={keep}");
+                assert_eq!(
+                    observed,
+                    bruteforce(&fixture, first_op, &anchor, second_op, false, keep),
+                    "keep={keep}"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn envelope_keep_sweep_falls_back_when_not_provable() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
@@ -5354,5 +5578,167 @@ mod envelope_keep_sweep_tests {
             Ok(())
         })
         .unwrap();
+    }
+}
+
+/// Streaming window intersection against the stored-window reference.
+#[cfg(test)]
+mod streaming_window_tests {
+    use super::*;
+    use numpy::PyArray1;
+    use pyo3::IntoPyObject;
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn below(&mut self, bound: u64) -> i64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound) as i64
+        }
+    }
+
+    fn anchor<'py>(
+        py: Python<'py>,
+        left: &[i64],
+        right: &[i64],
+        left_index: &Bound<'py, PyAny>,
+        right_index: &Bound<'py, PyAny>,
+        op: &str,
+        as_float: bool,
+    ) -> PyResult<AnyParsedRangePredicate<'py>> {
+        let (left, right) = if as_float {
+            (
+                PyArray1::from_vec(py, left.iter().map(|&v| v as f64 / 4.0).collect()).into_any(),
+                PyArray1::from_vec(py, right.iter().map(|&v| v as f64 / 4.0).collect()).into_any(),
+            )
+        } else {
+            (
+                PyArray1::from_vec(py, left.to_vec()).into_any(),
+                PyArray1::from_vec(py, right.to_vec()).into_any(),
+            )
+        };
+        parse_any_range_parts(
+            &left,
+            left_index,
+            &right,
+            right_index,
+            &op.into_pyobject(py)?.into_any(),
+        )
+    }
+
+    #[test]
+    fn streaming_windows_match_stored_intersection() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let mut rng = XorShift(0xC0FF_EE11);
+            for (left_len, right_len) in [(0, 5), (5, 0), (1, 1), (300, 200), (1_000, 37)] {
+                let mut first_right: Vec<i64> = (0..right_len).map(|_| rng.below(100)).collect();
+                first_right.sort_unstable();
+                // A sorted second layout, as an envelope anchor would be.
+                let mut second_right: Vec<i64> = (0..right_len).map(|_| rng.below(100)).collect();
+                second_right.sort_unstable();
+                let first_left: Vec<i64> = (0..left_len).map(|_| rng.below(110) - 5).collect();
+                let second_left: Vec<i64> = (0..left_len).map(|_| rng.below(110) - 5).collect();
+                let left_index =
+                    PyArray1::from_vec(py, (0..left_len as i64).map(|v| v * 2 + 1).collect())
+                        .into_any();
+                let right_index =
+                    PyArray1::from_vec(py, (0..right_len as i64).map(|v| 500 - v).collect())
+                        .into_any();
+                for first_op in ["<", "<=", ">", ">="] {
+                    for second_op in ["<", "<=", ">", ">="] {
+                        for as_float in [false, true] {
+                            let first = anchor(
+                                py,
+                                &first_left,
+                                &first_right,
+                                &left_index,
+                                &right_index,
+                                first_op,
+                                as_float,
+                            )?;
+                            let second = anchor(
+                                py,
+                                &second_left,
+                                &second_right,
+                                &left_index,
+                                &right_index,
+                                second_op,
+                                as_float,
+                            )?;
+                            let streamed = build_any_windows(&first, &second)
+                                .map_err(PyValueError::new_err)?;
+                            let stored = intersect_windows(
+                                first.windows(true).map_err(PyValueError::new_err)?,
+                                second.windows(false).map_err(PyValueError::new_err)?,
+                            )
+                            .map_err(PyValueError::new_err)?;
+                            let context = format!(
+                                "{left_len}x{right_len} {first_op} {second_op} float={as_float}"
+                            );
+                            assert_eq!(streamed.left_positions, stored.left_positions, "{context}");
+                            assert_eq!(streamed.left_index, stored.left_index, "{context}");
+                            assert_eq!(streamed.starts, stored.starts, "{context}");
+                            assert_eq!(streamed.ends, stored.ends, "{context}");
+                            if left_len > 0 {
+                                assert_eq!(streamed.right_index, stored.right_index, "{context}");
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod review_probe_tests {
+    use super::*;
+    use numpy::PyArray1;
+    use pyo3::IntoPyObject;
+
+    fn t<'py>(py: Python<'py>, l: Vec<i64>, r: Vec<i64>, op: &str) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, [PyArray1::from_vec(py, l).into_any(), PyArray1::from_vec(py, r).into_any(), op.into_pyobject(py)?.into_any()])
+    }
+
+    fn probe(short_left: bool, keep: &str) -> String {
+        Python::initialize();
+        Python::attach(|py| {
+            let (n, m) = (12_000_usize, 300_usize);
+            let lf: Vec<i64> = (0..n as i64).map(|v| v % 500).collect();
+            let rf: Vec<i64> = (0..m as i64).map(|v| v * 500 / m as i64).collect();
+            let ls: Vec<i64> = (0..n as i64).map(|v| (v * 7) % 500).collect();
+            let rs: Vec<i64> = (0..m as i64).map(|v| (v * 13) % 500).collect();
+            let mut env = rs.clone();
+            for p in (0..m - 1).rev() { env[p] = env[p].min(env[p + 1]); }
+            let preds = PyList::new(py, [
+                t(py, lf, rf, "<=").unwrap(),
+                t(py, ls.clone(), env, ">").unwrap(),
+                t(py, ls, rs, ">").unwrap(),
+            ]).unwrap();
+            let mut li: Vec<i64> = (0..n as i64).collect();
+            let mut ri: Vec<i64> = (0..m as i64).collect();
+            if short_left { li.pop(); } else { ri.pop(); }
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                range_join_extended_indices(py, &preds, PyArray1::from_vec(py, li).into_any(), PyArray1::from_vec(py, ri).into_any(), keep)
+            }));
+            match res {
+                Err(_) => "RUST PANIC".to_owned(),
+                Ok(Err(e)) => format!("PyErr: {e}"),
+                Ok(Ok(_)) => "Ok".to_owned(),
+            }
+        })
+    }
+
+    #[test]
+    fn review_probe_label_length_mismatch() {
+        for keep in ["first", "all"] {
+            eprintln!("PROBE short left_index keep={keep}: {}", probe(true, keep));
+            eprintln!("PROBE short right_index keep={keep}: {}", probe(false, keep));
+        }
     }
 }

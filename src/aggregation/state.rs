@@ -504,11 +504,12 @@ impl<'a> AggregationSet<'a> {
     /// Aggregate rows whose matches are a growing prefix of an insertion
     /// order, filtered by a rank threshold, with an insert-only rank tree.
     ///
-    /// Row `query.0` positions of `insertion_order` have been inserted when a
-    /// query is answered; it matches every inserted source position whose
-    /// `position_ranks` entry is at least `query.1`, and merges their
-    /// aggregate into output slot `query.2`. Queries must be sorted by their
-    /// inserted-prefix length. A rank of `usize::MAX` is never inserted.
+    /// Queries arrive bucketed by inserted-prefix length: the queries in
+    /// `queries[bin_ends[v - 1]..bin_ends[v]]` are answered once the first
+    /// `v` positions of `insertion_order` have been inserted. Each query
+    /// matches every inserted source position whose `position_ranks` entry
+    /// is at least its threshold rank, and merges their aggregate into its
+    /// output slot. A rank of `usize::MAX` is never inserted.
     ///
     /// ELI5: cards arrive one at a time and are filed by their rank. Each
     /// question asks "of the cards that have arrived so far, combine every
@@ -526,18 +527,21 @@ impl<'a> AggregationSet<'a> {
     ///   visible to later queries.
     /// * `position_ranks` - Rank of every source position, or `usize::MAX`.
     /// * `rank_count` - One past the largest rank in `position_ranks`.
-    /// * `queries` - `(inserted_prefix_len, threshold_rank, output_slot)`,
-    ///   sorted by `inserted_prefix_len`.
+    /// * `queries` - One `u64` per query: the output slot in the low 32
+    ///   bits and the threshold rank in the high 32. Packing keeps 8 bytes
+    ///   per output row; `(prefix, threshold, slot)` tuples held 24.
+    /// * `bin_ends` - Cumulative query counts per inserted-prefix length;
+    ///   `bin_ends[0]` is 0.
     /// * `inputs` - The aggregation inputs this set was built from.
     pub(crate) fn aggregate_rank_threshold_sweep(
         &mut self,
         insertion_order: &[usize],
         position_ranks: &[usize],
         rank_count: usize,
-        queries: &[(usize, usize, usize)],
+        queries: &[u64],
+        bin_ends: &[usize],
         inputs: &'a [AggregationInput<'_>],
     ) {
-        debug_assert!(queries.windows(2).all(|pair| pair[0].0 <= pair[1].0));
         if rank_count == 0 || queries.is_empty() {
             return;
         }
@@ -548,8 +552,14 @@ impl<'a> AggregationSet<'a> {
         let mut inserted = 0_usize;
         let mut nodes = Vec::new();
         let mut right_nodes = Vec::new();
-        for &(prefix_len, threshold, output_slot) in queries {
-            let prefix_len = prefix_len.min(insertion_order.len());
+        // A plain slice loop on purpose: driving this loop from a generic
+        // iterator made the Arun 40M count sweep 0.4-0.8 s slower.
+        for bin in 1..bin_ends.len() {
+            let bin_queries = &queries[bin_ends[bin - 1]..bin_ends[bin]];
+            if bin_queries.is_empty() {
+                continue;
+            }
+            let prefix_len = bin.min(insertion_order.len());
             for &position in &insertion_order[inserted.min(prefix_len)..prefix_len] {
                 let rank = position_ranks[position];
                 if rank != usize::MAX {
@@ -557,30 +567,34 @@ impl<'a> AggregationSet<'a> {
                 }
             }
             inserted = inserted.max(prefix_len);
-            if threshold >= rank_count {
-                continue;
-            }
-            // ELI5: collect the few summary boxes that exactly cover ranks
-            // `threshold..`, walking the usual half-open range up the tree;
-            // the empty padding leaves past `rank_count` are identities.
-            nodes.clear();
-            right_nodes.clear();
-            let mut left = tree_size + threshold;
-            let mut right = tree_output_len;
-            while left < right {
-                if left & 1 == 1 {
-                    nodes.push(left);
-                    left += 1;
+            for &query in bin_queries {
+                let output_slot = (query as u32) as usize;
+                let threshold = (query >> 32) as usize;
+                if threshold >= rank_count {
+                    continue;
                 }
-                if right & 1 == 1 {
-                    right -= 1;
-                    right_nodes.push(right);
+                // ELI5: collect the few summary boxes that exactly cover ranks
+                // `threshold..`, walking the usual half-open range up the tree;
+                // the empty padding leaves past `rank_count` are identities.
+                nodes.clear();
+                right_nodes.clear();
+                let mut left = tree_size + threshold;
+                let mut right = tree_output_len;
+                while left < right {
+                    if left & 1 == 1 {
+                        nodes.push(left);
+                        left += 1;
+                    }
+                    if right & 1 == 1 {
+                        right -= 1;
+                        right_nodes.push(right);
+                    }
+                    left /= 2;
+                    right /= 2;
                 }
-                left /= 2;
-                right /= 2;
-            }
-            for &node in nodes.iter().chain(right_nodes.iter().rev()) {
-                self.merge_output_from(&tree, node, output_slot);
+                for &node in nodes.iter().chain(right_nodes.iter().rev()) {
+                    self.merge_output_from(&tree, node, output_slot);
+                }
             }
         }
     }

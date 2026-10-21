@@ -1659,13 +1659,42 @@ first/last must see every match to find the smallest or largest right
 label, and the windows held 5.5 billion matches.
 **Learning**: Once `anchor_is_envelope_of` proves the second anchor is the
 residual's envelope, a row's matches are "positions in a growing prefix or
-suffix whose residual rank clears a threshold". A Fenwick tree over reversed
-residual ranks that keeps the best label per node answers each row with one
-prefix query after inserting right positions in window-growth order:
-`select_envelope_rank_sweep`, O((left + right) log right). An envelope always
-admits a superset of the residual's matches, so the drop is exact.
-**Recommendation**: Keep `any` and `all` on the residual scan, share
-`envelope_residual_ranks` with the aggregation sweep, and use the sampled
-survivor-count gate plus the selector workspace budget before building the
-rank tree. The estimate compares sampled survivors scaled to total candidate
-width against the 64x right-side build cost.
+suffix whose residual rank clears a threshold" (the same shape as the
+#267 aggregation sweep). A Fenwick tree over reversed residual ranks that
+keeps the best label per node answers each row with one prefix query after
+inserting right positions in window-growth order:
+`select_envelope_rank_sweep`, O((left + right) log right). An envelope
+always admits a superset of the residual's matches, so the drop is exact
+for every operator pairing, not only the opposing ones pyjanitor sends.
+**Recommendation**: Keep `any` and `all` on the residual scan: `any`
+already stops early, and `all` must emit every pair. Gate the sweep with
+`should_use_segment_tree` on the intersected width so sparse joins keep the
+scan, and share `envelope_residual_ranks` with the aggregation sweep rather
+than re-deriving the proof.
+
+### [2026-10-21] Dual-range windows: stream the intersection, size per-row state
+**Context**: For a 40M-row left table, `range_join_extended_*` held about
+5 GiB of transient memory on 0.5 GiB of input. Each anchor's windows were
+built for every left row (four `usize`-wide vectors grown by doubling, so
+512 MiB of capacity each), both anchors at once, before the intersection
+kept only the overlapping rows. The envelope sweeps then cloned the first
+anchor's windows and sorted 24-byte `(visible, threshold, row)` tuples.
+**Learning**: Only the intersection is needed, so compute it in batches of
+`WINDOW_CHUNK` rows (`for_each_window_pair`), running each anchor's binary
+searches in its own typed loop per batch. A fused loop that searched both
+anchors per row was about 13% slower than the old separate passes, because
+the CPU could no longer overlap neighbouring rows' searches; the batched
+version is faster than both. The sweeps need only each row's visible count,
+which a counting sort over `0..=right_len` buckets in O(left + right),
+packing `row | threshold << 32` into one `u64`. Passing those queries to
+`aggregate_rank_threshold_sweep` through a generic iterator made its loop
+0.4-0.8 s slower on Arun 40M; keep that API on plain slices. The sweep's
+cost gate needs only an estimate of the intersected width: an exact pass
+searched every row once for the gate and again for the fallback, making
+sparse joins where the sweep declines up to 1.5x slower. Sample 32 evenly
+spaced 256-row blocks instead.
+**Recommendation**: Measure memory as peak RSS (sample it while the call
+runs), not memray's allocation peak, when a buffer is reserved at an upper
+bound: untouched reserved pages cost nothing. Check every memory change for
+speed in the same run, since layout changes moved the timing both ways
+here.

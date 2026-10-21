@@ -29,8 +29,10 @@
 
 use super::compare_op::CompareOp;
 use super::join_search::{range_window, range_window_bounds};
+#[cfg(test)]
 use super::join_types::SingleJoinResult;
 use crate::aggregation::common::ensure_equal_lengths_core;
+use numpy::ndarray::ArrayView1;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -39,6 +41,7 @@ use pyo3::prelude::*;
 /// anchor module. The returned bounds address the supplied sorted right-value
 /// layout; the right index labels are copied only when building blocks need
 /// to expose them to Python.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_range_core_with_labels<T: PartialOrd + Copy>(
     left: numpy::ndarray::ArrayView1<'_, T>,
@@ -297,6 +300,7 @@ impl AnyParsedRangePredicate<'_> {
     ///
     /// Returns an error when the value/index arrays are not length-aligned or
     /// the comparator is not a supported range comparator.
+    #[cfg(test)]
     pub(crate) fn windows(&self, include_right_index: bool) -> Result<SingleJoinResult, String> {
         macro_rules! build {
             ($predicate:expr) => {{
@@ -324,6 +328,52 @@ impl AnyParsedRangePredicate<'_> {
             Self::U8(value) => build!(value),
             Self::F64(value) => build!(value),
             Self::F32(value) => build!(value),
+        }
+    }
+
+    /// Borrow this anchor for per-row window searches.
+    ///
+    /// Callers that only need one row's window at a time (streaming window
+    /// intersection, the envelope sweeps) use this instead of
+    /// [`Self::windows`], which stores four values for every left row.
+    pub(crate) fn search(&self) -> AnchorSearch<'_> {
+        macro_rules! search {
+            ($variant:ident, $predicate:expr) => {{
+                let predicate = $predicate;
+                AnchorSearch::$variant(
+                    predicate.left.as_array(),
+                    predicate.right.as_array(),
+                    predicate.op,
+                )
+            }};
+        }
+        match self {
+            Self::I64(value) => search!(I64, value),
+            Self::I32(value) => search!(I32, value),
+            Self::I16(value) => search!(I16, value),
+            Self::I8(value) => search!(I8, value),
+            Self::U64(value) => search!(U64, value),
+            Self::U32(value) => search!(U32, value),
+            Self::U16(value) => search!(U16, value),
+            Self::U8(value) => search!(U8, value),
+            Self::F64(value) => search!(F64, value),
+            Self::F32(value) => search!(F32, value),
+        }
+    }
+
+    /// The anchor's left and right label arrays.
+    pub(crate) fn labels(&self) -> (ArrayView1<'_, i64>, ArrayView1<'_, i64>) {
+        match self {
+            Self::I64(value) => (value.left_index.as_array(), value.right_index.as_array()),
+            Self::I32(value) => (value.left_index.as_array(), value.right_index.as_array()),
+            Self::I16(value) => (value.left_index.as_array(), value.right_index.as_array()),
+            Self::I8(value) => (value.left_index.as_array(), value.right_index.as_array()),
+            Self::U64(value) => (value.left_index.as_array(), value.right_index.as_array()),
+            Self::U32(value) => (value.left_index.as_array(), value.right_index.as_array()),
+            Self::U16(value) => (value.left_index.as_array(), value.right_index.as_array()),
+            Self::U8(value) => (value.left_index.as_array(), value.right_index.as_array()),
+            Self::F64(value) => (value.left_index.as_array(), value.right_index.as_array()),
+            Self::F32(value) => (value.left_index.as_array(), value.right_index.as_array()),
         }
     }
 
@@ -365,6 +415,73 @@ impl AnyParsedRangePredicate<'_> {
             Self::U8(value) => value.right.as_array().len(),
             Self::F64(value) => value.right.as_array().len(),
             Self::F32(value) => value.right.as_array().len(),
+        }
+    }
+}
+
+/// One range anchor borrowed for per-row window searches.
+///
+/// ELI5: instead of writing down every row's shelf range up front, keep the
+/// shelf and the ruler handy and measure a row's range when it is needed.
+pub(crate) enum AnchorSearch<'a> {
+    I64(ArrayView1<'a, i64>, ArrayView1<'a, i64>, CompareOp),
+    I32(ArrayView1<'a, i32>, ArrayView1<'a, i32>, CompareOp),
+    I16(ArrayView1<'a, i16>, ArrayView1<'a, i16>, CompareOp),
+    I8(ArrayView1<'a, i8>, ArrayView1<'a, i8>, CompareOp),
+    U64(ArrayView1<'a, u64>, ArrayView1<'a, u64>, CompareOp),
+    U32(ArrayView1<'a, u32>, ArrayView1<'a, u32>, CompareOp),
+    U16(ArrayView1<'a, u16>, ArrayView1<'a, u16>, CompareOp),
+    U8(ArrayView1<'a, u8>, ArrayView1<'a, u8>, CompareOp),
+    F64(ArrayView1<'a, f64>, ArrayView1<'a, f64>, CompareOp),
+    F32(ArrayView1<'a, f32>, ArrayView1<'a, f32>, CompareOp),
+}
+
+impl AnchorSearch<'_> {
+    /// Windows for rows `first_row..first_row + starts.len()`, written into
+    /// `starts` and `ends`.
+    ///
+    /// The dtype is dispatched once per call, so each anchor's binary
+    /// searches run in a tight typed loop the CPU can overlap across rows.
+    pub(crate) fn windows_into(&self, first_row: usize, starts: &mut [usize], ends: &mut [usize]) {
+        macro_rules! fill {
+            ($left:expr, $right:expr, $op:expr) => {{
+                let rows = first_row..first_row + starts.len();
+                for ((start, end), &value) in starts
+                    .iter_mut()
+                    .zip(ends.iter_mut())
+                    .zip($left.slice(numpy::ndarray::s![rows]).iter())
+                {
+                    (*start, *end) = range_window(value, *$right, *$op);
+                }
+            }};
+        }
+        match self {
+            Self::I64(left, right, op) => fill!(left, right, op),
+            Self::I32(left, right, op) => fill!(left, right, op),
+            Self::I16(left, right, op) => fill!(left, right, op),
+            Self::I8(left, right, op) => fill!(left, right, op),
+            Self::U64(left, right, op) => fill!(left, right, op),
+            Self::U32(left, right, op) => fill!(left, right, op),
+            Self::U16(left, right, op) => fill!(left, right, op),
+            Self::U8(left, right, op) => fill!(left, right, op),
+            Self::F64(left, right, op) => fill!(left, right, op),
+            Self::F32(left, right, op) => fill!(left, right, op),
+        }
+    }
+
+    /// The anchor's comparison operator.
+    pub(crate) fn op(&self) -> CompareOp {
+        match self {
+            Self::I64(_, _, op)
+            | Self::I32(_, _, op)
+            | Self::I16(_, _, op)
+            | Self::I8(_, _, op)
+            | Self::U64(_, _, op)
+            | Self::U32(_, _, op)
+            | Self::U16(_, _, op)
+            | Self::U8(_, _, op)
+            | Self::F64(_, _, op)
+            | Self::F32(_, _, op) => *op,
         }
     }
 }
