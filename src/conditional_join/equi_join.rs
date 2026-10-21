@@ -38,6 +38,8 @@ use crate::aggregation::common::ensure_equal_lengths_core;
 thread_local! {
     static EQUI_STARTS_ENDS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EQUI_RESIDUAL_WINDOW_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SECOND_RANGE_SKIP_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SECOND_RANGE_SUPER_SKIPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 type IndexPairs = Option<(Vec<i64>, Vec<i64>)>;
@@ -223,6 +225,8 @@ fn build_equi_range_indices_core(
                 second_range,
                 equality_starts.view(),
                 equality_ends.view(),
+                &[],
+                None,
                 keep,
             );
         }
@@ -384,6 +388,8 @@ fn materialize_unordered_second_range(
     range: &AnyParsedRangePredicate<'_>,
     equality_starts: ArrayView1<'_, i64>,
     equality_ends: ArrayView1<'_, i64>,
+    residual_predicates: &[PredicateView<'_>],
+    null_metadata: Option<&[NullMetadataView<'_>]>,
     keep: Keep,
 ) -> Result<IndexPairs, String> {
     if !narrow_unordered_second_range_for_predicate(
@@ -395,27 +401,61 @@ fn materialize_unordered_second_range(
     )? {
         return Ok(None);
     }
+    let use_skip = second_range_skip_pays_off(right_index.len(), starts.view(), ends.view());
+    if !use_skip && !residual_predicates.is_empty() {
+        // ELI5: when the shelves are short anyway, keep the residual
+        // checklist that crosses off whole shelves at once; the skip scan only
+        // replaces it when it can skip most of the candidates.
+        return materialize_equi_windows_and_residuals(
+            left_index,
+            right_index,
+            starts.view(),
+            ends.view(),
+            residual_predicates,
+            null_metadata,
+            Some(range),
+            keep,
+        );
+    }
+    // ELI5: the skip scan hands over only candidates that pass the second range;
+    // each one must still pass every residual rule to count as a match.
+    let residuals_pass = |row: usize, right_position: usize| {
+        residual_predicates.is_empty()
+            || predicates_match_dispatch(residual_predicates, null_metadata, row, right_position)
+    };
 
     macro_rules! materialize {
         ($predicate:expr) => {{
             let predicate = $predicate;
             let left = predicate.left.as_array();
             let right = predicate.right.as_array();
+            let scanner = if use_skip {
+                SecondRangeSkipScan::new(right, predicate.op)
+            } else {
+                SecondRangeSkipScan::direct(right, predicate.op)
+            };
             if keep == Keep::All {
                 let mut output_capacity = 0_usize;
                 for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
                     if start < 0 || end < 0 {
                         continue;
                     }
-                    let start = start as usize;
-                    let end = end as usize;
-                    for right_position in start..end {
-                        if predicate.op.apply(&left[row], &right[right_position]) {
-                            output_capacity = output_capacity
-                                .checked_add(1)
-                                .ok_or("equi-join result size exceeds platform capacity")?;
-                        }
-                    }
+                    let (start, end) = (start as usize, end as usize);
+                    let row_matches = if residual_predicates.is_empty() {
+                        scanner.count_matches(left[row], start, end)
+                    } else {
+                        let mut row_matches = 0_usize;
+                        scanner.for_each_match(left[row], start, end, |right_position| {
+                            // ELI5: one window holds at most every right
+                            // row, so a single row's count cannot overflow.
+                            row_matches += usize::from(residuals_pass(row, right_position));
+                            true
+                        });
+                        row_matches
+                    };
+                    output_capacity = output_capacity
+                        .checked_add(row_matches)
+                        .ok_or("equi-join result size exceeds platform capacity")?;
                 }
                 if output_capacity == 0 {
                     return Ok(None);
@@ -426,14 +466,18 @@ fn materialize_unordered_second_range(
                     if start < 0 || end < 0 {
                         continue;
                     }
-                    let start = start as usize;
-                    let end = end as usize;
-                    for right_position in start..end {
-                        if predicate.op.apply(&left[row], &right[right_position]) {
-                            left_output.push(left_index[row]);
-                            right_output.push(right_index[right_position]);
-                        }
-                    }
+                    scanner.for_each_match(
+                        left[row],
+                        start as usize,
+                        end as usize,
+                        |right_position| {
+                            if residuals_pass(row, right_position) {
+                                left_output.push(left_index[row]);
+                                right_output.push(right_index[right_position]);
+                            }
+                            true
+                        },
+                    );
                 }
                 return Ok(Some((left_output, right_output)));
             }
@@ -444,17 +488,11 @@ fn materialize_unordered_second_range(
                 if start < 0 || end < 0 {
                     continue;
                 }
-                let start = start as usize;
-                let end = end as usize;
                 let mut selected = None;
-                for right_position in start..end {
-                    if !predicate.op.apply(&left[row], &right[right_position]) {
-                        continue;
-                    }
-                    if !update_keep_selection(&mut selected, right_position, keep, right_index) {
-                        break;
-                    }
-                }
+                scanner.for_each_match(left[row], start as usize, end as usize, |right_position| {
+                    !residuals_pass(row, right_position)
+                        || update_keep_selection(&mut selected, right_position, keep, right_index)
+                });
                 if let Some(right_position) = selected {
                     left_output.push(left_index[row]);
                     right_output.push(right_index[right_position]);
@@ -669,6 +707,240 @@ fn narrow_unordered_second_range<T: PartialOrd + Copy>(
         }
     }
     Ok(has_active_window)
+}
+
+/// Rows summarized by one block of [`SecondRangeSkipScan`].
+const SECOND_RANGE_BLOCK: usize = 32;
+
+/// Blocks summarized by one super-block (`32 * 32 = 1,024` rows).
+const SECOND_RANGE_SUPER: usize = 32;
+
+/// Windows narrower than this are scanned directly; the block bookkeeping
+/// would cost more than reading a couple of blocks.
+const SECOND_RANGE_DIRECT_WIDTH: usize = 2 * SECOND_RANGE_BLOCK;
+
+/// Two-level block summaries that skip right rows failing an unordered range.
+///
+/// The cumulative envelope can only trim a window's prefix or suffix. One
+/// early right row with an extreme value (a very long interval, say) keeps
+/// every later window wide, and the exact scan then reads many candidates per
+/// match. This index stores the most permissive value of every
+/// `SECOND_RANGE_BLOCK`-row block -- the maximum for `<`/`<=`, the minimum for
+/// `>`/`>=` -- and of every `SECOND_RANGE_SUPER`-block super-block. A query
+/// walks its window left to right, skipping a whole super-block or block
+/// whose summary already fails the predicate, and checks rows exactly only
+/// inside surviving blocks. Positions are therefore reported in ascending
+/// order, exactly like the direct scan.
+///
+/// The cost is about one summary check per 1,024 rows of a sparse window and
+/// one per 32 rows of a dense one, plus the rows of the surviving blocks.
+/// A segment tree prunes sparse windows only marginally better but pays a
+/// per-node descent on dense windows, where nothing can be skipped; measured
+/// on AIList, that made dense joins up to 1.7x slower in the kernel.
+///
+/// ELI5: each box of 32 cards has a sticky note with its best card, and each
+/// crate of 32 boxes has a note with the best card in the crate. Walking down
+/// the aisle, we skip any crate or box whose best card cannot win, and only
+/// open the boxes that might hold a winner.
+///
+/// The summaries cover the whole prepared right layout, so they are
+/// independent of equality windows. A window that starts or ends inside a
+/// block or super-block still reads that summary: it covers a superset of the
+/// window's rows, which can only make skipping less aggressive, never wrong.
+struct SecondRangeSkipScan<'a, T> {
+    values: ArrayView1<'a, T>,
+    /// One summary per block; empty when the scanner reads windows directly.
+    blocks: Vec<T>,
+    /// One summary per super-block of `SECOND_RANGE_SUPER` blocks.
+    supers: Vec<T>,
+    op: CompareOp,
+}
+
+impl<'a, T: PartialOrd + Copy> SecondRangeSkipScan<'a, T> {
+    /// A scanner without summaries: every query reads its window directly.
+    ///
+    /// Used when the candidate windows are too narrow in total to repay the
+    /// summary build (see [`second_range_skip_pays_off`]).
+    fn direct(values: ArrayView1<'a, T>, op: CompareOp) -> Self {
+        Self {
+            values,
+            blocks: Vec::new(),
+            supers: Vec::new(),
+            op,
+        }
+    }
+
+    /// Build block and super-block summaries for `left op right`.
+    ///
+    /// `op` must be a range comparator.
+    fn new(values: ArrayView1<'a, T>, op: CompareOp) -> Self {
+        debug_assert!(!matches!(op, CompareOp::Eq | CompareOp::Ne));
+        // `left < right` needs some right value above `left`, so a block's
+        // most permissive value is its maximum; `left > right` needs one
+        // below, so it is the minimum.
+        let use_max = matches!(op, CompareOp::Lt | CompareOp::Le);
+        let most_permissive = |chunk: &mut dyn Iterator<Item = T>| {
+            let mut current = chunk.next().expect("summary chunks are non-empty");
+            for value in chunk {
+                let better = if use_max {
+                    value > current
+                } else {
+                    value < current
+                };
+                if better {
+                    current = value;
+                }
+            }
+            current
+        };
+        let block_count = values.len().div_ceil(SECOND_RANGE_BLOCK);
+        let blocks: Vec<T> = (0..block_count)
+            .map(|block| {
+                let start = block * SECOND_RANGE_BLOCK;
+                let end = (start + SECOND_RANGE_BLOCK).min(values.len());
+                most_permissive(&mut (start..end).map(|position| values[position]))
+            })
+            .collect();
+        let supers = blocks
+            .chunks(SECOND_RANGE_SUPER)
+            .map(|chunk| most_permissive(&mut chunk.iter().copied()))
+            .collect();
+        Self {
+            values,
+            blocks,
+            supers,
+            op,
+        }
+    }
+
+    /// Call `emit` for every position in `[start, end)` whose right value
+    /// satisfies `left op right`, in ascending position order.
+    ///
+    /// `emit` returns `false` to stop the query early (used by `keep="any"`
+    /// and the `first`/`last` selection helper).
+    /// The caller guarantees `start <= end <= values.len()`.
+    #[inline]
+    fn for_each_match(
+        &self,
+        left: T,
+        start: usize,
+        end: usize,
+        mut emit: impl FnMut(usize) -> bool,
+    ) {
+        debug_assert!(start <= end && end <= self.values.len());
+        if self.blocks.is_empty() || end - start < SECOND_RANGE_DIRECT_WIDTH {
+            for position in start..end {
+                if self.op.apply(&left, &self.values[position]) && !emit(position) {
+                    return;
+                }
+            }
+            return;
+        }
+        #[cfg(test)]
+        SECOND_RANGE_SKIP_HITS.with(|hits| hits.set(hits.get() + 1));
+        let mut block = start / SECOND_RANGE_BLOCK;
+        let last_block = (end - 1) / SECOND_RANGE_BLOCK;
+        while block <= last_block {
+            // ELI5: at the front door of a crate, read the crate's note. If
+            // even its best card loses, walk past all 32 boxes at once. A
+            // crate the window only partly covers is checked the same way:
+            // its note covers more cards than we need, never fewer.
+            if block.is_multiple_of(SECOND_RANGE_SUPER)
+                && !self
+                    .op
+                    .apply(&left, &self.supers[block / SECOND_RANGE_SUPER])
+            {
+                #[cfg(test)]
+                SECOND_RANGE_SUPER_SKIPS.with(|skips| skips.set(skips.get() + 1));
+                block += SECOND_RANGE_SUPER;
+                continue;
+            }
+            if self.op.apply(&left, &self.blocks[block]) {
+                let block_start = (block * SECOND_RANGE_BLOCK).max(start);
+                let block_end = ((block + 1) * SECOND_RANGE_BLOCK).min(end);
+                for position in block_start..block_end {
+                    if self.op.apply(&left, &self.values[position]) && !emit(position) {
+                        return;
+                    }
+                }
+            }
+            block += 1;
+        }
+    }
+
+    /// Count the positions in `[start, end)` that `for_each_match` would
+    /// report, without a per-match callback.
+    ///
+    /// ELI5: when we only need how many cards win, tallying a whole open box
+    /// in one sweep is faster than handing over the cards one at a time; the
+    /// tally loop has no early exit, so the compiler can vectorize it.
+    #[inline]
+    fn count_matches(&self, left: T, start: usize, end: usize) -> usize {
+        debug_assert!(start <= end && end <= self.values.len());
+        let count_range = |from: usize, to: usize| {
+            (from..to)
+                .filter(|&position| self.op.apply(&left, &self.values[position]))
+                .count()
+        };
+        if self.blocks.is_empty() || end - start < SECOND_RANGE_DIRECT_WIDTH {
+            return count_range(start, end);
+        }
+        #[cfg(test)]
+        SECOND_RANGE_SKIP_HITS.with(|hits| hits.set(hits.get() + 1));
+        let mut count = 0;
+        let mut block = start / SECOND_RANGE_BLOCK;
+        let last_block = (end - 1) / SECOND_RANGE_BLOCK;
+        while block <= last_block {
+            if block.is_multiple_of(SECOND_RANGE_SUPER)
+                && !self
+                    .op
+                    .apply(&left, &self.supers[block / SECOND_RANGE_SUPER])
+            {
+                block += SECOND_RANGE_SUPER;
+                continue;
+            }
+            if self.op.apply(&left, &self.blocks[block]) {
+                count += count_range(
+                    (block * SECOND_RANGE_BLOCK).max(start),
+                    ((block + 1) * SECOND_RANGE_BLOCK).min(end),
+                );
+            }
+            block += 1;
+        }
+        count
+    }
+}
+
+/// Report whether a [`SecondRangeSkipScan`] should scan the narrowed windows.
+///
+/// Building the summaries reads every right value once, so it pays off only
+/// when the windows still to be scanned are much wider in total than the
+/// right layout. Below twice its length, the direct scan costs at most about
+/// one extra pass over the right values, which is what the build itself
+/// costs; on AIList exons x chainXenTro3Link (53M of window over 51M right
+/// rows) the build was pure overhead.
+///
+/// ELI5: labeling every box costs one look at every card. That is worth it
+/// only when we were going to look at more cards than that anyway.
+fn second_range_skip_pays_off(
+    right_len: usize,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+) -> bool {
+    let mut total_width = 0_usize;
+    for (&start, &end) in starts.iter().zip(ends.iter()) {
+        if start < 0 || end < 0 {
+            continue;
+        }
+        // ELI5: the windows were validated before narrowing; saturating
+        // keeps an unexpected inverted window at zero width, matching the
+        // empty `start..end` loop that would scan it.
+        total_width = total_width.saturating_add((end as usize).saturating_sub(start as usize));
+        if total_width / 2 > right_len {
+            return true;
+        }
+    }
+    false
 }
 
 /// Borrow a range predicate as a residual-style view.
@@ -1088,23 +1360,16 @@ fn build_equi_range_and_residual_indices_core(
             let (equality_starts, equality_ends) = equality_windows
                 .as_ref()
                 .expect("second range must retain the equality windows");
-            if !narrow_unordered_second_range_for_predicate(
+            return materialize_unordered_second_range(
+                left_index,
+                right_index,
+                starts.view_mut(),
+                ends.view_mut(),
                 second_range,
                 equality_starts.view(),
                 equality_ends.view(),
-                starts.view_mut(),
-                ends.view_mut(),
-            )? {
-                return Ok(None);
-            }
-            return materialize_equi_windows_and_residuals(
-                left_index,
-                right_index,
-                starts.view(),
-                ends.view(),
                 residual_predicates,
                 null_metadata,
-                Some(second_range),
                 keep,
             );
         }
@@ -1394,6 +1659,43 @@ fn equi_aggregate_impl<'py>(
         }
     }
 
+    // ELI5: with no residual rules, the unordered second range is the only
+    // test left inside each shelf, so the block skip scan can hand over exactly
+    // the passing positions instead of every candidate being tried in turn.
+    // With residual rules on short shelves, the general loop below keeps
+    // its whole-shelf residual checklist instead.
+    if let (Some(second_range), Some(starts), Some(ends)) =
+        (demoted_second, starts.as_ref(), ends.as_ref())
+    {
+        let use_skip = second_range_skip_pays_off(right_index.len(), starts.view(), ends.view());
+        if use_skip || views.is_empty() {
+            aggregate_unordered_second_range(
+                &mut set,
+                second_range,
+                starts.view(),
+                ends.view(),
+                &views,
+                metadata_views.as_deref(),
+                use_skip,
+                reverse,
+            );
+            if set.is_empty() {
+                return Ok(None);
+            }
+            let output_positions = if reverse {
+                Some(right_index)
+            } else {
+                Some(left_index)
+            };
+            return Ok(Some(make_results_with_positions(
+                py,
+                set,
+                output_positions,
+                output_len,
+                return_matched,
+            )?));
+        }
+    }
     for row in 0..left_index.len() {
         let candidate_start = starts
             .as_ref()
@@ -1486,6 +1788,78 @@ fn equi_aggregate_impl<'py>(
         output_len,
         return_matched,
     )?))
+}
+
+/// Aggregate every pair passing an unordered second range in its window.
+///
+/// `starts`/`ends` are the windows left by the first range and the envelope
+/// narrowing; negative windows are inactive. Residual predicates, when
+/// present, are checked for each position the scanner reports; `use_skip`
+/// comes from [`second_range_skip_pays_off`]. The windows come from
+/// precomputed equality groups, so a reverse aggregation writes straight to
+/// the right position (the unique-label slot map is only for the window-free
+/// layout). Forward updates use `(right source, left output)`; reverse
+/// updates use `(left source, right output)`, matching the general loop in
+/// `equi_aggregate_impl`.
+#[allow(clippy::too_many_arguments)]
+fn aggregate_unordered_second_range(
+    set: &mut AggregationSet,
+    range: &AnyParsedRangePredicate<'_>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    residual_predicates: &[PredicateView<'_>],
+    null_metadata: Option<&[NullMetadataView<'_>]>,
+    use_skip: bool,
+    reverse: bool,
+) {
+    macro_rules! aggregate {
+        ($predicate:expr) => {{
+            let predicate = $predicate;
+            let left = predicate.left.as_array();
+            let right = predicate.right.as_array();
+            let scanner = if use_skip {
+                SecondRangeSkipScan::new(right, predicate.op)
+            } else {
+                SecondRangeSkipScan::direct(right, predicate.op)
+            };
+            for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
+                if start < 0 || end < 0 {
+                    continue;
+                }
+                scanner.for_each_match(left[row], start as usize, end as usize, |right_position| {
+                    if !residual_predicates.is_empty()
+                        && !predicates_match_dispatch(
+                            residual_predicates,
+                            null_metadata,
+                            row,
+                            right_position,
+                        )
+                    {
+                        return true;
+                    }
+                    if reverse {
+                        set.update(row, right_position);
+                    } else {
+                        set.update(right_position, row);
+                    }
+                    true
+                });
+            }
+        }};
+    }
+
+    match range {
+        AnyParsedRangePredicate::I64(predicate) => aggregate!(predicate),
+        AnyParsedRangePredicate::I32(predicate) => aggregate!(predicate),
+        AnyParsedRangePredicate::I16(predicate) => aggregate!(predicate),
+        AnyParsedRangePredicate::I8(predicate) => aggregate!(predicate),
+        AnyParsedRangePredicate::U64(predicate) => aggregate!(predicate),
+        AnyParsedRangePredicate::U32(predicate) => aggregate!(predicate),
+        AnyParsedRangePredicate::U16(predicate) => aggregate!(predicate),
+        AnyParsedRangePredicate::U8(predicate) => aggregate!(predicate),
+        AnyParsedRangePredicate::F64(predicate) => aggregate!(predicate),
+        AnyParsedRangePredicate::F32(predicate) => aggregate!(predicate),
+    }
 }
 
 /// Benchmark-only entry point that can force the legacy candidate path.
@@ -1924,11 +2298,12 @@ mod tests {
 
     use super::{
         apply_equi_range_bound, build_equi_ne_indices_core, build_equi_only_indices_core,
-        build_equi_range_indices_core, build_equi_uniq_residual_indices_core,
-        build_second_range_envelope, equi_aggregate, materialize_equi_windows,
-        materialize_equi_windows_and_residuals, materialize_unordered_second_range,
-        narrow_unordered_second_range, unique_reverse_output_slots, EQUI_RESIDUAL_WINDOW_HITS,
-        EQUI_STARTS_ENDS_HITS,
+        build_equi_range_and_residual_indices_core, build_equi_range_indices_core,
+        build_equi_uniq_residual_indices_core, build_second_range_envelope, equi_aggregate,
+        materialize_equi_windows, materialize_equi_windows_and_residuals,
+        materialize_unordered_second_range, narrow_unordered_second_range,
+        unique_reverse_output_slots, SecondRangeSkipScan, EQUI_RESIDUAL_WINDOW_HITS,
+        EQUI_STARTS_ENDS_HITS, SECOND_RANGE_SKIP_HITS, SECOND_RANGE_SUPER_SKIPS,
     };
     use crate::conditional_join::compare_op::CompareOp;
     use crate::conditional_join::join_types::Keep;
@@ -3176,6 +3551,8 @@ mod tests {
                     &range,
                     equality_starts.view(),
                     equality_ends.view(),
+                    &[],
+                    None,
                     keep,
                 )
                 .unwrap()
@@ -3183,5 +3560,523 @@ mod tests {
                 assert_eq!(result.1, expected);
             }
         });
+    }
+
+    /// Deterministic xorshift generator so the randomized cases are identical
+    /// on every run and platform.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    const RANGE_OPS: [CompareOp; 4] = [CompareOp::Lt, CompareOp::Le, CompareOp::Gt, CompareOp::Ge];
+
+    fn skip_hits() -> usize {
+        SECOND_RANGE_SKIP_HITS.with(|hits| hits.get())
+    }
+
+    #[test]
+    fn second_range_skip_scan_matches_bruteforce() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let hits_before = skip_hits();
+        let super_skips_before = SECOND_RANGE_SUPER_SKIPS.with(|skips| skips.get());
+        // `sparse` puts a rare extreme value (0 or 49) in a mostly-middle
+        // column, so whole blocks and super-blocks fail and get skipped.
+        for (len, sparse) in [1_usize, 31, 32, 33, 63, 64, 65, 100, 1_000, 4_097, 20_000]
+            .into_iter()
+            .flat_map(|len| [(len, false), (len, true)])
+        {
+            for op in RANGE_OPS {
+                let ints = Array1::from_iter((0..len).map(|_| {
+                    if !sparse {
+                        rng.below(50) as i64
+                    } else if rng.below(500) == 0 {
+                        [0, 49][rng.below(2)]
+                    } else {
+                        25
+                    }
+                }));
+                let floats = ints.mapv(|value| value as f64 / 4.0);
+                let int_scan = SecondRangeSkipScan::new(ints.view(), op);
+                let float_scan = SecondRangeSkipScan::new(floats.view(), op);
+                let direct = SecondRangeSkipScan::direct(ints.view(), op);
+                // Every window, including empty ones and the exact block
+                // edges, for small arrays; random windows for large ones.
+                let windows: Vec<(usize, usize)> = if len <= 65 {
+                    (0..=len)
+                        .flat_map(|start| (start..=len).map(move |end| (start, end)))
+                        .collect()
+                } else {
+                    (0..300)
+                        .map(|_| {
+                            let start = rng.below(len + 1);
+                            (start, start + rng.below(len - start + 1))
+                        })
+                        .chain([(0, len), (0, 0), (len, len)])
+                        .collect()
+                };
+                for (start, end) in windows {
+                    let threshold = if sparse {
+                        [1, 2, 47, 48][rng.below(4)]
+                    } else {
+                        rng.below(52) as i64 - 1
+                    };
+                    let expected: Vec<usize> = (start..end)
+                        .filter(|&position| op.apply(&threshold, &ints[position]))
+                        .collect();
+                    let mut got = Vec::new();
+                    int_scan.for_each_match(threshold, start, end, |position| {
+                        got.push(position);
+                        true
+                    });
+                    assert_eq!(got, expected, "i64 len={len} op={op:?} [{start}, {end})");
+                    got.clear();
+                    float_scan.for_each_match(threshold as f64 / 4.0, start, end, |position| {
+                        got.push(position);
+                        true
+                    });
+                    assert_eq!(got, expected, "f64 len={len} op={op:?} [{start}, {end})");
+                    got.clear();
+                    direct.for_each_match(threshold, start, end, |position| {
+                        got.push(position);
+                        true
+                    });
+                    assert_eq!(got, expected, "direct len={len} op={op:?}");
+                    for scanner_count in [
+                        int_scan.count_matches(threshold, start, end),
+                        float_scan.count_matches(threshold as f64 / 4.0, start, end),
+                        direct.count_matches(threshold, start, end),
+                    ] {
+                        assert_eq!(scanner_count, expected.len(), "count len={len} op={op:?}");
+                    }
+                    // Stopping early must yield the lowest matching position.
+                    let mut first = None;
+                    int_scan.for_each_match(threshold, start, end, |position| {
+                        first = Some(position);
+                        false
+                    });
+                    assert_eq!(first, expected.first().copied());
+                }
+            }
+        }
+        assert!(skip_hits() > hits_before, "the skip scan never ran");
+        assert!(
+            SECOND_RANGE_SUPER_SKIPS.with(|skips| skips.get()) > super_skips_before,
+            "no super-block was ever skipped"
+        );
+    }
+
+    /// Build a two-group overlap-join fixture whose second range defeats the
+    /// envelope: each group starts with one very long interval, so the
+    /// suffix-minimum of the right starts stays tiny across the whole group.
+    ///
+    /// Returns (first-range left, first-range right, second-range left,
+    /// second-range right, group windows per left row, right labels).
+    #[allow(clippy::type_complexity)]
+    fn overscan_fixture(
+        rng: &mut XorShift,
+    ) -> (
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<(i64, i64)>,
+        Vec<i64>,
+    ) {
+        let group_len = 600_usize;
+        let mut right_start = Vec::new();
+        let mut right_end = Vec::new();
+        let mut group_windows = Vec::new();
+        for group in 0..2 {
+            let offset = right_start.len();
+            let mut intervals: Vec<(i64, i64)> = (0..group_len)
+                .map(|_| {
+                    let start = rng.below(10_000) as i64;
+                    (start, start + rng.below(40) as i64)
+                })
+                .collect();
+            // The long interval: it starts first and ends last.
+            intervals[0] = (0, 20_000);
+            // Right rows are sorted by the first-range column (the end).
+            intervals.sort_by_key(|&(start, end)| (end, start));
+            for (start, end) in intervals {
+                right_start.push(start);
+                right_end.push(end);
+            }
+            group_windows.push((offset as i64, (offset + group_len) as i64, group));
+        }
+        let mut left_start = Vec::new();
+        let mut left_end = Vec::new();
+        let mut windows = Vec::new();
+        for row in 0..400 {
+            let start = rng.below(10_000) as i64;
+            left_start.push(start);
+            left_end.push(start + rng.below(30) as i64);
+            let (group_start, group_end, _) = group_windows[row % 2];
+            windows.push((group_start, group_end));
+        }
+        // Unique but unordered physical labels, so first/last must compare
+        // labels rather than positions.
+        let mut labels: Vec<i64> = (0..right_start.len() as i64)
+            .map(|v| v * 7 % 1_201)
+            .collect();
+        labels.reverse();
+        (
+            left_start,
+            right_end,
+            left_end,
+            right_start,
+            windows,
+            labels,
+        )
+    }
+
+    #[test]
+    fn overscan_second_range_uses_skip_scan_and_matches_bruteforce() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut rng = XorShift(0xD1B5_4A32_D192_ED03);
+            let (left_start, right_end, left_end, right_start, windows, labels) =
+                overscan_fixture(&mut rng);
+            let left_len = left_start.len();
+            // Overlap: start_l <= end_r (first, sorted) and end_l >= start_r
+            // (second, unordered inside each group).
+            let range_pair = || {
+                let first = AnyParsedRangePredicate::I64(ParsedRangePredicate {
+                    left: PyArray1::from_vec(py, left_start.clone()).readonly(),
+                    left_index: PyArray1::from_vec(py, (0..left_len as i64).collect()).readonly(),
+                    right: PyArray1::from_vec(py, right_end.clone()).readonly(),
+                    right_index: PyArray1::from_vec(py, labels.clone()).readonly(),
+                    op: CompareOp::Le,
+                });
+                let second = AnyParsedRangePredicate::I64(ParsedRangePredicate {
+                    left: PyArray1::from_vec(py, left_end.clone()).readonly(),
+                    left_index: PyArray1::from_vec(py, (0..left_len as i64).collect()).readonly(),
+                    right: PyArray1::from_vec(py, right_start.clone()).readonly(),
+                    right_index: PyArray1::from_vec(py, labels.clone()).readonly(),
+                    op: CompareOp::Ge,
+                });
+                (first, second)
+            };
+            let left_labels = Array1::from_iter((0..left_len as i64).map(|v| v + 1_000));
+            let right_labels = Array1::from_vec(labels.clone());
+            let mut expected: Vec<Vec<i64>> = vec![Vec::new(); left_len];
+            for (row, &(start, end)) in windows.iter().enumerate() {
+                for position in start as usize..end as usize {
+                    if left_start[row] <= right_end[position]
+                        && left_end[row] >= right_start[position]
+                    {
+                        expected[row].push(labels[position]);
+                    }
+                }
+            }
+            assert!(expected.iter().any(|matches| !matches.is_empty()));
+            for keep in [Keep::All, Keep::Any, Keep::First, Keep::Last] {
+                let (first, second) = range_pair();
+                let mut starts = Array1::from_iter(windows.iter().map(|w| w.0));
+                let mut ends = Array1::from_iter(windows.iter().map(|w| w.1));
+                let hits_before = skip_hits();
+                let (left_out, right_out) = build_equi_range_indices_core(
+                    left_labels.view(),
+                    right_labels.view(),
+                    starts.view_mut(),
+                    ends.view_mut(),
+                    &first,
+                    Some(&second),
+                    keep,
+                )
+                .unwrap()
+                .unwrap();
+                assert!(
+                    skip_hits() > hits_before,
+                    "keep={keep:?} did not use the skip scan"
+                );
+                let mut got: Vec<Vec<i64>> = vec![Vec::new(); left_len];
+                for (left, right) in left_out.iter().zip(&right_out) {
+                    got[(*left - 1_000) as usize].push(*right);
+                }
+                for row in 0..left_len {
+                    let want = &expected[row];
+                    let have = &got[row];
+                    match keep {
+                        Keep::All => {
+                            let mut sorted_want = want.clone();
+                            let mut sorted_have = have.clone();
+                            sorted_want.sort_unstable();
+                            sorted_have.sort_unstable();
+                            assert_eq!(sorted_have, sorted_want, "row {row}");
+                        }
+                        Keep::Any => {
+                            assert_eq!(have.len(), usize::from(!want.is_empty()));
+                            assert!(have.iter().all(|label| want.contains(label)));
+                        }
+                        Keep::First => {
+                            assert_eq!(have.first(), want.iter().min(), "row {row}");
+                        }
+                        Keep::Last => {
+                            assert_eq!(have.first(), want.iter().max(), "row {row}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn overscan_second_range_aggregation_uses_skip_scan() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+            let (left_start, right_end, left_end, right_start, windows, labels) =
+                overscan_fixture(&mut rng);
+            let left_len = left_start.len();
+            let right_len = right_end.len();
+            let values: Vec<i64> = (0..right_len as i64).map(|v| v * 3 + 1).collect();
+            let left_values: Vec<i64> = (0..left_len as i64).map(|v| v * 5 + 2).collect();
+            for reverse in [false, true] {
+                let ranges = PyList::new(
+                    py,
+                    [
+                        equi_range_tuple(py, left_start.clone(), right_end.clone(), "<=")?,
+                        equi_range_tuple(py, left_end.clone(), right_start.clone(), ">=")?,
+                    ],
+                )?;
+                let aggregations = if reverse {
+                    equi_sum_aggregations(py, left_values.clone())?
+                } else {
+                    equi_sum_aggregations(py, values.clone())?
+                };
+                let starts = PyArray1::from_vec(py, windows.iter().map(|w| w.0).collect());
+                let ends = PyArray1::from_vec(py, windows.iter().map(|w| w.1).collect());
+                let hits_before = skip_hits();
+                let result = equi_aggregate(
+                    py,
+                    PyArray1::from_vec(py, (0..left_len as i64).collect()).readonly(),
+                    PyArray1::from_vec(py, labels.clone()).readonly(),
+                    Some(starts.readwrite()),
+                    Some(ends.readwrite()),
+                    &ranges,
+                    &PyList::empty(py),
+                    &aggregations,
+                    true,
+                    reverse,
+                )?
+                .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+                assert!(
+                    skip_hits() > hits_before,
+                    "reverse={reverse} did not use the skip scan"
+                );
+                let output_len = if reverse { right_len } else { left_len };
+                let mut want_sums = vec![0_i64; output_len];
+                let mut want_matched = vec![false; output_len];
+                for (row, &(start, end)) in windows.iter().enumerate() {
+                    for position in start as usize..end as usize {
+                        if left_start[row] <= right_end[position]
+                            && left_end[row] >= right_start[position]
+                        {
+                            if reverse {
+                                want_sums[position] += left_values[row];
+                                want_matched[position] = true;
+                            } else {
+                                want_sums[row] += values[position];
+                                want_matched[row] = true;
+                            }
+                        }
+                    }
+                }
+                let (matched, sums) = equi_sum_result(&result)?;
+                assert_eq!(matched, want_matched, "reverse={reverse}");
+                assert_eq!(sums, want_sums, "reverse={reverse}");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn overscan_second_range_with_residuals_uses_skip_scan_and_matches_bruteforce() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut rng = XorShift(0x6A09_E667_F3BC_C908);
+            let (left_start, right_end, left_end, right_start, windows, labels) =
+                overscan_fixture(&mut rng);
+            let left_len = left_start.len();
+            let right_len = right_end.len();
+            // Residuals: weight_l > weight_r and tag_l != tag_r.
+            let left_weight = Array1::from_iter((0..left_len).map(|_| rng.below(100) as i64));
+            let right_weight = Array1::from_iter((0..right_len).map(|_| rng.below(100) as i64));
+            let left_tag = Array1::from_iter((0..left_len).map(|_| rng.below(3) as i64));
+            let right_tag = Array1::from_iter((0..right_len).map(|_| rng.below(3) as i64));
+            let residuals = [
+                PredicateView::I64(left_weight.view(), right_weight.view(), CompareOp::Gt),
+                PredicateView::I64(left_tag.view(), right_tag.view(), CompareOp::Ne),
+            ];
+            let left_labels = Array1::from_iter((0..left_len as i64).map(|v| v + 1_000));
+            let right_labels = Array1::from_vec(labels.clone());
+            let mut expected: Vec<Vec<i64>> = vec![Vec::new(); left_len];
+            for (row, &(start, end)) in windows.iter().enumerate() {
+                for position in start as usize..end as usize {
+                    if left_start[row] <= right_end[position]
+                        && left_end[row] >= right_start[position]
+                        && left_weight[row] > right_weight[position]
+                        && left_tag[row] != right_tag[position]
+                    {
+                        expected[row].push(labels[position]);
+                    }
+                }
+            }
+            assert!(expected.iter().any(|matches| !matches.is_empty()));
+            for keep in [Keep::All, Keep::Any, Keep::First, Keep::Last] {
+                let first = AnyParsedRangePredicate::I64(ParsedRangePredicate {
+                    left: PyArray1::from_vec(py, left_start.clone()).readonly(),
+                    left_index: PyArray1::from_vec(py, (0..left_len as i64).collect()).readonly(),
+                    right: PyArray1::from_vec(py, right_end.clone()).readonly(),
+                    right_index: PyArray1::from_vec(py, labels.clone()).readonly(),
+                    op: CompareOp::Le,
+                });
+                let second = AnyParsedRangePredicate::I64(ParsedRangePredicate {
+                    left: PyArray1::from_vec(py, left_end.clone()).readonly(),
+                    left_index: PyArray1::from_vec(py, (0..left_len as i64).collect()).readonly(),
+                    right: PyArray1::from_vec(py, right_start.clone()).readonly(),
+                    right_index: PyArray1::from_vec(py, labels.clone()).readonly(),
+                    op: CompareOp::Ge,
+                });
+                let mut starts = Array1::from_iter(windows.iter().map(|w| w.0));
+                let mut ends = Array1::from_iter(windows.iter().map(|w| w.1));
+                let hits_before = skip_hits();
+                let (left_out, right_out) = build_equi_range_and_residual_indices_core(
+                    left_labels.view(),
+                    right_labels.view(),
+                    starts.view_mut(),
+                    ends.view_mut(),
+                    &first,
+                    Some(&second),
+                    &residuals,
+                    None,
+                    keep,
+                )
+                .unwrap()
+                .unwrap();
+                assert!(
+                    skip_hits() > hits_before,
+                    "keep={keep:?} did not use the skip scan"
+                );
+                let mut got: Vec<Vec<i64>> = vec![Vec::new(); left_len];
+                for (left, right) in left_out.iter().zip(&right_out) {
+                    got[(*left - 1_000) as usize].push(*right);
+                }
+                for row in 0..left_len {
+                    let (want, have) = (&expected[row], &got[row]);
+                    match keep {
+                        Keep::All => {
+                            let mut sorted_want = want.clone();
+                            let mut sorted_have = have.clone();
+                            sorted_want.sort_unstable();
+                            sorted_have.sort_unstable();
+                            assert_eq!(sorted_have, sorted_want, "row {row}");
+                        }
+                        Keep::Any => {
+                            assert_eq!(have.len(), usize::from(!want.is_empty()));
+                            assert!(have.iter().all(|label| want.contains(label)));
+                        }
+                        Keep::First => assert_eq!(have.first(), want.iter().min(), "row {row}"),
+                        Keep::Last => assert_eq!(have.first(), want.iter().max(), "row {row}"),
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn overscan_second_range_aggregation_with_residual_uses_skip_scan() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let mut rng = XorShift(0xBB67_AE85_84CA_A73B);
+            let (left_start, right_end, left_end, right_start, windows, labels) =
+                overscan_fixture(&mut rng);
+            let left_len = left_start.len();
+            let right_len = right_end.len();
+            let left_weight: Vec<i64> = (0..left_len).map(|_| rng.below(100) as i64).collect();
+            let right_weight: Vec<i64> = (0..right_len).map(|_| rng.below(100) as i64).collect();
+            let values: Vec<i64> = (0..right_len as i64).map(|v| v * 3 + 1).collect();
+            let left_values: Vec<i64> = (0..left_len as i64).map(|v| v * 5 + 2).collect();
+            for reverse in [false, true] {
+                let ranges = PyList::new(
+                    py,
+                    [
+                        equi_range_tuple(py, left_start.clone(), right_end.clone(), "<=")?,
+                        equi_range_tuple(py, left_end.clone(), right_start.clone(), ">=")?,
+                    ],
+                )?;
+                let residuals = PyList::new(
+                    py,
+                    [equi_range_tuple(
+                        py,
+                        left_weight.clone(),
+                        right_weight.clone(),
+                        ">",
+                    )?],
+                )?;
+                let aggregations = if reverse {
+                    equi_sum_aggregations(py, left_values.clone())?
+                } else {
+                    equi_sum_aggregations(py, values.clone())?
+                };
+                let starts = PyArray1::from_vec(py, windows.iter().map(|w| w.0).collect());
+                let ends = PyArray1::from_vec(py, windows.iter().map(|w| w.1).collect());
+                let hits_before = skip_hits();
+                let result = equi_aggregate(
+                    py,
+                    PyArray1::from_vec(py, (0..left_len as i64).collect()).readonly(),
+                    PyArray1::from_vec(py, labels.clone()).readonly(),
+                    Some(starts.readwrite()),
+                    Some(ends.readwrite()),
+                    &ranges,
+                    &residuals,
+                    &aggregations,
+                    true,
+                    reverse,
+                )?
+                .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+                assert!(
+                    skip_hits() > hits_before,
+                    "reverse={reverse} did not use the skip scan"
+                );
+                let output_len = if reverse { right_len } else { left_len };
+                let mut want_sums = vec![0_i64; output_len];
+                let mut want_matched = vec![false; output_len];
+                for (row, &(start, end)) in windows.iter().enumerate() {
+                    for position in start as usize..end as usize {
+                        if left_start[row] <= right_end[position]
+                            && left_end[row] >= right_start[position]
+                            && left_weight[row] > right_weight[position]
+                        {
+                            if reverse {
+                                want_sums[position] += left_values[row];
+                                want_matched[position] = true;
+                            } else {
+                                want_sums[row] += values[position];
+                                want_matched[row] = true;
+                            }
+                        }
+                    }
+                }
+                let (matched, sums) = equi_sum_result(&result)?;
+                assert_eq!(matched, want_matched, "reverse={reverse}");
+                assert_eq!(sums, want_sums, "reverse={reverse}");
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 }

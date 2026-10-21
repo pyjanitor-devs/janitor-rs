@@ -1536,3 +1536,27 @@ case that the optimization must define.
 documentation when changing the path builder. Do not silently introduce a
 panic for direct lower-level Rust callers if it is inexpensive to avoid one,
 but do not expand the optimization's contract to define NaN join semantics.
+
+### [2026-10-21] Envelope narrowing does not bound unordered second-range scans
+
+**Context**: AIList genomic overlap joins (`contig ==`, `start_l <= end_r`,
+`end_l >= start_r`) through the equi path. The second range is unordered in
+the first range's sort order, so the cumulative envelope trims only a prefix
+or suffix of each window. One long right interval sorted early keeps the
+suffix minimum low for its whole group: ex-anno x chainOrnAna1 scanned 667M
+candidates for 4.4M matches.
+**Learning**: The envelope cannot help when the extreme value sits inside
+the window, and its cost model (window width) is unrelated to output size.
+A two-level skip scan (`SecondRangeSkipScan`: per-32-row block and
+per-1,024-row super-block summaries, walked left to right) reports matches in
+ascending order at about one check per 1,024 rows of a sparse window. A
+segment-tree descent was tried first and made dense, unprunable joins up to
+1.7x slower in the kernel because it paid per-node stack work on every block.
+**Recommendation**: Build the summaries only when the narrowed windows'
+total width exceeds twice the right length (`second_range_skip_pays_off`);
+at 1x, a 51M-row right table whose windows barely exceeded it paid the build
+for nothing. Size `keep="all"` output with the callback-free
+`count_matches`, which vectorizes; a per-match closure made the dense count
+pass about 14% slower than the old plain loop. With residuals, keep the
+whole-window residual mask when the gate does not fire. Benchmark dense,
+gate-firing cases as well as the overscan headline.
