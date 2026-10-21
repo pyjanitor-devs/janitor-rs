@@ -501,6 +501,90 @@ impl<'a> AggregationSet<'a> {
         }
     }
 
+    /// Aggregate rows whose matches are a growing prefix of an insertion
+    /// order, filtered by a rank threshold, with an insert-only rank tree.
+    ///
+    /// Row `query.0` positions of `insertion_order` have been inserted when a
+    /// query is answered; it matches every inserted source position whose
+    /// `position_ranks` entry is at least `query.1`, and merges their
+    /// aggregate into output slot `query.2`. Queries must be sorted by their
+    /// inserted-prefix length. A rank of `usize::MAX` is never inserted.
+    ///
+    /// ELI5: cards arrive one at a time and are filed by their rank. Each
+    /// question asks "of the cards that have arrived so far, combine every
+    /// card ranked at least this high", which a few stacked summary boxes
+    /// answer without looking at each card.
+    ///
+    /// This is the same tree as [`Self::aggregate_dual_rank_tree`]; only the
+    /// order in which positions arrive and the query coordinates are
+    /// supplied explicitly, so range joins can drive it from their own
+    /// layouts. The caller must check [`Self::supports_dual_rank_tree`].
+    ///
+    /// # Arguments
+    ///
+    /// * `insertion_order` - Source positions in the order they become
+    ///   visible to later queries.
+    /// * `position_ranks` - Rank of every source position, or `usize::MAX`.
+    /// * `rank_count` - One past the largest rank in `position_ranks`.
+    /// * `queries` - `(inserted_prefix_len, threshold_rank, output_slot)`,
+    ///   sorted by `inserted_prefix_len`.
+    /// * `inputs` - The aggregation inputs this set was built from.
+    pub(crate) fn aggregate_rank_threshold_sweep(
+        &mut self,
+        insertion_order: &[usize],
+        position_ranks: &[usize],
+        rank_count: usize,
+        queries: &[(usize, usize, usize)],
+        inputs: &'a [AggregationInput<'_>],
+    ) {
+        debug_assert!(queries.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        if rank_count == 0 || queries.is_empty() {
+            return;
+        }
+        let tree_size = rank_count.next_power_of_two();
+        let tree_output_len = tree_size.saturating_mul(2);
+        let mut tree = AggregationSet::new(tree_output_len, self.source_len, inputs, true)
+            .expect("rank threshold sweep inputs were validated by the caller");
+        let mut inserted = 0_usize;
+        let mut nodes = Vec::new();
+        let mut right_nodes = Vec::new();
+        for &(prefix_len, threshold, output_slot) in queries {
+            let prefix_len = prefix_len.min(insertion_order.len());
+            for &position in &insertion_order[inserted.min(prefix_len)..prefix_len] {
+                let rank = position_ranks[position];
+                if rank != usize::MAX {
+                    tree.insert_path(position, tree_size + rank);
+                }
+            }
+            inserted = inserted.max(prefix_len);
+            if threshold >= rank_count {
+                continue;
+            }
+            // ELI5: collect the few summary boxes that exactly cover ranks
+            // `threshold..`, walking the usual half-open range up the tree;
+            // the empty padding leaves past `rank_count` are identities.
+            nodes.clear();
+            right_nodes.clear();
+            let mut left = tree_size + threshold;
+            let mut right = tree_output_len;
+            while left < right {
+                if left & 1 == 1 {
+                    nodes.push(left);
+                    left += 1;
+                }
+                if right & 1 == 1 {
+                    right -= 1;
+                    right_nodes.push(right);
+                }
+                left /= 2;
+                right /= 2;
+            }
+            for &node in nodes.iter().chain(right_nodes.iter().rev()) {
+                self.merge_output_from(&tree, node, output_slot);
+            }
+        }
+    }
+
     /// Insert one source position into its leaf and every ancestor.
     ///
     /// ELI5: instead of rebuilding a parent from both children after every

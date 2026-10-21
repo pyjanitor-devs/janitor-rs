@@ -1615,3 +1615,22 @@ the per-row check. Keep the masked path out of line. When changing the gate
 or the scan, benchmark right layouts whose 32-row blocks match the residual
 on every row or on none, at 25/35/45% open, alongside sparse joins, each
 with and without a masked `!=`.
+### [2026-10-21] Aggregations follow `join_algorithm`; speed up each path in place
+
+**Context**: Default range-only `join_agg` counts (Arun useR!2016 `x <= x`,
+`y > y`) were O(pairs): the second predicate is unordered in the first
+anchor's layout, so pyjanitor passes its cumulative envelope as the second
+anchor and the original predicate as a residual, and
+`range_join_extended_aggregate` visited every envelope candidate.
+**User correction**: aggregation dispatch follows the user's
+`join_algorithm`. `"default"` stays on the default range-join kernels and
+`"regions"` uses the regions path; never route one to the other for speed.
+**Learning**: When the second anchor is provably the envelope of the only
+residual (`anchor_is_envelope_of`: same operator, equal left values, anchor
+right equal to the recomputed suffix-min / prefix-max), every first-anchor
+window is a prefix or suffix and the envelope can be dropped exactly. Each
+row then asks for positions inserted so far whose residual rank clears a
+threshold, answered by the existing insert-only rank tree.
+**Recommendation**: Verify the envelope from values rather than trusting the
+call shape, gate on intersected candidate width, and keep floating-point sums
+and products on the encounter-order traversal.
