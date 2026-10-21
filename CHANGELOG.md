@@ -7,6 +7,7 @@ All notable changes to janitor-rs are documented here.
 ### Changed
 
 - update PyO3 and rust-numpy; Python argument and array-mismatch error text may differ, with some argument names now exposed through exception notes
+- 32-bit Linux wheels no longer include free-threaded CPython 3.14t because rust-numpy 0.30 rejects that unsupported target; regular CPython and PyPy wheels remain available
 
 ## [0.6.5](https://github.com/pyjanitor-devs/janitor-rs/compare/v0.6.4...v0.6.5) - 2026-10-18
 
