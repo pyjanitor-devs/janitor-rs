@@ -353,8 +353,9 @@ fn materialize_equi_windows(
 /// the remaining window. The envelope is never treated as the final truth
 /// test.
 ///
-/// PyJanitor filters nulls before entering this Rust path, so the supported
-/// inputs are expected to contain ordinary ordered values rather than `NaN`.
+/// The caller must provide ordinary ordered values rather than `NaN` for the
+/// second-range right-hand side. This is a trusted input contract: this path
+/// does not validate it at runtime, and the monotonicity check relies on it.
 ///
 /// # Arguments
 ///
@@ -522,6 +523,9 @@ fn materialize_unordered_second_range(
 /// aggregation. Both paths narrow candidate windows before the exact scan;
 /// the residual check remains necessary because the envelope is only a safe
 /// pruning proof.
+///
+/// The second-range right-hand values must contain no `NaN`; this trusted
+/// contract is documented at the caller boundary and is not revalidated here.
 ///
 /// # Arguments
 ///
