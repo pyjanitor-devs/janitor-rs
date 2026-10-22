@@ -1615,6 +1615,11 @@ the per-row check. Keep the masked path out of line. When changing the gate
 or the scan, benchmark right layouts whose 32-row blocks match the residual
 on every row or on none, at 25/35/45% open, alongside sparse joins, each
 with and without a masked `!=`.
+**User correction**: The no-`NaN` second-range contract is documented and
+trusted, rather than runtime-enforced. Do not add a validation scan or require
+the optimized path to raise for `NaN`; under the contract, a direct `>` check
+is sufficient for monotonicity.
+
 ### [2026-10-21] Aggregations follow `join_algorithm`; speed up each path in place
 
 **Context**: Default range-only `join_agg` counts (Arun useR!2016 `x <= x`,

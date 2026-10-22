@@ -294,11 +294,8 @@ fn range_is_monotonic_for_windows(
             let right = $predicate.right.as_array();
             let mut bad_prefix = vec![0usize; right.len()];
             for position in 1..right.len() {
-                bad_prefix[position] = bad_prefix[position - 1]
-                    + usize::from(!matches!(
-                        right[position - 1].partial_cmp(&right[position]),
-                        Some(Ordering::Less | Ordering::Equal)
-                    ));
+                bad_prefix[position] =
+                    bad_prefix[position - 1] + usize::from(right[position - 1] > right[position]);
             }
             for (&start, &end) in starts.iter().zip(ends.iter()) {
                 if start < 0 || end < 0 {
