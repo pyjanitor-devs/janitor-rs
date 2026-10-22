@@ -9,7 +9,7 @@ standalone command-line tool.
 Install Rust and [uv](https://docs.astral.sh/uv/), then run the Rust tests:
 
 ```sh
-cargo test --no-default-features
+cargo test
 ```
 
 On macOS, the repository wrapper provides a consistent Python framework for

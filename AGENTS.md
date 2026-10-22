@@ -112,7 +112,7 @@ Every janitor-rs change needs an explicit pyjanitor impact assessment before
 merge:
 
 - Rust-only internals, benchmarks, or refactors: document why no pyjanitor
-  change is needed and run `cargo test --no-default-features`.
+  change is needed and run `cargo test`.
 - Python-visible behavior, signatures, dtypes, errors, or performance
   contracts: use coordinated PRs or add explicit compatibility tests in both
   repositories, linking janitor-rs #225.
@@ -166,16 +166,16 @@ ints don't.
 | Task | Command |
 | --- | --- |
 | Run kernel unit tests | `./scripts/test-rust.sh` |
-| Run benchmarks | `cargo bench --no-default-features` |
-| Compile-check benches (fast) | `cargo bench --no-default-features --no-run` |
+| Run benchmarks | `cargo bench` |
+| Compile-check benches (fast) | `cargo bench --no-run` |
 | Lint | `cargo clippy --all-targets --all-features -- -D warnings` |
 | Format check | `cargo fmt --check` |
 | Format | `cargo fmt` |
 | Build the real wheel locally | `maturin build --release` |
 
-See `README.md` for the full explanation of each command and why the
-`--no-default-features`/`--all-features` split exists (short version: it's
-the `extension-module` PyO3 linker gotcha below).
+See `README.md` for the contributor quickstart. Wheel builds receive
+`PYO3_BUILD_EXTENSION_MODULE=1` from Maturin; ordinary Cargo tests and
+benchmarks link against the selected Python installation.
 
 ---
 
@@ -284,28 +284,21 @@ silently never reaches Python.
 
 ## Non-Obvious Gotchas
 
-### 1. `extension-module` breaks `cargo test`/`cargo bench` linking
+### 1. Wheel builds use Maturin's extension-module environment setting
 
-PyO3's `extension-module` feature deliberately avoids linking against
-libpython, because the shipped `.so`/`.pyd` is `dlopen()`'d *by* a Python
-interpreter that already provides those symbols. A standalone `cargo test`
-or `cargo bench` binary has no such interpreter, so with the feature on,
-linking fails with "symbol(s) not found" for the Python C API (`__Py_Dealloc`,
-`_PyUnicode_...`, etc.) -- a
-[documented pyo3 pitfall](https://pyo3.rs/latest/faq.html#i-cant-run-cargo-test).
-
-Fix in this repo: `extension-module` is a `default` Cargo feature (see
-`[features]` in `Cargo.toml`), not an unconditional dependency feature.
-Always run:
+PyO3's deprecated `extension-module` and `generate-import-lib` Cargo features
+are not enabled in this crate. Maturin sets
+`PYO3_BUILD_EXTENSION_MODULE=1` for wheel builds, so the shipped extension
+still uses the correct Python extension linking behavior. Standalone tests
+and benchmarks link against libpython normally. Always run:
 
 ```sh
-cargo test --no-default-features
-cargo bench --no-default-features
+cargo test
+cargo bench
 ```
 
-`cargo clippy` is unaffected (it type-checks, it doesn't link), so
-`cargo clippy --all-targets --all-features` is correct and exercises the
-exact feature set the real wheel builds with.
+`cargo clippy` type-checks without linking binaries, so
+`cargo clippy --all-targets --all-features` remains the canonical lint command.
 
 ### 2. `clippy` doesn't fully lint inside `#[pyfunction]`-macro bodies
 
@@ -345,7 +338,7 @@ None of this changes the *Python* surface, which remains only what
 ### 5. macOS-only: use the repository Rust-test wrapper for Python linking
 
 Standalone PyO3 test binaries link against libpython and need to find that
-library again at runtime. Calling `cargo test --no-default-features`
+library again at runtime. Calling `cargo test`
 directly can accidentally select `/usr/bin/python3` or another framework
 Python, producing a binary that fails with a dyld error such as
 `Library not loaded: @rpath/Python3.framework/...` or
@@ -362,7 +355,7 @@ python_bin=".venv/bin/python"
 python_libdir="$($python_bin -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"
 DYLD_LIBRARY_PATH="$python_libdir" \
 PYO3_PYTHON="$python_bin" \
-  cargo test --no-default-features
+  cargo test
 ```
 
 CI uses a hosted Python on Linux and does not need the macOS dyld export, but

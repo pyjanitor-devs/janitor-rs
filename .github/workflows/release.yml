@@ -61,7 +61,11 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: >-
+            --release --out dist
+            ${{ (matrix.platform.target == 'x86' || matrix.platform.target == 'armv7')
+              && '--interpreter python3.11 --interpreter python3.12 --interpreter python3.13 --interpreter python3.14 --interpreter pypy3.11'
+              || '--find-interpreter' }}
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: 2_28
       - name: Upload wheels
@@ -93,7 +97,11 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: >-
+            --release --out dist
+            ${{ (matrix.platform.target == 'x86' || matrix.platform.target == 'armv7')
+              && '--interpreter python3.11 --interpreter python3.12 --interpreter python3.13 --interpreter python3.14 --interpreter pypy3.11'
+              || '--find-interpreter' }}
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: musllinux_1_2
       - name: Upload wheels
