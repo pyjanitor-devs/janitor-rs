@@ -2308,6 +2308,104 @@ fn anchor_is_envelope_of<T: PartialOrd + Copy>(
     }
 }
 
+/// The sweep has a materially larger fixed build cost than a segment tree.
+const RANK_SWEEP_BUILD_FACTOR: usize = 64;
+const MIN_RANK_SWEEP_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
+const RANK_SWEEP_MEMORY_MULTIPLIER: usize = 3;
+
+fn should_use_rank_sweep(
+    query_count: usize,
+    total_width: usize,
+    source_len: usize,
+    rank_count: usize,
+) -> bool {
+    if query_count <= 3 || source_len == 0 || rank_count == 0 {
+        return false;
+    }
+    let height = (usize::BITS - (rank_count - 1).leading_zeros()) as usize;
+    let build = source_len.saturating_mul(RANK_SWEEP_BUILD_FACTOR);
+    let queries = query_count.saturating_mul(height).saturating_mul(2);
+    total_width > build.saturating_add(queries)
+}
+
+fn rank_sweep_workspace_bytes(
+    query_count: usize,
+    source_len: usize,
+    rank_count: usize,
+    state_bytes: usize,
+) -> Option<usize> {
+    let tree_size = rank_count.checked_next_power_of_two()?;
+    let tree_nodes = tree_size.checked_mul(2)?;
+    let tree_bytes = tree_nodes.checked_mul(state_bytes)?;
+    let right_workspace = source_len.checked_mul(3 * std::mem::size_of::<usize>())?;
+    let left_workspace = query_count.checked_mul(7 * std::mem::size_of::<usize>())?;
+    tree_bytes
+        .checked_add(right_workspace)?
+        .checked_add(left_workspace)
+}
+
+fn rank_sweep_memory_budget(
+    source_len: usize,
+    query_count: usize,
+    operation_count: usize,
+) -> usize {
+    let input_bytes = source_len
+        .saturating_mul(32 + operation_count.saturating_mul(8))
+        .saturating_add(query_count.saturating_mul(32));
+    input_bytes
+        .saturating_mul(RANK_SWEEP_MEMORY_MULTIPLIER)
+        .max(MIN_RANK_SWEEP_MEMORY_BUDGET)
+}
+
+fn rank_sweep_state_bytes(
+    inputs: &[crate::aggregation::input::AggregationInput<'_>],
+) -> Option<usize> {
+    use crate::aggregation::input::{AggregationInput, AggregationOp};
+
+    let mut bytes: usize = 1;
+    let mut has_count_all = false;
+    for input in inputs {
+        match input {
+            AggregationInput::CountAll => has_count_all = true,
+            AggregationInput::CountNonNull(_) => bytes = bytes.checked_add(8)?,
+            AggregationInput::I64(_, _, op)
+            | AggregationInput::I32(_, _, op)
+            | AggregationInput::I16(_, _, op)
+            | AggregationInput::I8(_, _, op)
+            | AggregationInput::U64(_, _, op)
+            | AggregationInput::U32(_, _, op)
+            | AggregationInput::U16(_, _, op)
+            | AggregationInput::U8(_, _, op) => {
+                if *op == AggregationOp::CountAll {
+                    has_count_all = true;
+                    continue;
+                }
+                if !matches!(
+                    op,
+                    AggregationOp::Sum | AggregationOp::Min | AggregationOp::Max
+                ) {
+                    return None;
+                }
+                bytes = bytes.checked_add(8)?;
+            }
+            AggregationInput::F64(_, _, op) | AggregationInput::F32(_, _, op) => {
+                if *op == AggregationOp::CountAll {
+                    has_count_all = true;
+                    continue;
+                }
+                if !matches!(op, AggregationOp::Min | AggregationOp::Max) {
+                    return None;
+                }
+                bytes = bytes.checked_add(8)?;
+            }
+        }
+    }
+    if has_count_all {
+        bytes = bytes.checked_add(8)?;
+    }
+    Some(bytes)
+}
+
 /// Aggregate an envelope-backed dual range without visiting every pair.
 ///
 /// Applies when the second anchor is the cumulative envelope of the only
@@ -2352,8 +2450,15 @@ fn aggregate_envelope_rank_sweep<'py>(
         ends: first_ends,
         left_positions,
     } = first_bounds;
-    // The sweep replaces a traversal of the intersected windows; only take
-    // it when that traversal is large next to building and querying a tree.
+    let inputs = parse_inputs(aggregations)?;
+    if inputs.is_empty() {
+        return Err(PyValueError::new_err(
+            "at least one aggregation is required",
+        ));
+    }
+    let Some(state_bytes) = rank_sweep_state_bytes(&inputs) else {
+        return Ok(None);
+    };
     let candidate_width = windows
         .starts
         .iter()
@@ -2361,7 +2466,7 @@ fn aggregate_envelope_rank_sweep<'py>(
         .fold(0_usize, |total, (start, end)| {
             total.saturating_add(end.saturating_sub(*start))
         });
-    if !should_use_segment_tree(first_starts.len(), candidate_width, source_len) {
+    if !should_use_rank_sweep(first_starts.len(), candidate_width, source_len, source_len) {
         return Ok(None);
     }
     let suffix = first_ends.iter().all(|&end| end == source_len);
@@ -2369,17 +2474,6 @@ fn aggregate_envelope_rank_sweep<'py>(
     if !(suffix || prefix) {
         return Ok(None);
     }
-    let inputs = parse_inputs(aggregations)?;
-    if inputs.is_empty() {
-        return Err(PyValueError::new_err(
-            "at least one aggregation is required",
-        ));
-    }
-    let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
-    if !set.supports_dual_rank_tree() {
-        return Ok(None);
-    }
-
     macro_rules! ranked {
         ($variant:ident, $anchor:expr) => {{
             let anchor = $anchor;
@@ -2415,6 +2509,20 @@ fn aggregate_envelope_rank_sweep<'py>(
         AnyParsedRangePredicate::F64(anchor) => ranked!(F64, anchor),
         AnyParsedRangePredicate::F32(anchor) => ranked!(F32, anchor),
     };
+
+    if !should_use_rank_sweep(first_starts.len(), candidate_width, source_len, rank_count)
+        || rank_sweep_workspace_bytes(first_starts.len(), source_len, rank_count, state_bytes)
+            .is_none_or(|bytes| {
+                bytes > rank_sweep_memory_budget(source_len, first_starts.len(), inputs.len())
+            })
+    {
+        return Ok(None);
+    }
+
+    let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
+    if !set.supports_dual_rank_tree() {
+        return Ok(None);
+    }
 
     #[cfg(test)]
     ENVELOPE_RANK_SWEEP_HITS.with(|hits| hits.set(hits.get() + 1));
@@ -4236,7 +4344,8 @@ mod default_skip_scan_tests {
                 PyTuple::new(
                     py,
                     [
-                        "*".into_pyobject(py)?.into_any(),
+                        values.clone(),
+                        nulls.clone(),
                         "size".into_pyobject(py)?.into_any(),
                     ],
                 )?,
@@ -4616,6 +4725,44 @@ mod default_skip_scan_tests {
                 Ok(())
             })
             .unwrap();
+        }
+
+        #[test]
+        fn rank_sweep_gate_charges_build_and_workspace() {
+            let query_count: usize = 10_000;
+            let source_len: usize = 10_000;
+            let rank_count: usize = 10_000;
+            let height = (usize::BITS - (rank_count - 1).leading_zeros()) as usize;
+            let query_cost = query_count * height * 2;
+            let crossover = source_len * RANK_SWEEP_BUILD_FACTOR + query_cost;
+
+            assert!(!should_use_rank_sweep(
+                query_count,
+                crossover,
+                source_len,
+                rank_count,
+            ));
+            assert!(should_use_rank_sweep(
+                query_count,
+                crossover + 1,
+                source_len,
+                rank_count,
+            ));
+            assert!(!should_use_rank_sweep(
+                3,
+                crossover + 1,
+                source_len,
+                rank_count
+            ));
+
+            let bytes = rank_sweep_workspace_bytes(10_000_000, 40_000_000, 10_000_000, 8).unwrap();
+            assert!(bytes > 40_000_000 * 3 * std::mem::size_of::<usize>());
+            assert!(bytes > 10_000_000 * 7 * std::mem::size_of::<usize>());
+            let estimated_input = 10_000_000 * (32 + 4 * 8) + 1_000_000 * 32;
+            assert_eq!(
+                rank_sweep_memory_budget(10_000_000, 1_000_000, 4),
+                estimated_input * RANK_SWEEP_MEMORY_MULTIPLIER
+            );
         }
     }
 }
