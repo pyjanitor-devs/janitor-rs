@@ -1615,3 +1615,37 @@ the per-row check. Keep the masked path out of line. When changing the gate
 or the scan, benchmark right layouts whose 32-row blocks match the residual
 on every row or on none, at 25/35/45% open, alongside sparse joins, each
 with and without a masked `!=`.
+### [2026-10-21] Aggregations follow `join_algorithm`; speed up each path in place
+
+**Context**: Default range-only `join_agg` counts (Arun useR!2016 `x <= x`,
+`y > y`) were O(pairs): the second predicate is unordered in the first
+anchor's layout, so pyjanitor passes its cumulative envelope as the second
+anchor and the original predicate as a residual, and
+`range_join_extended_aggregate` visited every envelope candidate.
+**User correction**: aggregation dispatch follows the user's
+`join_algorithm`. `"default"` stays on the default range-join kernels and
+`"regions"` uses the regions path; never route one to the other for speed.
+**Learning**: When the second anchor is provably the envelope of the only
+residual (`anchor_is_envelope_of`: same operator, equal left values, anchor
+right equal to the recomputed suffix-min / prefix-max), every first-anchor
+window is a prefix or suffix and the envelope can be dropped exactly. Each
+row then asks for positions inserted so far whose residual rank clears a
+threshold, answered by the existing insert-only rank tree.
+**Recommendation**: Verify the envelope from values rather than trusting the
+call shape. Use the rank-sweep gate: charge the 64x right-side build cost plus
+rank-tree query cost, then reject workspace above
+`max(512 MiB, 3x estimated input footprint)`; do not reuse the generic
+`should_use_segment_tree` gate. Keep floating-point sums and products on the
+encounter-order traversal.
+
+### [2026-10-23] Rebase overlapping range-join test modules carefully
+
+**Context**: PR #267 rebased onto `main` after PR #268 added a large test
+module in the same file. Git's conflict regions interleaved the two modules,
+which can leave one test module nested inside another while still compiling.
+**Learning**: A successful compile is not enough to validate a conflict
+resolution: test discovery and module boundaries can silently change.
+**Recommendation**: After resolving a same-file rebase, inspect the module
+structure, run the full test suite, and confirm the expected test count and
+names. Preserve both feature tests and the base branch's tests rather than
+accepting one side of a broad conflict wholesale.
