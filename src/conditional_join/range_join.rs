@@ -2432,23 +2432,23 @@ fn rank_sweep_state_bytes(
     Some(bytes)
 }
 
-/// Estimate whether the residual is dense enough to justify building a rank tree.
+/// Sample residual survivors to estimate the work left for the ordinary scan.
 ///
 /// ELI5: a rank tree is worthwhile when many cards in the windows survive the
-/// residual. If only a few cards survive, the skip scanner can discard the
-/// rest cheaply and building the tree is wasted work.
-fn residual_density_is_sufficient<T: PartialOrd + Copy>(
+/// residual. The caller compares the estimated survivor count with the rank
+/// tree's fixed build cost.
+fn residual_density_sample<T: PartialOrd + Copy>(
     windows: &SingleJoinResult,
     left_positions: &[usize],
     left: ArrayView1<'_, T>,
     right: ArrayView1<'_, T>,
     op: super::compare_op::CompareOp,
-) -> bool {
+) -> Option<(usize, usize)> {
     const SAMPLE_ROWS: usize = 32;
     const SAMPLE_POSITIONS: usize = 32;
     let row_count = windows.starts.len();
     if row_count == 0 {
-        return false;
+        return None;
     }
     let row_step = row_count.div_ceil(SAMPLE_ROWS).max(1);
     let mut sampled = 0_usize;
@@ -2467,45 +2467,45 @@ fn residual_density_is_sufficient<T: PartialOrd + Copy>(
             surviving += usize::from(op.apply(&left[left_positions[row]], &right[position]));
         }
     }
-    sampled > 0 && surviving.saturating_mul(4) >= sampled
+    (sampled > 0).then_some((sampled, surviving))
 }
 
-fn residual_density_is_sufficient_dispatch(
+fn residual_density_sample_dispatch(
     windows: &SingleJoinResult,
     left_positions: &[usize],
     residual: &super::predicate::Predicate<'_>,
-) -> bool {
+) -> Option<(usize, usize)> {
     use super::predicate::PredicateView;
     match residual.view() {
         PredicateView::I64(left, right, op) => {
-            residual_density_is_sufficient(windows, left_positions, left, right, op)
+            residual_density_sample(windows, left_positions, left, right, op)
         }
         PredicateView::I32(left, right, op) => {
-            residual_density_is_sufficient(windows, left_positions, left, right, op)
+            residual_density_sample(windows, left_positions, left, right, op)
         }
         PredicateView::I16(left, right, op) => {
-            residual_density_is_sufficient(windows, left_positions, left, right, op)
+            residual_density_sample(windows, left_positions, left, right, op)
         }
         PredicateView::I8(left, right, op) => {
-            residual_density_is_sufficient(windows, left_positions, left, right, op)
+            residual_density_sample(windows, left_positions, left, right, op)
         }
         PredicateView::U64(left, right, op) => {
-            residual_density_is_sufficient(windows, left_positions, left, right, op)
+            residual_density_sample(windows, left_positions, left, right, op)
         }
         PredicateView::U32(left, right, op) => {
-            residual_density_is_sufficient(windows, left_positions, left, right, op)
+            residual_density_sample(windows, left_positions, left, right, op)
         }
         PredicateView::U16(left, right, op) => {
-            residual_density_is_sufficient(windows, left_positions, left, right, op)
+            residual_density_sample(windows, left_positions, left, right, op)
         }
         PredicateView::U8(left, right, op) => {
-            residual_density_is_sufficient(windows, left_positions, left, right, op)
+            residual_density_sample(windows, left_positions, left, right, op)
         }
         PredicateView::F64(left, right, op) => {
-            residual_density_is_sufficient(windows, left_positions, left, right, op)
+            residual_density_sample(windows, left_positions, left, right, op)
         }
         PredicateView::F32(left, right, op) => {
-            residual_density_is_sufficient(windows, left_positions, left, right, op)
+            residual_density_sample(windows, left_positions, left, right, op)
         }
     }
 }
@@ -2617,10 +2617,19 @@ fn select_envelope_rank_sweep(
     if !(suffix || prefix) {
         return None;
     }
-    if !residual_density_is_sufficient_dispatch(windows, left_positions, residual) {
+    let (sampled, surviving) =
+        residual_density_sample_dispatch(windows, &windows.left_positions, residual)?;
+    if (surviving as u128) * (candidate_width as u128) / (sampled as u128)
+        <= (right_len as u128) * (RANK_SWEEP_BUILD_FACTOR as u128)
+    {
         return None;
     }
     let (ranks, rank_count, thresholds) = envelope_residual_ranks(second, residual)?;
+    if rank_sweep_workspace_bytes(first_starts.len(), right_len, rank_count, 8)
+        .is_none_or(|bytes| bytes > rank_sweep_memory_budget(right_len, first_starts.len(), 1))
+    {
+        return None;
+    }
 
     #[cfg(test)]
     ENVELOPE_KEEP_SWEEP_HITS.with(|hits| hits.set(hits.get() + 1));

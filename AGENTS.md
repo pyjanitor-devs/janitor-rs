@@ -1632,11 +1632,13 @@ window is a prefix or suffix and the envelope can be dropped exactly. Each
 row then asks for positions inserted so far whose residual rank clears a
 threshold, answered by the existing insert-only rank tree.
 **Recommendation**: Verify the envelope from values rather than trusting the
-call shape. Use the rank-sweep gate: charge the 64x right-side build cost plus
-rank-tree query cost, then reject workspace above
-`max(512 MiB, 3x estimated input footprint)`; do not reuse the generic
-`should_use_segment_tree` gate. Keep floating-point sums and products on the
-encounter-order traversal.
+call shape, so a tighter or mismatched anchor falls back to the traversal.
+Gate aggregation with `should_use_rank_sweep` and its workspace budget. Gate
+`keep="first"`/`"last"` selection with the same build/query cost model,
+workspace budget, and a sampled survivor-count estimate; do not reuse the
+generic `should_use_segment_tree` gate. Keep `any` and `all` on the residual
+scan, and keep floating-point sums and products on the encounter-order
+traversal.
 
 ### [2026-10-23] Rebase overlapping range-join test modules carefully
 
@@ -1649,12 +1651,6 @@ resolution: test discovery and module boundaries can silently change.
 structure, run the full test suite, and confirm the expected test count and
 names. Preserve both feature tests and the base branch's tests rather than
 accepting one side of a broad conflict wholesale.
-call shape, so a tighter or mismatched anchor falls back to the traversal.
-Gate both aggregation and `keep="first"`/`"last"` selection with
-`should_use_rank_sweep`: charge the 64x right-side build cost plus rank-tree
-query cost, reject excessive workspace, and do not reuse the generic
-`should_use_segment_tree` gate. Keep `any` and `all` on the residual scan,
-and keep floating-point sums and products on the encounter-order traversal.
 
 ### [2026-10-21] keep="first"/"last" on envelope joins: answer from a label tree
 **Context**: On Arun's 1M x 33K dominance join, `keep="any"` took 0.05 s but
@@ -1669,6 +1665,7 @@ prefix query after inserting right positions in window-growth order:
 `select_envelope_rank_sweep`, O((left + right) log right). An envelope always
 admits a superset of the residual's matches, so the drop is exact.
 **Recommendation**: Keep `any` and `all` on the residual scan, share
-`envelope_residual_ranks` with the aggregation sweep, and use the same
-cost/memory gate as the aggregation sweep. Add density-aware gating if
-benchmarks show the skip scan wins on sparse, wide windows.
+`envelope_residual_ranks` with the aggregation sweep, and use the sampled
+survivor-count gate plus the selector workspace budget before building the
+rank tree. The estimate compares sampled survivors scaled to total candidate
+width against the 64x right-side build cost.
