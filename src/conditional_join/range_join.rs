@@ -2432,6 +2432,84 @@ fn rank_sweep_state_bytes(
     Some(bytes)
 }
 
+/// Estimate whether the residual is dense enough to justify building a rank tree.
+///
+/// ELI5: a rank tree is worthwhile when many cards in the windows survive the
+/// residual. If only a few cards survive, the skip scanner can discard the
+/// rest cheaply and building the tree is wasted work.
+fn residual_density_is_sufficient<T: PartialOrd + Copy>(
+    windows: &SingleJoinResult,
+    left_positions: &[usize],
+    left: ArrayView1<'_, T>,
+    right: ArrayView1<'_, T>,
+    op: super::compare_op::CompareOp,
+) -> bool {
+    const SAMPLE_ROWS: usize = 32;
+    const SAMPLE_POSITIONS: usize = 32;
+    let row_count = windows.starts.len();
+    if row_count == 0 {
+        return false;
+    }
+    let row_step = row_count.div_ceil(SAMPLE_ROWS).max(1);
+    let mut sampled = 0_usize;
+    let mut surviving = 0_usize;
+    for row in (0..row_count).step_by(row_step).take(SAMPLE_ROWS) {
+        let start = windows.starts[row];
+        let end = windows.ends[row];
+        if start >= end {
+            continue;
+        }
+        let width = end - start;
+        let probes = width.min(SAMPLE_POSITIONS);
+        for probe in 0..probes {
+            let position = start + probe * width / probes;
+            sampled += 1;
+            surviving += usize::from(op.apply(&left[left_positions[row]], &right[position]));
+        }
+    }
+    sampled > 0 && surviving.saturating_mul(4) >= sampled
+}
+
+fn residual_density_is_sufficient_dispatch(
+    windows: &SingleJoinResult,
+    left_positions: &[usize],
+    residual: &super::predicate::Predicate<'_>,
+) -> bool {
+    use super::predicate::PredicateView;
+    match residual.view() {
+        PredicateView::I64(left, right, op) => {
+            residual_density_is_sufficient(windows, left_positions, left, right, op)
+        }
+        PredicateView::I32(left, right, op) => {
+            residual_density_is_sufficient(windows, left_positions, left, right, op)
+        }
+        PredicateView::I16(left, right, op) => {
+            residual_density_is_sufficient(windows, left_positions, left, right, op)
+        }
+        PredicateView::I8(left, right, op) => {
+            residual_density_is_sufficient(windows, left_positions, left, right, op)
+        }
+        PredicateView::U64(left, right, op) => {
+            residual_density_is_sufficient(windows, left_positions, left, right, op)
+        }
+        PredicateView::U32(left, right, op) => {
+            residual_density_is_sufficient(windows, left_positions, left, right, op)
+        }
+        PredicateView::U16(left, right, op) => {
+            residual_density_is_sufficient(windows, left_positions, left, right, op)
+        }
+        PredicateView::U8(left, right, op) => {
+            residual_density_is_sufficient(windows, left_positions, left, right, op)
+        }
+        PredicateView::F64(left, right, op) => {
+            residual_density_is_sufficient(windows, left_positions, left, right, op)
+        }
+        PredicateView::F32(left, right, op) => {
+            residual_density_is_sufficient(windows, left_positions, left, right, op)
+        }
+    }
+}
+
 /// Residual ranks and per-left thresholds when `second` is provably the
 /// cumulative envelope of `residual` (see [`anchor_is_envelope_of`]).
 ///
@@ -2537,6 +2615,9 @@ fn select_envelope_rank_sweep(
     let suffix = first_ends.iter().all(|&end| end == right_len);
     let prefix = first_starts.iter().all(|&start| start == 0);
     if !(suffix || prefix) {
+        return None;
+    }
+    if !residual_density_is_sufficient_dispatch(windows, left_positions, residual) {
         return None;
     }
     let (ranks, rank_count, thresholds) = envelope_residual_ranks(second, residual)?;
