@@ -1595,3 +1595,23 @@ the skip scan only over unmatched rows' remaining windows (`plan_windows`).
 A 64-candidate probe was 1.2-1.35x slower on deep-match joins; benchmark
 early-match, deep-match and no-match `any` cases at both 200K and 5M right
 rows when changing either constant.
+
+### [2026-10-23] Skipping a block must not make its survivors dearer
+**Context**: PR #268's skip scan checked the other residuals one passing row
+at a time (`predicates_match_dispatch`), while the plain window loop builds
+one vectorized mask (`predicates_match_window`). The density gate counts only
+the skipped residual, so with a masked `!=`, about 35-45% of blocks open and
+every row of an opened block passing, the plan ran and was 0.66-0.87x of
+main for every `keep` and aggregation.
+**Learning**: The right check depends on how many rows of an opened block
+pass the skipped residual, and the choice has to be made once per plan.
+Masking every opened block was 0.42-0.49x on sparse masked joins, and a
+per-chunk choice was still 0.78-0.89x there even when it always picked the
+per-row check: the chunked loop itself is slower than the per-block one.
+**Recommendation**: The density sample also counts passing rows in the
+probed blocks it would open; when at least half pass, `WindowResidualScan`
+masks `rest` over whole opened runs (`for_each_open_run`), otherwise it keeps
+the per-row check. Keep the masked path out of line. When changing the gate
+or the scan, benchmark right layouts whose 32-row blocks match the residual
+on every row or on none, at 25/35/45% open, alongside sparse joins, each
+with and without a masked `!=`.

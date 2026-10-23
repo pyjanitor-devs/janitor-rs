@@ -3318,7 +3318,7 @@ mod aggregation_tests {
 mod default_skip_scan_tests {
     use super::*;
     use crate::conditional_join::range_skip_scan::{
-        ANY_PROBE_PENDING, ANY_PROBE_RESOLVED, SECOND_RANGE_SUPER_SKIPS,
+        ANY_PROBE_PENDING, ANY_PROBE_RESOLVED, SECOND_RANGE_SUPER_SKIPS, WINDOW_RESIDUAL_MASK_RUNS,
         WINDOW_RESIDUAL_SKIP_DENSE, WINDOW_RESIDUAL_SKIP_PLANS,
     };
     use numpy::{PyArray1, PyArrayMethods};
@@ -3684,6 +3684,77 @@ mod default_skip_scan_tests {
                         .filter(|positions| !positions.is_empty())
                         .count()
                 };
+                assert_eq!(observed, expected, "keep={keep}");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn dense_opened_blocks_mask_the_other_residuals() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // About a third of the 32-row right blocks match the residual on
+            // every row and the rest on none: the plan runs, and since the
+            // sampled opened blocks all pass, the masked `!=` is checked with
+            // the window mask over opened runs.
+            let mut data = overlap_fixture(300, 5_000, 61);
+            let mut seed = 7_u64;
+            for block in 0..data.right_start.len().div_ceil(32) {
+                let start = if next(&mut seed).is_multiple_of(3) {
+                    0
+                } else {
+                    1_000_000
+                };
+                for position in block * 32..((block + 1) * 32).min(data.right_start.len()) {
+                    data.right_start[position] = start;
+                }
+            }
+            let reference = data.reference(true);
+            for keep in ["all", "any", "first", "last"] {
+                let predicates = data.predicates(py, false, true)?;
+                let (plans_before, runs_before) =
+                    (plans(), WINDOW_RESIDUAL_MASK_RUNS.with(|runs| runs.get()));
+                let result = range_join_extended_indices(
+                    py,
+                    &predicates,
+                    PyArray1::from_vec(py, data.left_index.clone()).into_any(),
+                    PyArray1::from_vec(py, data.right_index.clone()).into_any(),
+                    keep,
+                )?
+                .expect("blocky join has matches");
+                assert!(
+                    plans() > plans_before,
+                    "keep={keep}: the skip plan must run"
+                );
+                assert!(
+                    WINDOW_RESIDUAL_MASK_RUNS.with(|runs| runs.get()) > runs_before,
+                    "keep={keep}: opened runs must be masked"
+                );
+                let column = |name: &str| -> PyResult<Vec<i64>> {
+                    result
+                        .get_item(name)?
+                        .expect("index output")
+                        .extract::<Vec<i64>>()
+                };
+                let mut observed: Vec<(i64, i64)> = column("left_index")?
+                    .into_iter()
+                    .zip(column("right_index")?)
+                    .collect();
+                observed.sort_unstable();
+                let mut expected: Vec<(i64, i64)> = Vec::new();
+                for (row, positions) in reference.iter().enumerate() {
+                    let labels = positions.iter().map(|&position| data.right_index[position]);
+                    let left = data.left_index[row];
+                    match keep {
+                        "all" => expected.extend(labels.map(|label| (left, label))),
+                        "any" => expected.extend(labels.take(1).map(|label| (left, label))),
+                        "first" => expected.extend(labels.min().map(|label| (left, label))),
+                        _ => expected.extend(labels.max().map(|label| (left, label))),
+                    }
+                }
+                expected.sort_unstable();
                 assert_eq!(observed, expected, "keep={keep}");
             }
             Ok(())

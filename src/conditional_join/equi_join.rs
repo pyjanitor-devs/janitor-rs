@@ -3420,6 +3420,23 @@ mod tests {
                         true
                     });
                     assert_eq!(got, expected, "direct len={len} op={op:?}");
+                    // Opened runs are ordered, disjoint, inside the window,
+                    // and hold every match.
+                    for scanner in [&int_scan, &direct] {
+                        let mut previous_end = start;
+                        got.clear();
+                        scanner.for_each_open_run(threshold, start, end, |run_start, run_end| {
+                            assert!(previous_end <= run_start && run_start < run_end);
+                            assert!(run_end <= end);
+                            previous_end = run_end;
+                            got.extend(
+                                (run_start..run_end)
+                                    .filter(|&position| op.apply(&threshold, &ints[position])),
+                            );
+                            true
+                        });
+                        assert_eq!(got, expected, "runs len={len} op={op:?} [{start}, {end})");
+                    }
                     for scanner_count in [
                         int_scan.count_matches(threshold, start, end),
                         float_scan.count_matches(threshold as f64 / 4.0, start, end),
