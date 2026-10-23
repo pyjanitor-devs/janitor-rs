@@ -2334,6 +2334,104 @@ fn anchor_is_envelope_of<T: PartialOrd + Copy>(
     }
 }
 
+/// The sweep has a materially larger fixed build cost than a segment tree.
+const RANK_SWEEP_BUILD_FACTOR: usize = 64;
+const MIN_RANK_SWEEP_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
+const RANK_SWEEP_MEMORY_MULTIPLIER: usize = 3;
+
+fn should_use_rank_sweep(
+    query_count: usize,
+    total_width: usize,
+    source_len: usize,
+    rank_count: usize,
+) -> bool {
+    if query_count <= 3 || source_len == 0 || rank_count == 0 {
+        return false;
+    }
+    let height = (usize::BITS - (rank_count - 1).leading_zeros()) as usize;
+    let build = source_len.saturating_mul(RANK_SWEEP_BUILD_FACTOR);
+    let queries = query_count.saturating_mul(height).saturating_mul(2);
+    total_width > build.saturating_add(queries)
+}
+
+fn rank_sweep_workspace_bytes(
+    query_count: usize,
+    source_len: usize,
+    rank_count: usize,
+    state_bytes: usize,
+) -> Option<usize> {
+    let tree_size = rank_count.checked_next_power_of_two()?;
+    let tree_nodes = tree_size.checked_mul(2)?;
+    let tree_bytes = tree_nodes.checked_mul(state_bytes)?;
+    let right_workspace = source_len.checked_mul(3 * std::mem::size_of::<usize>())?;
+    let left_workspace = query_count.checked_mul(7 * std::mem::size_of::<usize>())?;
+    tree_bytes
+        .checked_add(right_workspace)?
+        .checked_add(left_workspace)
+}
+
+fn rank_sweep_memory_budget(
+    source_len: usize,
+    query_count: usize,
+    operation_count: usize,
+) -> usize {
+    let input_bytes = source_len
+        .saturating_mul(32 + operation_count.saturating_mul(8))
+        .saturating_add(query_count.saturating_mul(32));
+    input_bytes
+        .saturating_mul(RANK_SWEEP_MEMORY_MULTIPLIER)
+        .max(MIN_RANK_SWEEP_MEMORY_BUDGET)
+}
+
+fn rank_sweep_state_bytes(
+    inputs: &[crate::aggregation::input::AggregationInput<'_>],
+) -> Option<usize> {
+    use crate::aggregation::input::{AggregationInput, AggregationOp};
+
+    let mut bytes: usize = 1;
+    let mut has_count_all = false;
+    for input in inputs {
+        match input {
+            AggregationInput::CountAll => has_count_all = true,
+            AggregationInput::CountNonNull(_) => bytes = bytes.checked_add(8)?,
+            AggregationInput::I64(_, _, op)
+            | AggregationInput::I32(_, _, op)
+            | AggregationInput::I16(_, _, op)
+            | AggregationInput::I8(_, _, op)
+            | AggregationInput::U64(_, _, op)
+            | AggregationInput::U32(_, _, op)
+            | AggregationInput::U16(_, _, op)
+            | AggregationInput::U8(_, _, op) => {
+                if *op == AggregationOp::CountAll {
+                    has_count_all = true;
+                    continue;
+                }
+                if !matches!(
+                    op,
+                    AggregationOp::Sum | AggregationOp::Min | AggregationOp::Max
+                ) {
+                    return None;
+                }
+                bytes = bytes.checked_add(8)?;
+            }
+            AggregationInput::F64(_, _, op) | AggregationInput::F32(_, _, op) => {
+                if *op == AggregationOp::CountAll {
+                    has_count_all = true;
+                    continue;
+                }
+                if !matches!(op, AggregationOp::Min | AggregationOp::Max) {
+                    return None;
+                }
+                bytes = bytes.checked_add(8)?;
+            }
+        }
+    }
+    if has_count_all {
+        bytes = bytes.checked_add(8)?;
+    }
+    Some(bytes)
+}
+
 /// Residual ranks and per-left thresholds when `second` is provably the
 /// cumulative envelope of `residual` (see [`anchor_is_envelope_of`]).
 ///
@@ -2591,7 +2689,7 @@ fn aggregate_envelope_rank_sweep<'py>(
             "at least one aggregation is required",
         ));
     }
-    let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
+    let set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
     if !set.supports_dual_rank_tree() {
         return Ok(None);
     }
@@ -3988,7 +4086,14 @@ mod default_skip_scan_tests {
                             keep,
                         )?
                         .expect("the overlap has matches");
-                        assert!(plans() > plans_before, "skip scan did not run for {keep}");
+                        // The envelope rank sweep intentionally supersedes the
+                        // skip scan for first/last on this fixture. Those modes
+                        // retain dedicated skip-scan coverage in the blocky
+                        // residual test below; keep this test focused on the
+                        // scan path for all/any.
+                        if matches!(keep, "all" | "any") {
+                            assert!(plans() > plans_before, "skip scan did not run for {keep}");
+                        }
                         let read = |name: &str| -> PyResult<Vec<i64>> {
                             Ok(result
                                 .get_item(name)?
