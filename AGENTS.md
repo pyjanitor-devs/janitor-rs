@@ -1634,3 +1634,15 @@ threshold, answered by the existing insert-only rank tree.
 **Recommendation**: Verify the envelope from values rather than trusting the
 call shape, gate on intersected candidate width, and keep floating-point sums
 and products on the encounter-order traversal.
+
+### [2026-10-23] Rebase overlapping range-join test modules carefully
+
+**Context**: PR #267 rebased onto `main` after PR #268 added a large test
+module in the same file. Git's conflict regions interleaved the two modules,
+which can leave one test module nested inside another while still compiling.
+**Learning**: A successful compile is not enough to validate a conflict
+resolution: test discovery and module boundaries can silently change.
+**Recommendation**: After resolving a same-file rebase, inspect the module
+structure, run the full test suite, and confirm the expected test count and
+names. Preserve both feature tests and the base branch's tests rather than
+accepting one side of a broad conflict wholesale.
