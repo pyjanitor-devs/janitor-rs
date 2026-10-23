@@ -118,7 +118,8 @@ pub(crate) fn materialize_range_candidates(
         return Ok((output_left, output_right));
     }
 
-    // First/last/any emit at most one result per retained left row.
+    // First/last emit at most one result per retained left row; `any` returned
+    // early through `materialize_range_any`.
     let mut output_left = Vec::new();
     output_left
         .try_reserve_exact(windows.left_index.len())
@@ -132,26 +133,6 @@ pub(crate) fn materialize_range_candidates(
         let left_position = windows.left_positions[row];
         let start = windows.starts[row];
         let end = windows.ends[row];
-
-        if keep == Keep::Any {
-            let mut selected = None;
-            for right_position in start..end {
-                if predicates_match_dispatch(
-                    &views,
-                    metadata_views.as_deref(),
-                    left_position,
-                    right_position,
-                ) {
-                    selected = Some(right_position);
-                    break;
-                }
-            }
-            if let Some(right_position) = selected {
-                output_left.push(windows.left_index[row]);
-                output_right.push(labels[right_position]);
-            }
-            continue;
-        }
 
         mask.resize(end - start, 0);
         predicates_match_window(
@@ -169,10 +150,6 @@ pub(crate) fn materialize_range_candidates(
             }
             let right_position = start + offset;
             match keep {
-                Keep::Any => {
-                    selected = Some(right_position);
-                    break;
-                }
                 Keep::First => {
                     if selected.is_none_or(|current| label < labels[current]) {
                         selected = Some(right_position);
@@ -183,7 +160,7 @@ pub(crate) fn materialize_range_candidates(
                         selected = Some(right_position);
                     }
                 }
-                Keep::All => unreachable!(),
+                Keep::Any | Keep::All => unreachable!(),
             }
         }
         if let Some(right_position) = selected {
@@ -372,17 +349,13 @@ fn materialize_range_candidates_skipping(
         let mut selected: Option<usize> = None;
         scan.for_each_match(left_position, start, end, |right_position| {
             let replace = match keep {
-                Keep::Any => {
-                    selected = Some(right_position);
-                    return false;
-                }
                 Keep::First => {
                     selected.is_none_or(|current| labels[right_position] < labels[current])
                 }
                 Keep::Last => {
                     selected.is_none_or(|current| labels[right_position] > labels[current])
                 }
-                Keep::All => unreachable!(),
+                Keep::Any | Keep::All => unreachable!(),
             };
             if replace {
                 selected = Some(right_position);
