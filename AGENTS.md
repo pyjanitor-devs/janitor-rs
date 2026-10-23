@@ -1632,8 +1632,11 @@ window is a prefix or suffix and the envelope can be dropped exactly. Each
 row then asks for positions inserted so far whose residual rank clears a
 threshold, answered by the existing insert-only rank tree.
 **Recommendation**: Verify the envelope from values rather than trusting the
-call shape, gate on intersected candidate width, and keep floating-point sums
-and products on the encounter-order traversal.
+call shape. Use the rank-sweep gate: charge the 64x right-side build cost plus
+rank-tree query cost, then reject workspace above
+`max(512 MiB, 3x estimated input footprint)`; do not reuse the generic
+`should_use_segment_tree` gate. Keep floating-point sums and products on the
+encounter-order traversal.
 
 ### [2026-10-23] Rebase overlapping range-join test modules carefully
 
