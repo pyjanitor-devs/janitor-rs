@@ -24,6 +24,8 @@ thread_local! {
     pub(crate) static SECOND_RANGE_SUPER_SKIPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static WINDOW_RESIDUAL_SKIP_PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static WINDOW_RESIDUAL_SKIP_DENSE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static ANY_PROBE_RESOLVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static ANY_PROBE_PENDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Rows summarized by one block of [`SecondRangeSkipScan`].
@@ -185,35 +187,39 @@ impl<'a, T: PartialOrd + Copy> SecondRangeSkipScan<'a, T> {
         }
     }
 
-    /// Rows of `[start, end)` inside blocks the walk would open.
+    /// Estimate how many rows of `[start, end)` sit in blocks the walk would
+    /// open, from at most `probes` evenly spaced block summaries.
     ///
-    /// This is the work [`Self::for_each_match`] does after skipping, without
-    /// reading any row values. A window too narrow for summaries reports its
-    /// full width.
-    pub(crate) fn surviving_rows(&self, left: T, start: usize, end: usize) -> usize {
-        debug_assert!(start <= end && end <= self.values.len());
-        if self.blocks.is_empty() || end - start < SECOND_RANGE_DIRECT_WIDTH {
-            return end - start;
+    /// Walking every block of a window costs one check per 32 rows, so on
+    /// windows spanning the right layout a full walk of 256 sampled windows
+    /// cost several times the summary build itself. A fixed number of probes
+    /// keeps the density sample's cost independent of window width. A window
+    /// too narrow for summaries reports its full width.
+    ///
+    /// ELI5: to guess how many boxes in an aisle we would open, read the
+    /// sticky notes on a few boxes spread along it instead of every one.
+    pub(crate) fn estimate_surviving_rows(
+        &self,
+        left: T,
+        start: usize,
+        end: usize,
+        probes: usize,
+    ) -> usize {
+        debug_assert!(start <= end && end <= self.values.len() && probes > 0);
+        let width = end - start;
+        if self.blocks.is_empty() || width < SECOND_RANGE_DIRECT_WIDTH {
+            return width;
         }
-        let mut rows = 0;
-        let mut block = start / SECOND_RANGE_BLOCK;
-        let last_block = (end - 1) / SECOND_RANGE_BLOCK;
-        while block <= last_block {
-            if block.is_multiple_of(SECOND_RANGE_SUPER)
-                && !self
-                    .op
-                    .apply(&left, &self.supers[block / SECOND_RANGE_SUPER])
-            {
-                block += SECOND_RANGE_SUPER;
-                continue;
-            }
-            if self.op.apply(&left, &self.blocks[block]) {
-                rows += ((block + 1) * SECOND_RANGE_BLOCK).min(end)
-                    - (block * SECOND_RANGE_BLOCK).max(start);
-            }
-            block += 1;
-        }
-        rows
+        let first = start / SECOND_RANGE_BLOCK;
+        let count = (end - 1) / SECOND_RANGE_BLOCK - first + 1;
+        let probes = probes.min(count);
+        let open = (0..probes)
+            .filter(|&probe| {
+                self.op
+                    .apply(&left, &self.blocks[first + probe * count / probes])
+            })
+            .count();
+        width * open / probes
     }
 
     /// Count the positions in `[start, end)` that `for_each_match` would
@@ -306,6 +312,10 @@ pub(crate) fn skip_pays_off(right_len: usize, widths: impl Iterator<Item = usize
 /// summaries can skip.
 const DENSITY_SAMPLE_ROWS: usize = 256;
 
+/// Block summaries probed in each sampled window (see
+/// [`SecondRangeSkipScan::estimate_surviving_rows`]).
+const DENSITY_SAMPLE_PROBES: usize = 32;
+
 /// One typed residual promoted to a [`SecondRangeSkipScan`], with its left
 /// values.
 enum TypedSkipScan<'a> {
@@ -373,9 +383,10 @@ impl<'a> WindowResidualScan<'a> {
     /// dominance counts nearly every candidate matches, nothing can be
     /// skipped, and the per-candidate scan is about 15% slower than the
     /// caller's vectorized residual mask. So after building the summaries,
-    /// up to [`DENSITY_SAMPLE_ROWS`] evenly spaced windows are walked at
-    /// block level only; when more than half of their candidates sit in
-    /// blocks the scan would open, the plan is dropped.
+    /// up to [`DENSITY_SAMPLE_ROWS`] evenly spaced windows are probed at
+    /// [`DENSITY_SAMPLE_PROBES`] blocks each; when more than half of their
+    /// candidates are estimated to sit in blocks the scan would open, the
+    /// plan is dropped.
     ///
     /// A residual is eligible when its operator is `<`, `<=`, `>` or `>=`
     /// and it carries no null masks: a masked row's stored value is
@@ -386,6 +397,25 @@ impl<'a> WindowResidualScan<'a> {
         predicates: &'a [Predicate<'_>],
         metadata: Option<&'a [NullMetadata<'_>]>,
         windows: &SingleJoinResult,
+    ) -> Option<Self> {
+        Self::plan_windows(
+            predicates,
+            metadata,
+            &windows.left_positions,
+            &windows.starts,
+            &windows.ends,
+        )
+    }
+
+    /// [`Self::plan`] over parallel window slices, so a caller can plan for
+    /// a subset of rows (or trimmed windows) without building a
+    /// [`SingleJoinResult`].
+    pub(crate) fn plan_windows(
+        predicates: &'a [Predicate<'_>],
+        metadata: Option<&'a [NullMetadata<'_>]>,
+        left_positions: &[usize],
+        starts: &[usize],
+        ends: &[usize],
     ) -> Option<Self> {
         let unmasked = |position: usize| {
             metadata.is_none_or(|metadata| {
@@ -399,10 +429,9 @@ impl<'a> WindowResidualScan<'a> {
                 !matches!(predicate_op(predicate), CompareOp::Eq | CompareOp::Ne)
                     && unmasked(position)
             })?;
-        let widths = windows
-            .starts
+        let widths = starts
             .iter()
-            .zip(&windows.ends)
+            .zip(ends)
             .map(|(&start, &end)| end.saturating_sub(start));
         if !skip_pays_off(predicates[chosen].right_len(), widths) {
             return None;
@@ -427,18 +456,18 @@ impl<'a> WindowResidualScan<'a> {
         // ELI5: before trusting the sticky notes, peek at a few aisles. If
         // most boxes in them would be opened anyway, the notes are not
         // saving any work.
-        let rows = windows.starts.len();
+        let rows = starts.len();
         let step = rows.div_ceil(DENSITY_SAMPLE_ROWS).max(1);
         let (mut sampled, mut surviving) = (0_usize, 0_usize);
         for row in (0..rows).step_by(step) {
-            let (start, end) = (windows.starts[row], windows.ends[row]);
+            let (start, end) = (starts[row], ends[row]);
             if start >= end {
                 continue;
             }
-            let left_position = windows.left_positions[row];
+            let left_position = left_positions[row];
             sampled += end - start;
             surviving += with_typed_scan!(&scan, |left, scan| {
-                scan.surviving_rows(left[left_position], start, end)
+                scan.estimate_surviving_rows(left[left_position], start, end, DENSITY_SAMPLE_PROBES)
             });
         }
         if surviving.saturating_mul(2) > sampled {

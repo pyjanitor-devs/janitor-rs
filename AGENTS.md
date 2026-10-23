@@ -1578,3 +1578,20 @@ aggregation update order (including Kahan float sums) are unchanged.
 equi path, and fall back to the whole-window residual mask below it. Only
 range residuals without null masks are eligible (masks exist only for `!=`
 today).
+
+### [2026-10-23] Skip summaries must not tax `keep="any"` early matches
+**Context**: PR #268's first version planned the skip scan for every `keep`
+mode before reading any window. Base `any` stops at the first match, often
+after a few candidates, so it paid only the summary build and the density
+sample: 0.6 ms became 12 ms at 5M right rows. The sample walked every block
+of 256 full windows, about 8x the cost of the build itself.
+**Learning**: Gate costs must not grow with window width when the work they
+guard can stop early. Width and density say nothing about where the first
+match sits.
+**Recommendation**: Estimate the density gate from a fixed number of block
+probes per sampled window (`estimate_surviving_rows`, 32 probes). For
+`keep="any"`, read the first 32 candidates of each window directly and plan
+the skip scan only over unmatched rows' remaining windows (`plan_windows`).
+A 64-candidate probe was 1.2-1.35x slower on deep-match joins; benchmark
+early-match, deep-match and no-match `any` cases at both 200K and 5M right
+rows when changing either constant.

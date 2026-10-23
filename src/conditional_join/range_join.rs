@@ -3318,7 +3318,8 @@ mod aggregation_tests {
 mod default_skip_scan_tests {
     use super::*;
     use crate::conditional_join::range_skip_scan::{
-        SECOND_RANGE_SUPER_SKIPS, WINDOW_RESIDUAL_SKIP_DENSE, WINDOW_RESIDUAL_SKIP_PLANS,
+        ANY_PROBE_PENDING, ANY_PROBE_RESOLVED, SECOND_RANGE_SUPER_SKIPS,
+        WINDOW_RESIDUAL_SKIP_DENSE, WINDOW_RESIDUAL_SKIP_PLANS,
     };
     use numpy::{PyArray1, PyArrayMethods};
     use pyo3::IntoPyObject;
@@ -3726,6 +3727,79 @@ mod default_skip_scan_tests {
                     .unwrap()
             });
             assert_eq!(observed, expected);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn keep_any_probes_windows_before_planning_a_skip_scan() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let counters = || {
+                (
+                    ANY_PROBE_RESOLVED.with(|rows| rows.get()),
+                    ANY_PROBE_PENDING.with(|rows| rows.get()),
+                    plans(),
+                )
+            };
+            // The sparse overlap leaves some rows unmatched after the direct
+            // probe, and their remaining windows still repay the skip scan.
+            // The dense fixture matches every row within the probe, so no
+            // summaries are built at all.
+            let sparse = overlap_fixture(500, 5_000, 17);
+            let mut dense = overlap_fixture(300, 5_000, 53);
+            for position in 0..dense.right_start.len() {
+                dense.right_start[position] = (position % 3) as i64;
+            }
+            for (data, expect_plan) in [(&sparse, true), (&dense, false)] {
+                for with_tag in [false, true] {
+                    let reference = data.reference(with_tag);
+                    let predicates = data.predicates(py, false, with_tag)?;
+                    let (resolved, pending, plans_before) = counters();
+                    let result = range_join_extended_indices(
+                        py,
+                        &predicates,
+                        PyArray1::from_vec(py, data.left_index.clone()).into_any(),
+                        PyArray1::from_vec(py, data.right_index.clone()).into_any(),
+                        "any",
+                    )?
+                    .expect("the overlap has matches");
+                    let (resolved_after, pending_after, plans_after) = counters();
+                    assert!(resolved_after > resolved, "no row resolved by the probe");
+                    if expect_plan {
+                        assert!(pending_after > pending, "no row left for the skip scan");
+                        assert!(plans_after > plans_before, "skip scan did not run");
+                    } else {
+                        assert_eq!(pending_after, pending, "dense rows left the probe");
+                        assert_eq!(plans_after, plans_before, "dense join built summaries");
+                    }
+                    let read = |name: &str| -> PyResult<Vec<i64>> {
+                        Ok(result
+                            .get_item(name)?
+                            .expect("index output")
+                            .cast::<PyArray1<i64>>()?
+                            .readonly()
+                            .as_array()
+                            .to_vec())
+                    };
+                    let observed: Vec<(i64, i64)> = read("left_index")?
+                        .into_iter()
+                        .zip(read("right_index")?)
+                        .collect();
+                    // `any` reports each row's first match in position order.
+                    let expected: Vec<(i64, i64)> = reference
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(row, positions)| {
+                            positions
+                                .first()
+                                .map(|&position| (data.left_index[row], data.right_index[position]))
+                        })
+                        .collect();
+                    assert_eq!(observed, expected, "plan={expect_plan} tag={with_tag}");
+                }
+            }
             Ok(())
         })
         .unwrap();

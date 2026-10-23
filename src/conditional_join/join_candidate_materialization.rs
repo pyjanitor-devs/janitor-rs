@@ -47,6 +47,9 @@ pub(crate) fn materialize_range_candidates(
     metadata: Option<&[NullMetadata<'_>]>,
     keep: Keep,
 ) -> Result<(Vec<i64>, Vec<i64>), String> {
+    if keep == Keep::Any {
+        return materialize_range_any(windows, predicates, metadata);
+    }
     if let Some(scan) = WindowResidualScan::plan(predicates, metadata, windows) {
         return materialize_range_candidates_skipping(windows, &scan, keep);
     }
@@ -184,6 +187,116 @@ pub(crate) fn materialize_range_candidates(
             }
         }
         if let Some(right_position) = selected {
+            output_left.push(windows.left_index[row]);
+            output_right.push(labels[right_position]);
+        }
+    }
+    Ok((output_left, output_right))
+}
+
+/// Candidates read directly from the front of each window before `keep="any"`
+/// considers a skip scan.
+const ANY_DIRECT_PROBE: usize = 32;
+
+/// `keep="any"`: report the first matching position of every window.
+///
+/// Most `any` joins find a match within a few candidates, and building skip
+/// summaries would cost a full pass over the right values for nothing. So
+/// every window is first read directly for up to [`ANY_DIRECT_PROBE`]
+/// candidates. Only the rows still unmatched go to
+/// [`WindowResidualScan::plan_windows`], over the rest of their windows; its
+/// width and density gates then see just the work that remains.
+///
+/// ELI5: glance at the first few cards in each aisle. Only for the aisles
+/// where nothing turned up do we bother labelling the boxes.
+///
+/// Positions are still read in ascending order, so each row reports the same
+/// first match as the plain scan.
+#[inline(never)]
+fn materialize_range_any(
+    windows: &SingleJoinResult,
+    predicates: &[Predicate<'_>],
+    metadata: Option<&[NullMetadata<'_>]>,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    let views: Vec<_> = predicates.iter().map(Predicate::view).collect();
+    let metadata_views = metadata.map(null_metadata_views);
+    let first_match = |left_position: usize, start: usize, end: usize| {
+        (start..end).find(|&right_position| {
+            predicates_match_dispatch(
+                &views,
+                metadata_views.as_deref(),
+                left_position,
+                right_position,
+            )
+        })
+    };
+    let rows = windows.left_index.len();
+    let mut selected: Vec<Option<usize>> = Vec::new();
+    selected
+        .try_reserve_exact(rows)
+        .map_err(|_| "single extended join result allocation failed")?;
+    let (mut pending_rows, mut pending_left, mut pending_starts, mut pending_ends) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for row in 0..rows {
+        let (left_position, start, end) = (
+            windows.left_positions[row],
+            windows.starts[row],
+            windows.ends[row],
+        );
+        let probe_end = end.min(start.saturating_add(ANY_DIRECT_PROBE));
+        let found = first_match(left_position, start, probe_end);
+        #[cfg(test)]
+        if found.is_some() {
+            super::range_skip_scan::ANY_PROBE_RESOLVED.with(|rows| rows.set(rows.get() + 1));
+        }
+        if found.is_none() && probe_end < end {
+            #[cfg(test)]
+            super::range_skip_scan::ANY_PROBE_PENDING.with(|rows| rows.set(rows.get() + 1));
+            pending_rows.push(row);
+            pending_left.push(left_position);
+            pending_starts.push(probe_end);
+            pending_ends.push(end);
+        }
+        selected.push(found);
+    }
+    if !pending_rows.is_empty() {
+        let scan = WindowResidualScan::plan_windows(
+            predicates,
+            metadata,
+            &pending_left,
+            &pending_starts,
+            &pending_ends,
+        );
+        for (index, &row) in pending_rows.iter().enumerate() {
+            let (left_position, start, end) = (
+                pending_left[index],
+                pending_starts[index],
+                pending_ends[index],
+            );
+            selected[row] = match &scan {
+                Some(scan) => {
+                    let mut found = None;
+                    scan.for_each_match(left_position, start, end, |right_position| {
+                        found = Some(right_position);
+                        false
+                    });
+                    found
+                }
+                None => first_match(left_position, start, end),
+            };
+        }
+    }
+    let labels = windows.right_index.as_slice();
+    let mut output_left = Vec::new();
+    output_left
+        .try_reserve_exact(rows)
+        .map_err(|_| "single extended join result allocation failed")?;
+    let mut output_right = Vec::new();
+    output_right
+        .try_reserve_exact(rows)
+        .map_err(|_| "single extended join result allocation failed")?;
+    for (row, right_position) in selected.into_iter().enumerate() {
+        if let Some(right_position) = right_position {
             output_left.push(windows.left_index[row]);
             output_right.push(labels[right_position]);
         }
