@@ -29,6 +29,7 @@ use super::predicate::{
 };
 use super::range_join::adaptive_extreme_positions;
 use super::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
+use super::range_skip_scan::{second_range_skip_pays_off, SecondRangeSkipScan};
 use crate::aggregation::common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
@@ -38,8 +39,6 @@ use crate::aggregation::common::ensure_equal_lengths_core;
 thread_local! {
     static EQUI_STARTS_ENDS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EQUI_RESIDUAL_WINDOW_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SECOND_RANGE_SKIP_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SECOND_RANGE_SUPER_SKIPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 type IndexPairs = Option<(Vec<i64>, Vec<i64>)>;
@@ -707,240 +706,6 @@ fn narrow_unordered_second_range<T: PartialOrd + Copy>(
         }
     }
     Ok(has_active_window)
-}
-
-/// Rows summarized by one block of [`SecondRangeSkipScan`].
-const SECOND_RANGE_BLOCK: usize = 32;
-
-/// Blocks summarized by one super-block (`32 * 32 = 1,024` rows).
-const SECOND_RANGE_SUPER: usize = 32;
-
-/// Windows narrower than this are scanned directly; the block bookkeeping
-/// would cost more than reading a couple of blocks.
-const SECOND_RANGE_DIRECT_WIDTH: usize = 2 * SECOND_RANGE_BLOCK;
-
-/// Two-level block summaries that skip right rows failing an unordered range.
-///
-/// The cumulative envelope can only trim a window's prefix or suffix. One
-/// early right row with an extreme value (a very long interval, say) keeps
-/// every later window wide, and the exact scan then reads many candidates per
-/// match. This index stores the most permissive value of every
-/// `SECOND_RANGE_BLOCK`-row block -- the maximum for `<`/`<=`, the minimum for
-/// `>`/`>=` -- and of every `SECOND_RANGE_SUPER`-block super-block. A query
-/// walks its window left to right, skipping a whole super-block or block
-/// whose summary already fails the predicate, and checks rows exactly only
-/// inside surviving blocks. Positions are therefore reported in ascending
-/// order, exactly like the direct scan.
-///
-/// The cost is about one summary check per 1,024 rows of a sparse window and
-/// one per 32 rows of a dense one, plus the rows of the surviving blocks.
-/// A segment tree prunes sparse windows only marginally better but pays a
-/// per-node descent on dense windows, where nothing can be skipped; measured
-/// on AIList, that made dense joins up to 1.7x slower in the kernel.
-///
-/// ELI5: each box of 32 cards has a sticky note with its best card, and each
-/// crate of 32 boxes has a note with the best card in the crate. Walking down
-/// the aisle, we skip any crate or box whose best card cannot win, and only
-/// open the boxes that might hold a winner.
-///
-/// The summaries cover the whole prepared right layout, so they are
-/// independent of equality windows. A window that starts or ends inside a
-/// block or super-block still reads that summary: it covers a superset of the
-/// window's rows, which can only make skipping less aggressive, never wrong.
-struct SecondRangeSkipScan<'a, T> {
-    values: ArrayView1<'a, T>,
-    /// One summary per block; empty when the scanner reads windows directly.
-    blocks: Vec<T>,
-    /// One summary per super-block of `SECOND_RANGE_SUPER` blocks.
-    supers: Vec<T>,
-    op: CompareOp,
-}
-
-impl<'a, T: PartialOrd + Copy> SecondRangeSkipScan<'a, T> {
-    /// A scanner without summaries: every query reads its window directly.
-    ///
-    /// Used when the candidate windows are too narrow in total to repay the
-    /// summary build (see [`second_range_skip_pays_off`]).
-    fn direct(values: ArrayView1<'a, T>, op: CompareOp) -> Self {
-        Self {
-            values,
-            blocks: Vec::new(),
-            supers: Vec::new(),
-            op,
-        }
-    }
-
-    /// Build block and super-block summaries for `left op right`.
-    ///
-    /// `op` must be a range comparator.
-    fn new(values: ArrayView1<'a, T>, op: CompareOp) -> Self {
-        debug_assert!(!matches!(op, CompareOp::Eq | CompareOp::Ne));
-        // `left < right` needs some right value above `left`, so a block's
-        // most permissive value is its maximum; `left > right` needs one
-        // below, so it is the minimum.
-        let use_max = matches!(op, CompareOp::Lt | CompareOp::Le);
-        let most_permissive = |chunk: &mut dyn Iterator<Item = T>| {
-            let mut current = chunk.next().expect("summary chunks are non-empty");
-            for value in chunk {
-                let better = if use_max {
-                    value > current
-                } else {
-                    value < current
-                };
-                if better {
-                    current = value;
-                }
-            }
-            current
-        };
-        let block_count = values.len().div_ceil(SECOND_RANGE_BLOCK);
-        let blocks: Vec<T> = (0..block_count)
-            .map(|block| {
-                let start = block * SECOND_RANGE_BLOCK;
-                let end = (start + SECOND_RANGE_BLOCK).min(values.len());
-                most_permissive(&mut (start..end).map(|position| values[position]))
-            })
-            .collect();
-        let supers = blocks
-            .chunks(SECOND_RANGE_SUPER)
-            .map(|chunk| most_permissive(&mut chunk.iter().copied()))
-            .collect();
-        Self {
-            values,
-            blocks,
-            supers,
-            op,
-        }
-    }
-
-    /// Call `emit` for every position in `[start, end)` whose right value
-    /// satisfies `left op right`, in ascending position order.
-    ///
-    /// `emit` returns `false` to stop the query early (used by `keep="any"`
-    /// and the `first`/`last` selection helper).
-    /// The caller guarantees `start <= end <= values.len()`.
-    #[inline]
-    fn for_each_match(
-        &self,
-        left: T,
-        start: usize,
-        end: usize,
-        mut emit: impl FnMut(usize) -> bool,
-    ) {
-        debug_assert!(start <= end && end <= self.values.len());
-        if self.blocks.is_empty() || end - start < SECOND_RANGE_DIRECT_WIDTH {
-            for position in start..end {
-                if self.op.apply(&left, &self.values[position]) && !emit(position) {
-                    return;
-                }
-            }
-            return;
-        }
-        #[cfg(test)]
-        SECOND_RANGE_SKIP_HITS.with(|hits| hits.set(hits.get() + 1));
-        let mut block = start / SECOND_RANGE_BLOCK;
-        let last_block = (end - 1) / SECOND_RANGE_BLOCK;
-        while block <= last_block {
-            // ELI5: at the front door of a crate, read the crate's note. If
-            // even its best card loses, walk past all 32 boxes at once. A
-            // crate the window only partly covers is checked the same way:
-            // its note covers more cards than we need, never fewer.
-            if block.is_multiple_of(SECOND_RANGE_SUPER)
-                && !self
-                    .op
-                    .apply(&left, &self.supers[block / SECOND_RANGE_SUPER])
-            {
-                #[cfg(test)]
-                SECOND_RANGE_SUPER_SKIPS.with(|skips| skips.set(skips.get() + 1));
-                block += SECOND_RANGE_SUPER;
-                continue;
-            }
-            if self.op.apply(&left, &self.blocks[block]) {
-                let block_start = (block * SECOND_RANGE_BLOCK).max(start);
-                let block_end = ((block + 1) * SECOND_RANGE_BLOCK).min(end);
-                for position in block_start..block_end {
-                    if self.op.apply(&left, &self.values[position]) && !emit(position) {
-                        return;
-                    }
-                }
-            }
-            block += 1;
-        }
-    }
-
-    /// Count the positions in `[start, end)` that `for_each_match` would
-    /// report, without a per-match callback.
-    ///
-    /// ELI5: when we only need how many cards win, tallying a whole open box
-    /// in one sweep is faster than handing over the cards one at a time; the
-    /// tally loop has no early exit, so the compiler can vectorize it.
-    #[inline]
-    fn count_matches(&self, left: T, start: usize, end: usize) -> usize {
-        debug_assert!(start <= end && end <= self.values.len());
-        let count_range = |from: usize, to: usize| {
-            (from..to)
-                .filter(|&position| self.op.apply(&left, &self.values[position]))
-                .count()
-        };
-        if self.blocks.is_empty() || end - start < SECOND_RANGE_DIRECT_WIDTH {
-            return count_range(start, end);
-        }
-        #[cfg(test)]
-        SECOND_RANGE_SKIP_HITS.with(|hits| hits.set(hits.get() + 1));
-        let mut count = 0;
-        let mut block = start / SECOND_RANGE_BLOCK;
-        let last_block = (end - 1) / SECOND_RANGE_BLOCK;
-        while block <= last_block {
-            if block.is_multiple_of(SECOND_RANGE_SUPER)
-                && !self
-                    .op
-                    .apply(&left, &self.supers[block / SECOND_RANGE_SUPER])
-            {
-                block += SECOND_RANGE_SUPER;
-                continue;
-            }
-            if self.op.apply(&left, &self.blocks[block]) {
-                count += count_range(
-                    (block * SECOND_RANGE_BLOCK).max(start),
-                    ((block + 1) * SECOND_RANGE_BLOCK).min(end),
-                );
-            }
-            block += 1;
-        }
-        count
-    }
-}
-
-/// Report whether a [`SecondRangeSkipScan`] should scan the narrowed windows.
-///
-/// Building the summaries reads every right value once, so it pays off only
-/// when the windows still to be scanned are much wider in total than the
-/// right layout. Below twice its length, the direct scan costs at most about
-/// one extra pass over the right values, which is what the build itself
-/// costs; on AIList exons x chainXenTro3Link (53M of window over 51M right
-/// rows) the build was pure overhead.
-///
-/// ELI5: labeling every box costs one look at every card. That is worth it
-/// only when we were going to look at more cards than that anyway.
-fn second_range_skip_pays_off(
-    right_len: usize,
-    starts: ArrayView1<'_, i64>,
-    ends: ArrayView1<'_, i64>,
-) -> bool {
-    let mut total_width = 0_usize;
-    for (&start, &end) in starts.iter().zip(ends.iter()) {
-        if start < 0 || end < 0 {
-            continue;
-        }
-        // ELI5: the windows were validated before narrowing; saturating
-        // keeps an unexpected inverted window at zero width, matching the
-        // empty `start..end` loop that would scan it.
-        total_width = total_width.saturating_add((end as usize).saturating_sub(start as usize));
-        if total_width / 2 > right_len {
-            return true;
-        }
-    }
-    false
 }
 
 /// Borrow a range predicate as a residual-style view.
@@ -2303,10 +2068,13 @@ mod tests {
         materialize_equi_windows, materialize_equi_windows_and_residuals,
         materialize_unordered_second_range, narrow_unordered_second_range,
         unique_reverse_output_slots, SecondRangeSkipScan, EQUI_RESIDUAL_WINDOW_HITS,
-        EQUI_STARTS_ENDS_HITS, SECOND_RANGE_SKIP_HITS, SECOND_RANGE_SUPER_SKIPS,
+        EQUI_STARTS_ENDS_HITS,
     };
     use crate::conditional_join::compare_op::CompareOp;
     use crate::conditional_join::join_types::Keep;
+    use crate::conditional_join::range_skip_scan::{
+        SECOND_RANGE_SKIP_HITS, SECOND_RANGE_SUPER_SKIPS,
+    };
     use pyo3::exceptions::PyValueError;
     use pyo3::types::{PyAnyMethods, PyBool, PyList, PyListMethods, PyTuple, PyTupleMethods};
 
@@ -3652,6 +3420,23 @@ mod tests {
                         true
                     });
                     assert_eq!(got, expected, "direct len={len} op={op:?}");
+                    // Opened runs are ordered, disjoint, inside the window,
+                    // and hold every match.
+                    for scanner in [&int_scan, &direct] {
+                        let mut previous_end = start;
+                        got.clear();
+                        scanner.for_each_open_run(threshold, start, end, |run_start, run_end| {
+                            assert!(previous_end <= run_start && run_start < run_end);
+                            assert!(run_end <= end);
+                            previous_end = run_end;
+                            got.extend(
+                                (run_start..run_end)
+                                    .filter(|&position| op.apply(&threshold, &ints[position])),
+                            );
+                            true
+                        });
+                        assert_eq!(got, expected, "runs len={len} op={op:?} [{start}, {end})");
+                    }
                     for scanner_count in [
                         int_scan.count_matches(threshold, start, end),
                         float_scan.count_matches(threshold as f64 / 4.0, start, end),

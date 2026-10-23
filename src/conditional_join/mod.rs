@@ -10,6 +10,7 @@ mod not_equals_only;
 mod predicate;
 mod range_join;
 mod range_predicate;
+mod range_skip_scan;
 mod region_kd_tree;
 mod regions;
 mod single_range_predicate;

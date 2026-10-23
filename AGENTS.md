@@ -1560,3 +1560,58 @@ for nothing. Size `keep="all"` output with the callback-free
 pass about 14% slower than the old plain loop. With residuals, keep the
 whole-window residual mask when the gate does not fire. Benchmark dense,
 gate-firing cases as well as the overscan headline.
+
+### [2026-10-21] Default range path: residual overscan behind a cumulative envelope
+**Context**: pyjanitor's default dual-range preparation replaces a
+non-monotonic second range with its cumulative envelope and keeps the
+original predicate as a residual (`range_join_extended_*`). The window loops
+then checked every candidate. On AIList ex-anno x chainRn4 the windows held
+15.1 billion candidates for 2.8 million matches, so every `keep` mode took
+12-48 s while the same join flipped took 0.15 s.
+**Learning**: This is the same overscan as the equi path's second range, one
+layer down: the envelope only trims window ends. `WindowResidualScan`
+(`range_skip_scan.rs`) promotes the first unmasked range residual to a
+`SecondRangeSkipScan` and checks the remaining residuals on the candidates
+it reports. Positions arrive in ascending order, so `keep` selection and
+aggregation update order (including Kahan float sums) are unchanged.
+**Recommendation**: Keep the 2x-right-length width gate shared with the
+equi path, and fall back to the whole-window residual mask below it. Only
+range residuals without null masks are eligible (masks exist only for `!=`
+today).
+
+### [2026-10-23] Skip summaries must not tax `keep="any"` early matches
+**Context**: PR #268's first version planned the skip scan for every `keep`
+mode before reading any window. Base `any` stops at the first match, often
+after a few candidates, so it paid only the summary build and the density
+sample: 0.6 ms became 12 ms at 5M right rows. The sample walked every block
+of 256 full windows, about 8x the cost of the build itself.
+**Learning**: Gate costs must not grow with window width when the work they
+guard can stop early. Width and density say nothing about where the first
+match sits.
+**Recommendation**: Estimate the density gate from a fixed number of block
+probes per sampled window (`estimate_surviving_rows`, 32 probes). For
+`keep="any"`, read the first 32 candidates of each window directly and plan
+the skip scan only over unmatched rows' remaining windows (`plan_windows`).
+A 64-candidate probe was 1.2-1.35x slower on deep-match joins; benchmark
+early-match, deep-match and no-match `any` cases at both 200K and 5M right
+rows when changing either constant.
+
+### [2026-10-23] Skipping a block must not make its survivors dearer
+**Context**: PR #268's skip scan checked the other residuals one passing row
+at a time (`predicates_match_dispatch`), while the plain window loop builds
+one vectorized mask (`predicates_match_window`). The density gate counts only
+the skipped residual, so with a masked `!=`, about 35-45% of blocks open and
+every row of an opened block passing, the plan ran and was 0.66-0.87x of
+main for every `keep` and aggregation.
+**Learning**: The right check depends on how many rows of an opened block
+pass the skipped residual, and the choice has to be made once per plan.
+Masking every opened block was 0.42-0.49x on sparse masked joins, and a
+per-chunk choice was still 0.78-0.89x there even when it always picked the
+per-row check: the chunked loop itself is slower than the per-block one.
+**Recommendation**: The density sample also counts passing rows in the
+probed blocks it would open; when at least half pass, `WindowResidualScan`
+masks `rest` over whole opened runs (`for_each_open_run`), otherwise it keeps
+the per-row check. Keep the masked path out of line. When changing the gate
+or the scan, benchmark right layouts whose 32-row blocks match the residual
+on every row or on none, at 25/35/45% open, alongside sparse joins, each
+with and without a masked `!=`.
