@@ -670,6 +670,47 @@ fn for_each_window_pair(
     }
 }
 
+/// Find the first non-empty intersection in a row range using batched
+/// searches. The caller reuses the scratch buffers across ranges.
+type WindowPair = ((usize, usize), (usize, usize));
+
+fn first_intersection_in_rows(
+    first: &AnchorSearch<'_>,
+    second: &AnchorSearch<'_>,
+    rows: std::ops::Range<usize>,
+    first_starts: &mut [usize],
+    first_ends: &mut [usize],
+    second_starts: &mut [usize],
+    second_ends: &mut [usize],
+) -> Option<(usize, WindowPair)> {
+    let chunk = WINDOW_CHUNK.min(rows.len());
+    debug_assert!(first_starts.len() >= chunk);
+    debug_assert!(first_ends.len() >= chunk);
+    debug_assert!(second_starts.len() >= chunk);
+    debug_assert!(second_ends.len() >= chunk);
+    for chunk_start in rows.clone().step_by(WINDOW_CHUNK) {
+        let rows = WINDOW_CHUNK.min(rows.end - chunk_start);
+        first.windows_into(
+            chunk_start,
+            &mut first_starts[..rows],
+            &mut first_ends[..rows],
+        );
+        second.windows_into(
+            chunk_start,
+            &mut second_starts[..rows],
+            &mut second_ends[..rows],
+        );
+        for offset in 0..rows {
+            let first_window = (first_starts[offset], first_ends[offset]);
+            let second_window = (second_starts[offset], second_ends[offset]);
+            if first_window.0.max(second_window.0) < first_window.1.min(second_window.1) {
+                return Some((chunk_start + offset, (first_window, second_window)));
+            }
+        }
+    }
+    None
+}
+
 /// Build dual-range windows while dispatching each anchor independently.
 ///
 /// The two anchors may use different NumPy dtypes. Each is binary-searched in
@@ -2475,10 +2516,10 @@ impl<'a> FirstAnchorSweep<'a> {
             for_each_window_pair(&search, &second_search, 0..left_len, &mut count_width);
         } else {
             let stride = left_len / SWEEP_WIDTH_SAMPLE_BLOCKS;
-            let mut first_start = [0_usize; 1];
-            let mut first_end = [0_usize; 1];
-            let mut second_start = [0_usize; 1];
-            let mut second_end = [0_usize; 1];
+            let mut first_start = vec![0_usize; WINDOW_CHUNK];
+            let mut first_end = vec![0_usize; WINDOW_CHUNK];
+            let mut second_start = vec![0_usize; WINDOW_CHUNK];
+            let mut second_end = vec![0_usize; WINDOW_CHUNK];
             for block in 0..SWEEP_WIDTH_SAMPLE_BLOCKS {
                 let block_start = block * stride;
                 let block_end = if block + 1 == SWEEP_WIDTH_SAMPLE_BLOCKS {
@@ -2491,11 +2532,15 @@ impl<'a> FirstAnchorSweep<'a> {
                 // overlap is clustered away from its first row still informs
                 // the estimate, while a single matching row contributes only
                 // its sampled fraction.
-                let Some(first_match_row) = (block_start..block_end).find(|&row| {
-                    search.windows_into(row, &mut first_start, &mut first_end);
-                    second_search.windows_into(row, &mut second_start, &mut second_end);
-                    first_start[0].max(second_start[0]) < first_end[0].min(second_end[0])
-                }) else {
+                let Some((first_match_row, _)) = first_intersection_in_rows(
+                    &search,
+                    &second_search,
+                    block_start..block_end,
+                    &mut first_start,
+                    &mut first_end,
+                    &mut second_start,
+                    &mut second_end,
+                ) else {
                     continue;
                 };
                 // Start at the first real match we found. This keeps a narrow
@@ -2505,8 +2550,8 @@ impl<'a> FirstAnchorSweep<'a> {
                 let mut block_width = 0_usize;
                 for probe in 0..probes {
                     let row = first_match_row + probe * probe_span / probes;
-                    search.windows_into(row, &mut first_start, &mut first_end);
-                    second_search.windows_into(row, &mut second_start, &mut second_end);
+                    search.windows_into(row, &mut first_start[..1], &mut first_end[..1]);
+                    second_search.windows_into(row, &mut second_start[..1], &mut second_end[..1]);
                     block_width = block_width.saturating_add(
                         first_end[0]
                             .min(second_end[0])
@@ -2722,24 +2767,28 @@ fn sampled_envelope_density(
         return None;
     }
     let row_step = left_len.div_ceil(SAMPLE_ROWS).max(1);
-    let mut first_start = [0_usize; 1];
-    let mut first_end = [0_usize; 1];
-    let mut second_start = [0_usize; 1];
-    let mut second_end = [0_usize; 1];
+    let mut first_start = vec![0_usize; WINDOW_CHUNK];
+    let mut first_end = vec![0_usize; WINDOW_CHUNK];
+    let mut second_start = vec![0_usize; WINDOW_CHUNK];
+    let mut second_end = vec![0_usize; WINDOW_CHUNK];
     let residual = residual.view();
     let mut sampled = 0_usize;
     let mut surviving = 0_usize;
     for block_start in (0..left_len).step_by(row_step).take(SAMPLE_ROWS) {
         let block_end = (block_start + row_step).min(left_len);
-        let Some(row) = (block_start..block_end).find(|&row| {
-            first.windows_into(row, &mut first_start, &mut first_end);
-            second.windows_into(row, &mut second_start, &mut second_end);
-            first_start[0].max(second_start[0]) < first_end[0].min(second_end[0])
-        }) else {
+        let Some((row, (first_window, second_window))) = first_intersection_in_rows(
+            first,
+            second,
+            block_start..block_end,
+            &mut first_start,
+            &mut first_end,
+            &mut second_start,
+            &mut second_end,
+        ) else {
             continue;
         };
-        let start = first_start[0].max(second_start[0]);
-        let end = first_end[0].min(second_end[0]);
+        let start = first_window.0.max(second_window.0);
+        let end = first_window.1.min(second_window.1);
         if start >= end {
             continue;
         }
