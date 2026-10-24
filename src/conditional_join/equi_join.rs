@@ -1770,38 +1770,6 @@ pub fn equi_uniq_residual_indices<'py>(
         .transpose()
 }
 
-/// Build index pairs for unique equality keys with at least one predicate.
-///
-/// This compatibility wrapper retains the older non-empty-predicate
-/// contract. New callers that may have zero aligned predicates should use
-/// [`equi_uniq_residual_indices`] instead.
-///
-/// # Arguments
-///
-/// * `left_index` - Prepared left labels or physical positions.
-/// * `right_index` - Prepared right labels or physical positions aligned
-///   one-for-one with `left_index`.
-/// * `residual_predicates` - Non-empty list of aligned predicate tuples.
-///
-/// # Returns
-///
-/// A dictionary containing the surviving aligned index pairs, or `None` when
-/// no pair satisfies the predicates.
-#[pyfunction]
-pub fn equi_uniq_indices<'py>(
-    py: Python<'py>,
-    left_index: PyReadonlyArray1<'py, i64>,
-    right_index: PyReadonlyArray1<'py, i64>,
-    residual_predicates: &Bound<'py, PyList>,
-) -> PyResult<Option<Bound<'py, PyDict>>> {
-    if residual_predicates.is_empty() {
-        return Err(PyValueError::new_err(
-            "residual_predicates must not be empty",
-        ));
-    }
-    equi_uniq_residual_indices(py, left_index, right_index, residual_predicates)
-}
-
 fn build_equi_ne_indices_core(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
@@ -2047,7 +2015,6 @@ pub fn equi_only_indices<'py>(
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(equi_only_indices, m)?)?;
-    m.add_function(wrap_pyfunction!(equi_uniq_indices, m)?)?;
     m.add_function(wrap_pyfunction!(equi_uniq_residual_indices, m)?)?;
     m.add_function(wrap_pyfunction!(equi_ne_indices, m)?)?;
     m.add_function(wrap_pyfunction!(equi_range_indices, m)?)?;
