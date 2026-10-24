@@ -392,6 +392,49 @@ fn range_extended_residual_aggregation(c: &mut Criterion) {
     });
 }
 
+fn range_reverse_envelope_aggregation(c: &mut Criterion) {
+    Python::initialize();
+    Python::attach(|py| {
+        let left_rows = 10_000_usize;
+        let right_rows = 10_000_usize;
+        let left_index = PyArray1::from_vec(py, (0..left_rows as i64).collect());
+        let right_index = PyArray1::from_vec(py, (0..right_rows as i64).collect());
+        let first_left = PyArray1::from_vec(py, vec![2_000_i64; left_rows]);
+        let first_right = PyArray1::from_vec(py, (0..right_rows as i64).collect());
+        let second_left = PyArray1::from_iter(
+            py,
+            (0..left_rows).map(|row| 6_000_i64 + (row % 2_000) as i64),
+        );
+        let second_right = PyArray1::from_vec(py, (0..right_rows as i64).collect());
+        let predicates = PyList::new(
+            py,
+            [
+                make_predicate(py, first_left.as_any(), first_right.as_any(), "<"),
+                make_predicate(py, second_left.as_any(), second_right.as_any(), ">"),
+                make_predicate(py, second_left.as_any(), second_right.as_any(), ">"),
+            ],
+        )
+        .unwrap();
+        let aggregations = make_size_aggregation(py);
+        let mut group = c.benchmark_group("range_reverse_envelope_aggregation");
+        group.bench_function("reverse", |b| {
+            b.iter(|| {
+                let result = range_join_extended_aggregate_reverse(
+                    py,
+                    &predicates,
+                    left_index.as_any(),
+                    right_index.as_any(),
+                    &aggregations,
+                    false,
+                )
+                .unwrap();
+                black_box(result);
+            });
+        });
+        group.finish();
+    });
+}
+
 type UnorderedSecondRangeInputs<'py> = (
     Bound<'py, PyArray1<i64>>,
     Bound<'py, PyArray1<i64>>,
@@ -936,6 +979,7 @@ criterion_group!(
     staggered_dual_predicate,
     n_region_kd_tree,
     range_extended_residual_aggregation,
+    range_reverse_envelope_aggregation,
     equi_unordered_second_range_aggregate_guard,
     equi_ordered_second_range_aggregate_guard,
     equi_unordered_second_range_materialize,
