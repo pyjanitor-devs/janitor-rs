@@ -4,6 +4,54 @@ All notable changes to janitor-rs are documented here.
 
 ## [Unreleased]
 
+## [0.6.6](https://github.com/pyjanitor-devs/janitor-rs/compare/v0.6.5...v0.6.6) - 2026-10-24
+
+### Fixed
+
+- avoid rebuilding proven empty joins
+- preserve sweep gate for clustered matches
+- gate sweeps before ranking and validate layouts
+- retain sweep gates and validate labels
+- preserve rank sweep density and memory gates
+- resolve main branch conflicts
+- preserve equi unique index export
+- rebase envelope keep sweep onto main
+
+### Other
+
+- *(equi)* sample residual selectivity before mask fallback
+- Merge pull request #281 from pyjanitor-devs/issue-273-reverse-aggregation
+- optimize reverse envelope range aggregation
+- gate range skip scans on passing rows
+- *(equi)* rewrap an over-long skip_scan_is_dense doc line
+- *(equi)* gate the second-range skip scan on row density with residuals
+- stop sweep probes with geometric batches
+- batch sweep gate window searches
+- remove redundant sweep gate
+- remove unused equi unique index export
+- state trusted no-NaN range precondition
+- simplify trusted range monotonicity check
+- remove redundant equi uniq wrapper
+- stream dual-range window intersection and compact envelope sweep state
+- calibrate envelope sweep gate
+- gate rank sweep by residual density
+- answer keep=first/last on envelope-backed range joins with a rank sweep
+- document rank sweep gate
+- record range join rebase guidance
+- restore rank sweep gate after rebase
+- answer envelope-backed range aggregations with a rank sweep
+- mask other residuals over opened runs when opened blocks are dense
+- drop keep=any branches made unreachable by materialize_range_any
+- keep skip-scan setup off keep="any" early matches
+- skip unprunable blocks of a range residual in default window joins
+- skip unprunable blocks when scanning an unordered second range
+- require maturin 1.9.4 for PyO3 extension builds
+- retain PyPy wheels on 32-bit targets
+- remove deprecated PyO3 feature configuration
+- remove unused itertools dependency
+- skip free-threaded Python on 32-bit wheels
+- bump PyO3 and rust-numpy
+
 ### Changed
 
 - update PyO3 and rust-numpy; Python argument and array-mismatch error text may differ, with some argument names now exposed through exception notes
