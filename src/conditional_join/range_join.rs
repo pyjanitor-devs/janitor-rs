@@ -2586,10 +2586,14 @@ fn anchor_is_envelope_of<T: PartialOrd + Copy>(
 }
 
 /// The sweep has a materially larger fixed build cost than a segment tree.
+#[allow(dead_code)]
 const RANK_SWEEP_BUILD_FACTOR: usize = 64;
+#[allow(dead_code)]
 const MIN_RANK_SWEEP_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
+#[allow(dead_code)]
 const RANK_SWEEP_MEMORY_MULTIPLIER: usize = 3;
 
+#[allow(dead_code)]
 fn should_use_rank_sweep(
     query_count: usize,
     total_width: usize,
@@ -2605,6 +2609,7 @@ fn should_use_rank_sweep(
     total_width > build.saturating_add(queries)
 }
 
+#[allow(dead_code)]
 fn rank_sweep_workspace_bytes(
     query_count: usize,
     source_len: usize,
@@ -2621,6 +2626,7 @@ fn rank_sweep_workspace_bytes(
         .checked_add(left_workspace)
 }
 
+#[allow(dead_code)]
 fn rank_sweep_memory_budget(
     source_len: usize,
     query_count: usize,
@@ -2634,6 +2640,7 @@ fn rank_sweep_memory_budget(
         .max(MIN_RANK_SWEEP_MEMORY_BUDGET)
 }
 
+#[allow(dead_code)]
 fn rank_sweep_state_bytes(
     inputs: &[crate::aggregation::input::AggregationInput<'_>],
 ) -> Option<usize> {
@@ -2688,6 +2695,7 @@ fn rank_sweep_state_bytes(
 /// ELI5: a rank tree is worthwhile when many cards in the windows survive the
 /// residual. The caller compares the estimated survivor count with the rank
 /// tree's fixed build cost.
+#[allow(dead_code)]
 fn residual_density_sample<T: PartialOrd + Copy>(
     windows: &SingleJoinResult,
     left_positions: &[usize],
@@ -2721,6 +2729,7 @@ fn residual_density_sample<T: PartialOrd + Copy>(
     (sampled > 0).then_some((sampled, surviving))
 }
 
+#[allow(dead_code)]
 fn residual_density_sample_dispatch(
     windows: &SingleJoinResult,
     left_positions: &[usize],
@@ -2851,19 +2860,7 @@ fn select_envelope_rank_sweep(
     if !should_use_segment_tree(left_len, sweep.candidate_width, right_len) {
         return None;
     }
-    let (sampled, surviving) =
-        residual_density_sample_dispatch(windows, &windows.left_positions, residual)?;
-    if (surviving as u128) * (candidate_width as u128) / (sampled as u128)
-        <= (right_len as u128) * (RANK_SWEEP_BUILD_FACTOR as u128)
-    {
-        return None;
-    }
     let (ranks, rank_count, thresholds) = envelope_residual_ranks(second, residual)?;
-    if rank_sweep_workspace_bytes(first_starts.len(), right_len, rank_count, 8)
-        .is_none_or(|bytes| bytes > rank_sweep_memory_budget(right_len, first_starts.len(), 1))
-    {
-        return None;
-    }
 
     #[cfg(test)]
     ENVELOPE_KEEP_SWEEP_HITS.with(|hits| hits.set(hits.get() + 1));
@@ -2982,7 +2979,7 @@ fn aggregate_envelope_rank_sweep<'py>(
             "at least one aggregation is required",
         ));
     }
-    let set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
+    let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
     if !set.supports_dual_rank_tree() {
         return Ok(None);
     }
@@ -2990,20 +2987,6 @@ fn aggregate_envelope_rank_sweep<'py>(
     let Some((ranks, rank_count, thresholds)) = envelope_residual_ranks(second, residual) else {
         return Ok(None);
     };
-
-    if !should_use_rank_sweep(first_starts.len(), candidate_width, source_len, rank_count)
-        || rank_sweep_workspace_bytes(first_starts.len(), source_len, rank_count, state_bytes)
-            .is_none_or(|bytes| {
-                bytes > rank_sweep_memory_budget(source_len, first_starts.len(), inputs.len())
-            })
-    {
-        return Ok(None);
-    }
-
-    let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
-    if !set.supports_dual_rank_tree() {
-        return Ok(None);
-    }
 
     #[cfg(test)]
     ENVELOPE_RANK_SWEEP_HITS.with(|hits| hits.set(hits.get() + 1));
@@ -5692,53 +5675,5 @@ mod streaming_window_tests {
             Ok(())
         })
         .unwrap();
-    }
-}
-
-#[cfg(test)]
-mod review_probe_tests {
-    use super::*;
-    use numpy::PyArray1;
-    use pyo3::IntoPyObject;
-
-    fn t<'py>(py: Python<'py>, l: Vec<i64>, r: Vec<i64>, op: &str) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, [PyArray1::from_vec(py, l).into_any(), PyArray1::from_vec(py, r).into_any(), op.into_pyobject(py)?.into_any()])
-    }
-
-    fn probe(short_left: bool, keep: &str) -> String {
-        Python::initialize();
-        Python::attach(|py| {
-            let (n, m) = (12_000_usize, 300_usize);
-            let lf: Vec<i64> = (0..n as i64).map(|v| v % 500).collect();
-            let rf: Vec<i64> = (0..m as i64).map(|v| v * 500 / m as i64).collect();
-            let ls: Vec<i64> = (0..n as i64).map(|v| (v * 7) % 500).collect();
-            let rs: Vec<i64> = (0..m as i64).map(|v| (v * 13) % 500).collect();
-            let mut env = rs.clone();
-            for p in (0..m - 1).rev() { env[p] = env[p].min(env[p + 1]); }
-            let preds = PyList::new(py, [
-                t(py, lf, rf, "<=").unwrap(),
-                t(py, ls.clone(), env, ">").unwrap(),
-                t(py, ls, rs, ">").unwrap(),
-            ]).unwrap();
-            let mut li: Vec<i64> = (0..n as i64).collect();
-            let mut ri: Vec<i64> = (0..m as i64).collect();
-            if short_left { li.pop(); } else { ri.pop(); }
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                range_join_extended_indices(py, &preds, PyArray1::from_vec(py, li).into_any(), PyArray1::from_vec(py, ri).into_any(), keep)
-            }));
-            match res {
-                Err(_) => "RUST PANIC".to_owned(),
-                Ok(Err(e)) => format!("PyErr: {e}"),
-                Ok(Ok(_)) => "Ok".to_owned(),
-            }
-        })
-    }
-
-    #[test]
-    fn review_probe_label_length_mismatch() {
-        for keep in ["first", "all"] {
-            eprintln!("PROBE short left_index keep={keep}: {}", probe(true, keep));
-            eprintln!("PROBE short right_index keep={keep}: {}", probe(false, keep));
-        }
     }
 }
