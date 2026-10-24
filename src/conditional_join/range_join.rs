@@ -68,6 +68,7 @@ thread_local! {
     pub(crate) static EXTREME_HULL_TREE_HITS: Cell<usize> = const { Cell::new(0) };
     pub(crate) static PACKING_PRECHECK_DIRECT_HITS: Cell<usize> = const { Cell::new(0) };
     pub(crate) static ENVELOPE_RANK_SWEEP_HITS: Cell<usize> = const { Cell::new(0) };
+    pub(crate) static REVERSE_ENVELOPE_RANK_SWEEP_HITS: Cell<usize> = const { Cell::new(0) };
     pub(crate) static ENVELOPE_KEEP_SWEEP_HITS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -2432,6 +2433,21 @@ pub(crate) fn aggregate_range_extended<'py>(
             return Ok(result);
         }
     }
+    if reverse && metadata.is_none() && parsed.len() == 1 {
+        if let Some(result) = aggregate_reverse_envelope_rank_sweep(
+            py,
+            &first,
+            &second,
+            &parsed[0],
+            aggregations,
+            output_positions,
+            output_len,
+            source_len,
+            return_matched,
+        )? {
+            return Ok(result);
+        }
+    }
     let windows = build_any_windows(&first, &second).map_err(PyValueError::new_err)?;
     if windows.left_index.is_empty() {
         return Ok(None);
@@ -2688,6 +2704,56 @@ fn residual_rank_thresholds<T: PartialOrd + Copy>(
     (ranks, count, thresholds)
 }
 
+/// Rank thresholds for the reverse direction of an envelope residual.
+///
+/// The forward sweep ranks right-side source positions and asks one query per
+/// left row. Reverse aggregation has the opposite shape: left positions are
+/// the source rows inserted into the tree, and each right position is a
+/// threshold query. Ranks are oriented so that every matching left value is
+/// still in the suffix `rank >= threshold` consumed by the shared tree.
+///
+/// ELI5: line up the left values so that every value passing the comparison
+/// sits at the right-hand end of the line; each right row then asks where that
+/// passing suffix begins.
+fn reverse_residual_rank_thresholds<T: PartialOrd + Copy>(
+    left: ArrayView1<'_, T>,
+    right: ArrayView1<'_, T>,
+    op: CompareOp,
+) -> (Vec<usize>, usize, Vec<u32>) {
+    use std::cmp::Ordering;
+
+    let mut distinct: Vec<T> = left.iter().copied().collect();
+    distinct.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    distinct.dedup_by(|a, b| (*a).partial_cmp(&*b) == Some(Ordering::Equal));
+    let count = distinct.len();
+    let descending = matches!(op, CompareOp::Lt | CompareOp::Le);
+    let rank_of = |value: T| {
+        let ascending = distinct.partition_point(|candidate| *candidate < value);
+        if descending {
+            count - 1 - ascending
+        } else {
+            ascending
+        }
+    };
+    let ranks = left.iter().map(|&value| rank_of(value)).collect();
+    let thresholds = right
+        .iter()
+        .map(|&value| match op {
+            // left < right / left <= right: matching left values are the
+            // lower values, so use descending ranks.
+            CompareOp::Lt => count - distinct.partition_point(|candidate| *candidate < value),
+            CompareOp::Le => count - distinct.partition_point(|candidate| *candidate <= value),
+            // left > right / left >= right: matching left values are the
+            // upper values, so use ascending ranks.
+            CompareOp::Gt => distinct.partition_point(|candidate| *candidate <= value),
+            CompareOp::Ge => distinct.partition_point(|candidate| *candidate < value),
+            CompareOp::Eq | CompareOp::Ne => unreachable!("caller checks range operators"),
+        })
+        .map(|threshold| threshold as u32)
+        .collect();
+    (ranks, count, thresholds)
+}
+
 /// Report whether `anchor` is exactly the cumulative envelope of `residual`.
 ///
 /// PyJanitor replaces an opposing second range predicate whose right values
@@ -2852,6 +2918,44 @@ fn rank_sweep_workspace_bytes(
         .checked_add(left_workspace)
 }
 
+/// Estimate the buffers owned by the reverse envelope sweep.
+///
+/// ELI5: the reverse route keeps a row-sized activation layout and a
+/// position-sized query layout, which are not the same buffers as the forward
+/// route. Keep their costs explicit so the memory gate cannot accidentally
+/// become optimistic when one route evolves independently.
+fn reverse_rank_sweep_workspace_bytes(
+    query_count: usize,
+    source_len: usize,
+    rank_count: usize,
+    state_bytes: usize,
+    value_bytes: usize,
+) -> Option<usize> {
+    let tree_size = rank_count.checked_next_power_of_two()?;
+    let tree_nodes = tree_size.checked_mul(2)?;
+    let tree_bytes = tree_nodes.checked_mul(state_bytes)?;
+    // The reverse route retains source ranks, activation keys, insertion
+    // order, and the per-bin query endpoints: five usize-sized words plus
+    // the temporary typed source-value rank input per left row.
+    let left_workspace = source_len.checked_mul(
+        5usize
+            .checked_mul(std::mem::size_of::<usize>())?
+            .checked_add(value_bytes)?,
+    )?;
+    // Right positions retain thresholds as u32 values, two activation arrays,
+    // insertion cursors, and packed u64 queries: four usize words plus one
+    // u32 per right position. The extra slot in each boundary array is
+    // covered by the conservative query-count rounding below.
+    let right_workspace = query_count.checked_mul(
+        4usize
+            .checked_mul(std::mem::size_of::<usize>())?
+            .checked_add(std::mem::size_of::<u32>())?,
+    )?;
+    tree_bytes
+        .checked_add(left_workspace)?
+        .checked_add(right_workspace)
+}
+
 fn rank_sweep_memory_budget(
     source_len: usize,
     query_count: usize,
@@ -2967,6 +3071,70 @@ fn envelope_residual_ranks(
         AnyParsedRangePredicate::U8(anchor) => ranked!(U8, anchor),
         AnyParsedRangePredicate::F64(anchor) => ranked!(F64, anchor),
         AnyParsedRangePredicate::F32(anchor) => ranked!(F32, anchor),
+    }
+}
+
+/// Return reverse-oriented ranks when `second` is exactly `residual`'s
+/// cumulative envelope.
+fn reverse_envelope_residual_ranks(
+    second: &AnyParsedRangePredicate<'_>,
+    residual: &super::predicate::Predicate<'_>,
+) -> Option<(Vec<usize>, usize, Vec<u32>)> {
+    use super::predicate::PredicateView;
+
+    macro_rules! ranked {
+        ($variant:ident, $anchor:expr) => {{
+            let anchor = $anchor;
+            let PredicateView::$variant(residual_left, residual_right, residual_op) =
+                residual.view()
+            else {
+                return None;
+            };
+            if matches!(residual_op, CompareOp::Eq | CompareOp::Ne)
+                || !anchor_is_envelope_of(
+                    anchor.left.as_array(),
+                    anchor.right.as_array(),
+                    anchor.op,
+                    residual_left,
+                    residual_right,
+                    residual_op,
+                )
+            {
+                return None;
+            }
+            Some(reverse_residual_rank_thresholds(
+                residual_left,
+                residual_right,
+                residual_op,
+            ))
+        }};
+    }
+    match second {
+        AnyParsedRangePredicate::I64(anchor) => ranked!(I64, anchor),
+        AnyParsedRangePredicate::I32(anchor) => ranked!(I32, anchor),
+        AnyParsedRangePredicate::I16(anchor) => ranked!(I16, anchor),
+        AnyParsedRangePredicate::I8(anchor) => ranked!(I8, anchor),
+        AnyParsedRangePredicate::U64(anchor) => ranked!(U64, anchor),
+        AnyParsedRangePredicate::U32(anchor) => ranked!(U32, anchor),
+        AnyParsedRangePredicate::U16(anchor) => ranked!(U16, anchor),
+        AnyParsedRangePredicate::U8(anchor) => ranked!(U8, anchor),
+        AnyParsedRangePredicate::F64(anchor) => ranked!(F64, anchor),
+        AnyParsedRangePredicate::F32(anchor) => ranked!(F32, anchor),
+    }
+}
+
+fn reverse_rank_value_bytes(range: &AnyParsedRangePredicate<'_>) -> usize {
+    match range {
+        AnyParsedRangePredicate::I64(_) => std::mem::size_of::<i64>(),
+        AnyParsedRangePredicate::I32(_) => std::mem::size_of::<i32>(),
+        AnyParsedRangePredicate::I16(_) => std::mem::size_of::<i16>(),
+        AnyParsedRangePredicate::I8(_) => std::mem::size_of::<i8>(),
+        AnyParsedRangePredicate::U64(_) => std::mem::size_of::<u64>(),
+        AnyParsedRangePredicate::U32(_) => std::mem::size_of::<u32>(),
+        AnyParsedRangePredicate::U16(_) => std::mem::size_of::<u16>(),
+        AnyParsedRangePredicate::U8(_) => std::mem::size_of::<u8>(),
+        AnyParsedRangePredicate::F64(_) => std::mem::size_of::<f64>(),
+        AnyParsedRangePredicate::F32(_) => std::mem::size_of::<f32>(),
     }
 }
 
@@ -3196,6 +3364,173 @@ fn aggregate_envelope_rank_sweep<'py>(
         rank_count,
         &queries,
         &bin_ends,
+        &inputs,
+    );
+    if set.is_empty() {
+        return Ok(Some(None));
+    }
+    Ok(Some(Some(make_results_with_positions(
+        py,
+        set,
+        output_positions,
+        output_len,
+        return_matched,
+    )?)))
+}
+
+/// Aggregate a reverse envelope-backed dual range without visiting every
+/// matching pair.
+///
+/// Reverse aggregation sweeps the right output positions. For each position,
+/// left rows whose first-anchor window contains it are active; a rank tree over
+/// the residual's left values then answers the residual threshold query. A
+/// suffix first-anchor window grows from left to right, while a prefix window
+/// grows from right to left, so both layouts reduce to the shared insert-only
+/// rank sweep.
+///
+/// ELI5: let left rows enter a scoreboard when their first window reaches the
+/// current right row, then combine the scoreboard's matching suffix instead
+/// of shaking hands with every pair.
+///
+/// Floating-point sums and products stay on the ordinary traversal because
+/// tree merges would change their encounter order.
+#[allow(clippy::too_many_arguments)]
+fn aggregate_reverse_envelope_rank_sweep<'py>(
+    py: Python<'py>,
+    first: &AnyParsedRangePredicate<'_>,
+    second: &AnyParsedRangePredicate<'_>,
+    residual: &super::predicate::Predicate<'_>,
+    aggregations: &Bound<'py, PyList>,
+    output_positions: Option<ArrayView1<'_, i64>>,
+    output_len: usize,
+    source_len: usize,
+    return_matched: bool,
+) -> PyResult<Option<Option<Bound<'py, PyTuple>>>> {
+    use crate::aggregation::common::aggregation::{
+        make_results_with_positions, parse_inputs, AggregationSet,
+    };
+
+    let Some(sweep) = FirstAnchorSweep::new(first, second) else {
+        return Ok(None);
+    };
+    let inputs = parse_inputs(aggregations)?;
+    if inputs.is_empty() {
+        return Err(PyValueError::new_err(
+            "at least one aggregation is required",
+        ));
+    }
+    if sweep.candidate_width == 0 {
+        return Ok(Some(None));
+    }
+    let Some(state_bytes) = rank_sweep_state_bytes(&inputs) else {
+        return Ok(None);
+    };
+    let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
+    if !set.supports_dual_rank_tree()
+        || !should_use_rank_sweep(
+            sweep.right_len,
+            sweep.candidate_width,
+            source_len,
+            source_len,
+        )
+    {
+        return Ok(None);
+    }
+    let second_search = second.search();
+    let Some((sampled, surviving)) =
+        sampled_envelope_density(&sweep.search, &second_search, sweep.left_len, residual)
+    else {
+        return Ok(None);
+    };
+    if (surviving as u128) * (sweep.candidate_width as u128) / (sampled as u128)
+        <= (sweep.left_len as u128) * (RANK_SWEEP_BUILD_FACTOR as u128)
+    {
+        return Ok(None);
+    }
+    let Some((ranks, rank_count, thresholds)) = reverse_envelope_residual_ranks(second, residual)
+    else {
+        return Ok(None);
+    };
+    if reverse_rank_sweep_workspace_bytes(
+        sweep.right_len,
+        sweep.left_len,
+        rank_count,
+        state_bytes,
+        reverse_rank_value_bytes(second),
+    )
+    .is_none_or(|bytes| {
+        bytes > rank_sweep_memory_budget(sweep.left_len, sweep.right_len, inputs.len())
+    }) {
+        return Ok(None);
+    }
+
+    // At sweep step `v`, insert the left rows whose first-anchor window has
+    // become active before querying right position `v - 1` (or the mirrored
+    // position for prefix windows).
+    let mut activation_keys = vec![0_usize; sweep.left_len];
+    let mut activation_counts = vec![0_usize; sweep.right_len + 1];
+    for_each_window(&sweep.search, sweep.left_len, |row, (start, end)| {
+        let key = if sweep.suffix {
+            start.saturating_add(1)
+        } else {
+            sweep.right_len.saturating_sub(end).saturating_add(1)
+        };
+        if key <= sweep.right_len && start < end {
+            activation_keys[row] = key;
+            activation_counts[key] += 1;
+        }
+    });
+    let mut activation_ends = vec![0_usize; sweep.right_len + 1];
+    for step in 1..=sweep.right_len {
+        activation_ends[step] = activation_ends[step - 1] + activation_counts[step];
+    }
+    let mut cursors = activation_ends[..sweep.right_len].to_vec();
+    let mut insertion_order = vec![0_usize; activation_ends[sweep.right_len]];
+    for (row, &key) in activation_keys.iter().enumerate() {
+        if key != 0 {
+            let slot = &mut cursors[key - 1];
+            insertion_order[*slot] = row;
+            *slot += 1;
+        }
+    }
+
+    // ELI5: activation_ends never decreases, so right positions already
+    // arrive grouped by the number of inserted source rows. Record the end
+    // of each group as queries are appended; there is no second counting sort
+    // to build or walk.
+    let mut query_bin_ends = vec![0_usize; insertion_order.len() + 1];
+    let mut queries = Vec::with_capacity(sweep.right_len);
+    for (step, &bin) in activation_ends
+        .iter()
+        .enumerate()
+        .skip(1)
+        .take(sweep.right_len)
+    {
+        let position = if sweep.suffix {
+            step - 1
+        } else {
+            sweep.right_len - step
+        };
+        if bin == 0 {
+            continue;
+        }
+        queries.push(position as u64 | (u64::from(thresholds[position]) << 32));
+        query_bin_ends[bin] = queries.len();
+    }
+    let mut previous_end = 0_usize;
+    for end in query_bin_ends.iter_mut().skip(1) {
+        *end = (*end).max(previous_end);
+        previous_end = *end;
+    }
+
+    #[cfg(test)]
+    REVERSE_ENVELOPE_RANK_SWEEP_HITS.with(|hits| hits.set(hits.get() + 1));
+    set.aggregate_rank_threshold_sweep(
+        &insertion_order,
+        &ranks,
+        rank_count,
+        &queries,
+        &query_bin_ends,
         &inputs,
     );
     if set.is_empty() {
@@ -5918,5 +6253,515 @@ mod streaming_window_tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn reverse_envelope_rank_sweep_matches_bruteforce() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_len = 400_usize;
+            let right_len = 300_usize;
+            let left_index = PyArray1::from_vec(py, (0..left_len as i64).collect()).into_any();
+            let right_index =
+                PyArray1::from_vec(py, (0..right_len as i64).map(|p| 1_000 + p).collect())
+                    .into_any();
+            let first_left = PyArray1::from_vec(py, vec![50_i64; left_len]).into_any();
+            let first_right = PyArray1::from_vec(py, (0..right_len as i64).collect()).into_any();
+            let second_left_values: Vec<i64> =
+                (0..left_len).map(|row| 100 + (row % 200) as i64).collect();
+            let residual_right_values: Vec<i64> = (0..right_len)
+                .map(|position| ((position * 37 + 11) % right_len) as i64)
+                .collect();
+            let mut second_right_values = residual_right_values.clone();
+            for position in (0..right_len.saturating_sub(1)).rev() {
+                second_right_values[position] =
+                    second_right_values[position].min(second_right_values[position + 1]);
+            }
+            let second_left = PyArray1::from_vec(py, second_left_values.clone()).into_any();
+            let second_right = PyArray1::from_vec(py, second_right_values).into_any();
+            let residual_left = PyArray1::from_vec(py, second_left_values.clone()).into_any();
+            let residual_right = PyArray1::from_vec(py, residual_right_values.clone()).into_any();
+            let predicates = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [first_left, first_right, "<".into_pyobject(py)?.into_any()],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            second_left.clone(),
+                            second_right.clone(),
+                            ">".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            residual_left,
+                            residual_right,
+                            ">".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+            let values = PyArray1::from_vec(py, (1..=left_len as i64).collect()).into_any();
+            let nulls = PyArray1::from_vec(py, vec![false; left_len]).into_any();
+            let aggregations = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            values.clone(),
+                            nulls.clone(),
+                            "sum".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            nulls,
+                            "count".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            "*".into_pyobject(py)?.into_any(),
+                            "size".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+            let hits = REVERSE_ENVELOPE_RANK_SWEEP_HITS.with(|hits| hits.get());
+            let result = range_join_extended_aggregate_reverse(
+                py,
+                &predicates,
+                &left_index,
+                &right_index,
+                &aggregations,
+                true,
+            )?
+            .expect("the reverse envelope fixture has matches");
+            assert_eq!(
+                REVERSE_ENVELOPE_RANK_SWEEP_HITS.with(|value| value.get()),
+                hits + 1,
+                "the reverse envelope sweep did not run"
+            );
+            assert_eq!(
+                result.get_item(0)?.extract::<Vec<i64>>()?,
+                (0..right_len as i64).map(|p| 1_000 + p).collect::<Vec<_>>()
+            );
+            let matched = result.get_item(1)?.extract::<Vec<bool>>()?;
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            let sum = outputs.get_item(0)?.extract::<Vec<i64>>()?;
+            let count = outputs.get_item(1)?.extract::<Vec<i64>>()?;
+            let size = outputs.get_item(2)?.extract::<Vec<i64>>()?;
+            for position in 0..right_len {
+                let mut expected_sum = 0_i64;
+                let mut expected_count = 0_i64;
+                for (row, &left_value) in second_left_values.iter().enumerate() {
+                    if 50 < position as i64 && left_value > residual_right_values[position] {
+                        expected_sum += row as i64 + 1;
+                        expected_count += 1;
+                    }
+                }
+                let expected = expected_count > 0;
+                assert_eq!(
+                    matched[position], expected,
+                    "matched at right position {position}"
+                );
+                assert_eq!(sum[position], expected_sum);
+                assert_eq!(count[position], expected_count);
+                assert_eq!(size[position], expected_count);
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reverse_envelope_rank_sweep_handles_prefix_windows() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_len = 400_usize;
+            let right_len = 300_usize;
+            let left_index = PyArray1::from_vec(py, (0..left_len as i64).collect()).into_any();
+            let right_index = PyArray1::from_vec(py, (0..right_len as i64).collect()).into_any();
+            let first_left = PyArray1::from_vec(py, vec![250_i64; left_len]).into_any();
+            let first_right = PyArray1::from_vec(py, (0..right_len as i64).collect()).into_any();
+            let second_left = PyArray1::from_vec(py, vec![50_i64; left_len]).into_any();
+            let second_right = PyArray1::from_vec(py, (0..right_len as i64).collect()).into_any();
+            let predicates = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [first_left, first_right, ">".into_pyobject(py)?.into_any()],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            second_left.clone(),
+                            second_right.clone(),
+                            "<".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [second_left, second_right, "<".into_pyobject(py)?.into_any()],
+                    )?,
+                ],
+            )?;
+            let nulls = PyArray1::from_vec(py, vec![false; left_len]).into_any();
+            let aggregations = PyList::new(
+                py,
+                [PyTuple::new(
+                    py,
+                    [
+                        "*".into_pyobject(py)?.into_any(),
+                        nulls,
+                        "count".into_pyobject(py)?.into_any(),
+                    ],
+                )?],
+            )?;
+            let hits = REVERSE_ENVELOPE_RANK_SWEEP_HITS.with(|hits| hits.get());
+            let result = range_join_extended_aggregate_reverse(
+                py,
+                &predicates,
+                &left_index,
+                &right_index,
+                &aggregations,
+                true,
+            )?
+            .expect("the reverse prefix fixture has matches");
+            assert_eq!(
+                REVERSE_ENVELOPE_RANK_SWEEP_HITS.with(|value| value.get()),
+                hits + 1
+            );
+            let matched = result.get_item(1)?.extract::<Vec<bool>>()?;
+            let outputs_item = result.get_item(2)?;
+            let outputs = outputs_item.cast::<PyList>()?;
+            let count = outputs.get_item(0)?.extract::<Vec<i64>>()?;
+            for position in 0..right_len {
+                let expected = (51..250).contains(&(position as i64));
+                assert_eq!(
+                    matched[position], expected,
+                    "matched at right position {position}"
+                );
+                assert_eq!(count[position], if expected { left_len as i64 } else { 0 });
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reverse_envelope_rank_sweep_falls_back_for_unsupported_shapes() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let left_len = 400_usize;
+            let right_len = 300_usize;
+            let first_left_value = 50_i64;
+            let second_left_values: Vec<i64> =
+                (0..left_len).map(|row| 100 + (row % 200) as i64).collect();
+            let residual_right_values: Vec<i64> = (0..right_len)
+                .map(|position| ((position * 37 + 11) % right_len) as i64)
+                .collect();
+            let mut envelope_right_values = residual_right_values.clone();
+            for position in (0..right_len.saturating_sub(1)).rev() {
+                envelope_right_values[position] =
+                    envelope_right_values[position].min(envelope_right_values[position + 1]);
+            }
+            let source_values: Vec<i64> = (1..=left_len as i64).collect();
+            let run = |second_right_values: &[i64], op: &str, float_values: bool| {
+                let left_index = PyArray1::from_vec(py, (0..left_len as i64).collect()).into_any();
+                let right_index =
+                    PyArray1::from_vec(py, (0..right_len as i64).collect()).into_any();
+                let first_left =
+                    PyArray1::from_vec(py, vec![first_left_value; left_len]).into_any();
+                let first_right =
+                    PyArray1::from_vec(py, (0..right_len as i64).collect()).into_any();
+                let second_left = PyArray1::from_vec(py, second_left_values.clone()).into_any();
+                let second_right = PyArray1::from_vec(py, second_right_values.to_vec()).into_any();
+                let residual_left = PyArray1::from_vec(py, second_left_values.clone()).into_any();
+                let residual_right =
+                    PyArray1::from_vec(py, residual_right_values.clone()).into_any();
+                let predicates = PyList::new(
+                    py,
+                    [
+                        PyTuple::new(
+                            py,
+                            [first_left, first_right, "<".into_pyobject(py)?.into_any()],
+                        )?,
+                        PyTuple::new(
+                            py,
+                            [second_left, second_right, ">".into_pyobject(py)?.into_any()],
+                        )?,
+                        PyTuple::new(
+                            py,
+                            [
+                                residual_left,
+                                residual_right,
+                                ">".into_pyobject(py)?.into_any(),
+                            ],
+                        )?,
+                    ],
+                )?;
+                let aggregations = if op == "size" {
+                    PyList::new(
+                        py,
+                        [PyTuple::new(
+                            py,
+                            [
+                                "*".into_pyobject(py)?.into_any(),
+                                "size".into_pyobject(py)?.into_any(),
+                            ],
+                        )?],
+                    )?
+                } else if float_values {
+                    let values = PyArray1::from_vec(
+                        py,
+                        source_values.iter().map(|&value| value as f64).collect(),
+                    )
+                    .into_any();
+                    let nulls = PyArray1::from_vec(py, vec![false; left_len]).into_any();
+                    PyList::new(
+                        py,
+                        [PyTuple::new(
+                            py,
+                            [values, nulls, op.into_pyobject(py)?.into_any()],
+                        )?],
+                    )?
+                } else {
+                    let values = PyArray1::from_vec(py, source_values.clone()).into_any();
+                    let nulls = PyArray1::from_vec(py, vec![false; left_len]).into_any();
+                    PyList::new(
+                        py,
+                        [PyTuple::new(
+                            py,
+                            [values, nulls, op.into_pyobject(py)?.into_any()],
+                        )?],
+                    )?
+                };
+                range_join_extended_aggregate_reverse(
+                    py,
+                    &predicates,
+                    &left_index,
+                    &right_index,
+                    &aggregations,
+                    false,
+                )
+            };
+
+            let expected_counts = |second_right_values: &[i64]| -> Vec<i64> {
+                (0..right_len)
+                    .map(|position| {
+                        (0..left_len)
+                            .filter(|&row| {
+                                first_left_value < position as i64
+                                    && second_left_values[row] > second_right_values[position]
+                                    && second_left_values[row] > residual_right_values[position]
+                            })
+                            .count() as i64
+                    })
+                    .collect()
+            };
+            let check_size = |result: &Bound<'_, PyTuple>, expected: &[i64]| -> PyResult<()> {
+                assert_eq!(
+                    result.get_item(0)?.extract::<Vec<i64>>()?,
+                    (0..right_len as i64).collect::<Vec<_>>()
+                );
+                let outputs_item = result.get_item(1)?;
+                let outputs = outputs_item.cast::<PyList>()?;
+                assert_eq!(outputs.get_item(0)?.extract::<Vec<i64>>()?, expected);
+                Ok(())
+            };
+
+            let baseline_hits = REVERSE_ENVELOPE_RANK_SWEEP_HITS.with(|hits| hits.get());
+            let control = run(&envelope_right_values, "size", false)?
+                .expect("the dense control case has matches");
+            check_size(&control, &expected_counts(&envelope_right_values))?;
+            assert_eq!(
+                REVERSE_ENVELOPE_RANK_SWEEP_HITS.with(|hits| hits.get()),
+                baseline_hits + 1,
+                "the dense control case must run the reverse sweep"
+            );
+            let fallback_hits = baseline_hits + 1;
+            let float_sum = run(&envelope_right_values, "sum", true)?
+                .expect("the dense float fallback has matches");
+            let float_outputs_item = float_sum.get_item(1)?;
+            let float_outputs = float_outputs_item.cast::<PyList>()?;
+            let expected_float_sums: Vec<f64> = (0..right_len)
+                .map(|position| {
+                    (0..left_len)
+                        .filter(|&row| {
+                            first_left_value < position as i64
+                                && second_left_values[row] > envelope_right_values[position]
+                                && second_left_values[row] > residual_right_values[position]
+                        })
+                        .map(|row| source_values[row] as f64)
+                        .sum()
+                })
+                .collect();
+            assert_eq!(
+                float_outputs.get_item(0)?.extract::<Vec<f64>>()?,
+                expected_float_sums
+            );
+            assert_eq!(
+                REVERSE_ENVELOPE_RANK_SWEEP_HITS.with(|hits| hits.get()),
+                fallback_hits,
+                "float sum must remain on the fallback"
+            );
+
+            let integer_prod = run(&envelope_right_values, "prod", false)?
+                .expect("the dense integer product fallback has matches");
+            let product_outputs_item = integer_prod.get_item(1)?;
+            let product_outputs = product_outputs_item.cast::<PyList>()?;
+            let expected_products: Vec<i64> = (0..right_len)
+                .map(|position| {
+                    (0..left_len)
+                        .filter(|&row| {
+                            first_left_value < position as i64
+                                && second_left_values[row] > envelope_right_values[position]
+                                && second_left_values[row] > residual_right_values[position]
+                        })
+                        .fold(1_i64, |product, row| {
+                            product.wrapping_mul(source_values[row])
+                        })
+                })
+                .collect();
+            assert_eq!(
+                product_outputs.get_item(0)?.extract::<Vec<i64>>()?,
+                expected_products
+            );
+            assert_eq!(
+                REVERSE_ENVELOPE_RANK_SWEEP_HITS.with(|hits| hits.get()),
+                fallback_hits,
+                "integer product must remain on the fallback"
+            );
+
+            // Lowering every envelope value keeps the anchor sorted while
+            // making it a strict superset of the residual's candidates.
+            let non_envelope: Vec<i64> = envelope_right_values
+                .iter()
+                .map(|&value| value - 1)
+                .collect();
+            let non_envelope_result =
+                run(&non_envelope, "size", false)?.expect("the non-envelope fallback has matches");
+            check_size(&non_envelope_result, &expected_counts(&non_envelope))?;
+            assert_eq!(
+                REVERSE_ENVELOPE_RANK_SWEEP_HITS.with(|hits| hits.get()),
+                fallback_hits,
+                "non-envelope anchors must use the fallback"
+            );
+
+            let sparse_left_len = 50_usize;
+            let sparse_right_len = 100_usize;
+            let sparse_left_index =
+                PyArray1::from_vec(py, (0..sparse_left_len as i64).collect()).into_any();
+            let sparse_right_index =
+                PyArray1::from_vec(py, (0..sparse_right_len as i64).collect()).into_any();
+            let sparse_predicates = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, vec![10_i64; sparse_left_len]).into_any(),
+                            PyArray1::from_vec(py, (0..sparse_right_len as i64).collect())
+                                .into_any(),
+                            "<".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, vec![50_i64; sparse_left_len]).into_any(),
+                            PyArray1::from_vec(py, (0..sparse_right_len as i64).collect())
+                                .into_any(),
+                            ">".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, vec![50_i64; sparse_left_len]).into_any(),
+                            PyArray1::from_vec(py, (0..sparse_right_len as i64).collect())
+                                .into_any(),
+                            ">".into_pyobject(py)?.into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+            let sparse_aggregations = PyList::new(
+                py,
+                [PyTuple::new(
+                    py,
+                    [
+                        "*".into_pyobject(py)?.into_any(),
+                        "size".into_pyobject(py)?.into_any(),
+                    ],
+                )?],
+            )?;
+            let sparse_result = range_join_extended_aggregate_reverse(
+                py,
+                &sparse_predicates,
+                &sparse_left_index,
+                &sparse_right_index,
+                &sparse_aggregations,
+                false,
+            )?
+            .expect("the sparse fallback has matches");
+            let sparse_outputs_item = sparse_result.get_item(1)?;
+            let sparse_outputs = sparse_outputs_item.cast::<PyList>()?;
+            assert_eq!(
+                sparse_outputs.get_item(0)?.extract::<Vec<i64>>()?,
+                (0..sparse_right_len)
+                    .map(|position| {
+                        if (11..50).contains(&position) {
+                            sparse_left_len as i64
+                        } else {
+                            0
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                REVERSE_ENVELOPE_RANK_SWEEP_HITS.with(|hits| hits.get()),
+                fallback_hits,
+                "sparse windows must use the fallback"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn reverse_residual_ranks_match_all_range_operators() {
+        let left = ArrayView1::from(&[1_i64, 1, 3, 5]);
+        let right = ArrayView1::from(&[0_i64, 1, 2, 3, 5, 6]);
+        for op in [CompareOp::Lt, CompareOp::Le, CompareOp::Gt, CompareOp::Ge] {
+            let (ranks, rank_count, thresholds) = reverse_residual_rank_thresholds(left, right, op);
+            for (position, &value) in right.iter().enumerate() {
+                let observed = left
+                    .iter()
+                    .enumerate()
+                    .filter(|&(row, _)| ranks[row] >= thresholds[position] as usize)
+                    .map(|(_, &candidate)| candidate)
+                    .collect::<Vec<_>>();
+                let expected = left
+                    .iter()
+                    .copied()
+                    .filter(|candidate| op.apply(candidate, &value))
+                    .collect::<Vec<_>>();
+                assert_eq!(observed, expected, "{op:?} at right position {position}");
+            }
+            assert!(ranks.iter().all(|&rank| rank < rank_count));
+        }
     }
 }

@@ -499,6 +499,37 @@ Add entries in the format:
 **Recommendation**: How to apply this learning
 -->
 
+### [2026-10-24] Reverse rank sweeps bin by inserted-source count
+
+**Context**: Extending the envelope rank sweep to reverse dual-range
+aggregation, where left rows are inserted and right positions are queried.
+
+**Learning**: `aggregate_rank_threshold_sweep` bins queries by the cumulative
+number of inserted source rows, not by the external sweep position. Reverse
+prefix/suffix scans visit steps in increasing active-source order, so their
+queries are already grouped by that cumulative count and can record bin ends
+as they are appended.
+
+**Recommendation**: Build the activation order first, append right queries in
+sweep order, and fill skipped bin endpoints with a prefix maximum. This keeps
+the shared state contract without a second query counting sort.
+
+### [2026-10-24] Reverse fallback tests must reach the proof gate
+
+**Context**: Reviewing reverse envelope-rank-sweep fallback coverage. A sparse
+fixture can exit at the cost gate before testing envelope validation or
+unsupported aggregation operations, making several fallback assertions
+vacuous.
+
+**Learning**: Each fallback reason needs a dense control fixture that proves
+the optimized branch runs, followed by the non-envelope or unsupported case
+on the same layout. Assertions must compare returned values with a brute-force
+reference, not only check that a result exists.
+
+**Recommendation**: Separate sparse-gate coverage from envelope-proof and
+operation-support coverage; assert the branch counter increases for the dense
+control and remains unchanged for every intended fallback.
+
 ### [2026-08-22] Foundation PR for issue #21
 
 **Context**: Adding the first Rust unit tests, benchmarks, and CI to this
