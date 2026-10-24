@@ -1746,3 +1746,12 @@ can observe the dense join.
 start from a real intersecting row and remain bounded by that block. A gate
 test must assert the sweep counter fires for a large left input whose matches
 are clustered in one stretch.
+
+### [2026-10-24] Exhaustive gate probes can prove an empty join
+
+**Context**: Walking each width-sample block to its first real intersection
+adds a full extra pass when no row matches, after which the normal window
+builder would repeat the same searches.
+**Learning**: If every bounded block walk finds no intersection, the join is
+proven empty. Return the normal empty result directly, while still validating
+aggregation inputs before short-circuiting.

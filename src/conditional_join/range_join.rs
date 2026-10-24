@@ -2948,6 +2948,11 @@ fn select_envelope_rank_sweep(
 ) -> Option<(Vec<i64>, Vec<i64>)> {
     let sweep = FirstAnchorSweep::new(first, second)?;
     let (left_len, right_len, suffix) = (sweep.left_len, sweep.right_len, sweep.suffix);
+    // The width probe searched every row when no block contained an
+    // intersection, so the ordinary window builder cannot find a match.
+    if sweep.candidate_width == 0 {
+        return Some((Vec::new(), Vec::new()));
+    }
     if !should_use_segment_tree(left_len, sweep.candidate_width, right_len) {
         return None;
     }
@@ -3074,17 +3079,22 @@ fn aggregate_envelope_rank_sweep<'py>(
     let Some(sweep) = FirstAnchorSweep::new(first, second) else {
         return Ok(None);
     };
-    let suffix = sweep.suffix;
-    // The sweep replaces a traversal of the intersected windows; only take
-    // it when that traversal is large next to building and querying a tree.
-    if !should_use_segment_tree(sweep.left_len, sweep.candidate_width, source_len) {
-        return Ok(None);
-    }
     let inputs = parse_inputs(aggregations)?;
     if inputs.is_empty() {
         return Err(PyValueError::new_err(
             "at least one aggregation is required",
         ));
+    }
+    // The width probe searched every row when no block contained an
+    // intersection, so the ordinary window builder cannot find a match.
+    if sweep.candidate_width == 0 {
+        return Ok(Some(None));
+    }
+    let suffix = sweep.suffix;
+    // The sweep replaces a traversal of the intersected windows; only take
+    // it when that traversal is large next to building and querying a tree.
+    if !should_use_segment_tree(sweep.left_len, sweep.candidate_width, source_len) {
+        return Ok(None);
     }
     let Some(state_bytes) = rank_sweep_state_bytes(&inputs) else {
         return Ok(None);
@@ -5656,6 +5666,29 @@ mod envelope_keep_sweep_tests {
                 observed,
                 bruteforce(&fixture, first_op, &anchor, second_op, false, "first")
             );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn envelope_keep_sweep_returns_empty_for_large_no_match_input() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let mut rng = XorShift(0x0BAD_CAFE);
+            let mut fixture = fixture(&mut rng, 12_000, 300);
+            fixture.right_first = (0..300).map(i64::from).collect();
+            fixture.right_second = (0..300).map(i64::from).collect();
+            fixture.left_first.fill(300);
+            fixture.left_second.fill(301);
+            let (first_op, second_op) = (CompareOp::Le, CompareOp::Gt);
+            let anchor = envelope(&fixture.right_second, second_op);
+            let before = keep_hits();
+            let observed = run(
+                py, &fixture, first_op, &anchor, second_op, false, false, "first",
+            )?;
+            assert_eq!(keep_hits(), before, "empty join entered the sweep");
+            assert!(observed.0.is_empty() && observed.1.is_empty());
             Ok(())
         })
         .unwrap();
