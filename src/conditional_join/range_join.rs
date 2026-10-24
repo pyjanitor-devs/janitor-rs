@@ -67,6 +67,7 @@ thread_local! {
     pub(crate) static EXTREME_HULL_TREE_HITS: Cell<usize> = const { Cell::new(0) };
     pub(crate) static PACKING_PRECHECK_DIRECT_HITS: Cell<usize> = const { Cell::new(0) };
     pub(crate) static ENVELOPE_RANK_SWEEP_HITS: Cell<usize> = const { Cell::new(0) };
+    pub(crate) static ENVELOPE_KEEP_SWEEP_HITS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Select the smallest or largest physical label in each half-open window by scanning.
@@ -876,9 +877,34 @@ fn extended_join<'py>(
     )
     .map_err(PyValueError::new_err)?;
     check_predicate_lengths(&parsed, first.left_len(), first.right_len())?;
-    let windows = build_any_windows(&first, &second).map_err(PyValueError::new_err)?;
+    let first_windows = first.windows(true).map_err(PyValueError::new_err)?;
+    // ELI5: `first`/`last` only need the smallest or largest label among a
+    // row's matches. When the second anchor is just the residual's envelope,
+    // a running scoreboard answers that without walking every match.
+    let sweepable =
+        matches!(keep, Keep::First | Keep::Last) && metadata.is_none() && parsed.len() == 1;
+    let first_bounds = sweepable.then(|| FirstAnchorWindows {
+        starts: first_windows.starts.clone(),
+        ends: first_windows.ends.clone(),
+        left_positions: first_windows.left_positions.clone(),
+    });
+    let windows = intersect_windows(
+        first_windows,
+        second.windows(false).map_err(PyValueError::new_err)?,
+    )
+    .map_err(PyValueError::new_err)?;
     if windows.left_index.is_empty() {
         return Ok(None);
+    }
+    if let Some(first_bounds) = &first_bounds {
+        if let Some((out_left, out_right)) =
+            select_envelope_rank_sweep(&second, &parsed[0], first_bounds, &windows, keep)
+        {
+            if out_left.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(result_dict(py, out_left, out_right, None, None)?));
+        }
     }
     let (out_left, out_right) =
         materialize_range_candidates(&windows, &parsed, metadata.as_deref(), keep)
@@ -2406,6 +2432,281 @@ fn rank_sweep_state_bytes(
     Some(bytes)
 }
 
+/// Sample residual survivors to estimate the work left for the ordinary scan.
+///
+/// ELI5: a rank tree is worthwhile when many cards in the windows survive the
+/// residual. The caller compares the estimated survivor count with the rank
+/// tree's fixed build cost.
+fn residual_density_sample<T: PartialOrd + Copy>(
+    windows: &SingleJoinResult,
+    left_positions: &[usize],
+    left: ArrayView1<'_, T>,
+    right: ArrayView1<'_, T>,
+    op: super::compare_op::CompareOp,
+) -> Option<(usize, usize)> {
+    const SAMPLE_ROWS: usize = 32;
+    const SAMPLE_POSITIONS: usize = 32;
+    let row_count = windows.starts.len();
+    if row_count == 0 {
+        return None;
+    }
+    let row_step = row_count.div_ceil(SAMPLE_ROWS).max(1);
+    let mut sampled = 0_usize;
+    let mut surviving = 0_usize;
+    for row in (0..row_count).step_by(row_step).take(SAMPLE_ROWS) {
+        let start = windows.starts[row];
+        let end = windows.ends[row];
+        if start >= end {
+            continue;
+        }
+        let width = end - start;
+        let probes = width.min(SAMPLE_POSITIONS);
+        for probe in 0..probes {
+            let position = start + probe * width / probes;
+            sampled += 1;
+            surviving += usize::from(op.apply(&left[left_positions[row]], &right[position]));
+        }
+    }
+    (sampled > 0).then_some((sampled, surviving))
+}
+
+fn residual_density_sample_dispatch(
+    windows: &SingleJoinResult,
+    left_positions: &[usize],
+    residual: &super::predicate::Predicate<'_>,
+) -> Option<(usize, usize)> {
+    use super::predicate::PredicateView;
+    match residual.view() {
+        PredicateView::I64(left, right, op) => {
+            residual_density_sample(windows, left_positions, left, right, op)
+        }
+        PredicateView::I32(left, right, op) => {
+            residual_density_sample(windows, left_positions, left, right, op)
+        }
+        PredicateView::I16(left, right, op) => {
+            residual_density_sample(windows, left_positions, left, right, op)
+        }
+        PredicateView::I8(left, right, op) => {
+            residual_density_sample(windows, left_positions, left, right, op)
+        }
+        PredicateView::U64(left, right, op) => {
+            residual_density_sample(windows, left_positions, left, right, op)
+        }
+        PredicateView::U32(left, right, op) => {
+            residual_density_sample(windows, left_positions, left, right, op)
+        }
+        PredicateView::U16(left, right, op) => {
+            residual_density_sample(windows, left_positions, left, right, op)
+        }
+        PredicateView::U8(left, right, op) => {
+            residual_density_sample(windows, left_positions, left, right, op)
+        }
+        PredicateView::F64(left, right, op) => {
+            residual_density_sample(windows, left_positions, left, right, op)
+        }
+        PredicateView::F32(left, right, op) => {
+            residual_density_sample(windows, left_positions, left, right, op)
+        }
+    }
+}
+
+/// Residual ranks and per-left thresholds when `second` is provably the
+/// cumulative envelope of `residual` (see [`anchor_is_envelope_of`]).
+///
+/// Returns `None` when the residual is not a range predicate of the same
+/// dtype or the anchor is not its envelope; callers then keep the general
+/// traversal. On success the tuple is `(rank of every right position, rank
+/// count, threshold of every left position)` from
+/// [`residual_rank_thresholds`].
+fn envelope_residual_ranks(
+    second: &AnyParsedRangePredicate<'_>,
+    residual: &super::predicate::Predicate<'_>,
+) -> Option<(Vec<usize>, usize, Vec<usize>)> {
+    use super::compare_op::CompareOp;
+    use super::predicate::PredicateView;
+
+    macro_rules! ranked {
+        ($variant:ident, $anchor:expr) => {{
+            let anchor = $anchor;
+            let PredicateView::$variant(residual_left, residual_right, residual_op) =
+                residual.view()
+            else {
+                return None;
+            };
+            if matches!(residual_op, CompareOp::Eq | CompareOp::Ne)
+                || !anchor_is_envelope_of(
+                    anchor.left.as_array(),
+                    anchor.right.as_array(),
+                    anchor.op,
+                    residual_left,
+                    residual_right,
+                    residual_op,
+                )
+            {
+                return None;
+            }
+            Some(residual_rank_thresholds(
+                residual_left,
+                residual_right,
+                residual_op,
+            ))
+        }};
+    }
+    match second {
+        AnyParsedRangePredicate::I64(anchor) => ranked!(I64, anchor),
+        AnyParsedRangePredicate::I32(anchor) => ranked!(I32, anchor),
+        AnyParsedRangePredicate::I16(anchor) => ranked!(I16, anchor),
+        AnyParsedRangePredicate::I8(anchor) => ranked!(I8, anchor),
+        AnyParsedRangePredicate::U64(anchor) => ranked!(U64, anchor),
+        AnyParsedRangePredicate::U32(anchor) => ranked!(U32, anchor),
+        AnyParsedRangePredicate::U16(anchor) => ranked!(U16, anchor),
+        AnyParsedRangePredicate::U8(anchor) => ranked!(U8, anchor),
+        AnyParsedRangePredicate::F64(anchor) => ranked!(F64, anchor),
+        AnyParsedRangePredicate::F32(anchor) => ranked!(F32, anchor),
+    }
+}
+
+/// Select `keep="first"` or `"last"` for an envelope-backed dual range
+/// without visiting every match.
+///
+/// Same shape as [`aggregate_envelope_rank_sweep`]: the second anchor is
+/// provably the cumulative envelope of the only residual, and every
+/// first-anchor window is a suffix (or every one a prefix) of the right
+/// layout. Each row then wants the smallest (or largest) right label among
+/// the positions in its first-anchor window whose residual rank clears the
+/// row's threshold. Right positions are inserted in window-growth order into
+/// a Fenwick tree indexed by reversed residual rank, each node keeping the
+/// best label below it; a row's answer is one prefix query once its window
+/// is fully inserted. That is O((left + right) log right), against the
+/// residual scan's one check per candidate: on Arun's 1M x 33K dominance
+/// join the scan visited 5.5 billion matches.
+///
+/// ELI5: right rows walk onto a stage one by one. Each spot on a ladder
+/// (ordered by how "good" the residual value is) remembers the smallest
+/// ticket number standing at or below it. When a left row's turn comes, it
+/// reads one ladder spot instead of checking every ticket.
+///
+/// Returns `None` when the shape does not apply or the candidate width is
+/// too small to repay the tree, so the caller keeps the residual scan.
+/// Otherwise the pairs are emitted in left-row order, as the scan does.
+fn select_envelope_rank_sweep(
+    second: &AnyParsedRangePredicate<'_>,
+    residual: &super::predicate::Predicate<'_>,
+    first_bounds: &FirstAnchorWindows,
+    windows: &SingleJoinResult,
+    keep: Keep,
+) -> Option<(Vec<i64>, Vec<i64>)> {
+    let FirstAnchorWindows {
+        starts: first_starts,
+        ends: first_ends,
+        left_positions,
+    } = first_bounds;
+    let right_len = windows.right_index.len();
+    let candidate_width = windows
+        .starts
+        .iter()
+        .zip(&windows.ends)
+        .fold(0_usize, |total, (start, end)| {
+            total.saturating_add(end.saturating_sub(*start))
+        });
+    if !should_use_rank_sweep(first_starts.len(), candidate_width, right_len, right_len) {
+        return None;
+    }
+    let suffix = first_ends.iter().all(|&end| end == right_len);
+    let prefix = first_starts.iter().all(|&start| start == 0);
+    if !(suffix || prefix) {
+        return None;
+    }
+    let (sampled, surviving) =
+        residual_density_sample_dispatch(windows, &windows.left_positions, residual)?;
+    if (surviving as u128) * (candidate_width as u128) / (sampled as u128)
+        <= (right_len as u128) * (RANK_SWEEP_BUILD_FACTOR as u128)
+    {
+        return None;
+    }
+    let (ranks, rank_count, thresholds) = envelope_residual_ranks(second, residual)?;
+    if rank_sweep_workspace_bytes(first_starts.len(), right_len, rank_count, 8)
+        .is_none_or(|bytes| bytes > rank_sweep_memory_budget(right_len, first_starts.len(), 1))
+    {
+        return None;
+    }
+
+    #[cfg(test)]
+    ENVELOPE_KEEP_SWEEP_HITS.with(|hits| hits.set(hits.get() + 1));
+    let labels = &windows.right_index;
+    let better = |candidate: i64, current: i64| match keep {
+        Keep::First => candidate < current,
+        _ => candidate > current,
+    };
+    // `(visible, query prefix length, row)`: the row's window holds the
+    // first `visible` inserted positions, and positions with rank at or
+    // above its threshold sit in reversed-rank slots `0..rank_count -
+    // threshold`.
+    let mut queries: Vec<(usize, usize, usize)> = (0..first_starts.len())
+        .filter_map(|row| {
+            let threshold = *thresholds.get(left_positions[row])?;
+            let visible = if suffix {
+                right_len.saturating_sub(first_starts[row])
+            } else {
+                first_ends[row]
+            };
+            (threshold < rank_count && visible > 0).then_some((
+                visible,
+                rank_count - threshold,
+                row,
+            ))
+        })
+        .collect();
+    queries.sort_unstable_by_key(|&(visible, _, _)| visible);
+
+    let mut tree: Vec<Option<i64>> = vec![None; rank_count + 1];
+    // Indexed by compact left position, which is how the intersected
+    // windows name their rows.
+    let mut selected: Vec<Option<i64>> = vec![None; thresholds.len()];
+    let mut inserted = 0_usize;
+    for (visible, prefix_len, row) in queries {
+        while inserted < visible {
+            let position = if suffix {
+                right_len - 1 - inserted
+            } else {
+                inserted
+            };
+            let label = labels[position];
+            let mut slot = rank_count - ranks[position];
+            while slot <= rank_count {
+                if tree[slot].is_none_or(|current| better(label, current)) {
+                    tree[slot] = Some(label);
+                }
+                slot += slot.isolate_lowest_one();
+            }
+            inserted += 1;
+        }
+        let mut best = None;
+        let mut slot = prefix_len;
+        while slot > 0 {
+            if let Some(label) = tree[slot] {
+                if best.is_none_or(|current| better(label, current)) {
+                    best = Some(label);
+                }
+            }
+            slot -= slot.isolate_lowest_one();
+        }
+        selected[left_positions[row]] = best;
+    }
+
+    // ELI5: a left row whose intersected window is empty has no match, so
+    // walk the intersected rows; they also carry the left labels.
+    let mut out_left = Vec::with_capacity(windows.left_index.len());
+    let mut out_right = Vec::with_capacity(windows.left_index.len());
+    for (window_row, &left_position) in windows.left_positions.iter().enumerate() {
+        if let Some(label) = selected[left_position] {
+            out_left.push(windows.left_index[window_row]);
+            out_right.push(label);
+        }
+    }
+    Some((out_left, out_right))
+}
+
 /// Aggregate an envelope-backed dual range without visiting every pair.
 ///
 /// Applies when the second anchor is the cumulative envelope of the only
@@ -2439,8 +2740,6 @@ fn aggregate_envelope_rank_sweep<'py>(
     source_len: usize,
     return_matched: bool,
 ) -> PyResult<Option<Option<Bound<'py, PyTuple>>>> {
-    use super::compare_op::CompareOp;
-    use super::predicate::PredicateView;
     use crate::aggregation::common::aggregation::{
         make_results_with_positions, parse_inputs, AggregationSet,
     };
@@ -2474,40 +2773,19 @@ fn aggregate_envelope_rank_sweep<'py>(
     if !(suffix || prefix) {
         return Ok(None);
     }
-    macro_rules! ranked {
-        ($variant:ident, $anchor:expr) => {{
-            let anchor = $anchor;
-            let PredicateView::$variant(residual_left, residual_right, residual_op) =
-                residual.view()
-            else {
-                return Ok(None);
-            };
-            if matches!(residual_op, CompareOp::Eq | CompareOp::Ne)
-                || !anchor_is_envelope_of(
-                    anchor.left.as_array(),
-                    anchor.right.as_array(),
-                    anchor.op,
-                    residual_left,
-                    residual_right,
-                    residual_op,
-                )
-            {
-                return Ok(None);
-            }
-            residual_rank_thresholds(residual_left, residual_right, residual_op)
-        }};
+    let inputs = parse_inputs(aggregations)?;
+    if inputs.is_empty() {
+        return Err(PyValueError::new_err(
+            "at least one aggregation is required",
+        ));
     }
-    let (ranks, rank_count, thresholds) = match second {
-        AnyParsedRangePredicate::I64(anchor) => ranked!(I64, anchor),
-        AnyParsedRangePredicate::I32(anchor) => ranked!(I32, anchor),
-        AnyParsedRangePredicate::I16(anchor) => ranked!(I16, anchor),
-        AnyParsedRangePredicate::I8(anchor) => ranked!(I8, anchor),
-        AnyParsedRangePredicate::U64(anchor) => ranked!(U64, anchor),
-        AnyParsedRangePredicate::U32(anchor) => ranked!(U32, anchor),
-        AnyParsedRangePredicate::U16(anchor) => ranked!(U16, anchor),
-        AnyParsedRangePredicate::U8(anchor) => ranked!(U8, anchor),
-        AnyParsedRangePredicate::F64(anchor) => ranked!(F64, anchor),
-        AnyParsedRangePredicate::F32(anchor) => ranked!(F32, anchor),
+    let set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
+    if !set.supports_dual_rank_tree() {
+        return Ok(None);
+    }
+
+    let Some((ranks, rank_count, thresholds)) = envelope_residual_ranks(second, residual) else {
+        return Ok(None);
     };
 
     if !should_use_rank_sweep(first_starts.len(), candidate_width, source_len, rank_count)
@@ -3898,7 +4176,14 @@ mod default_skip_scan_tests {
                             keep,
                         )?
                         .expect("the overlap has matches");
-                        assert!(plans() > plans_before, "skip scan did not run for {keep}");
+                        // The envelope rank sweep intentionally supersedes the
+                        // skip scan for first/last on this fixture. Those modes
+                        // retain dedicated skip-scan coverage in the blocky
+                        // residual test below; keep this test focused on the
+                        // scan path for all/any.
+                        if matches!(keep, "all" | "any") {
+                            assert!(plans() > plans_before, "skip scan did not run for {keep}");
+                        }
                         let read = |name: &str| -> PyResult<Vec<i64>> {
                             Ok(result
                                 .get_item(name)?
@@ -4764,5 +5049,310 @@ mod default_skip_scan_tests {
                 estimated_input * RANK_SWEEP_MEMORY_MULTIPLIER
             );
         }
+    }
+}
+
+/// `keep="first"`/`"last"` on envelope-backed dual ranges via the rank sweep.
+#[cfg(test)]
+mod envelope_keep_sweep_tests {
+    use super::*;
+    use crate::conditional_join::compare_op::CompareOp;
+    use numpy::{PyArray1, PyArrayMethods};
+    use pyo3::IntoPyObject;
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn below(&mut self, bound: u64) -> i64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound) as i64
+        }
+    }
+
+    fn keep_hits() -> usize {
+        ENVELOPE_KEEP_SWEEP_HITS.with(|hits| hits.get())
+    }
+
+    fn op_str(op: CompareOp) -> &'static str {
+        match op {
+            CompareOp::Lt => "<",
+            CompareOp::Le => "<=",
+            CompareOp::Gt => ">",
+            CompareOp::Ge => ">=",
+            CompareOp::Eq => "==",
+            CompareOp::Ne => "!=",
+        }
+    }
+
+    /// Envelope of `values` for the second operator, as pyjanitor builds it.
+    fn envelope(values: &[i64], op: CompareOp) -> Vec<i64> {
+        let mut out = values.to_vec();
+        if matches!(op, CompareOp::Gt | CompareOp::Ge) {
+            for position in (0..out.len().saturating_sub(1)).rev() {
+                out[position] = out[position].min(out[position + 1]);
+            }
+        } else {
+            for position in 1..out.len() {
+                out[position] = out[position].max(out[position - 1]);
+            }
+        }
+        out
+    }
+
+    struct Fixture {
+        left_first: Vec<i64>,
+        right_first: Vec<i64>,
+        left_second: Vec<i64>,
+        right_second: Vec<i64>,
+        left_extra: Vec<i64>,
+        right_extra: Vec<i64>,
+        left_index: Vec<i64>,
+        right_index: Vec<i64>,
+    }
+
+    fn fixture(rng: &mut XorShift, left_len: usize, right_len: usize) -> Fixture {
+        let mut right_first: Vec<i64> = (0..right_len).map(|_| rng.below(500)).collect();
+        right_first.sort_unstable();
+        // Shuffled, unique right labels so first/last are not just the
+        // window ends.
+        let mut right_index: Vec<i64> = (0..right_len as i64).map(|label| label * 3 + 7).collect();
+        for position in (1..right_len).rev() {
+            right_index.swap(position, rng.below(position as u64 + 1) as usize);
+        }
+        Fixture {
+            left_first: (0..left_len).map(|_| rng.below(500)).collect(),
+            right_first,
+            left_second: (0..left_len).map(|_| rng.below(500)).collect(),
+            right_second: (0..right_len).map(|_| rng.below(500)).collect(),
+            left_extra: (0..left_len).map(|_| rng.below(4)).collect(),
+            right_extra: (0..right_len).map(|_| rng.below(4)).collect(),
+            left_index: (0..left_len as i64).map(|label| 10_000 + label).collect(),
+            right_index,
+        }
+    }
+
+    fn tuple<'py>(
+        py: Python<'py>,
+        left: &[i64],
+        right: &[i64],
+        op: CompareOp,
+        as_float: bool,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let (left, right) = if as_float {
+            (
+                PyArray1::from_vec(py, left.iter().map(|&v| v as f64 / 2.0).collect()).into_any(),
+                PyArray1::from_vec(py, right.iter().map(|&v| v as f64 / 2.0).collect()).into_any(),
+            )
+        } else {
+            (
+                PyArray1::from_vec(py, left.to_vec()).into_any(),
+                PyArray1::from_vec(py, right.to_vec()).into_any(),
+            )
+        };
+        PyTuple::new(py, [left, right, op_str(op).into_pyobject(py)?.into_any()])
+    }
+
+    /// Every pair checked directly, with the anchor applied as given.
+    #[allow(clippy::too_many_arguments)]
+    fn bruteforce(
+        fixture: &Fixture,
+        first_op: CompareOp,
+        anchor_right: &[i64],
+        second_op: CompareOp,
+        with_extra: bool,
+        keep: &str,
+    ) -> (Vec<i64>, Vec<i64>) {
+        let mut out = (Vec::new(), Vec::new());
+        for row in 0..fixture.left_first.len() {
+            let labels = (0..fixture.right_first.len())
+                .filter(|&position| {
+                    first_op.apply(&fixture.left_first[row], &fixture.right_first[position])
+                        && second_op.apply(&fixture.left_second[row], &anchor_right[position])
+                        && second_op
+                            .apply(&fixture.left_second[row], &fixture.right_second[position])
+                        && (!with_extra || fixture.left_extra[row] != fixture.right_extra[position])
+                })
+                .map(|position| fixture.right_index[position]);
+            let best = if keep == "first" {
+                labels.min()
+            } else {
+                labels.max()
+            };
+            if let Some(label) = best {
+                out.0.push(fixture.left_index[row]);
+                out.1.push(label);
+            }
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        py: Python<'_>,
+        fixture: &Fixture,
+        first_op: CompareOp,
+        anchor_right: &[i64],
+        second_op: CompareOp,
+        with_extra: bool,
+        as_float: bool,
+        keep: &str,
+    ) -> PyResult<(Vec<i64>, Vec<i64>)> {
+        let mut items = vec![
+            tuple(
+                py,
+                &fixture.left_first,
+                &fixture.right_first,
+                first_op,
+                as_float,
+            )?,
+            tuple(py, &fixture.left_second, anchor_right, second_op, as_float)?,
+            tuple(
+                py,
+                &fixture.left_second,
+                &fixture.right_second,
+                second_op,
+                as_float,
+            )?,
+        ];
+        if with_extra {
+            items.push(tuple(
+                py,
+                &fixture.left_extra,
+                &fixture.right_extra,
+                CompareOp::Ne,
+                as_float,
+            )?);
+        }
+        let predicates = PyList::new(py, items)?;
+        let result = range_join_extended_indices(
+            py,
+            &predicates,
+            PyArray1::from_vec(py, fixture.left_index.clone()).into_any(),
+            PyArray1::from_vec(py, fixture.right_index.clone()).into_any(),
+            keep,
+        )?;
+        let Some(result) = result else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let read = |name: &str| -> PyResult<Vec<i64>> {
+            Ok(result
+                .get_item(name)?
+                .expect("index output")
+                .cast::<PyArray1<i64>>()?
+                .readonly()
+                .as_array()
+                .to_vec())
+        };
+        Ok((read("left_index")?, read("right_index")?))
+    }
+
+    const RANGE_OPS: [CompareOp; 4] = [CompareOp::Lt, CompareOp::Le, CompareOp::Gt, CompareOp::Ge];
+
+    #[test]
+    fn envelope_keep_sweep_matches_bruteforce() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let mut rng = XorShift(0x5EED_F00D);
+            for first_op in RANGE_OPS {
+                for second_op in RANGE_OPS {
+                    let fixture = fixture(&mut rng, 400, 300);
+                    let anchor = envelope(&fixture.right_second, second_op);
+                    // The opposing shapes are the ones pyjanitor builds. The
+                    // same-direction shapes are exact too: an envelope always
+                    // admits a superset of the residual's matches, whatever
+                    // the first window's direction.
+                    for as_float in [false, true] {
+                        for keep in ["first", "last"] {
+                            let before = keep_hits();
+                            let observed = run(
+                                py, &fixture, first_op, &anchor, second_op, false, as_float, keep,
+                            )?;
+                            let expected =
+                                bruteforce(&fixture, first_op, &anchor, second_op, false, keep);
+                            assert!(!expected.0.is_empty());
+                            assert_eq!(
+                                observed, expected,
+                                "{first_op:?} {second_op:?} float={as_float} keep={keep}"
+                            );
+                            assert!(
+                                keep_hits() > before,
+                                "sweep did not run for {first_op:?} {second_op:?} keep={keep}"
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn envelope_keep_sweep_falls_back_when_not_provable() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let mut rng = XorShift(0xFA11_BAC4);
+            let fixture = fixture(&mut rng, 400, 300);
+            let (first_op, second_op) = (CompareOp::Le, CompareOp::Gt);
+            let envelope = envelope(&fixture.right_second, second_op);
+            let mut tighter = envelope.clone();
+            tighter[150] += 1;
+            for (anchor, with_extra, why) in [
+                (&tighter, false, "anchor is not the envelope"),
+                (&envelope, true, "a second residual"),
+            ] {
+                for keep in ["first", "last"] {
+                    let before = keep_hits();
+                    let observed = run(
+                        py, &fixture, first_op, anchor, second_op, with_extra, false, keep,
+                    )?;
+                    assert_eq!(keep_hits(), before, "sweep ran with {why}");
+                    assert_eq!(
+                        observed,
+                        bruteforce(&fixture, first_op, anchor, second_op, with_extra, keep),
+                        "{why} keep={keep}"
+                    );
+                }
+            }
+            // `any` and `all` keep the residual scan.
+            for keep in ["any", "all"] {
+                let before = keep_hits();
+                run(
+                    py, &fixture, first_op, &envelope, second_op, false, false, keep,
+                )?;
+                assert_eq!(keep_hits(), before, "sweep ran for keep={keep}");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn envelope_keep_sweep_skips_sparse_windows() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let mut rng = XorShift(0x005B_A45E);
+            let mut fixture = fixture(&mut rng, 400, 300);
+            // Left values near the top of the first anchor leave each row a
+            // few candidates, too few to repay the tree.
+            for value in &mut fixture.left_first {
+                *value = 490 + *value % 10;
+            }
+            let (first_op, second_op) = (CompareOp::Le, CompareOp::Gt);
+            let anchor = envelope(&fixture.right_second, second_op);
+            let before = keep_hits();
+            let observed = run(
+                py, &fixture, first_op, &anchor, second_op, false, false, "first",
+            )?;
+            assert_eq!(keep_hits(), before, "sparse windows must keep the scan");
+            assert_eq!(
+                observed,
+                bruteforce(&fixture, first_op, &anchor, second_op, false, "first")
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 }
