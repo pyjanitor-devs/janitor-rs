@@ -2953,9 +2953,6 @@ fn select_envelope_rank_sweep(
     if sweep.candidate_width == 0 {
         return Some((Vec::new(), Vec::new()));
     }
-    if !should_use_segment_tree(left_len, sweep.candidate_width, right_len) {
-        return None;
-    }
     if !should_use_rank_sweep(left_len, sweep.candidate_width, right_len, right_len) {
         return None;
     }
@@ -3091,11 +3088,6 @@ fn aggregate_envelope_rank_sweep<'py>(
         return Ok(Some(None));
     }
     let suffix = sweep.suffix;
-    // The sweep replaces a traversal of the intersected windows; only take
-    // it when that traversal is large next to building and querying a tree.
-    if !should_use_segment_tree(sweep.left_len, sweep.candidate_width, source_len) {
-        return Ok(None);
-    }
     let Some(state_bytes) = rank_sweep_state_bytes(&inputs) else {
         return Ok(None);
     };

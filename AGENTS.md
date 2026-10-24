@@ -1673,10 +1673,11 @@ always admits a superset of the residual's matches, so the drop is exact
 for every operator pairing, not only the opposing ones pyjanitor sends.
 **Recommendation**: Keep `any` and `all` on the residual scan: `any`
 already stops early, and `all` must emit every pair. Gate the sweep with
-`should_use_rank_sweep`, the workspace budget, and a sampled survivor count;
-the generic `should_use_segment_tree` check may remain an additional broad
-workload guard. Share `envelope_residual_ranks` with the aggregation sweep
-rather than re-deriving the proof.
+`should_use_rank_sweep`, the workspace budget, and a sampled survivor count.
+The generic `should_use_segment_tree` guard is for the separate extrema-tree
+path and is redundant in these rank-sweep dispatches. Share
+`envelope_residual_ranks` with the aggregation sweep rather than re-deriving
+the proof.
 
 ### [2026-10-21] Dual-range windows: stream the intersection, size per-row state
 **Context**: For a 40M-row left table, `range_join_extended_*` held about
