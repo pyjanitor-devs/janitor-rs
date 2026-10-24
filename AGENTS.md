@@ -1673,9 +1673,10 @@ always admits a superset of the residual's matches, so the drop is exact
 for every operator pairing, not only the opposing ones pyjanitor sends.
 **Recommendation**: Keep `any` and `all` on the residual scan: `any`
 already stops early, and `all` must emit every pair. Gate the sweep with
-`should_use_segment_tree` on the intersected width so sparse joins keep the
-scan, and share `envelope_residual_ranks` with the aggregation sweep rather
-than re-deriving the proof.
+`should_use_rank_sweep`, the workspace budget, and a sampled survivor count;
+the generic `should_use_segment_tree` check may remain an additional broad
+workload guard. Share `envelope_residual_ranks` with the aggregation sweep
+rather than re-deriving the proof.
 
 ### [2026-10-21] Dual-range windows: stream the intersection, size per-row state
 **Context**: For a 40M-row left table, `range_join_extended_*` held about
@@ -1703,3 +1704,20 @@ runs), not memray's allocation peak, when a buffer is reserved at an upper
 bound: untouched reserved pages cost nothing. Check every memory change for
 speed in the same run, since layout changes moved the timing both ways
 here.
+
+### [2026-10-24] Preserve active adaptive gates when merging stacked PRs
+
+**Context**: Resolving PR #271 onto a `main` branch that already contained
+#267, #268, and #270 caused the streaming sweep code to keep only the generic
+`should_use_segment_tree` check while leaving #270's density, build-cost, and
+workspace guards as dead helpers. The existing unit tests still passed because
+they tested the helpers directly rather than proving the production sweep
+declined selective inputs.
+**Learning**: A conflict resolution must preserve both the optimized data
+layout and the predecessor's dispatch policy. When the optimized path no
+longer materializes the predecessor's windows, port the gate's sampling to a
+streaming/batched view rather than deleting the gate.
+**Recommendation**: After merging stacked performance PRs, compare active
+callers—not only helper tests—and add a selective workload that asserts the
+optimized-branch counter stays unchanged. Validate label/index lengths before
+any fast path indexes borrowed label arrays.

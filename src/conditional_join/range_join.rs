@@ -2209,6 +2209,39 @@ mod tests {
                 .to_string()
                 .contains("extended range anchors must contain 3 elements"));
 
+            // The envelope sweep is attempted before the fallback window
+            // builder for keep="first"/"last". Malformed shared labels must
+            // still decline the sweep and surface the normal ValueError.
+            for (left_index, right_index, expected) in [
+                (vec![0_i64], vec![10_i64, 20], "left and left_index"),
+                (vec![0_i64, 1], vec![10_i64], "right and right_index"),
+            ] {
+                let predicates = PyList::empty(py);
+                for (left_values, right_values, operator) in [
+                    (vec![5_i64, 6], vec![1_i64, 2], "<="),
+                    (vec![5_i64, 6], vec![1_i64, 2], ">"),
+                    (vec![5_i64, 6], vec![1_i64, 2], ">"),
+                ] {
+                    predicates.append(PyTuple::new(
+                        py,
+                        [
+                            PyArray1::from_vec(py, left_values).into_any(),
+                            PyArray1::from_vec(py, right_values).into_any(),
+                            operator.into_pyobject(py)?.into_any(),
+                        ],
+                    )?)?;
+                }
+                let error = call_range_join_extended_indices(
+                    py,
+                    &predicates,
+                    &left_index,
+                    &right_index,
+                    "first",
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains(expected));
+            }
+
             let empty = PyList::empty(py);
             for operator in ["<", ">"] {
                 empty.append(PyTuple::new(
@@ -2367,6 +2400,19 @@ impl<'a> FirstAnchorSweep<'a> {
         let search = first.search();
         let second_search = second.search();
         let (left_len, right_len) = (first.left_len(), first.right_len());
+        let (first_left_index, first_right_index) = first.labels();
+        let (second_left_index, second_right_index) = second.labels();
+        // ELI5: the sweep indexes labels only after it has decided to take
+        // the fast path. Decline early when the shared maps are malformed so
+        // the ordinary builder can return the public ValueError instead of
+        // the optimized path panicking on a short slice.
+        if first_left_index.len() != left_len
+            || first_right_index.len() != right_len
+            || second_left_index.len() != second.left_len()
+            || second_right_index.len() != second.right_len()
+        {
+            return None;
+        }
         // Rows, positions and thresholds are stored as `u32` below.
         if second.left_len() != left_len
             || u32::try_from(left_len).is_err()
@@ -2660,8 +2706,13 @@ fn rank_sweep_workspace_bytes(
     let tree_size = rank_count.checked_next_power_of_two()?;
     let tree_nodes = tree_size.checked_mul(2)?;
     let tree_bytes = tree_nodes.checked_mul(state_bytes)?;
-    let right_workspace = source_len.checked_mul(3 * std::mem::size_of::<usize>())?;
-    let left_workspace = query_count.checked_mul(7 * std::mem::size_of::<usize>())?;
+    // The streaming layout uses a packed u64 query, u32 visible/selected
+    // slots, a usize rank/insertion layout, and two usize bin arrays. Keep
+    // the estimate tied to those actual buffers rather than the old
+    // tuple-based seven-usize query workspace.
+    let right_workspace = source_len.checked_mul(4 * std::mem::size_of::<usize>())?;
+    let query_bytes = std::mem::size_of::<u64>() + 3 * std::mem::size_of::<u32>();
+    let left_workspace = query_count.checked_mul(query_bytes)?;
     tree_bytes
         .checked_add(right_workspace)?
         .checked_add(left_workspace)
