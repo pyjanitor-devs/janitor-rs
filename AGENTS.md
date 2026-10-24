@@ -1735,3 +1735,14 @@ assuming the stride point is representative.
 **Recommendation**: Add selective and clustered-match fixtures to sweep-gate
 tests, and validate shared label lengths at the public entry point before
 optimized dispatch.
+
+### [2026-10-24] Width gates must see clustered matches
+
+**Context**: Sampling fixed positions inside each left-side block can estimate
+zero candidate width when all matching rows occupy a smaller stretch between
+those positions. The cost gate then declines the sweep before the density gate
+can observe the dense join.
+**Learning**: When a block contains an intersection, anchor width probes must
+start from a real intersecting row and remain bounded by that block. A gate
+test must assert the sweep counter fires for a large left input whose matches
+are clustered in one stretch.

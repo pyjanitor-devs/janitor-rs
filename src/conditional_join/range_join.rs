@@ -2475,12 +2475,47 @@ impl<'a> FirstAnchorSweep<'a> {
             for_each_window_pair(&search, &second_search, 0..left_len, &mut count_width);
         } else {
             let stride = left_len / SWEEP_WIDTH_SAMPLE_BLOCKS;
+            let mut first_start = [0_usize; 1];
+            let mut first_end = [0_usize; 1];
+            let mut second_start = [0_usize; 1];
+            let mut second_end = [0_usize; 1];
             for block in 0..SWEEP_WIDTH_SAMPLE_BLOCKS {
-                let start = block * stride;
-                let rows = start..start + SWEEP_WIDTH_SAMPLE_ROWS;
-                for_each_window_pair(&search, &second_search, rows, &mut count_width);
+                let block_start = block * stride;
+                let block_end = if block + 1 == SWEEP_WIDTH_SAMPLE_BLOCKS {
+                    left_len
+                } else {
+                    (block + 1) * stride
+                };
+                // ELI5: first find a real overlap somewhere in this block;
+                // then probe the block at fixed positions. A block whose
+                // overlap is clustered away from its first row still informs
+                // the estimate, while a single matching row contributes only
+                // its sampled fraction.
+                let Some(first_match_row) = (block_start..block_end).find(|&row| {
+                    search.windows_into(row, &mut first_start, &mut first_end);
+                    second_search.windows_into(row, &mut second_start, &mut second_end);
+                    first_start[0].max(second_start[0]) < first_end[0].min(second_end[0])
+                }) else {
+                    continue;
+                };
+                // Start at the first real match we found. This keeps a narrow
+                // clustered run from disappearing between fixed probe points.
+                let probe_span = block_end - first_match_row;
+                let probes = probe_span.min(SWEEP_WIDTH_SAMPLE_ROWS);
+                let mut block_width = 0_usize;
+                for probe in 0..probes {
+                    let row = first_match_row + probe * probe_span / probes;
+                    search.windows_into(row, &mut first_start, &mut first_end);
+                    second_search.windows_into(row, &mut second_start, &mut second_end);
+                    block_width = block_width.saturating_add(
+                        first_end[0]
+                            .min(second_end[0])
+                            .saturating_sub(first_start[0].max(second_start[0])),
+                    );
+                }
+                candidate_width = candidate_width
+                    .saturating_add(block_width.saturating_mul(block_end - block_start) / probes);
             }
-            candidate_width = (candidate_width as f64 * left_len as f64 / sampled as f64) as usize;
         }
         let suffix = matches!(search.op(), CompareOp::Lt | CompareOp::Le);
         Some(Self {
@@ -5590,6 +5625,37 @@ mod envelope_keep_sweep_tests {
                     "keep={keep}"
                 );
             }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn envelope_keep_sweep_detects_clustered_left_matches() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let mut rng = XorShift(0xC157_7E12);
+            let mut fixture = fixture(&mut rng, 20_000, 300);
+            fixture.right_first = (0..300).map(i64::from).collect();
+            fixture.right_second = (0..300).map(i64::from).collect();
+            fixture.left_first = (0..20_000)
+                .map(|row| if (300..6_000).contains(&row) { 0 } else { 300 })
+                .collect();
+            fixture.left_second.fill(301);
+            let (first_op, second_op) = (CompareOp::Le, CompareOp::Gt);
+            let anchor = envelope(&fixture.right_second, second_op);
+            let before = keep_hits();
+            let observed = run(
+                py, &fixture, first_op, &anchor, second_op, false, false, "first",
+            )?;
+            assert!(
+                keep_hits() > before,
+                "sweep did not run for clustered matches"
+            );
+            assert_eq!(
+                observed,
+                bruteforce(&fixture, first_op, &anchor, second_op, false, "first")
+            );
             Ok(())
         })
         .unwrap();
