@@ -519,6 +519,57 @@ fn equi_unordered_second_range_aggregate_guard(c: &mut Criterion) {
     });
 }
 
+fn equi_unordered_second_range_residual_selectivity(c: &mut Criterion) {
+    Python::initialize();
+    Python::attach(|py| {
+        let (left_index, right_index, starts_values, ends_values, ranges, _) =
+            second_range_inputs(py, true);
+        let aggregations = make_size_aggregation(py);
+        let left_rows = left_index.len().unwrap();
+        let right_rows = right_index.len().unwrap();
+        let mut group = c.benchmark_group("equi_unordered_second_range_residual_selectivity");
+        for (name, left_value, right_value) in [
+            ("mostly_pass", 10_000_i64, 0_i64),
+            ("mostly_reject", 0, 10_000),
+        ] {
+            let residual_left = PyArray1::from_vec(py, vec![left_value; left_rows]);
+            let residual_right = PyArray1::from_vec(py, vec![right_value; right_rows]);
+            let residuals = PyList::new(
+                py,
+                [make_predicate(
+                    py,
+                    residual_left.as_any(),
+                    residual_right.as_any(),
+                    ">=",
+                )],
+            )
+            .unwrap();
+            group.bench_function(name, |b| {
+                b.iter(|| {
+                    let starts = PyArray1::from_vec(py, starts_values.clone());
+                    let ends = PyArray1::from_vec(py, ends_values.clone());
+                    let result = equi_aggregate_bench(
+                        py,
+                        left_index.readonly(),
+                        right_index.readonly(),
+                        Some(starts.readwrite()),
+                        Some(ends.readwrite()),
+                        &ranges,
+                        &residuals,
+                        &aggregations,
+                        false,
+                        false,
+                        true,
+                    )
+                    .unwrap();
+                    black_box(result);
+                });
+            });
+        }
+        group.finish();
+    });
+}
+
 fn equi_ordered_second_range_aggregate_guard(c: &mut Criterion) {
     Python::initialize();
     Python::attach(|py| {
@@ -981,6 +1032,7 @@ criterion_group!(
     range_extended_residual_aggregation,
     range_reverse_envelope_aggregation,
     equi_unordered_second_range_aggregate_guard,
+    equi_unordered_second_range_residual_selectivity,
     equi_ordered_second_range_aggregate_guard,
     equi_unordered_second_range_materialize,
     equi_selective,
