@@ -1597,9 +1597,10 @@ fn equi_aggregate_impl<'py>(
 /// many short dense windows outvote a few 1M-row sparse ones (0.29-0.36x
 /// once the gate fired on them), and a stride can step over every wide
 /// window of a periodic layout. Counting the opened blocks' rows (the
-/// estimate's `surviving`) instead fired on windows where nearly every block holds one passing row but
-/// about 4% of rows pass: there the scan checks residuals on few pairs, the
-/// general loop masks the whole window, and the fallback ran at 0.22-0.26x.
+/// estimate's `surviving`) instead fired on windows where nearly every
+/// block holds one passing row but about 4% of rows pass: there the scan
+/// checks residuals on few pairs, the general loop masks the whole window,
+/// and the fallback ran at 0.22-0.26x.
 /// Windows narrower than [`SECOND_RANGE_DIRECT_WIDTH`] are left out of the
 /// sample: the scan reads them directly without summaries, and on short
 /// windows that beats the general loop's per-window setup (0.80x on a
