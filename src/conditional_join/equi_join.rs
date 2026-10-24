@@ -294,11 +294,8 @@ fn range_is_monotonic_for_windows(
             let right = $predicate.right.as_array();
             let mut bad_prefix = vec![0usize; right.len()];
             for position in 1..right.len() {
-                bad_prefix[position] = bad_prefix[position - 1]
-                    + usize::from(!matches!(
-                        right[position - 1].partial_cmp(&right[position]),
-                        Some(Ordering::Less | Ordering::Equal)
-                    ));
+                bad_prefix[position] =
+                    bad_prefix[position - 1] + usize::from(right[position - 1] > right[position]);
             }
             for (&start, &end) in starts.iter().zip(ends.iter()) {
                 if start < 0 || end < 0 {
@@ -356,8 +353,9 @@ fn materialize_equi_windows(
 /// the remaining window. The envelope is never treated as the final truth
 /// test.
 ///
-/// PyJanitor filters nulls before entering this Rust path, so the supported
-/// inputs are expected to contain ordinary ordered values rather than `NaN`.
+/// The caller must provide ordinary ordered values rather than `NaN` for the
+/// second-range right-hand side. This is a trusted input contract: this path
+/// does not validate it at runtime, and the monotonicity check relies on it.
 ///
 /// # Arguments
 ///
@@ -525,6 +523,9 @@ fn materialize_unordered_second_range(
 /// aggregation. Both paths narrow candidate windows before the exact scan;
 /// the residual check remains necessary because the envelope is only a safe
 /// pruning proof.
+///
+/// The second-range right-hand values must contain no `NaN`; this trusted
+/// contract is documented at the caller boundary and is not revalidated here.
 ///
 /// # Arguments
 ///
@@ -1769,38 +1770,6 @@ pub fn equi_uniq_residual_indices<'py>(
         .transpose()
 }
 
-/// Build index pairs for unique equality keys with at least one predicate.
-///
-/// This compatibility wrapper retains the older non-empty-predicate
-/// contract. New callers that may have zero aligned predicates should use
-/// [`equi_uniq_residual_indices`] instead.
-///
-/// # Arguments
-///
-/// * `left_index` - Prepared left labels or physical positions.
-/// * `right_index` - Prepared right labels or physical positions aligned
-///   one-for-one with `left_index`.
-/// * `residual_predicates` - Non-empty list of aligned predicate tuples.
-///
-/// # Returns
-///
-/// A dictionary containing the surviving aligned index pairs, or `None` when
-/// no pair satisfies the predicates.
-#[pyfunction]
-pub fn equi_uniq_indices<'py>(
-    py: Python<'py>,
-    left_index: PyReadonlyArray1<'py, i64>,
-    right_index: PyReadonlyArray1<'py, i64>,
-    residual_predicates: &Bound<'py, PyList>,
-) -> PyResult<Option<Bound<'py, PyDict>>> {
-    if residual_predicates.is_empty() {
-        return Err(PyValueError::new_err(
-            "residual_predicates must not be empty",
-        ));
-    }
-    equi_uniq_residual_indices(py, left_index, right_index, residual_predicates)
-}
-
 fn build_equi_ne_indices_core(
     left_index: ArrayView1<'_, i64>,
     right_index: ArrayView1<'_, i64>,
@@ -2046,7 +2015,6 @@ pub fn equi_only_indices<'py>(
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(equi_only_indices, m)?)?;
-    m.add_function(wrap_pyfunction!(equi_uniq_indices, m)?)?;
     m.add_function(wrap_pyfunction!(equi_uniq_residual_indices, m)?)?;
     m.add_function(wrap_pyfunction!(equi_ne_indices, m)?)?;
     m.add_function(wrap_pyfunction!(equi_range_indices, m)?)?;

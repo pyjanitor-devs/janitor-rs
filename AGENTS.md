@@ -1615,6 +1615,11 @@ the per-row check. Keep the masked path out of line. When changing the gate
 or the scan, benchmark right layouts whose 32-row blocks match the residual
 on every row or on none, at 25/35/45% open, alongside sparse joins, each
 with and without a masked `!=`.
+**User correction**: The no-`NaN` second-range contract is documented and
+trusted, rather than runtime-enforced. Do not add a validation scan or require
+the optimized path to raise for `NaN`; under the contract, a direct `>` check
+is sufficient for monotonicity.
+
 ### [2026-10-21] Aggregations follow `join_algorithm`; speed up each path in place
 
 **Context**: Default range-only `join_agg` counts (Arun useR!2016 `x <= x`,
@@ -1659,13 +1664,95 @@ first/last must see every match to find the smallest or largest right
 label, and the windows held 5.5 billion matches.
 **Learning**: Once `anchor_is_envelope_of` proves the second anchor is the
 residual's envelope, a row's matches are "positions in a growing prefix or
-suffix whose residual rank clears a threshold". A Fenwick tree over reversed
-residual ranks that keeps the best label per node answers each row with one
-prefix query after inserting right positions in window-growth order:
-`select_envelope_rank_sweep`, O((left + right) log right). An envelope always
-admits a superset of the residual's matches, so the drop is exact.
-**Recommendation**: Keep `any` and `all` on the residual scan, share
-`envelope_residual_ranks` with the aggregation sweep, and use the sampled
-survivor-count gate plus the selector workspace budget before building the
-rank tree. The estimate compares sampled survivors scaled to total candidate
-width against the 64x right-side build cost.
+suffix whose residual rank clears a threshold" (the same shape as the
+#267 aggregation sweep). A Fenwick tree over reversed residual ranks that
+keeps the best label per node answers each row with one prefix query after
+inserting right positions in window-growth order:
+`select_envelope_rank_sweep`, O((left + right) log right). An envelope
+always admits a superset of the residual's matches, so the drop is exact
+for every operator pairing, not only the opposing ones pyjanitor sends.
+**Recommendation**: Keep `any` and `all` on the residual scan: `any`
+already stops early, and `all` must emit every pair. Gate the sweep with
+`should_use_rank_sweep`, the workspace budget, and a sampled survivor count.
+The generic `should_use_segment_tree` guard is for the separate extrema-tree
+path and is redundant in these rank-sweep dispatches. Share
+`envelope_residual_ranks` with the aggregation sweep rather than re-deriving
+the proof.
+
+### [2026-10-21] Dual-range windows: stream the intersection, size per-row state
+**Context**: For a 40M-row left table, `range_join_extended_*` held about
+5 GiB of transient memory on 0.5 GiB of input. Each anchor's windows were
+built for every left row (four `usize`-wide vectors grown by doubling, so
+512 MiB of capacity each), both anchors at once, before the intersection
+kept only the overlapping rows. The envelope sweeps then cloned the first
+anchor's windows and sorted 24-byte `(visible, threshold, row)` tuples.
+**Learning**: Only the intersection is needed, so compute it in batches of
+`WINDOW_CHUNK` rows (`for_each_window_pair`), running each anchor's binary
+searches in its own typed loop per batch. A fused loop that searched both
+anchors per row was about 13% slower than the old separate passes, because
+the CPU could no longer overlap neighbouring rows' searches; the batched
+version is faster than both. The sweeps need only each row's visible count,
+which a counting sort over `0..=right_len` buckets in O(left + right),
+packing `row | threshold << 32` into one `u64`. Passing those queries to
+`aggregate_rank_threshold_sweep` through a generic iterator made its loop
+0.4-0.8 s slower on Arun 40M; keep that API on plain slices. The sweep's
+cost gate needs only an estimate of the intersected width: an exact pass
+searched every row once for the gate and again for the fallback, making
+sparse joins where the sweep declines up to 1.5x slower. Sample 32 evenly
+spaced 256-row blocks instead.
+**Recommendation**: Measure memory as peak RSS (sample it while the call
+runs), not memray's allocation peak, when a buffer is reserved at an upper
+bound: untouched reserved pages cost nothing. Check every memory change for
+speed in the same run, since layout changes moved the timing both ways
+here.
+
+### [2026-10-24] Preserve active adaptive gates when merging stacked PRs
+
+**Context**: Resolving PR #271 onto a `main` branch that already contained
+#267, #268, and #270 caused the streaming sweep code to keep only the generic
+`should_use_segment_tree` check while leaving #270's density, build-cost, and
+workspace guards as dead helpers. The existing unit tests still passed because
+they tested the helpers directly rather than proving the production sweep
+declined selective inputs.
+**Learning**: A conflict resolution must preserve both the optimized data
+layout and the predecessor's dispatch policy. When the optimized path no
+longer materializes the predecessor's windows, port the gate's sampling to a
+streaming/batched view rather than deleting the gate.
+**Recommendation**: After merging stacked performance PRs, compare active
+callers—not only helper tests—and add a selective workload that asserts the
+optimized-branch counter stays unchanged. Validate label/index lengths before
+any fast path indexes borrowed label arrays.
+
+### [2026-10-24] Gate sweep sorting and sample only real intersections
+
+**Context**: A streaming density sampler that ranked the residual before
+deciding whether to sweep made selective joins pay for a full right-side sort.
+Sampling fixed-stride rows also missed dense matches when the stride points had
+empty intersections.
+**Learning**: The pre-sweep gate must compare raw residual values and defer
+rank construction until every cheap decline check passes. Each sample block
+must advance to a real intersecting row, bounded by that block, rather than
+assuming the stride point is representative.
+**Recommendation**: Add selective and clustered-match fixtures to sweep-gate
+tests, and validate shared label lengths at the public entry point before
+optimized dispatch.
+
+### [2026-10-24] Width gates must see clustered matches
+
+**Context**: Sampling fixed positions inside each left-side block can estimate
+zero candidate width when all matching rows occupy a smaller stretch between
+those positions. The cost gate then declines the sweep before the density gate
+can observe the dense join.
+**Learning**: When a block contains an intersection, anchor width probes must
+start from a real intersecting row and remain bounded by that block. A gate
+test must assert the sweep counter fires for a large left input whose matches
+are clustered in one stretch.
+
+### [2026-10-24] Exhaustive gate probes can prove an empty join
+
+**Context**: Walking each width-sample block to its first real intersection
+adds a full extra pass when no row matches, after which the normal window
+builder would repeat the same searches.
+**Learning**: If every bounded block walk finds no intersection, the join is
+proven empty. Return the normal empty result directly, while still validating
+aggregation inputs before short-circuiting.
