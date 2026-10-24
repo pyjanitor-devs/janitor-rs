@@ -29,7 +29,10 @@ use super::predicate::{
 };
 use super::range_join::adaptive_extreme_positions;
 use super::range_predicate::{parse_any_range_parts, AnyParsedRangePredicate};
-use super::range_skip_scan::{second_range_skip_pays_off, SecondRangeSkipScan};
+use super::range_skip_scan::{
+    second_range_skip_pays_off, SecondRangeSkipScan, DENSITY_SAMPLE_PROBES, DENSITY_SAMPLE_ROWS,
+    SECOND_RANGE_DIRECT_WIDTH,
+};
 use crate::aggregation::common::aggregation::{
     make_results_with_positions, parse_inputs, AggregationSet,
 };
@@ -39,6 +42,7 @@ use crate::aggregation::common::ensure_equal_lengths_core;
 thread_local! {
     static EQUI_STARTS_ENDS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EQUI_RESIDUAL_WINDOW_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SECOND_RANGE_SKIP_DENSE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 type IndexPairs = Option<(Vec<i64>, Vec<i64>)>;
@@ -402,7 +406,8 @@ fn materialize_unordered_second_range(
     if !use_skip && !residual_predicates.is_empty() {
         // ELI5: when the shelves are short anyway, keep the residual
         // checklist that crosses off whole shelves at once; the skip scan only
-        // replaces it when it can skip most of the candidates.
+        // replaces it when it can skip most of the candidates (wide shelves
+        // that are mostly opened anyway are caught by `skip_scan_is_dense`).
         return materialize_equi_windows_and_residuals(
             left_index,
             right_index,
@@ -431,6 +436,21 @@ fn materialize_unordered_second_range(
             } else {
                 SecondRangeSkipScan::direct(right, predicate.op)
             };
+            if use_skip
+                && !residual_predicates.is_empty()
+                && skip_scan_is_dense(&scanner, left, starts.view(), ends.view())
+            {
+                return materialize_equi_windows_and_residuals(
+                    left_index,
+                    right_index,
+                    starts.view(),
+                    ends.view(),
+                    residual_predicates,
+                    null_metadata,
+                    Some(range),
+                    keep,
+                );
+            }
             if keep == Keep::All {
                 let mut output_capacity = 0_usize;
                 for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
@@ -1434,8 +1454,8 @@ fn equi_aggregate_impl<'py>(
         (demoted_second, starts.as_ref(), ends.as_ref())
     {
         let use_skip = second_range_skip_pays_off(right_index.len(), starts.view(), ends.view());
-        if use_skip || views.is_empty() {
-            aggregate_unordered_second_range(
+        if (use_skip || views.is_empty())
+            && aggregate_unordered_second_range(
                 &mut set,
                 second_range,
                 starts.view(),
@@ -1444,7 +1464,8 @@ fn equi_aggregate_impl<'py>(
                 metadata_views.as_deref(),
                 use_skip,
                 reverse,
-            );
+            )
+        {
             if set.is_empty() {
                 return Ok(None);
             }
@@ -1556,6 +1577,108 @@ fn equi_aggregate_impl<'py>(
     )?))
 }
 
+/// Report whether most candidates of the windows pass the second range, so
+/// the skip scan would hand most of them over anyway.
+///
+/// Wide windows alone do not make the skip scan worthwhile when residual
+/// predicates remain. The scan hands candidates over one at a time, so the
+/// residuals are then checked pair by pair, whereas the general loop checks
+/// them for a whole window at once and gets cheaper as they reject more rows.
+/// On points-in-boxes with 16 keys (two range anchors plus two residual
+/// ranges) the summaries skipped about 2% of the window and the per-pair
+/// residual checks made the count 0.63x as fast.
+///
+/// [`DENSITY_SAMPLE_ROWS`] windows are picked in proportion to their width,
+/// and [`SecondRangeSkipScan::estimate_surviving_rows`] probes up to
+/// [`DENSITY_SAMPLE_PROBES`] blocks of each, giving the share of probed rows
+/// that pass the second range; when the picks' average passing share is
+/// above half, the caller keeps the general loop. Picking by width keeps the
+/// estimate tied to the work: a fixed row stride with a per-window cap let
+/// many short dense windows outvote a few 1M-row sparse ones (0.29-0.36x
+/// once the gate fired on them), and a stride can step over every wide
+/// window of a periodic layout. Counting the opened blocks' rows (the
+/// estimate's `surviving`) instead fired on windows where nearly every
+/// block holds one passing row but about 4% of rows pass: there the scan
+/// checks residuals on few pairs, the general loop masks the whole window,
+/// and the fallback ran at 0.22-0.26x.
+/// Windows narrower than [`SECOND_RANGE_DIRECT_WIDTH`] are left out of the
+/// sample: the scan reads them directly without summaries, and on short
+/// windows that beats the general loop's per-window setup (0.80x on a
+/// short-window timing shape when they counted as dense).
+///
+/// The gate ignores how much the residuals reject. When they reject almost
+/// nothing (AIList ex-rna x ex-anno with an `!=` residual), the per-pair
+/// scan is the faster one and this fallback costs about 0.89x; that is
+/// accepted for now.
+///
+/// ELI5: before trusting the sticky notes, peek at a few long aisles. If most
+/// cards in them would win the second rule anyway, read the other rules shelf
+/// by shelf as before. Short aisles are quicker to walk either way, so they
+/// don't vote.
+fn skip_scan_is_dense<T: PartialOrd + Copy>(
+    scanner: &SecondRangeSkipScan<'_, T>,
+    left: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+) -> bool {
+    // ELI5: inactive, inverted and short windows get no vote, so they have
+    // zero width here and the walk below steps straight over them.
+    let voting_width = |row: usize| {
+        let (start, end) = (starts[row], ends[row]);
+        if start < 0 || end < 0 || end - start < SECOND_RANGE_DIRECT_WIDTH as i64 {
+            0
+        } else {
+            (end - start) as usize
+        }
+    };
+    let total = (0..starts.len()).fold(0_usize, |total, row| {
+        total.saturating_add(voting_width(row))
+    });
+    if total == 0 {
+        return false;
+    }
+    let (mut row, mut covered) = (0_usize, 0_usize);
+    let mut last: Option<(usize, f64)> = None;
+    let mut passing_share = 0.0_f64;
+    for pick in 0..DENSITY_SAMPLE_ROWS {
+        // ELI5: lay the windows end to end and drop a pin at the middle of
+        // each of DENSITY_SAMPLE_ROWS equal stretches; the pin lands in
+        // window `row`. The midpoint is below `total`, so a window holds it.
+        let target =
+            ((2 * pick + 1) as u128 * total as u128 / (2 * DENSITY_SAMPLE_ROWS) as u128) as usize;
+        while covered + voting_width(row) <= target {
+            covered += voting_width(row);
+            row += 1;
+        }
+        let share = match last {
+            Some((cached, share)) if cached == row => share,
+            _ => {
+                let (start, end) = (starts[row] as usize, ends[row] as usize);
+                let estimate =
+                    scanner.estimate_surviving_rows(left[row], start, end, DENSITY_SAMPLE_PROBES);
+                // ELI5: the share of probed boxes that open, times the share
+                // of cards that win inside the opened ones, is the share of
+                // probed cards that win.
+                let share = if estimate.probed_open == 0 {
+                    0.0
+                } else {
+                    estimate.surviving as f64 / (end - start) as f64
+                        * (estimate.probed_passing as f64 / estimate.probed_open as f64)
+                };
+                last = Some((row, share));
+                share
+            }
+        };
+        passing_share += share;
+    }
+    let dense = passing_share * 2.0 > DENSITY_SAMPLE_ROWS as f64;
+    #[cfg(test)]
+    if dense {
+        SECOND_RANGE_SKIP_DENSE.with(|hits| hits.set(hits.get() + 1));
+    }
+    dense
+}
+
 /// Aggregate every pair passing an unordered second range in its window.
 ///
 /// `starts`/`ends` are the windows left by the first range and the envelope
@@ -1567,6 +1690,10 @@ fn equi_aggregate_impl<'py>(
 /// layout). Forward updates use `(right source, left output)`; reverse
 /// updates use `(left source, right output)`, matching the general loop in
 /// `equi_aggregate_impl`.
+///
+/// Returns `false`, without updating `set`, when residuals remain and
+/// [`skip_scan_is_dense`] finds most candidates pass the second range; the
+/// caller then aggregates with its general loop.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_unordered_second_range(
     set: &mut AggregationSet,
@@ -1577,7 +1704,7 @@ fn aggregate_unordered_second_range(
     null_metadata: Option<&[NullMetadataView<'_>]>,
     use_skip: bool,
     reverse: bool,
-) {
+) -> bool {
     macro_rules! aggregate {
         ($predicate:expr) => {{
             let predicate = $predicate;
@@ -1588,6 +1715,12 @@ fn aggregate_unordered_second_range(
             } else {
                 SecondRangeSkipScan::direct(right, predicate.op)
             };
+            if use_skip
+                && !residual_predicates.is_empty()
+                && skip_scan_is_dense(&scanner, left, starts, ends)
+            {
+                return false;
+            }
             for (row, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
                 if start < 0 || end < 0 {
                     continue;
@@ -1611,6 +1744,7 @@ fn aggregate_unordered_second_range(
                     true
                 });
             }
+            true
         }};
     }
 
@@ -2034,14 +2168,14 @@ mod tests {
         build_equi_range_and_residual_indices_core, build_equi_range_indices_core,
         build_equi_uniq_residual_indices_core, build_second_range_envelope, equi_aggregate,
         materialize_equi_windows, materialize_equi_windows_and_residuals,
-        materialize_unordered_second_range, narrow_unordered_second_range,
+        materialize_unordered_second_range, narrow_unordered_second_range, skip_scan_is_dense,
         unique_reverse_output_slots, SecondRangeSkipScan, EQUI_RESIDUAL_WINDOW_HITS,
-        EQUI_STARTS_ENDS_HITS,
+        EQUI_STARTS_ENDS_HITS, SECOND_RANGE_SKIP_DENSE,
     };
     use crate::conditional_join::compare_op::CompareOp;
     use crate::conditional_join::join_types::Keep;
     use crate::conditional_join::range_skip_scan::{
-        SECOND_RANGE_SKIP_HITS, SECOND_RANGE_SUPER_SKIPS,
+        SECOND_RANGE_DIRECT_WIDTH, SECOND_RANGE_SKIP_HITS, SECOND_RANGE_SUPER_SKIPS,
     };
     use pyo3::exceptions::PyValueError;
     use pyo3::types::{PyAnyMethods, PyBool, PyList, PyListMethods, PyTuple, PyTupleMethods};
@@ -3831,5 +3965,355 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// Build a two-group fixture whose windows are wide enough for
+    /// [`second_range_skip_pays_off`] but whose unordered second range passes
+    /// in almost every block, so the summaries cannot skip anything.
+    ///
+    /// Returns (first-range left, first-range right, second-range left,
+    /// second-range right, residual left, residual right, group windows per
+    /// left row).
+    #[allow(clippy::type_complexity)]
+    fn dense_fixture(
+        rng: &mut XorShift,
+    ) -> (
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<(i64, i64)>,
+    ) {
+        let group_len = 600_usize;
+        let (mut right_end, mut right_start, mut group_windows) =
+            (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..2 {
+            let offset = right_end.len();
+            // Sorted by the first-range column; the second-range column is
+            // random, so every 32-row block holds small values.
+            for position in 0..group_len {
+                right_end.push(position as i64);
+                right_start.push(rng.below(10_000) as i64);
+            }
+            group_windows.push((offset as i64, (offset + group_len) as i64));
+        }
+        let left_len = 400;
+        let left_first: Vec<i64> = (0..left_len).map(|_| rng.below(20) as i64).collect();
+        let left_second: Vec<i64> = (0..left_len)
+            .map(|_| 5_000 + rng.below(5_000) as i64)
+            .collect();
+        let left_weight: Vec<i64> = (0..left_len).map(|_| rng.below(100) as i64).collect();
+        let right_weight: Vec<i64> = (0..right_end.len())
+            .map(|_| rng.below(100) as i64)
+            .collect();
+        let windows = (0..left_len).map(|row| group_windows[row % 2]).collect();
+        (
+            left_first,
+            right_end,
+            left_second,
+            right_start,
+            left_weight,
+            right_weight,
+            windows,
+        )
+    }
+
+    #[test]
+    fn dense_second_range_with_residuals_keeps_window_loop() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let mut rng = XorShift(0x3C6E_F372_FE94_F82B);
+            let (
+                left_first,
+                right_end,
+                left_second,
+                right_start,
+                left_weight,
+                right_weight,
+                windows,
+            ) = dense_fixture(&mut rng);
+            let (left_len, right_len) = (left_first.len(), right_end.len());
+            let passes = |row: usize, position: usize| {
+                left_first[row] <= right_end[position]
+                    && left_second[row] >= right_start[position]
+                    && left_weight[row] > right_weight[position]
+            };
+            let dense_hits = || SECOND_RANGE_SKIP_DENSE.with(|hits| hits.get());
+            let labels: Vec<i64> = (0..right_len as i64).rev().collect();
+
+            // Index materialization, every keep mode.
+            let mut expected: Vec<Vec<i64>> = vec![Vec::new(); left_len];
+            for (row, &(start, end)) in windows.iter().enumerate() {
+                expected[row] = (start as usize..end as usize)
+                    .filter(|&position| passes(row, position))
+                    .map(|position| labels[position])
+                    .collect();
+            }
+            assert!(expected.iter().any(|matches| !matches.is_empty()));
+            let left_weight_view = Array1::from_vec(left_weight.clone());
+            let right_weight_view = Array1::from_vec(right_weight.clone());
+            let residuals = [PredicateView::I64(
+                left_weight_view.view(),
+                right_weight_view.view(),
+                CompareOp::Gt,
+            )];
+            let left_labels = Array1::from_iter((0..left_len as i64).map(|v| v + 1_000));
+            let right_labels = Array1::from_vec(labels.clone());
+            for keep in [Keep::All, Keep::Any, Keep::First, Keep::Last] {
+                let range = |left: &Vec<i64>, right: &Vec<i64>, op| {
+                    AnyParsedRangePredicate::I64(ParsedRangePredicate {
+                        left: PyArray1::from_vec(py, left.clone()).readonly(),
+                        left_index: PyArray1::from_vec(py, (0..left_len as i64).collect())
+                            .readonly(),
+                        right: PyArray1::from_vec(py, right.clone()).readonly(),
+                        right_index: PyArray1::from_vec(py, labels.clone()).readonly(),
+                        op,
+                    })
+                };
+                let first = range(&left_first, &right_end, CompareOp::Le);
+                let second = range(&left_second, &right_start, CompareOp::Ge);
+                let mut starts = Array1::from_iter(windows.iter().map(|w| w.0));
+                let mut ends = Array1::from_iter(windows.iter().map(|w| w.1));
+                let (skips_before, dense_before) = (skip_hits(), dense_hits());
+                let (left_out, right_out) = build_equi_range_and_residual_indices_core(
+                    left_labels.view(),
+                    right_labels.view(),
+                    starts.view_mut(),
+                    ends.view_mut(),
+                    &first,
+                    Some(&second),
+                    &residuals,
+                    None,
+                    keep,
+                )
+                .unwrap()
+                .unwrap();
+                assert!(
+                    dense_hits() > dense_before,
+                    "keep={keep:?} skipped the density check"
+                );
+                assert_eq!(
+                    skip_hits(),
+                    skips_before,
+                    "keep={keep:?} still used the skip scan"
+                );
+                let mut got: Vec<Vec<i64>> = vec![Vec::new(); left_len];
+                for (left, right) in left_out.iter().zip(&right_out) {
+                    got[(*left - 1_000) as usize].push(*right);
+                }
+                for row in 0..left_len {
+                    let (want, have) = (&expected[row], &got[row]);
+                    match keep {
+                        Keep::All => {
+                            let mut sorted_want = want.clone();
+                            let mut sorted_have = have.clone();
+                            sorted_want.sort_unstable();
+                            sorted_have.sort_unstable();
+                            assert_eq!(sorted_have, sorted_want, "row {row}");
+                        }
+                        Keep::Any => {
+                            assert_eq!(have.len(), usize::from(!want.is_empty()));
+                            assert!(have.iter().all(|label| want.contains(label)));
+                        }
+                        Keep::First => assert_eq!(have.first(), want.iter().min(), "row {row}"),
+                        Keep::Last => assert_eq!(have.first(), want.iter().max(), "row {row}"),
+                    }
+                }
+            }
+
+            // Aggregation, forward and reverse.
+            let values: Vec<i64> = (0..right_len as i64).map(|v| v * 3 + 1).collect();
+            let left_values: Vec<i64> = (0..left_len as i64).map(|v| v * 5 + 2).collect();
+            for reverse in [false, true] {
+                let ranges = PyList::new(
+                    py,
+                    [
+                        equi_range_tuple(py, left_first.clone(), right_end.clone(), "<=")?,
+                        equi_range_tuple(py, left_second.clone(), right_start.clone(), ">=")?,
+                    ],
+                )?;
+                let residuals = PyList::new(
+                    py,
+                    [equi_range_tuple(
+                        py,
+                        left_weight.clone(),
+                        right_weight.clone(),
+                        ">",
+                    )?],
+                )?;
+                let aggregations = if reverse {
+                    equi_sum_aggregations(py, left_values.clone())?
+                } else {
+                    equi_sum_aggregations(py, values.clone())?
+                };
+                let starts = PyArray1::from_vec(py, windows.iter().map(|w| w.0).collect());
+                let ends = PyArray1::from_vec(py, windows.iter().map(|w| w.1).collect());
+                let (skips_before, dense_before) = (skip_hits(), dense_hits());
+                let window_hits_before = EQUI_RESIDUAL_WINDOW_HITS.with(|hits| hits.get());
+                let result = equi_aggregate(
+                    py,
+                    PyArray1::from_vec(py, (0..left_len as i64).collect()).readonly(),
+                    PyArray1::from_vec(py, labels.clone()).readonly(),
+                    Some(starts.readwrite()),
+                    Some(ends.readwrite()),
+                    &ranges,
+                    &residuals,
+                    &aggregations,
+                    true,
+                    reverse,
+                )?
+                .ok_or_else(|| PyValueError::new_err("equi aggregation returned None"))?;
+                assert!(
+                    dense_hits() > dense_before,
+                    "reverse={reverse} skipped the density check"
+                );
+                assert_eq!(
+                    skip_hits(),
+                    skips_before,
+                    "reverse={reverse} still used the skip scan"
+                );
+                assert!(
+                    EQUI_RESIDUAL_WINDOW_HITS.with(|hits| hits.get()) > window_hits_before,
+                    "reverse={reverse} did not use the window residual loop"
+                );
+                let output_len = if reverse { right_len } else { left_len };
+                let mut want_sums = vec![0_i64; output_len];
+                let mut want_matched = vec![false; output_len];
+                for (row, &(start, end)) in windows.iter().enumerate() {
+                    for position in start as usize..end as usize {
+                        if passes(row, position) {
+                            if reverse {
+                                want_sums[position] += left_values[row];
+                                want_matched[position] = true;
+                            } else {
+                                want_sums[row] += values[position];
+                                want_matched[row] = true;
+                            }
+                        }
+                    }
+                }
+                let (matched, sums) = equi_sum_result(&result)?;
+                assert_eq!(matched, want_matched, "reverse={reverse}");
+                assert_eq!(sums, want_sums, "reverse={reverse}");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn skip_scan_density_ignores_short_windows() {
+        // Every block passes, so any window the summaries can act on is dense.
+        let right = Array1::from_iter((0..8_192_i64).map(|position| position % 7));
+        let scanner = SecondRangeSkipScan::new(right.view(), CompareOp::Ge);
+        let left = Array1::from_elem(512, 100_i64);
+        let short = SECOND_RANGE_DIRECT_WIDTH as i64 - 1;
+        let starts = Array1::from_iter((0..512_i64).map(|row| row * 8));
+        let short_ends = starts.mapv(|start| start + short);
+        let wide_ends = starts.mapv(|start| start + short + 1);
+        let dense_hits = || SECOND_RANGE_SKIP_DENSE.with(|hits| hits.get());
+
+        // Short windows are read directly, so they never make the scan dense.
+        let before = dense_hits();
+        assert!(!skip_scan_is_dense(
+            &scanner,
+            left.view(),
+            starts.view(),
+            short_ends.view()
+        ));
+        assert_eq!(dense_hits(), before);
+
+        // One row wider and the same windows are sampled and found dense.
+        assert!(skip_scan_is_dense(
+            &scanner,
+            left.view(),
+            starts.view(),
+            wide_ends.view()
+        ));
+        assert_eq!(dense_hits(), before + 1);
+    }
+
+    #[test]
+    fn skip_scan_density_counts_passing_rows_not_opened_blocks() {
+        // Random values in [0, 10_000): a 32-row block's minimum is about 300,
+        // so `400 >= right` opens about 73% of blocks while 4% of rows pass.
+        let mut rng = XorShift(0xA54F_F53A_5F1D_36F1);
+        let right = Array1::from_iter((0..65_536).map(|_| rng.below(10_000) as i64));
+        let scanner = SecondRangeSkipScan::new(right.view(), CompareOp::Ge);
+        let starts = Array1::from_iter((0..256_i64).map(|row| row * 128));
+        let ends = starts.mapv(|start| start + 32_768);
+
+        // Most blocks open, but the scan would hand over few candidates.
+        let sparse = Array1::from_elem(256, 400_i64);
+        let before = SECOND_RANGE_SKIP_DENSE.with(|hits| hits.get());
+        assert!(!skip_scan_is_dense(
+            &scanner,
+            sparse.view(),
+            starts.view(),
+            ends.view()
+        ));
+        assert_eq!(SECOND_RANGE_SKIP_DENSE.with(|hits| hits.get()), before);
+
+        // When most rows pass, the same windows are dense.
+        let dense = Array1::from_elem(256, 8_000_i64);
+        assert!(skip_scan_is_dense(
+            &scanner,
+            dense.view(),
+            starts.view(),
+            ends.view()
+        ));
+    }
+
+    /// Build 1,024 windows over 1M random right values: rows with
+    /// `row % 32 == wide_phase` get a full-width window where `400 >= right`
+    /// passes about 4% of rows; the rest get a 100-row window where every
+    /// row passes.
+    fn mixed_width_windows(
+        wide_phase: i64,
+    ) -> (Array1<i64>, Array1<i64>, Array1<i64>, Array1<i64>) {
+        let mut rng = XorShift(0x510E_527F_ADE6_82D1);
+        let right = Array1::from_iter((0..1_048_576).map(|_| rng.below(10_000) as i64));
+        let wide = |row: i64| row % 32 == wide_phase;
+        let starts =
+            Array1::from_iter((0..1_024_i64).map(|row| if wide(row) { 0 } else { row * 1_000 }));
+        let ends = Array1::from_iter((0..1_024_i64).map(|row| {
+            if wide(row) {
+                right.len() as i64
+            } else {
+                row * 1_000 + 100
+            }
+        }));
+        let left =
+            Array1::from_iter((0..1_024_i64).map(|row| if wide(row) { 400 } else { 20_000 }));
+        (right, left, starts, ends)
+    }
+
+    #[test]
+    fn skip_scan_density_weights_windows_by_width() {
+        // 32 wide windows hold 32M sparse candidates; 992 short ones hold
+        // about 99K dense candidates. The wide ones are the work, so the
+        // windows are not dense, wherever the wide rows sit.
+        for wide_phase in [0, 1] {
+            let (right, left, starts, ends) = mixed_width_windows(wide_phase);
+            let scanner = SecondRangeSkipScan::new(right.view(), CompareOp::Ge);
+            assert!(
+                !skip_scan_is_dense(&scanner, left.view(), starts.view(), ends.view()),
+                "wide_phase={wide_phase}"
+            );
+        }
+
+        // Without the wide windows, the short dense ones decide alone.
+        let (right, left, starts, _) = mixed_width_windows(0);
+        let scanner = SecondRangeSkipScan::new(right.view(), CompareOp::Ge);
+        let short_ends = starts.mapv(|start| start + 100);
+        let short_left = left.mapv(|_| 20_000);
+        assert!(skip_scan_is_dense(
+            &scanner,
+            short_left.view(),
+            starts.view(),
+            short_ends.view()
+        ));
     }
 }

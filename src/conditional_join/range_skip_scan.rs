@@ -38,7 +38,7 @@ const SECOND_RANGE_SUPER: usize = 32;
 
 /// Windows narrower than this are scanned directly; the block bookkeeping
 /// would cost more than reading a couple of blocks.
-const SECOND_RANGE_DIRECT_WIDTH: usize = 2 * SECOND_RANGE_BLOCK;
+pub(crate) const SECOND_RANGE_DIRECT_WIDTH: usize = 2 * SECOND_RANGE_BLOCK;
 
 /// Rows of an opened run that [`WindowResidualScan`] masks at a time.
 const RESIDUAL_MASK_CHUNK: usize = 1_024;
@@ -394,11 +394,11 @@ pub(crate) fn skip_pays_off(right_len: usize, widths: impl Iterator<Item = usize
 
 /// Windows sampled by [`WindowResidualScan::plan`] to estimate how much the
 /// summaries can skip.
-const DENSITY_SAMPLE_ROWS: usize = 256;
+pub(crate) const DENSITY_SAMPLE_ROWS: usize = 256;
 
 /// Block summaries probed in each sampled window (see
 /// [`SecondRangeSkipScan::estimate_surviving_rows`]).
-const DENSITY_SAMPLE_PROBES: usize = 32;
+pub(crate) const DENSITY_SAMPLE_PROBES: usize = 32;
 
 /// One typed residual promoted to a [`SecondRangeSkipScan`], with its left
 /// values.
