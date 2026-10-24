@@ -41,6 +41,7 @@ mod registration_tests {
             for name in [
                 "equi_range_indices",
                 "equi_range_and_residual_indices",
+                "equi_uniq_indices",
                 "equi_uniq_residual_indices",
                 "equi_aggregate",
                 "not_equals_aggregate_int64",
