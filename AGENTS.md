@@ -1756,3 +1756,48 @@ builder would repeat the same searches.
 **Learning**: If every bounded block walk finds no intersection, the join is
 proven empty. Return the normal empty result directly, while still validating
 aggregation inputs before short-circuiting.
+
+### [2026-10-24] Gate the equi skip scan on row density when residuals remain
+
+**Context**: Points-in-boxes with 16 keys (`key ==`, two x anchors, two y
+residual ranges; 200K x 1M rows) through the equi path. The width-only
+`second_range_skip_pays_off` gate fired, but the block summaries skipped
+only about 2% of each window. The skip scan hands candidates over one at a
+time, so the residuals were checked pair by pair instead of with the
+general loop's whole-window mask: the count went from 4.6 s to 7.3 s
+(0.63x) after the skip scan landed.
+**Learning**: Window width predicts how much the summaries might skip, not
+how much they will. With residuals, the per-pair checks only pay off when
+most candidates are skipped, and three details of the density sample
+(`skip_scan_is_dense`) each cost a 0.2-0.8x regression before they were
+right:
+- Count rows that pass, not rows in opened blocks. One passing row opens a
+  32-row block, so counting opened blocks fired on windows where nearly
+  every block opened but about 4% of rows passed, and the fallback ran at
+  0.22-0.26x. `estimate_surviving_rows` gives both: the passing share is
+  `surviving / width * probed_passing / probed_open`.
+- Keep the check cheap. Reading each sampled window in full is a second
+  counting pass whenever the scan runs anyway (0.76-0.84x with 64 left rows
+  over 1M candidates); probing a fixed number of blocks per window
+  (`DENSITY_SAMPLE_PROBES`) caps it.
+- Once each window's vote is capped, pick windows in proportion to their
+  width, not by row stride. A stride with capped votes let many short dense
+  windows outvote a few 1M-row sparse ones (0.29-0.36x), and a stride can
+  step over every wide window of a periodic layout (wide rows on odd
+  positions, stride 4).
+Windows narrower than `SECOND_RANGE_DIRECT_WIDTH` must not vote: the scan
+reads them directly without summaries, and counting them as dense sent a
+short-window timing shape to the general loop at 0.80x. Density is not the
+whole story: the whole-window mask wins when the residuals reject most
+candidates (about 95% on the boxes case) and loses when they reject almost
+none. AIList ex-rna x ex-anno with an `!=` residual is dense, so the gate
+fires, and it runs at 0.89x; that trade-off is accepted (#274).
+`WindowResidualScan::plan` (#268, default range path) still decides on
+opened blocks (`surviving`) and samples by row stride, so it is open to the
+first and third problems; check it against those shapes.
+**Recommendation**: When residuals remain and more than half of the
+width-weighted sample passes the second range, keep the whole-window
+residual mask (`materialize_equi_windows_and_residuals`, or the general
+aggregation loop). Without residuals, keep the skip scan regardless of
+density. Time short-window, no-residual, blocks-open-but-rows-sparse and
+mixed-width shapes as well as the dense headline.
