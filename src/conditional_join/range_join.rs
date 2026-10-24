@@ -670,10 +670,10 @@ fn for_each_window_pair(
     }
 }
 
-/// Find the first non-empty intersection in a row range using batched
-/// searches. The caller reuses the scratch buffers across ranges.
 type WindowPair = ((usize, usize), (usize, usize));
 
+/// Find the first non-empty intersection in a row range using batched
+/// searches. The caller reuses the scratch buffers across ranges.
 fn first_intersection_in_rows(
     first: &AnchorSearch<'_>,
     second: &AnchorSearch<'_>,
@@ -683,13 +683,15 @@ fn first_intersection_in_rows(
     second_starts: &mut [usize],
     second_ends: &mut [usize],
 ) -> Option<(usize, WindowPair)> {
-    let chunk = WINDOW_CHUNK.min(rows.len());
-    debug_assert!(first_starts.len() >= chunk);
-    debug_assert!(first_ends.len() >= chunk);
-    debug_assert!(second_starts.len() >= chunk);
-    debug_assert!(second_ends.len() >= chunk);
-    for chunk_start in rows.clone().step_by(WINDOW_CHUNK) {
-        let rows = WINDOW_CHUNK.min(rows.end - chunk_start);
+    let max_batch = WINDOW_CHUNK.min(rows.len());
+    debug_assert!(first_starts.len() >= max_batch);
+    debug_assert!(first_ends.len() >= max_batch);
+    debug_assert!(second_starts.len() >= max_batch);
+    debug_assert!(second_ends.len() >= max_batch);
+    let mut chunk_start = rows.start;
+    let mut batch = 16.min(WINDOW_CHUNK);
+    while chunk_start < rows.end {
+        let rows = batch.min(rows.end - chunk_start);
         first.windows_into(
             chunk_start,
             &mut first_starts[..rows],
@@ -707,6 +709,8 @@ fn first_intersection_in_rows(
                 return Some((chunk_start + offset, (first_window, second_window)));
             }
         }
+        chunk_start += rows;
+        batch = batch.saturating_mul(2).min(WINDOW_CHUNK);
     }
     None
 }
