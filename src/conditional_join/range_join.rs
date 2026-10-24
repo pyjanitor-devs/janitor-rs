@@ -4751,10 +4751,105 @@ mod default_skip_scan_tests {
     }
 
     #[test]
+    fn sparse_passing_rows_keep_skip_scan_when_blocks_are_open() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // Every block has one low value, so its summary opens, but only
+            // about one row in 32 passes the residual. The old gate counted
+            // the opened rows and incorrectly rejected this useful plan.
+            let mut data = overlap_fixture(300, 5_000, 67);
+            for block in 0..data.right_start.len().div_ceil(32) {
+                for position in block * 32..((block + 1) * 32).min(data.right_start.len()) {
+                    data.right_start[position] = if position == block * 32 { 0 } else { 1_000_000 };
+                }
+            }
+            let reference = data.reference(false);
+            let predicates = data.predicates(py, false, false)?;
+            let plans_before = plans();
+            let dense_before = WINDOW_RESIDUAL_SKIP_DENSE.with(|dense| dense.get());
+            let result = range_join_extended_indices(
+                py,
+                &predicates,
+                PyArray1::from_vec(py, data.left_index.clone()).into_any(),
+                PyArray1::from_vec(py, data.right_index.clone()).into_any(),
+                "all",
+            )?
+            .expect("the sparse join has matches");
+            assert!(
+                plans() > plans_before,
+                "sparse passing rows need the skip scan"
+            );
+            assert_eq!(
+                WINDOW_RESIDUAL_SKIP_DENSE.with(|dense| dense.get()),
+                dense_before,
+                "sparse passing rows must not be classified as dense"
+            );
+            let observed = result
+                .get_item("right_index")?
+                .expect("index output")
+                .extract::<Vec<i64>>()?;
+            let expected: Vec<i64> = reference
+                .iter()
+                .flat_map(|positions| positions.iter().map(|&position| data.right_index[position]))
+                .collect();
+            assert_eq!(observed, expected);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn uniform_thirty_percent_passing_drops_the_skip_scan() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            // Every block opens and roughly ten of its 32 rows pass. This is
+            // dense enough for the whole-window mask to beat scalar checks.
+            let mut data = overlap_fixture(300, 5_000, 71);
+            for block in 0..data.right_start.len().div_ceil(32) {
+                for position in block * 32..((block + 1) * 32).min(data.right_start.len()) {
+                    data.right_start[position] = if position % 32 < 10 { 0 } else { 1_000_000 };
+                }
+            }
+            let reference = data.reference(false);
+            let predicates = data.predicates(py, false, false)?;
+            let plans_before = plans();
+            let dense_before = WINDOW_RESIDUAL_SKIP_DENSE.with(|dense| dense.get());
+            let result = range_join_extended_indices(
+                py,
+                &predicates,
+                PyArray1::from_vec(py, data.left_index.clone()).into_any(),
+                PyArray1::from_vec(py, data.right_index.clone()).into_any(),
+                "all",
+            )?
+            .expect("the dense join has matches");
+            assert_eq!(
+                plans(),
+                plans_before,
+                "uniform dense rows must use the mask"
+            );
+            assert!(
+                WINDOW_RESIDUAL_SKIP_DENSE.with(|dense| dense.get()) > dense_before,
+                "uniform dense rows must be classified as dense"
+            );
+            let observed = result
+                .get_item("right_index")?
+                .expect("index output")
+                .extract::<Vec<i64>>()?;
+            let expected: Vec<i64> = reference
+                .iter()
+                .flat_map(|positions| positions.iter().map(|&position| data.right_index[position]))
+                .collect();
+            assert_eq!(observed, expected);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn dense_opened_blocks_mask_the_other_residuals() {
         Python::initialize();
         Python::attach(|py| -> PyResult<()> {
-            // About a third of the 32-row right blocks match the residual on
+            // About one third of the 32-row right blocks match the residual on
             // every row and the rest on none: the plan runs, and since the
             // sampled opened blocks all pass, the masked `!=` is checked with
             // the window mask over opened runs.

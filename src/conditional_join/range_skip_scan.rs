@@ -44,10 +44,12 @@ pub(crate) const SECOND_RANGE_DIRECT_WIDTH: usize = 2 * SECOND_RANGE_BLOCK;
 const RESIDUAL_MASK_CHUNK: usize = 1_024;
 
 /// What [`SecondRangeSkipScan::estimate_surviving_rows`] saw in one window.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct SurvivalEstimate {
     /// Estimated rows in blocks the walk would open.
     pub(crate) surviving: usize,
+    /// Estimated rows that pass the selected residual.
+    pub(crate) passing: usize,
     /// Rows of the probed blocks that would open.
     pub(crate) probed_open: usize,
     /// Rows of those blocks that pass the range itself.
@@ -281,6 +283,7 @@ impl<'a, T: PartialOrd + Copy> SecondRangeSkipScan<'a, T> {
         if self.blocks.is_empty() || width < SECOND_RANGE_DIRECT_WIDTH {
             return SurvivalEstimate {
                 surviving: width,
+                passing: width,
                 ..SurvivalEstimate::default()
             };
         }
@@ -303,6 +306,14 @@ impl<'a, T: PartialOrd + Copy> SecondRangeSkipScan<'a, T> {
                 .count();
         }
         estimate.surviving = width * open / probes;
+        // ELI5: estimate the passing cards in the whole aisle by scaling the
+        // passing share inside opened boxes to the number of cards those
+        // boxes represent.
+        estimate.passing = estimate
+            .surviving
+            .saturating_mul(estimate.probed_passing)
+            .checked_div(estimate.probed_open)
+            .unwrap_or(0);
         estimate
     }
 
@@ -393,12 +404,20 @@ pub(crate) fn skip_pays_off(right_len: usize, widths: impl Iterator<Item = usize
 }
 
 /// Windows sampled by [`WindowResidualScan::plan`] to estimate how much the
-/// summaries can skip.
+/// summaries can skip. Picks are weighted by window width.
 pub(crate) const DENSITY_SAMPLE_ROWS: usize = 256;
 
 /// Block summaries probed in each sampled window (see
 /// [`SecondRangeSkipScan::estimate_surviving_rows`]).
 pub(crate) const DENSITY_SAMPLE_PROBES: usize = 32;
+
+/// Keep the skip scan when the selected residual is estimated to pass no more
+/// than this fraction of sampled candidates. This initial cutoff is based on
+/// the issue's measured crossover and must be confirmed with release timings.
+/// The scalar scan is competitive when it visits only a small fraction of
+/// each window; the vectorized mask remains the safer choice for denser
+/// residuals.
+const RESIDUAL_SKIP_PASSING_CUTOFF: usize = 5;
 
 /// One typed residual promoted to a [`SecondRangeSkipScan`], with its left
 /// values.
@@ -471,10 +490,10 @@ impl<'a> WindowResidualScan<'a> {
     /// dominance counts nearly every candidate matches, nothing can be
     /// skipped, and the per-candidate scan is about 15% slower than the
     /// caller's vectorized residual mask. So after building the summaries,
-    /// up to [`DENSITY_SAMPLE_ROWS`] evenly spaced windows are probed at
-    /// [`DENSITY_SAMPLE_PROBES`] blocks each; when more than half of their
-    /// candidates are estimated to sit in blocks the scan would open, the
-    /// plan is dropped.
+    /// [`DENSITY_SAMPLE_ROWS`] width-weighted windows are probed at
+    /// [`DENSITY_SAMPLE_PROBES`] blocks each; the plan is dropped only when
+    /// both more than half of the candidates are in opened blocks and more
+    /// than the calibrated passing-row cutoff are estimated to pass.
     ///
     /// A residual is eligible when its operator is `<`, `<=`, `>` or `>=`
     /// and it carries no null masks: a masked row's stored value is
@@ -541,28 +560,58 @@ impl<'a> WindowResidualScan<'a> {
             PredicateView::F64(left, right, op) => typed!(F64, left, right, op),
             PredicateView::F32(left, right, op) => typed!(F32, left, right, op),
         };
-        // ELI5: before trusting the sticky notes, peek at a few aisles. If
-        // most boxes in them would be opened anyway, the notes are not
-        // saving any work.
-        let rows = starts.len();
-        let step = rows.div_ceil(DENSITY_SAMPLE_ROWS).max(1);
-        let (mut sampled, mut surviving) = (0_usize, 0_usize);
-        let (mut probed_open, mut probed_passing) = (0_usize, 0_usize);
-        for row in (0..rows).step_by(step) {
+        // ELI5: lay the eligible windows end to end and drop pins at the
+        // middle of equal-width stretches. This gives wide windows votes in
+        // proportion to the work they represent, so a row stride cannot skip
+        // every wide window in a periodic layout.
+        let voting_width = |row: usize| {
             let (start, end) = (starts[row], ends[row]);
-            if start >= end {
-                continue;
+            // Narrow windows still run through the retained plan, but their
+            // direct path reports every row as passing; count them as dense
+            // so they cannot be hidden by a few sparse wide windows.
+            end.saturating_sub(start)
+        };
+        let total = (0..starts.len()).fold(0_usize, |total, row| {
+            total.saturating_add(voting_width(row))
+        });
+        if total == 0 {
+            return None;
+        }
+        let (mut row, mut covered) = (0_usize, 0_usize);
+        let mut last: Option<(usize, SurvivalEstimate)> = None;
+        let (mut surviving_share, mut passing_share) = (0.0_f64, 0.0_f64);
+        let (mut probed_open, mut probed_passing) = (0_usize, 0_usize);
+        for pick in 0..DENSITY_SAMPLE_ROWS {
+            let target = ((2 * pick + 1) as u128 * total as u128
+                / (2 * DENSITY_SAMPLE_ROWS) as u128) as usize;
+            while covered + voting_width(row) <= target {
+                covered += voting_width(row);
+                row += 1;
             }
-            let left_position = left_positions[row];
-            sampled += end - start;
-            let estimate = with_typed_scan!(&scan, |left, scan| {
-                scan.estimate_surviving_rows(left[left_position], start, end, DENSITY_SAMPLE_PROBES)
-            });
-            surviving += estimate.surviving;
+            let estimate = match last.as_ref() {
+                Some((cached, estimate)) if *cached == row => estimate.clone(),
+                _ => {
+                    let estimate = with_typed_scan!(&scan, |left, scan| {
+                        scan.estimate_surviving_rows(
+                            left[left_positions[row]],
+                            starts[row],
+                            ends[row],
+                            DENSITY_SAMPLE_PROBES,
+                        )
+                    });
+                    last = Some((row, estimate.clone()));
+                    estimate
+                }
+            };
+            let width = voting_width(row) as f64;
+            surviving_share += estimate.surviving as f64 / width;
+            passing_share += estimate.passing as f64 / width;
             probed_open += estimate.probed_open;
             probed_passing += estimate.probed_passing;
         }
-        if surviving.saturating_mul(2) > sampled {
+        if surviving_share * 2.0 > DENSITY_SAMPLE_ROWS as f64
+            && passing_share * RESIDUAL_SKIP_PASSING_CUTOFF as f64 > DENSITY_SAMPLE_ROWS as f64
+        {
             #[cfg(test)]
             WINDOW_RESIDUAL_SKIP_DENSE.with(|dense| dense.set(dense.get() + 1));
             return None;
