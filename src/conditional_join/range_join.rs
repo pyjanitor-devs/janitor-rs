@@ -47,7 +47,9 @@ use super::join_candidate_materialization::materialize_range_candidates;
 #[cfg(test)]
 use super::join_search::range_window;
 use super::join_types::{result_dict, Keep, SingleJoinResult};
-use super::predicate::{check_predicate_lengths, parse_predicates_with_nulls_strings};
+use super::predicate::{
+    check_predicate_lengths, parse_predicates_with_nulls_strings, predicates_match,
+};
 use super::range_predicate::{parse_any_range_parts, AnchorSearch, AnyParsedRangePredicate};
 use crate::aggregation::common::adaptive::should_use_segment_tree;
 use crate::aggregation::common::ensure_equal_lengths_core;
@@ -381,6 +383,40 @@ fn parse_shared_index_range_predicate<'py>(
         right_index,
         &tuple.get_item(2)?,
     )
+}
+
+/// Validate shared value/index layouts before any optimized path runs.
+fn validate_shared_anchor_lengths(
+    first: &AnyParsedRangePredicate<'_>,
+    second: &AnyParsedRangePredicate<'_>,
+) -> Result<(), String> {
+    let (first_left_index, first_right_index) = first.labels();
+    let (second_left_index, second_right_index) = second.labels();
+    ensure_equal_lengths_core(
+        "left",
+        first.left_len(),
+        "left_index",
+        first_left_index.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "right",
+        first.right_len(),
+        "right_index",
+        first_right_index.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "left",
+        second.left_len(),
+        "left_index",
+        second_left_index.len(),
+    )?;
+    ensure_equal_lengths_core(
+        "right",
+        second.right_len(),
+        "right_index",
+        second_right_index.len(),
+    )?;
+    Ok(())
 }
 
 /// A typed range predicate used by the basic two-range kernel.
@@ -1023,6 +1059,7 @@ fn extended_join<'py>(
         second.right_len(),
     )
     .map_err(PyValueError::new_err)?;
+    validate_shared_anchor_lengths(&first, &second).map_err(PyValueError::new_err)?;
     check_predicate_lengths(&parsed, first.left_len(), first.right_len())?;
     // ELI5: `first`/`last` only need the smallest or largest label among a
     // row's matches. When the second anchor is just the residual's envelope,
@@ -2315,6 +2352,7 @@ pub(crate) fn aggregate_range_extended<'py>(
     let second = parse_shared_index_range_predicate(second_tuple, left_index, right_index)?;
     let (parsed, metadata) =
         super::join_aggregation_helpers::residuals(py, predicates, false, true)?;
+    validate_shared_anchor_lengths(&first, &second).map_err(PyValueError::new_err)?;
     super::predicate::check_predicate_lengths(&parsed, first.left_len(), first.right_len())?;
 
     let left_index = left_index.extract::<PyReadonlyArray1<'py, i64>>()?;
@@ -2631,18 +2669,17 @@ fn anchor_is_envelope_of<T: PartialOrd + Copy>(
     }
 }
 
-/// Sample residual survivors without materializing every row's windows.
+/// Sample raw residual survivors without sorting or materializing windows.
 ///
-/// ELI5: inspect a few evenly spaced rows and a few evenly spaced candidates
-/// in each intersection. The rank representation makes the residual check
-/// dtype-independent, while the two searches keep the streaming memory bound.
+/// ELI5: start at each evenly spaced row block, walk forward until finding a
+/// row with an actual intersection, then probe a few candidates in that row.
+/// This preserves the old gate's useful-row sampling while keeping the new
+/// path's bounded window memory.
 fn sampled_envelope_density(
     first: &AnchorSearch<'_>,
     second: &AnchorSearch<'_>,
     left_len: usize,
-    ranks: &[usize],
-    thresholds: &[u32],
-    rank_count: usize,
+    residual: &super::predicate::Predicate<'_>,
 ) -> Option<(usize, usize)> {
     const SAMPLE_ROWS: usize = 32;
     const SAMPLE_POSITIONS: usize = 32;
@@ -2654,11 +2691,18 @@ fn sampled_envelope_density(
     let mut first_end = [0_usize; 1];
     let mut second_start = [0_usize; 1];
     let mut second_end = [0_usize; 1];
+    let residual = residual.view();
     let mut sampled = 0_usize;
     let mut surviving = 0_usize;
-    for row in (0..left_len).step_by(row_step).take(SAMPLE_ROWS) {
-        first.windows_into(row, &mut first_start, &mut first_end);
-        second.windows_into(row, &mut second_start, &mut second_end);
+    for block_start in (0..left_len).step_by(row_step).take(SAMPLE_ROWS) {
+        let block_end = (block_start + row_step).min(left_len);
+        let Some(row) = (block_start..block_end).find(|&row| {
+            first.windows_into(row, &mut first_start, &mut first_end);
+            second.windows_into(row, &mut second_start, &mut second_end);
+            first_start[0].max(second_start[0]) < first_end[0].min(second_end[0])
+        }) else {
+            continue;
+        };
         let start = first_start[0].max(second_start[0]);
         let end = first_end[0].min(second_end[0]);
         if start >= end {
@@ -2669,9 +2713,11 @@ fn sampled_envelope_density(
         for probe in 0..probes {
             let position = start + probe * width / probes;
             sampled += 1;
-            surviving += usize::from(
-                ranks[position] >= thresholds[row] as usize && thresholds[row] < rank_count as u32,
-            );
+            surviving += usize::from(predicates_match(
+                std::slice::from_ref(&residual),
+                row,
+                position,
+            ));
         }
     }
     (sampled > 0).then_some((sampled, surviving))
@@ -2870,24 +2916,18 @@ fn select_envelope_rank_sweep(
     if !should_use_segment_tree(left_len, sweep.candidate_width, right_len) {
         return None;
     }
-    let (ranks, rank_count, thresholds) = envelope_residual_ranks(second, residual)?;
-    if !should_use_rank_sweep(left_len, sweep.candidate_width, right_len, rank_count) {
+    if !should_use_rank_sweep(left_len, sweep.candidate_width, right_len, right_len) {
         return None;
     }
     let second_search = second.search();
-    let (sampled, surviving) = sampled_envelope_density(
-        &sweep.search,
-        &second_search,
-        left_len,
-        &ranks,
-        &thresholds,
-        rank_count,
-    )?;
+    let (sampled, surviving) =
+        sampled_envelope_density(&sweep.search, &second_search, left_len, residual)?;
     if (surviving as u128) * (sweep.candidate_width as u128) / (sampled as u128)
         <= (right_len as u128) * (RANK_SWEEP_BUILD_FACTOR as u128)
     {
         return None;
     }
+    let (ranks, rank_count, thresholds) = envelope_residual_ranks(second, residual)?;
     if rank_sweep_workspace_bytes(left_len, right_len, rank_count, 8)
         .is_none_or(|bytes| bytes > rank_sweep_memory_budget(right_len, left_len, 1))
     {
@@ -3019,26 +3059,18 @@ fn aggregate_envelope_rank_sweep<'py>(
         return Ok(None);
     }
 
-    let Some((ranks, rank_count, thresholds)) = envelope_residual_ranks(second, residual) else {
-        return Ok(None);
-    };
     if !should_use_rank_sweep(
         sweep.left_len,
         sweep.candidate_width,
         source_len,
-        rank_count,
+        source_len,
     ) {
         return Ok(None);
     }
     let second_search = second.search();
-    let Some((sampled, surviving)) = sampled_envelope_density(
-        &sweep.search,
-        &second_search,
-        sweep.left_len,
-        &ranks,
-        &thresholds,
-        rank_count,
-    ) else {
+    let Some((sampled, surviving)) =
+        sampled_envelope_density(&sweep.search, &second_search, sweep.left_len, residual)
+    else {
         return Ok(None);
     };
     if (surviving as u128) * (sweep.candidate_width as u128) / (sampled as u128)
@@ -3046,6 +3078,9 @@ fn aggregate_envelope_rank_sweep<'py>(
     {
         return Ok(None);
     }
+    let Some((ranks, rank_count, thresholds)) = envelope_residual_ranks(second, residual) else {
+        return Ok(None);
+    };
     if rank_sweep_workspace_bytes(sweep.left_len, source_len, rank_count, state_bytes).is_none_or(
         |bytes| bytes > rank_sweep_memory_budget(source_len, sweep.left_len, inputs.len()),
     ) {

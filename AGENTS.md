@@ -1721,3 +1721,17 @@ streaming/batched view rather than deleting the gate.
 callers—not only helper tests—and add a selective workload that asserts the
 optimized-branch counter stays unchanged. Validate label/index lengths before
 any fast path indexes borrowed label arrays.
+
+### [2026-10-24] Gate sweep sorting and sample only real intersections
+
+**Context**: A streaming density sampler that ranked the residual before
+deciding whether to sweep made selective joins pay for a full right-side sort.
+Sampling fixed-stride rows also missed dense matches when the stride points had
+empty intersections.
+**Learning**: The pre-sweep gate must compare raw residual values and defer
+rank construction until every cheap decline check passes. Each sample block
+must advance to a real intersecting row, bounded by that block, rather than
+assuming the stride point is representative.
+**Recommendation**: Add selective and clustered-match fixtures to sweep-gate
+tests, and validate shared label lengths at the public entry point before
+optimized dispatch.
