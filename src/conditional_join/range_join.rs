@@ -2585,15 +2585,57 @@ fn anchor_is_envelope_of<T: PartialOrd + Copy>(
     }
 }
 
+/// Sample residual survivors without materializing every row's windows.
+///
+/// ELI5: inspect a few evenly spaced rows and a few evenly spaced candidates
+/// in each intersection. The rank representation makes the residual check
+/// dtype-independent, while the two searches keep the streaming memory bound.
+fn sampled_envelope_density(
+    first: &AnchorSearch<'_>,
+    second: &AnchorSearch<'_>,
+    left_len: usize,
+    ranks: &[usize],
+    thresholds: &[u32],
+    rank_count: usize,
+) -> Option<(usize, usize)> {
+    const SAMPLE_ROWS: usize = 32;
+    const SAMPLE_POSITIONS: usize = 32;
+    if left_len == 0 {
+        return None;
+    }
+    let row_step = left_len.div_ceil(SAMPLE_ROWS).max(1);
+    let mut first_start = [0_usize; 1];
+    let mut first_end = [0_usize; 1];
+    let mut second_start = [0_usize; 1];
+    let mut second_end = [0_usize; 1];
+    let mut sampled = 0_usize;
+    let mut surviving = 0_usize;
+    for row in (0..left_len).step_by(row_step).take(SAMPLE_ROWS) {
+        first.windows_into(row, &mut first_start, &mut first_end);
+        second.windows_into(row, &mut second_start, &mut second_end);
+        let start = first_start[0].max(second_start[0]);
+        let end = first_end[0].min(second_end[0]);
+        if start >= end {
+            continue;
+        }
+        let width = end - start;
+        let probes = width.min(SAMPLE_POSITIONS);
+        for probe in 0..probes {
+            let position = start + probe * width / probes;
+            sampled += 1;
+            surviving += usize::from(
+                ranks[position] >= thresholds[row] as usize && thresholds[row] < rank_count as u32,
+            );
+        }
+    }
+    (sampled > 0).then_some((sampled, surviving))
+}
+
 /// The sweep has a materially larger fixed build cost than a segment tree.
-#[allow(dead_code)]
 const RANK_SWEEP_BUILD_FACTOR: usize = 64;
-#[allow(dead_code)]
 const MIN_RANK_SWEEP_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
-#[allow(dead_code)]
 const RANK_SWEEP_MEMORY_MULTIPLIER: usize = 3;
 
-#[allow(dead_code)]
 fn should_use_rank_sweep(
     query_count: usize,
     total_width: usize,
@@ -2609,7 +2651,6 @@ fn should_use_rank_sweep(
     total_width > build.saturating_add(queries)
 }
 
-#[allow(dead_code)]
 fn rank_sweep_workspace_bytes(
     query_count: usize,
     source_len: usize,
@@ -2626,7 +2667,6 @@ fn rank_sweep_workspace_bytes(
         .checked_add(left_workspace)
 }
 
-#[allow(dead_code)]
 fn rank_sweep_memory_budget(
     source_len: usize,
     query_count: usize,
@@ -2640,7 +2680,6 @@ fn rank_sweep_memory_budget(
         .max(MIN_RANK_SWEEP_MEMORY_BUDGET)
 }
 
-#[allow(dead_code)]
 fn rank_sweep_state_bytes(
     inputs: &[crate::aggregation::input::AggregationInput<'_>],
 ) -> Option<usize> {
@@ -2688,86 +2727,6 @@ fn rank_sweep_state_bytes(
         bytes = bytes.checked_add(8)?;
     }
     Some(bytes)
-}
-
-/// Sample residual survivors to estimate the work left for the ordinary scan.
-///
-/// ELI5: a rank tree is worthwhile when many cards in the windows survive the
-/// residual. The caller compares the estimated survivor count with the rank
-/// tree's fixed build cost.
-#[allow(dead_code)]
-fn residual_density_sample<T: PartialOrd + Copy>(
-    windows: &SingleJoinResult,
-    left_positions: &[usize],
-    left: ArrayView1<'_, T>,
-    right: ArrayView1<'_, T>,
-    op: super::compare_op::CompareOp,
-) -> Option<(usize, usize)> {
-    const SAMPLE_ROWS: usize = 32;
-    const SAMPLE_POSITIONS: usize = 32;
-    let row_count = windows.starts.len();
-    if row_count == 0 {
-        return None;
-    }
-    let row_step = row_count.div_ceil(SAMPLE_ROWS).max(1);
-    let mut sampled = 0_usize;
-    let mut surviving = 0_usize;
-    for row in (0..row_count).step_by(row_step).take(SAMPLE_ROWS) {
-        let start = windows.starts[row];
-        let end = windows.ends[row];
-        if start >= end {
-            continue;
-        }
-        let width = end - start;
-        let probes = width.min(SAMPLE_POSITIONS);
-        for probe in 0..probes {
-            let position = start + probe * width / probes;
-            sampled += 1;
-            surviving += usize::from(op.apply(&left[left_positions[row]], &right[position]));
-        }
-    }
-    (sampled > 0).then_some((sampled, surviving))
-}
-
-#[allow(dead_code)]
-fn residual_density_sample_dispatch(
-    windows: &SingleJoinResult,
-    left_positions: &[usize],
-    residual: &super::predicate::Predicate<'_>,
-) -> Option<(usize, usize)> {
-    use super::predicate::PredicateView;
-    match residual.view() {
-        PredicateView::I64(left, right, op) => {
-            residual_density_sample(windows, left_positions, left, right, op)
-        }
-        PredicateView::I32(left, right, op) => {
-            residual_density_sample(windows, left_positions, left, right, op)
-        }
-        PredicateView::I16(left, right, op) => {
-            residual_density_sample(windows, left_positions, left, right, op)
-        }
-        PredicateView::I8(left, right, op) => {
-            residual_density_sample(windows, left_positions, left, right, op)
-        }
-        PredicateView::U64(left, right, op) => {
-            residual_density_sample(windows, left_positions, left, right, op)
-        }
-        PredicateView::U32(left, right, op) => {
-            residual_density_sample(windows, left_positions, left, right, op)
-        }
-        PredicateView::U16(left, right, op) => {
-            residual_density_sample(windows, left_positions, left, right, op)
-        }
-        PredicateView::U8(left, right, op) => {
-            residual_density_sample(windows, left_positions, left, right, op)
-        }
-        PredicateView::F64(left, right, op) => {
-            residual_density_sample(windows, left_positions, left, right, op)
-        }
-        PredicateView::F32(left, right, op) => {
-            residual_density_sample(windows, left_positions, left, right, op)
-        }
-    }
 }
 
 /// Residual ranks and per-left thresholds when `second` is provably the
@@ -2861,6 +2820,28 @@ fn select_envelope_rank_sweep(
         return None;
     }
     let (ranks, rank_count, thresholds) = envelope_residual_ranks(second, residual)?;
+    if !should_use_rank_sweep(left_len, sweep.candidate_width, right_len, rank_count) {
+        return None;
+    }
+    let second_search = second.search();
+    let (sampled, surviving) = sampled_envelope_density(
+        &sweep.search,
+        &second_search,
+        left_len,
+        &ranks,
+        &thresholds,
+        rank_count,
+    )?;
+    if (surviving as u128) * (sweep.candidate_width as u128) / (sampled as u128)
+        <= (right_len as u128) * (RANK_SWEEP_BUILD_FACTOR as u128)
+    {
+        return None;
+    }
+    if rank_sweep_workspace_bytes(left_len, right_len, rank_count, 8)
+        .is_none_or(|bytes| bytes > rank_sweep_memory_budget(right_len, left_len, 1))
+    {
+        return None;
+    }
 
     #[cfg(test)]
     ENVELOPE_KEEP_SWEEP_HITS.with(|hits| hits.set(hits.get() + 1));
@@ -2979,6 +2960,9 @@ fn aggregate_envelope_rank_sweep<'py>(
             "at least one aggregation is required",
         ));
     }
+    let Some(state_bytes) = rank_sweep_state_bytes(&inputs) else {
+        return Ok(None);
+    };
     let mut set = AggregationSet::new(output_len, source_len, &inputs, return_matched)?;
     if !set.supports_dual_rank_tree() {
         return Ok(None);
@@ -2987,6 +2971,35 @@ fn aggregate_envelope_rank_sweep<'py>(
     let Some((ranks, rank_count, thresholds)) = envelope_residual_ranks(second, residual) else {
         return Ok(None);
     };
+    if !should_use_rank_sweep(
+        sweep.left_len,
+        sweep.candidate_width,
+        source_len,
+        rank_count,
+    ) {
+        return Ok(None);
+    }
+    let second_search = second.search();
+    let Some((sampled, surviving)) = sampled_envelope_density(
+        &sweep.search,
+        &second_search,
+        sweep.left_len,
+        &ranks,
+        &thresholds,
+        rank_count,
+    ) else {
+        return Ok(None);
+    };
+    if (surviving as u128) * (sweep.candidate_width as u128) / (sampled as u128)
+        <= (source_len as u128) * (RANK_SWEEP_BUILD_FACTOR as u128)
+    {
+        return Ok(None);
+    }
+    if rank_sweep_workspace_bytes(sweep.left_len, source_len, rank_count, state_bytes).is_none_or(
+        |bytes| bytes > rank_sweep_memory_budget(source_len, sweep.left_len, inputs.len()),
+    ) {
+        return Ok(None);
+    }
 
     #[cfg(test)]
     ENVELOPE_RANK_SWEEP_HITS.with(|hits| hits.set(hits.get() + 1));
