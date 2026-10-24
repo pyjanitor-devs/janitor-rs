@@ -205,6 +205,41 @@ impl<'a, T: PartialOrd + Copy> SecondRangeSkipScan<'a, T> {
         }
     }
 
+    /// Call `emit` for up to `samples` evenly spaced positions in `[start, end)`
+    /// whose right value satisfies the range predicate.
+    ///
+    /// This is a bounded, side-effect-free probe for callers deciding whether
+    /// the skip scan should own a dense window. It deliberately does not walk
+    /// blocks or increment the production skip-scan counters: the probe's job
+    /// is to estimate residual selectivity at a fixed cost, not to execute the
+    /// candidate traversal a second time.
+    pub(crate) fn for_each_sampled_match(
+        &self,
+        left: T,
+        start: usize,
+        end: usize,
+        samples: usize,
+        mut emit: impl FnMut(usize),
+    ) {
+        debug_assert!(start <= end && end <= self.values.len() && samples > 0);
+        let width = end - start;
+        let samples = samples.min(width);
+        if samples == 0 {
+            return;
+        }
+        for sample in 0..samples {
+            // ELI5: place the probe in the middle of each equal-sized slice,
+            // so periodic layouts are less likely to hide all their useful
+            // or rejecting rows at a slice boundary.
+            let offset =
+                ((2 * sample + 1) as u128 * width as u128 / (2 * samples) as u128) as usize;
+            let position = start + offset;
+            if self.op.apply(&left, &self.values[position]) {
+                emit(position);
+            }
+        }
+    }
+
     /// Call `emit(run_start, run_end)` for every run of consecutive blocks of
     /// `[start, end)` that [`Self::for_each_match`] would open, clipped to the
     /// window, in ascending order. A window read directly is one run.

@@ -43,6 +43,7 @@ thread_local! {
     static EQUI_STARTS_ENDS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EQUI_RESIDUAL_WINDOW_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SECOND_RANGE_SKIP_DENSE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SECOND_RANGE_SKIP_RESIDUAL_SELECTIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 type IndexPairs = Option<(Vec<i64>, Vec<i64>)>;
@@ -439,6 +440,14 @@ fn materialize_unordered_second_range(
             if use_skip
                 && !residual_predicates.is_empty()
                 && skip_scan_is_dense(&scanner, left, starts.view(), ends.view())
+                && skip_scan_residuals_are_selective(
+                    &scanner,
+                    left,
+                    starts.view(),
+                    ends.view(),
+                    residual_predicates,
+                    null_metadata,
+                )
             {
                 return materialize_equi_windows_and_residuals(
                     left_index,
@@ -1592,8 +1601,9 @@ fn equi_aggregate_impl<'py>(
 /// and [`SecondRangeSkipScan::estimate_surviving_rows`] probes up to
 /// [`DENSITY_SAMPLE_PROBES`] blocks of each, giving the share of probed rows
 /// that pass the second range; when the picks' average passing share is
-/// above half, the caller keeps the general loop. Picking by width keeps the
-/// estimate tied to the work: a fixed row stride with a per-window cap let
+/// above half, the caller considers the residual-selectivity probe before
+/// choosing the general loop. Picking by width keeps the estimate tied to the
+/// work: a fixed row stride with a per-window cap let
 /// many short dense windows outvote a few 1M-row sparse ones (0.29-0.36x
 /// once the gate fired on them), and a stride can step over every wide
 /// window of a periodic layout. Counting the opened blocks' rows (the
@@ -1606,10 +1616,14 @@ fn equi_aggregate_impl<'py>(
 /// windows that beats the general loop's per-window setup (0.80x on a
 /// short-window timing shape when they counted as dense).
 ///
-/// The gate ignores how much the residuals reject. When they reject almost
-/// nothing (AIList ex-rna x ex-anno with an `!=` residual), the per-pair
-/// scan is the faster one and this fallback costs about 0.89x; that is
-/// accepted for now.
+/// The residual-selectivity probe is intentionally separate and bounded: it
+/// samples up to 64 width-weighted windows and up to 64 positions per window.
+/// When the second range passes almost everything, the whole-window mask can
+/// still win with only 10-20% residual rejection; that small crossover is an
+/// accepted trade-off below the probe's 25% rejection cutoff.
+/// The motivating AIList `ex-rna × ex-anno` case from issue #274 remains
+/// approximately neutral in the current measurements (7.64 s versus 7.73 s,
+/// or about 0.99x), so this gate does not claim to resolve that workload.
 ///
 /// ELI5: before trusting the sticky notes, peek at a few long aisles. If most
 /// cards in them would win the second rule anyway, read the other rules shelf
@@ -1679,6 +1693,101 @@ fn skip_scan_is_dense<T: PartialOrd + Copy>(
     dense
 }
 
+/// Maximum number of windows inspected by the residual-selectivity probe.
+const RESIDUAL_SAMPLE_ROWS: usize = 64;
+
+/// Maximum number of evenly spaced positions inspected in one sampled window.
+const RESIDUAL_SAMPLE_POSITIONS: usize = 64;
+
+/// Do not switch to the whole-window residual mask unless at least this many
+/// second-range survivors were sampled. This avoids making a decision from a
+/// handful of coincidental matches in a tiny or irregular sample.
+const RESIDUAL_SAMPLE_MIN_SURVIVORS: usize = 16;
+
+/// The vectorized whole-window residual mask is preferred once at least a
+/// quarter of sampled second-range survivors are rejected. The skip scan's
+/// per-pair residual dispatch only wins when it avoids enough candidates to
+/// repay its scalar callback and ordering overhead.
+const RESIDUAL_REJECTION_CUTOFF_DENOMINATOR: usize = 4;
+
+/// Report whether the remaining residual predicates reject enough second-range
+/// survivors to justify the ordinary whole-window mask.
+///
+/// This probe checks at most 64 evenly spaced positions in each of 64 windows,
+/// so its cost is bounded by 4,096 candidate checks even when a window contains
+/// millions of rows. Only positions that pass the second range contribute to
+/// the rejection estimate, which measures the selectivity that matters after
+/// the skip scan has done its work.
+///
+/// ELI5: after deciding that most shelves would be opened, peek at a few cards
+/// from each shelf. If the other rules reject many of those cards, cross off a
+/// whole shelf with the vectorized checklist; if nearly all survive, keep the
+/// skip scan's one-card-at-a-time walk.
+fn skip_scan_residuals_are_selective<T: PartialOrd + Copy>(
+    scanner: &SecondRangeSkipScan<'_, T>,
+    left: ArrayView1<'_, T>,
+    starts: ArrayView1<'_, i64>,
+    ends: ArrayView1<'_, i64>,
+    residual_predicates: &[PredicateView<'_>],
+    null_metadata: Option<&[NullMetadataView<'_>]>,
+) -> bool {
+    // Pick windows in proportion to their width, as `skip_scan_is_dense`
+    // does, so a few wide windows among many short ones still vote.
+    let voting_width = |row: usize| {
+        let (start, end) = (starts[row], ends[row]);
+        if start < 0 || end < 0 || end - start < SECOND_RANGE_DIRECT_WIDTH as i64 {
+            0
+        } else {
+            (end - start) as usize
+        }
+    };
+    let total = (0..starts.len()).fold(0_usize, |total, row| {
+        total.saturating_add(voting_width(row))
+    });
+    let (mut survivors, mut rejected) = (0_usize, 0_usize);
+    if total == 0 {
+        return false;
+    }
+    let (mut row, mut covered) = (0_usize, 0_usize);
+    let mut last = None;
+    for pick in 0..RESIDUAL_SAMPLE_ROWS {
+        let target =
+            ((2 * pick + 1) as u128 * total as u128 / (2 * RESIDUAL_SAMPLE_ROWS) as u128) as usize;
+        while covered + voting_width(row) <= target {
+            covered += voting_width(row);
+            row += 1;
+        }
+        if last == Some(row) {
+            continue;
+        }
+        last = Some(row);
+        scanner.for_each_sampled_match(
+            left[row],
+            starts[row] as usize,
+            ends[row] as usize,
+            RESIDUAL_SAMPLE_POSITIONS,
+            |right_position| {
+                survivors += 1;
+                if !predicates_match_dispatch(
+                    residual_predicates,
+                    null_metadata,
+                    row,
+                    right_position,
+                ) {
+                    rejected += 1;
+                }
+            },
+        );
+    }
+    let selective = survivors >= RESIDUAL_SAMPLE_MIN_SURVIVORS
+        && rejected.saturating_mul(RESIDUAL_REJECTION_CUTOFF_DENOMINATOR) >= survivors;
+    #[cfg(test)]
+    if selective {
+        SECOND_RANGE_SKIP_RESIDUAL_SELECTIVE.with(|hits| hits.set(hits.get() + 1));
+    }
+    selective
+}
+
 /// Aggregate every pair passing an unordered second range in its window.
 ///
 /// `starts`/`ends` are the windows left by the first range and the envelope
@@ -1691,9 +1800,9 @@ fn skip_scan_is_dense<T: PartialOrd + Copy>(
 /// updates use `(left source, right output)`, matching the general loop in
 /// `equi_aggregate_impl`.
 ///
-/// Returns `false`, without updating `set`, when residuals remain and
-/// [`skip_scan_is_dense`] finds most candidates pass the second range; the
-/// caller then aggregates with its general loop.
+/// Returns `false`, without updating `set`, when residuals remain, the second
+/// range is dense, and the bounded residual-selectivity probe finds enough
+/// rejections to justify the caller's general loop.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_unordered_second_range(
     set: &mut AggregationSet,
@@ -1718,6 +1827,14 @@ fn aggregate_unordered_second_range(
             if use_skip
                 && !residual_predicates.is_empty()
                 && skip_scan_is_dense(&scanner, left, starts, ends)
+                && skip_scan_residuals_are_selective(
+                    &scanner,
+                    left,
+                    starts,
+                    ends,
+                    residual_predicates,
+                    null_metadata,
+                )
             {
                 return false;
             }
@@ -2169,8 +2286,9 @@ mod tests {
         build_equi_uniq_residual_indices_core, build_second_range_envelope, equi_aggregate,
         materialize_equi_windows, materialize_equi_windows_and_residuals,
         materialize_unordered_second_range, narrow_unordered_second_range, skip_scan_is_dense,
-        unique_reverse_output_slots, SecondRangeSkipScan, EQUI_RESIDUAL_WINDOW_HITS,
-        EQUI_STARTS_ENDS_HITS, SECOND_RANGE_SKIP_DENSE,
+        skip_scan_residuals_are_selective, unique_reverse_output_slots, SecondRangeSkipScan,
+        EQUI_RESIDUAL_WINDOW_HITS, EQUI_STARTS_ENDS_HITS, SECOND_RANGE_SKIP_DENSE,
+        SECOND_RANGE_SKIP_RESIDUAL_SELECTIVE,
     };
     use crate::conditional_join::compare_op::CompareOp;
     use crate::conditional_join::join_types::Keep;
@@ -4314,6 +4432,87 @@ mod tests {
             short_left.view(),
             starts.view(),
             short_ends.view()
+        ));
+    }
+
+    #[test]
+    fn residual_selectivity_probe_distinguishes_dense_survivors() {
+        let right = Array1::from_iter((0..8_192_i64).map(|position| position % 7));
+        let scanner = SecondRangeSkipScan::new(right.view(), CompareOp::Ge);
+        let left = Array1::from_elem(64, 100_i64);
+        let starts = Array1::from_elem(64, 0_i64);
+        let ends = Array1::from_elem(64, 8_192_i64);
+
+        let passing_right = Array1::from_elem(8_192, 100_i64);
+        let passing = [PredicateView::I64(
+            left.view(),
+            passing_right.view(),
+            CompareOp::Eq,
+        )];
+        assert!(!skip_scan_residuals_are_selective(
+            &scanner,
+            left.view(),
+            starts.view(),
+            ends.view(),
+            &passing,
+            None,
+        ));
+
+        let rejecting_right = Array1::from_elem(8_192, 0_i64);
+        let rejecting = [PredicateView::I64(
+            left.view(),
+            rejecting_right.view(),
+            CompareOp::Eq,
+        )];
+        let selective_before = SECOND_RANGE_SKIP_RESIDUAL_SELECTIVE.with(|hits| hits.get());
+        assert!(skip_scan_residuals_are_selective(
+            &scanner,
+            left.view(),
+            starts.view(),
+            ends.view(),
+            &rejecting,
+            None,
+        ));
+        assert_eq!(
+            SECOND_RANGE_SKIP_RESIDUAL_SELECTIVE.with(|hits| hits.get()),
+            selective_before + 1
+        );
+    }
+
+    #[test]
+    fn residual_selectivity_probe_finds_width_skewed_windows() {
+        let right = Array1::zeros(200_000);
+        let scanner = SecondRangeSkipScan::new(right.view(), CompareOp::Ge);
+        let left = Array1::from_elem(6_400, 1_i64);
+        let starts = Array1::from_iter((0..6_400).map(|row| {
+            if row % 100 == 50 {
+                0
+            } else {
+                ((row * 17) % (200_000 - 63)) as i64
+            }
+        }));
+        let ends = Array1::from_iter((0..6_400).map(|row| {
+            if row % 100 == 50 {
+                200_000
+            } else {
+                starts[row] + 63
+            }
+        }));
+        let residual_left = Array1::zeros(6_400);
+        let residual_right = Array1::ones(200_000);
+        let residuals = [PredicateView::I64(
+            residual_left.view(),
+            residual_right.view(),
+            CompareOp::Eq,
+        )];
+
+        assert!(skip_scan_residuals_are_selective(
+            &scanner,
+            left.view(),
+            starts.view(),
+            ends.view(),
+            &residuals,
+            None,
         ));
     }
 }
