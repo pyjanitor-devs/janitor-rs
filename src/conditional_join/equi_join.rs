@@ -43,6 +43,7 @@ thread_local! {
     static EQUI_STARTS_ENDS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EQUI_RESIDUAL_WINDOW_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SECOND_RANGE_SKIP_DENSE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EQUI_ANY_BOUNDARY_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SECOND_RANGE_SKIP_RESIDUAL_SELECTIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -515,10 +516,35 @@ fn materialize_unordered_second_range(
                     continue;
                 }
                 let mut selected = None;
-                scanner.for_each_match(left[row], start as usize, end as usize, |right_position| {
-                    !residuals_pass(row, right_position)
-                        || update_keep_selection(&mut selected, right_position, keep, right_index)
-                });
+                if keep == Keep::Any && end > start {
+                    // A window narrowed by the second range's own envelope
+                    // always holds a match at its far end when that range is
+                    // the only residual: the suffix-min envelope stops
+                    // admitting the row exactly where the value itself
+                    // qualifies. Any other shape pays one wasted check.
+                    let last = end as usize - 1;
+                    if predicate.op.apply(&left[row], &right[last]) && residuals_pass(row, last) {
+                        selected = Some(last);
+                        #[cfg(test)]
+                        EQUI_ANY_BOUNDARY_HITS.with(|hits| hits.set(hits.get() + 1));
+                    }
+                }
+                if selected.is_none() {
+                    scanner.for_each_match(
+                        left[row],
+                        start as usize,
+                        end as usize,
+                        |right_position| {
+                            !residuals_pass(row, right_position)
+                                || update_keep_selection(
+                                    &mut selected,
+                                    right_position,
+                                    keep,
+                                    right_index,
+                                )
+                        },
+                    );
+                }
                 if let Some(right_position) = selected {
                     left_output.push(left_index[row]);
                     right_output.push(right_index[right_position]);
@@ -2287,8 +2313,8 @@ mod tests {
         materialize_equi_windows, materialize_equi_windows_and_residuals,
         materialize_unordered_second_range, narrow_unordered_second_range, skip_scan_is_dense,
         skip_scan_residuals_are_selective, unique_reverse_output_slots, SecondRangeSkipScan,
-        EQUI_RESIDUAL_WINDOW_HITS, EQUI_STARTS_ENDS_HITS, SECOND_RANGE_SKIP_DENSE,
-        SECOND_RANGE_SKIP_RESIDUAL_SELECTIVE,
+        EQUI_ANY_BOUNDARY_HITS, EQUI_RESIDUAL_WINDOW_HITS, EQUI_STARTS_ENDS_HITS,
+        SECOND_RANGE_SKIP_DENSE, SECOND_RANGE_SKIP_RESIDUAL_SELECTIVE,
     };
     use crate::conditional_join::compare_op::CompareOp;
     use crate::conditional_join::join_types::Keep;
@@ -3527,6 +3553,7 @@ mod tests {
                 (Keep::First, vec![11]),
                 (Keep::Last, vec![13]),
             ] {
+                let boundary_before = EQUI_ANY_BOUNDARY_HITS.with(|hits| hits.get());
                 let mut starts = Array1::from_vec(vec![0]);
                 let mut ends = Array1::from_vec(vec![4]);
                 let equality_starts = starts.clone();
@@ -3545,7 +3572,18 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap();
-                assert_eq!(result.1, expected);
+                if keep == Keep::Any {
+                    // One genuine match; the far-end probe may pick the later one.
+                    assert_eq!(
+                        EQUI_ANY_BOUNDARY_HITS.with(|hits| hits.get()),
+                        boundary_before + 1,
+                        "the far-end probe did not resolve the row"
+                    );
+                    assert_eq!(result.1.len(), 1);
+                    assert!([11, 13].contains(&result.1[0]), "{:?}", result.1);
+                } else {
+                    assert_eq!(result.1, expected);
+                }
             }
         });
     }
@@ -3802,8 +3840,10 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap();
+                // `any` may resolve a row at the window's far end without
+                // scanning, so only the other modes must reach the skip scan.
                 assert!(
-                    skip_hits() > hits_before,
+                    keep == Keep::Any || skip_hits() > hits_before,
                     "keep={keep:?} did not use the skip scan"
                 );
                 let mut got: Vec<Vec<i64>> = vec![Vec::new(); left_len];

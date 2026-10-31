@@ -4885,7 +4885,9 @@ mod default_skip_scan_tests {
                         // retain dedicated skip-scan coverage in the blocky
                         // residual test below; keep this test focused on the
                         // scan path for all/any.
-                        if matches!(keep, "all" | "any") {
+                        // Plain envelope `any` is answered by the boundary probe
+                        // and needs no scan; an extra tag residual still does.
+                        if keep == "all" || (keep == "any" && with_tag) {
                             assert!(plans() > plans_before, "skip scan did not run for {keep}");
                         }
                         let read = |name: &str| -> PyResult<Vec<i64>> {
@@ -4901,6 +4903,22 @@ mod default_skip_scan_tests {
                             .into_iter()
                             .zip(read("right_index")?)
                             .collect();
+                        if keep == "any" {
+                            // One genuine match per matching row; which one is
+                            // not a contract.
+                            let matching: Vec<usize> = (0..reference.len())
+                                .filter(|&row| !reference[row].is_empty())
+                                .collect();
+                            assert_eq!(observed.len(), matching.len(), "any float={as_float} tag={with_tag}");
+                            for (&(left, right), &row) in observed.iter().zip(&matching) {
+                                assert_eq!(left, data.left_index[row]);
+                                assert!(
+                                    reference[row].iter().any(|&p| data.right_index[p] == right),
+                                    "any float={as_float} tag={with_tag}: {right} does not match row {row}"
+                                );
+                            }
+                            continue;
+                        }
                         let mut expected = Vec::new();
                         for (row, positions) in reference.iter().enumerate() {
                             let labels =
@@ -5232,6 +5250,19 @@ mod default_skip_scan_tests {
                     .zip(column("right_index")?)
                     .collect();
                 observed.sort_unstable();
+                if keep == "any" {
+                    // One genuine match per matching row; which one is not a
+                    // contract (the boundary probe may pick a later one).
+                    let matching: Vec<usize> = (0..reference.len())
+                        .filter(|&row| !reference[row].is_empty())
+                        .collect();
+                    assert_eq!(observed.len(), matching.len(), "keep=any");
+                    for (&(left, right), &row) in observed.iter().zip(&matching) {
+                        assert_eq!(left, data.left_index[row]);
+                        assert!(reference[row].iter().any(|&p| data.right_index[p] == right));
+                    }
+                    continue;
+                }
                 let mut expected: Vec<(i64, i64)> = Vec::new();
                 for (row, positions) in reference.iter().enumerate() {
                     let labels = positions.iter().map(|&position| data.right_index[position]);
@@ -5677,9 +5708,15 @@ mod default_skip_scan_tests {
                         .expect("the overlap has matches");
                         let (resolved_after, pending_after, plans_after) = counters();
                         assert!(resolved_after > resolved, "no row resolved by the probe");
-                        if expect_plan {
+                        // With only the envelope's residual, the boundary probe
+                        // resolves every sparse row; an extra tag residual voids
+                        // that guarantee and the skip scan still runs.
+                        if expect_plan && with_tag {
                             assert!(pending_after > pending, "no row left for the skip scan");
                             assert!(plans_after > plans_before, "skip scan did not run");
+                        } else if expect_plan {
+                            assert_eq!(pending_after, pending, "boundary probe missed rows");
+                            assert_eq!(plans_after, plans_before, "envelope-only any planned a scan");
                         } else {
                             assert_eq!(pending_after, pending, "dense rows left the probe");
                             assert_eq!(plans_after, plans_before, "dense join built summaries");
@@ -5697,17 +5734,31 @@ mod default_skip_scan_tests {
                             .into_iter()
                             .zip(read("right_index")?)
                             .collect();
-                        // `any` reports each row's first match in position order.
-                        let expected: Vec<(i64, i64)> = reference
+                        // `any` reports one genuine match per matching row; which one
+                        // is not a contract (the boundary probe may pick a later one).
+                        let expected: Vec<(i64, Vec<i64>)> = reference
                             .iter()
                             .enumerate()
-                            .filter_map(|(row, positions)| {
-                                positions.first().map(|&position| {
-                                    (data.left_index[row], data.right_index[position])
-                                })
+                            .filter(|(_, positions)| !positions.is_empty())
+                            .map(|(row, positions)| {
+                                (
+                                    data.left_index[row],
+                                    positions.iter().map(|&p| data.right_index[p]).collect(),
+                                )
                             })
                             .collect();
-                        assert_eq!(observed, expected, "plan={expect_plan} tag={with_tag}");
+                        assert_eq!(
+                            observed.len(),
+                            expected.len(),
+                            "plan={expect_plan} tag={with_tag}"
+                        );
+                        for ((left, right), (want_left, labels)) in observed.iter().zip(&expected) {
+                            assert_eq!(left, want_left, "plan={expect_plan} tag={with_tag}");
+                            assert!(
+                                labels.contains(right),
+                                "plan={expect_plan} tag={with_tag}: {right} is not a match of {left}"
+                            );
+                        }
                     }
                 }
                 Ok(())
@@ -6045,6 +6096,69 @@ mod envelope_keep_sweep_tests {
                 .to_vec())
         };
         Ok((read("left_index")?, read("right_index")?))
+    }
+
+    /// `keep="any"` on the shapes pyjanitor builds (opposing predicates, the
+    /// second replaced by its cumulative envelope): the right array falls as
+    /// the sorted first anchor rises, so a suffix window holds its only
+    /// matches at the far end. The direct probe at the window front misses
+    /// them; the boundary probe must find them without the skip scan.
+    #[test]
+    fn keep_any_boundary_probe_resolves_envelope_windows() {
+        use crate::conditional_join::range_skip_scan::ANY_PROBE_BOUNDARY;
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let mut rng = XorShift(0xA11_CE5);
+            let (left_len, right_len) = (300_usize, 400_usize);
+            for (first_op, second_op) in [
+                (CompareOp::Le, CompareOp::Gt),
+                (CompareOp::Lt, CompareOp::Gt),
+                (CompareOp::Le, CompareOp::Ge),
+                (CompareOp::Lt, CompareOp::Ge),
+            ] {
+                let right_first: Vec<i64> = (0..right_len as i64).collect();
+                // falls with the first anchor, with small noise
+                let right_second: Vec<i64> = (0..right_len as i64)
+                    .map(|p| 2 * (right_len as i64 - p) + rng.below(5))
+                    .collect();
+                let fixture = Fixture {
+                    left_first: (0..left_len).map(|_| rng.below(40)).collect(),
+                    right_first,
+                    left_second: (0..left_len).map(|_| rng.below(30)).collect(),
+                    right_second,
+                    left_extra: vec![0; left_len],
+                    right_extra: vec![0; right_len],
+                    left_index: (0..left_len as i64).map(|l| 10_000 + l).collect(),
+                    right_index: (0..right_len as i64).map(|l| l * 3 + 7).collect(),
+                };
+                let anchor = envelope(&fixture.right_second, second_op);
+                let before = ANY_PROBE_BOUNDARY.with(|rows| rows.get());
+                let (left, right) = run(
+                    py, &fixture, first_op, &anchor, second_op, false, false, "any",
+                )?;
+                let after = ANY_PROBE_BOUNDARY.with(|rows| rows.get());
+                let (want_left, _) =
+                    bruteforce(&fixture, first_op, &anchor, second_op, false, "last");
+                assert!(!want_left.is_empty());
+                assert!(
+                    after > before,
+                    "{first_op:?}/{second_op:?}: no boundary hit"
+                );
+                assert_eq!(left, want_left, "{first_op:?}/{second_op:?} matched rows");
+                for (l, r) in left.iter().zip(&right) {
+                    let row = (*l - 10_000) as usize;
+                    let position = ((*r - 7) / 3) as usize;
+                    assert!(
+                        first_op.apply(&fixture.left_first[row], &fixture.right_first[position])
+                            && second_op
+                                .apply(&fixture.left_second[row], &fixture.right_second[position]),
+                        "{first_op:?}/{second_op:?}: row {row} paired with non-match {position}"
+                    );
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 
     const RANGE_OPS: [CompareOp; 4] = [CompareOp::Lt, CompareOp::Le, CompareOp::Gt, CompareOp::Ge];
