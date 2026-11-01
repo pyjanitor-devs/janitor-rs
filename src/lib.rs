@@ -45,6 +45,7 @@ mod registration_tests {
                 "equi_aggregate",
                 "not_equals_aggregate_int64",
                 "range_join_indices",
+                "range_exists_indices",
                 "single_range_predicate_indices_int64",
                 "dual_regions_indices",
                 "dual_regions_and_residual_indices",

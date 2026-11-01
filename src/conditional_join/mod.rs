@@ -14,6 +14,7 @@ mod range_skip_scan;
 mod region_kd_tree;
 mod regions;
 mod single_range_predicate;
+mod staircase_any;
 
 pub use equi_join::{equi_aggregate_bench, equi_range_and_residual_indices};
 pub use range_join::{
@@ -30,5 +31,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     range_join::register(m)?;
     single_range_predicate::register(m)?;
     regions::register(m)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        staircase_any::range_exists_indices,
+        m
+    )?)?;
     Ok(())
 }
