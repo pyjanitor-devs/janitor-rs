@@ -27,6 +27,7 @@ thread_local! {
     pub(crate) static WINDOW_RESIDUAL_SKIP_DENSE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static WINDOW_RESIDUAL_MASK_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static ANY_PROBE_RESOLVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static ANY_PROBE_BOUNDARY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static ANY_PROBE_PENDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 

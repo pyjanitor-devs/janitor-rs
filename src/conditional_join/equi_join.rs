@@ -43,6 +43,7 @@ thread_local! {
     static EQUI_STARTS_ENDS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EQUI_RESIDUAL_WINDOW_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SECOND_RANGE_SKIP_DENSE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EQUI_ANY_BOUNDARY_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SECOND_RANGE_SKIP_RESIDUAL_SELECTIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -515,10 +516,53 @@ fn materialize_unordered_second_range(
                     continue;
                 }
                 let mut selected = None;
-                scanner.for_each_match(left[row], start as usize, end as usize, |right_position| {
-                    !residuals_pass(row, right_position)
-                        || update_keep_selection(&mut selected, right_position, keep, right_index)
-                });
+                if keep == Keep::Any
+                    && end > start
+                    && matches!(predicate.op, CompareOp::Gt | CompareOp::Ge)
+                {
+                    // For `>`/`>=` the narrowing above pulls `end` back to the
+                    // point where the suffix-min envelope stops admitting the
+                    // row. If the envelope drops below the row's value there
+                    // while the position after it does not, the value at
+                    // `end - 1` is itself the envelope, so it is a genuine
+                    // match. That holds when the narrowing cut the window or
+                    // the first range left `end` at the equality group's end.
+                    // If the first range cut `end` earlier and the narrowing
+                    // changed nothing, the envelope minimum may sit beyond the
+                    // window, and about half the probes miss (one wasted
+                    // check). `<`/`<=` narrow `start` instead, where `end - 1`
+                    // is no better than any other position, so they skip the
+                    // probe.
+                    //
+                    // ELI5: each key has its own shelf with a "best so far"
+                    // tag on every item. Where the tag stops fitting the
+                    // customer, the item under it is itself a fit, so one
+                    // look at the far end replaces checking the whole shelf.
+                    // The trick only works when the shelf was not cut short
+                    // by someone else's rule first.
+                    let last = end as usize - 1;
+                    if predicate.op.apply(&left[row], &right[last]) && residuals_pass(row, last) {
+                        selected = Some(last);
+                        #[cfg(test)]
+                        EQUI_ANY_BOUNDARY_HITS.with(|hits| hits.set(hits.get() + 1));
+                    }
+                }
+                if selected.is_none() {
+                    scanner.for_each_match(
+                        left[row],
+                        start as usize,
+                        end as usize,
+                        |right_position| {
+                            !residuals_pass(row, right_position)
+                                || update_keep_selection(
+                                    &mut selected,
+                                    right_position,
+                                    keep,
+                                    right_index,
+                                )
+                        },
+                    );
+                }
                 if let Some(right_position) = selected {
                     left_output.push(left_index[row]);
                     right_output.push(right_index[right_position]);
@@ -2287,8 +2331,8 @@ mod tests {
         materialize_equi_windows, materialize_equi_windows_and_residuals,
         materialize_unordered_second_range, narrow_unordered_second_range, skip_scan_is_dense,
         skip_scan_residuals_are_selective, unique_reverse_output_slots, SecondRangeSkipScan,
-        EQUI_RESIDUAL_WINDOW_HITS, EQUI_STARTS_ENDS_HITS, SECOND_RANGE_SKIP_DENSE,
-        SECOND_RANGE_SKIP_RESIDUAL_SELECTIVE,
+        EQUI_ANY_BOUNDARY_HITS, EQUI_RESIDUAL_WINDOW_HITS, EQUI_STARTS_ENDS_HITS,
+        SECOND_RANGE_SKIP_DENSE, SECOND_RANGE_SKIP_RESIDUAL_SELECTIVE,
     };
     use crate::conditional_join::compare_op::CompareOp;
     use crate::conditional_join::join_types::Keep;
@@ -3527,6 +3571,7 @@ mod tests {
                 (Keep::First, vec![11]),
                 (Keep::Last, vec![13]),
             ] {
+                let boundary_before = EQUI_ANY_BOUNDARY_HITS.with(|hits| hits.get());
                 let mut starts = Array1::from_vec(vec![0]);
                 let mut ends = Array1::from_vec(vec![4]);
                 let equality_starts = starts.clone();
@@ -3545,8 +3590,85 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap();
-                assert_eq!(result.1, expected);
+                if keep == Keep::Any {
+                    // One genuine match; the far-end probe may pick the later one.
+                    assert_eq!(
+                        EQUI_ANY_BOUNDARY_HITS.with(|hits| hits.get()),
+                        boundary_before + 1,
+                        "the far-end probe did not resolve the row"
+                    );
+                    assert_eq!(result.1.len(), 1);
+                    assert!([11, 13].contains(&result.1[0]), "{:?}", result.1);
+                } else {
+                    assert_eq!(result.1, expected);
+                }
             }
+        });
+    }
+
+    #[test]
+    fn unordered_second_range_any_probe_only_runs_for_greater_than_ranges() {
+        Python::initialize();
+        Python::attach(|py| {
+            // One left row and one equality group over the four right rows.
+            // `window_end` is where the first range stopped the window.
+            let run = |op: CompareOp, left: i64, right: Vec<i64>, window_end: i64| {
+                let range = AnyParsedRangePredicate::I64(ParsedRangePredicate {
+                    left: PyArray1::from_vec(py, vec![left]).readonly(),
+                    left_index: PyArray1::from_vec(py, vec![0_i64]).readonly(),
+                    right: PyArray1::from_vec(py, right).readonly(),
+                    right_index: PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]).readonly(),
+                    op,
+                });
+                let mut starts = Array1::from_vec(vec![0]);
+                let mut ends = Array1::from_vec(vec![window_end]);
+                let equality_starts = Array1::from_vec(vec![0]);
+                let equality_ends = Array1::from_vec(vec![4]);
+                let before = EQUI_ANY_BOUNDARY_HITS.with(|hits| hits.get());
+                let result = materialize_unordered_second_range(
+                    Array1::from_vec(vec![10]).view(),
+                    Array1::from_vec(vec![10, 11, 12, 13]).view(),
+                    starts.view_mut(),
+                    ends.view_mut(),
+                    &range,
+                    equality_starts.view(),
+                    equality_ends.view(),
+                    &[],
+                    None,
+                    Keep::Any,
+                )
+                .unwrap()
+                .unwrap();
+                let hits = EQUI_ANY_BOUNDARY_HITS.with(|hits| hits.get()) - before;
+                (result.1, hits)
+            };
+
+            // `>` and `>=`: the suffix-min envelope pulls the end back, so the
+            // far end is a genuine match and the probe resolves the row.
+            for op in [CompareOp::Gt, CompareOp::Ge] {
+                let (right, hits) = run(op, 3, vec![4, 1, 3, 2], 4);
+                assert_eq!(hits, 1, "{op:?}: far-end probe did not run");
+                assert_eq!(right.len(), 1);
+                // `>` matches rows 11 and 13; `>=` also matches row 12.
+                assert!([11, 12, 13].contains(&right[0]), "{op:?}: {right:?}");
+            }
+
+            // `<` and `<=` narrow the start instead, so the probe is skipped
+            // even though the far end (position 3, value 5) also matches.
+            for op in [CompareOp::Lt, CompareOp::Le] {
+                let (right, hits) = run(op, 3, vec![4, 1, 3, 5], 4);
+                assert_eq!(hits, 0, "{op:?}: probe must be skipped");
+                assert_eq!(right.len(), 1);
+                assert!([10, 13].contains(&right[0]), "{op:?}: {right:?}");
+            }
+
+            // `>` with the first range cutting the window to the first two
+            // rows: nothing is narrowed and the far end (value 4) misses, but
+            // position 0 (value 2) matches. The probe must miss quietly and
+            // the scan must still find the real match.
+            let (right, hits) = run(CompareOp::Gt, 3, vec![2, 4, 1, 5], 2);
+            assert_eq!(hits, 0, "a missed probe must not count as a hit");
+            assert_eq!(right, vec![10]);
         });
     }
 
@@ -3802,8 +3924,10 @@ mod tests {
                 )
                 .unwrap()
                 .unwrap();
+                // `any` may resolve a row at the window's far end without
+                // scanning, so only the other modes must reach the skip scan.
                 assert!(
-                    skip_hits() > hits_before,
+                    keep == Keep::Any || skip_hits() > hits_before,
                     "keep={keep:?} did not use the skip scan"
                 );
                 let mut got: Vec<Vec<i64>> = vec![Vec::new(); left_len];

@@ -187,8 +187,9 @@ const ANY_DIRECT_PROBE: usize = 32;
 /// ELI5: glance at the first few cards in each aisle. Only for the aisles
 /// where nothing turned up do we bother labelling the boxes.
 ///
-/// Positions are still read in ascending order, so each row reports the same
-/// first match as the plain scan.
+/// A row's reported match is the first one in position order unless the
+/// window's last position is checked first (see the boundary probe below);
+/// `any` promises only some match, never which.
 #[inline(never)]
 fn materialize_range_any(
     windows: &SingleJoinResult,
@@ -221,7 +222,26 @@ fn materialize_range_any(
             windows.ends[row],
         );
         let probe_end = end.min(start.saturating_add(ANY_DIRECT_PROBE));
-        let found = first_match(left_position, start, probe_end);
+        let mut found = first_match(left_position, start, probe_end);
+        if found.is_none() && probe_end < end {
+            // A window whose second anchor is the cumulative envelope of the
+            // only residual always has a match at one of its two ends: a
+            // suffix window ends where the envelope stops admitting the row,
+            // and the envelope there is the residual value itself; a prefix
+            // window starts at the first row that lifts the envelope. Any
+            // other shape just pays one extra check before the skip scan.
+            //
+            // ELI5: the shelf is sorted so that a "best price so far" tag sits
+            // on every item. The tag stops saying "cheap enough" at exactly
+            // the last item that is itself cheap enough, so peeking at the
+            // far end of the shelf answers "is there any?" without walking it.
+            let last = end - 1;
+            found = first_match(left_position, last, end);
+            #[cfg(test)]
+            if found.is_some() {
+                super::range_skip_scan::ANY_PROBE_BOUNDARY.with(|rows| rows.set(rows.get() + 1));
+            }
+        }
         #[cfg(test)]
         if found.is_some() {
             super::range_skip_scan::ANY_PROBE_RESOLVED.with(|rows| rows.set(rows.get() + 1));
