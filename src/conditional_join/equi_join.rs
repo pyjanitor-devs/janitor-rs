@@ -522,6 +522,11 @@ fn materialize_unordered_second_range(
                     // the only residual: the suffix-min envelope stops
                     // admitting the row exactly where the value itself
                     // qualifies. Any other shape pays one wasted check.
+                    //
+                    // ELI5: each key has its own shelf with a "best so far"
+                    // tag on every item. Where the tag stops fitting the
+                    // customer, the item under it is itself a fit, so one
+                    // look at the far end replaces checking the whole shelf.
                     let last = end as usize - 1;
                     if predicate.op.apply(&left[row], &right[last]) && residuals_pass(row, last) {
                         selected = Some(last);

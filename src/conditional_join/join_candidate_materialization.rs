@@ -230,6 +230,11 @@ fn materialize_range_any(
             // and the envelope there is the residual value itself; a prefix
             // window starts at the first row that lifts the envelope. Any
             // other shape just pays one extra check before the skip scan.
+            //
+            // ELI5: the shelf is sorted so that a "best price so far" tag sits
+            // on every item. The tag stops saying "cheap enough" at exactly
+            // the last item that is itself cheap enough, so peeking at the
+            // far end of the shelf answers "is there any?" without walking it.
             let last = end - 1;
             found = first_match(left_position, last, end);
             #[cfg(test)]
