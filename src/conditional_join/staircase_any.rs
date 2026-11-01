@@ -288,7 +288,7 @@ fn staircase_any<X: PartialOrd + Copy, Y: PartialOrd + Copy>(
     }
 
     // Sort the right side by x unless it already is (the sort step allocates
-    // nothing when it is; `stair` and `witness` below are always built).
+    // nothing when it is; `witness` below is always built).
     // ELI5: if the shops are already in road order, don't re-shuffle them.
     let already_sorted = rx.windows(2).all(|pair| pair[0] <= pair[1]);
     let (bx, by, order): SortedRight<X, Y> = if already_sorted {
@@ -316,19 +316,16 @@ fn staircase_any<X: PartialOrd + Copy, Y: PartialOrd + Copy>(
         }
     };
     let mut witness: Vec<usize> = vec![0; n];
-    let mut stair: Vec<Y> = by.to_vec();
     if suffix {
         witness[n - 1] = n - 1;
         for p in (0..n - 1).rev() {
             let held = witness[p + 1];
             witness[p] = if better(by[p], by[held]) { p } else { held };
-            stair[p] = by[witness[p]];
         }
     } else {
         for p in 1..n {
             let held = witness[p - 1];
             witness[p] = if better(by[p], by[held]) { p } else { held };
-            stair[p] = by[witness[p]];
         }
     }
 
@@ -350,8 +347,8 @@ fn staircase_any<X: PartialOrd + Copy, Y: PartialOrd + Copy>(
             }
             cut - 1
         };
-        if op_y.apply(&ly[row], &stair[slot]) {
-            let held = witness[slot];
+        let held = witness[slot];
+        if op_y.apply(&ly[row], &by[held]) {
             left_out.push(left_labels[row]);
             right_out.push(right_labels[order.as_ref().map_or(held, |o| o[held])]);
         }
