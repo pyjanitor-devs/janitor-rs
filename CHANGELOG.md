@@ -4,6 +4,17 @@ All notable changes to janitor-rs are documented here.
 
 ## [Unreleased]
 
+## [0.6.8](https://github.com/pyjanitor-devs/janitor-rs/compare/v0.6.7...v0.6.8) - 2026-11-01
+
+### Added
+
+- add range_exists_indices, a staircase kernel for keep=any on two ranges
+
+### Other
+
+- drop the stair buffer from the staircase kernel
+- own registration in staircase_any, accept strided labels, widen tests
+
 ## [0.6.7](https://github.com/pyjanitor-devs/janitor-rs/compare/v0.6.6...v0.6.7) - 2026-11-01
 
 ### Other
