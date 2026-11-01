@@ -52,6 +52,14 @@ enum Column<'py> {
     F64Owned(Vec<f64>),
 }
 
+/// Borrow a label array, copying only when it is not contiguous.
+fn contiguous<'a>(labels: &'a PyReadonlyArray1<'_, i64>) -> Cow<'a, [i64]> {
+    match labels.as_slice() {
+        Ok(slice) => Cow::Borrowed(slice),
+        Err(_) => Cow::Owned(labels.as_array().to_vec()),
+    }
+}
+
 /// A borrowed view of a [`Column`] in one of the three element families.
 enum Values<'a> {
     I64(&'a [i64]),
@@ -157,8 +165,9 @@ pub fn range_exists_indices<'py>(
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
     let op_x = CompareOp::try_from_str(op_x)?;
     let op_y = CompareOp::try_from_str(op_y)?;
-    let left_labels = left_index.as_slice()?;
-    let right_labels = right_index.as_slice()?;
+    // Labels are read-only; copy only if numpy handed over a strided view.
+    let left_labels = contiguous(&left_index);
+    let right_labels = contiguous(&right_index);
     let (lx, rx) = (Column::load(left_x)?, Column::load(right_x)?);
     let (ly, ry) = (Column::load(left_y)?, Column::load(right_y)?);
     let x = pair(lx.values()?, rx.values()?).map_err(PyValueError::new_err)?;
@@ -166,7 +175,7 @@ pub fn range_exists_indices<'py>(
 
     macro_rules! run {
         ($xl:expr, $xr:expr, $yl:expr, $yr:expr) => {
-            staircase_any($xl, $xr, op_x, $yl, $yr, op_y, left_labels, right_labels)
+            staircase_any($xl, $xr, op_x, $yl, $yr, op_y, &left_labels, &right_labels)
         };
     }
     let result = match (x, y) {
@@ -278,8 +287,8 @@ fn staircase_any<X: PartialOrd + Copy, Y: PartialOrd + Copy>(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    // Sort the right side by x unless it already is (pyjanitor hands it over
-    // sorted, so the common case allocates nothing here).
+    // Sort the right side by x unless it already is (the sort step allocates
+    // nothing when it is; `stair` and `witness` below are always built).
     // ELI5: if the shops are already in road order, don't re-shuffle them.
     let already_sorted = rx.windows(2).all(|pair| pair[0] <= pair[1]);
     let (bx, by, order): SortedRight<X, Y> = if already_sorted {
@@ -359,6 +368,11 @@ fn staircase_any<X: PartialOrd + Copy, Y: PartialOrd + Copy>(
         finish(row, prefix_len(&bx, x, strict));
     }
     Ok((left_out, right_out))
+}
+
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(range_exists_indices, m)?)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -581,6 +595,48 @@ mod tests {
             )
             .is_err());
             assert!(call(py, lx, rx, ly, ry, "<=", "!=").is_err());
+            // The mixed-family check applies to y and to u64-against-i64 too.
+            let ix = || PyArray1::from_vec(py, vec![1_i64]).into_any();
+            let fy = PyArray1::from_vec(py, vec![1.0_f64]).into_any();
+            assert!(call(py, ix(), ix(), ix(), fy, "<=", ">").is_err());
+            let ux = PyArray1::from_vec(py, vec![1_u64]).into_any();
+            assert!(call(py, ux, ix(), ix(), ix(), "<=", ">").is_err());
+
+            // Every operator pair through the wrapper with more left rows than
+            // one 8-lane batch, a ragged tail, and a strided label array.
+            let lx: Vec<i64> = (0..21).map(|i| (i * 7) % 11).collect();
+            let ly: Vec<i64> = (0..21).map(|i| (i * 5) % 9).collect();
+            let rx = vec![3_i64, 8, 1, 6, 9, 2];
+            let ry = vec![4_i64, 0, 7, 2, 5, 8];
+            for op_x in ["<", "<=", ">", ">="] {
+                for op_y in ["<", "<=", ">", ">="] {
+                    let hit = |l: usize, r: usize| {
+                        let ok = |op: &str, a: i64, b: i64| match op {
+                            "<" => a < b,
+                            "<=" => a <= b,
+                            ">" => a > b,
+                            _ => a >= b,
+                        };
+                        ok(op_x, lx[l], rx[r]) && ok(op_y, ly[l], ry[r])
+                    };
+                    let want: Vec<i64> = (0..lx.len())
+                        .filter(|&l| (0..rx.len()).any(|r| hit(l, r)))
+                        .map(|l| 100 + l as i64)
+                        .collect();
+                    let col = |v: &Vec<i64>| PyArray1::from_vec(py, v.clone()).into_any();
+                    let mut got =
+                        matched(call(py, col(&lx), col(&rx), col(&ly), col(&ry), op_x, op_y));
+                    got.sort_unstable();
+                    assert_eq!(got, want, "{op_x} {op_y}");
+                }
+            }
+            let wide = PyArray1::from_vec(py, vec![0_i64, 9, 1, 9, 2, 9]);
+            let strided = wide
+                .call_method1("__getitem__", (pyo3::types::PySlice::new(py, 0, 6, 2),))
+                .unwrap();
+            let strided_labels = strided.cast::<PyArray1<i64>>().unwrap().readonly();
+            assert_eq!(contiguous(&strided_labels).as_ref(), &[0, 1, 2]);
+
             // No match anywhere is None, not an empty dict.
             let lx = PyArray1::from_vec(py, vec![9_i64]).into_any();
             let rx = PyArray1::from_vec(py, vec![2_i64]).into_any();

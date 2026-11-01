@@ -31,9 +31,6 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     range_join::register(m)?;
     single_range_predicate::register(m)?;
     regions::register(m)?;
-    m.add_function(pyo3::wrap_pyfunction!(
-        staircase_any::range_exists_indices,
-        m
-    )?)?;
+    staircase_any::register(m)?;
     Ok(())
 }
