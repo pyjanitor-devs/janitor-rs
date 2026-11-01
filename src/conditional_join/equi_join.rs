@@ -516,17 +516,30 @@ fn materialize_unordered_second_range(
                     continue;
                 }
                 let mut selected = None;
-                if keep == Keep::Any && end > start {
-                    // A window narrowed by the second range's own envelope
-                    // always holds a match at its far end when that range is
-                    // the only residual: the suffix-min envelope stops
-                    // admitting the row exactly where the value itself
-                    // qualifies. Any other shape pays one wasted check.
+                if keep == Keep::Any
+                    && end > start
+                    && matches!(predicate.op, CompareOp::Gt | CompareOp::Ge)
+                {
+                    // For `>`/`>=` the narrowing above pulls `end` back to the
+                    // point where the suffix-min envelope stops admitting the
+                    // row. If the envelope drops below the row's value there
+                    // while the position after it does not, the value at
+                    // `end - 1` is itself the envelope, so it is a genuine
+                    // match. That holds when the narrowing cut the window or
+                    // the first range left `end` at the equality group's end.
+                    // If the first range cut `end` earlier and the narrowing
+                    // changed nothing, the envelope minimum may sit beyond the
+                    // window, and about half the probes miss (one wasted
+                    // check). `<`/`<=` narrow `start` instead, where `end - 1`
+                    // is no better than any other position, so they skip the
+                    // probe.
                     //
                     // ELI5: each key has its own shelf with a "best so far"
                     // tag on every item. Where the tag stops fitting the
                     // customer, the item under it is itself a fit, so one
                     // look at the far end replaces checking the whole shelf.
+                    // The trick only works when the shelf was not cut short
+                    // by someone else's rule first.
                     let last = end as usize - 1;
                     if predicate.op.apply(&left[row], &right[last]) && residuals_pass(row, last) {
                         selected = Some(last);
