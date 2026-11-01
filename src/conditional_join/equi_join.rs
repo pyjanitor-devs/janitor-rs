@@ -3606,6 +3606,72 @@ mod tests {
         });
     }
 
+    #[test]
+    fn unordered_second_range_any_probe_only_runs_for_greater_than_ranges() {
+        Python::initialize();
+        Python::attach(|py| {
+            // One left row and one equality group over the four right rows.
+            // `window_end` is where the first range stopped the window.
+            let run = |op: CompareOp, left: i64, right: Vec<i64>, window_end: i64| {
+                let range = AnyParsedRangePredicate::I64(ParsedRangePredicate {
+                    left: PyArray1::from_vec(py, vec![left]).readonly(),
+                    left_index: PyArray1::from_vec(py, vec![0_i64]).readonly(),
+                    right: PyArray1::from_vec(py, right).readonly(),
+                    right_index: PyArray1::from_vec(py, vec![0_i64, 1, 2, 3]).readonly(),
+                    op,
+                });
+                let mut starts = Array1::from_vec(vec![0]);
+                let mut ends = Array1::from_vec(vec![window_end]);
+                let equality_starts = Array1::from_vec(vec![0]);
+                let equality_ends = Array1::from_vec(vec![4]);
+                let before = EQUI_ANY_BOUNDARY_HITS.with(|hits| hits.get());
+                let result = materialize_unordered_second_range(
+                    Array1::from_vec(vec![10]).view(),
+                    Array1::from_vec(vec![10, 11, 12, 13]).view(),
+                    starts.view_mut(),
+                    ends.view_mut(),
+                    &range,
+                    equality_starts.view(),
+                    equality_ends.view(),
+                    &[],
+                    None,
+                    Keep::Any,
+                )
+                .unwrap()
+                .unwrap();
+                let hits = EQUI_ANY_BOUNDARY_HITS.with(|hits| hits.get()) - before;
+                (result.1, hits)
+            };
+
+            // `>` and `>=`: the suffix-min envelope pulls the end back, so the
+            // far end is a genuine match and the probe resolves the row.
+            for op in [CompareOp::Gt, CompareOp::Ge] {
+                let (right, hits) = run(op, 3, vec![4, 1, 3, 2], 4);
+                assert_eq!(hits, 1, "{op:?}: far-end probe did not run");
+                assert_eq!(right.len(), 1);
+                // `>` matches rows 11 and 13; `>=` also matches row 12.
+                assert!([11, 12, 13].contains(&right[0]), "{op:?}: {right:?}");
+            }
+
+            // `<` and `<=` narrow the start instead, so the probe is skipped
+            // even though the far end (position 3, value 5) also matches.
+            for op in [CompareOp::Lt, CompareOp::Le] {
+                let (right, hits) = run(op, 3, vec![4, 1, 3, 5], 4);
+                assert_eq!(hits, 0, "{op:?}: probe must be skipped");
+                assert_eq!(right.len(), 1);
+                assert!([10, 13].contains(&right[0]), "{op:?}: {right:?}");
+            }
+
+            // `>` with the first range cutting the window to the first two
+            // rows: nothing is narrowed and the far end (value 4) misses, but
+            // position 0 (value 2) matches. The probe must miss quietly and
+            // the scan must still find the real match.
+            let (right, hits) = run(CompareOp::Gt, 3, vec![2, 4, 1, 5], 2);
+            assert_eq!(hits, 0, "a missed probe must not count as a hit");
+            assert_eq!(right, vec![10]);
+        });
+    }
+
     /// Deterministic xorshift generator so the randomized cases are identical
     /// on every run and platform.
     struct XorShift(u64);
