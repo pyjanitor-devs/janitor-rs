@@ -4,6 +4,15 @@ All notable changes to janitor-rs are documented here.
 
 ## [Unreleased]
 
+## [0.6.7](https://github.com/pyjanitor-devs/janitor-rs/compare/v0.6.6...v0.6.7) - 2026-11-01
+
+### Other
+
+- cover the equi keep=any probe gate for each second-range operator
+- limit the equi keep=any boundary probe to > and >= second ranges
+- Add ELI5 comments to the keep=any boundary probes
+- resolve keep="any" at the window boundary (may return a later match)
+
 ## [0.6.6](https://github.com/pyjanitor-devs/janitor-rs/compare/v0.6.5...v0.6.6) - 2026-10-24
 
 ### Fixed
